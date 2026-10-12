@@ -1,10 +1,10 @@
 //! Immich Sync shell: a GPUI-Kit window, a tray icon, and a single instance.
 
+pub mod dashboard;
 pub mod instance;
 pub mod shell;
 pub mod status;
 pub mod theme;
-pub mod dashboard;
 
 use anyhow::Context as _;
 use async_channel::Receiver;
