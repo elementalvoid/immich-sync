@@ -39,6 +39,8 @@ A background sync client for Immich on Windows. The user selects local folders i
 | Settings store | TOML in the OS config directory. XDG-ready, no hardcoded Windows paths. | this plan |
 | Path layout | Config in the OS config directory. State in the local data directory. | this plan |
 | Platforms (v1) | Windows and Linux ship together. macOS is deferred. | this plan |
+| Release signing (v1) | Unsigned. Signing moves to the public-release ticket. | this plan |
+| Release provenance | Guarded CI steps, enabled when the repository goes public. | this plan |
 | Sync-state store | SQLite via `rusqlite` (bundled), WAL, `synchronous=FULL`. | [ADR 0005](docs/adr/0005-sqlite-via-rusqlite-for-state.md) |
 | Album scope | User choice per mapped folder: leaf folders or the whole source folder. | this plan |
 | Tray display | Activity state, review count, upload progress, last error. | this plan |
@@ -143,6 +145,8 @@ Each ticket declares its blockers as a native GitHub issue dependency. The front
 | [#12](https://github.com/elementalvoid/immich-sync/issues/12) | Deletion review | #6 |
 | [#13](https://github.com/elementalvoid/immich-sync/issues/13) | Diagnostics | #6 |
 | [#14](https://github.com/elementalvoid/immich-sync/issues/14) | Packaged release | #7–#12 |
+| [#15](https://github.com/elementalvoid/immich-sync/issues/15) | Mock Immich server for engine tests | — |
+| [#16](https://github.com/elementalvoid/immich-sync/issues/16) | Public release: repo visibility, signing, provenance | #14 |
 
 ## Risks
 

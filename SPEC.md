@@ -137,11 +137,11 @@ Acceptance: a permanent error raises one notification. Grep of the log finds no 
 ### R11 — Packaging and distribution
 
 - R11.1 `cargo-packager` produces an NSIS installer for Windows and deb and AppImage packages for Linux.
-- R11.2 Windows binaries are Authenticode-signed. The signing method is an open decision: Azure Artifact Signing, an OV certificate, or unsigned for v1.
-- R11.3 CI builds both platforms and publishes build provenance attestations plus a SHA256SUMS file. `gh attestation verify` works against the artifacts.
+- R11.2 Windows binaries ship unsigned in v1. The installer warns under SmartScreen. Code signing belongs to the public-release ticket.
+- R11.3 CI builds both platforms, publishes a SHA256SUMS file, and contains provenance attestation steps guarded by a repository variable. The steps stay skipped while the repository is private. `gh attestation verify` succeeds when they are enabled.
 - R11.4 The README documents install and verification steps for both platforms.
 
-Acceptance: a clean Windows machine installs from the NSIS installer. A clean Linux desktop installs from the deb or the AppImage. The provenance attestation verifies for both artifacts.
+Acceptance: a clean Windows machine installs from the NSIS installer. A clean Linux desktop installs from the deb or the AppImage. The provenance attestation verifies for both artifacts once the repository is public.
 
 ## 4. Non-functional requirements
 
