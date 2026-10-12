@@ -1,0 +1,84 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Linux
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc g++ clang pkg-config \
+            libfontconfig-dev libfreetype-dev libwayland-dev libxkbcommon-dev \
+            libxkbcommon-x11-dev libx11-xcb-dev libxcb1-dev libvulkan1 \
+            libssl-dev libzstd-dev
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  windows:
+    name: Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  linux-gui-smoke:
+    name: Linux GUI smoke (Xvfb + lavapipe)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc g++ clang pkg-config \
+            libfontconfig-dev libfreetype-dev libwayland-dev libxkbcommon-dev \
+            libxkbcommon-x11-dev libx11-xcb-dev libxcb1-dev \
+            libvulkan1 mesa-vulkan-drivers \
+            xvfb xvfb-run xauth imagemagick x11-utils
+      - run: cargo build --bin immich-sync
+      - name: Capture a real frame
+        run: |
+          set -euo pipefail
+          export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json
+          export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json
+          export LIBGL_ALWAYS_SOFTWARE=1
+          unset WAYLAND_DISPLAY
+          dbus-run-session -- xvfb-run -a -s "-screen 0 1280x800x24" bash -c '
+            set -euo pipefail
+            target/debug/immich-sync >shot.png.log 2>&1 &
+            APP=$!
+            sleep 10
+            import -window root shot.png
+            target/debug/immich-sync       # second launch: hands off, exits
+            sleep 2
+            kill $APP 2>/dev/null || true
+            wait $APP 2>/dev/null || true
+            cat shot.png.log
+          '
+      - name: Assert the frame is not blank
+        run: |
+          set -euo pipefail
+          identify -format "geom=%wx%h colors=%k\n" shot.png
+          mean=$(convert shot.png -colorspace gray -format '%[fx:mean]' info:)
+          echo "screenshot gray mean=$mean"
+          test "$mean" != "0"
