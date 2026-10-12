@@ -1,8 +1,25 @@
 [workspace]
 resolver = "3"
-members = ["crates/mock-immich"]
+members = [
+    "crates/app",
+    "crates/immich-client",
+    "crates/mock-immich",
+    "crates/sync-core",
+]
 
 [workspace.package]
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.92"
+
+[workspace.dependencies]
+# Pin the shell stack exactly. gpui-kit imposes an exact `gpui-pre`; a caret
+# range would let a patch release move it (ADR 0001).
+anyhow = "1"
+async-channel = "=2.5.0"
+gpui-kit = "=0.7.2"
+# Only the `gpui-kit` backend. The three gpui-tray backends are mutually
+# exclusive and `compile_error!` when more than one is enabled, so never build
+# the workspace with `--all-features`.
+gpui-tray = { version = "=0.1.4", default-features = false, features = ["gpui-kit", "menu-state"] }
+interprocess = "=2.4.5"
