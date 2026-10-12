@@ -206,8 +206,10 @@ fn field_keys_map_settings_to_the_displayed_text() {
 
 #[test]
 fn the_bandwidth_field_round_trips_a_fractional_value() {
-    let mut settings = Settings::default();
-    settings.bandwidth_bytes_per_second = 1_500_000;
+    let mut settings = Settings {
+        bandwidth_bytes_per_second: 1_500_000,
+        ..Settings::default()
+    };
 
     assert_eq!(
         FieldKey::Bandwidth.display(&settings),

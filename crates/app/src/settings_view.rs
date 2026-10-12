@@ -180,7 +180,7 @@ fn bytes_per_second(megabytes: f64) -> u64 {
 fn megabytes_per_second_text(bytes: u64) -> String {
     const TENTHS_PER_MEGABYTE: u64 = BYTES_PER_MEGABYTE / 10;
     let tenths = bytes.saturating_add(TENTHS_PER_MEGABYTE / 2) / TENTHS_PER_MEGABYTE;
-    if tenths % 10 == 0 {
+    if tenths.is_multiple_of(10) {
         (tenths / 10).to_string()
     } else {
         format!("{}.{}", tenths / 10, tenths % 10)
