@@ -5,7 +5,7 @@ pub mod shell;
 
 use anyhow::Context as _;
 use async_channel::Receiver;
-use gpui_kit::App;
+use gpui_kit::{App, QuitMode};
 
 /// Runs the client, and returns when the primary instance quits.
 ///
@@ -46,6 +46,9 @@ fn boot(cx: &mut App, incoming: Receiver<instance::Request>) {
         eprintln!("immich-sync: could not open the main window: {error:#}");
     }
     if let Err(error) = shell::install_tray(cx) {
+        // With no tray there is no Quit menu item, so the app must not keep the
+        // tray's explicit quit mode: it would run with no way to quit.
+        cx.set_quit_mode(QuitMode::default());
         eprintln!("immich-sync: could not create the tray icon: {error}");
     }
 }
