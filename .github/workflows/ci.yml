@@ -13,8 +13,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.99.0"
           components: rustfmt, clippy
       - name: Install system dependencies
         run: |
@@ -33,8 +34,9 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.99.0"
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
@@ -45,7 +47,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.0"
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -68,9 +72,11 @@ jobs:
             target/debug/immich-sync >shot.png.log 2>&1 &
             APP=$!
             sleep 10
+            kill -0 $APP                  # the app survived startup
             import -window root shot.png
-            target/debug/immich-sync       # second launch: hands off, exits
+            target/debug/immich-sync      # second launch: non-primary, exits 0 under set -e
             sleep 2
+            kill -0 $APP                  # the handoff did not stop the primary
             kill $APP 2>/dev/null || true
             wait $APP 2>/dev/null || true
             cat shot.png.log
