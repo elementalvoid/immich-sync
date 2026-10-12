@@ -1,9 +1,12 @@
 //! The dashboard view (SPEC R8.1): a global status card and one card per
 //! source folder.
+//!
+//! Keyboard navigation stays out until the form controls land in #3.
 
 use crate::status::{ActivityState, DashboardModel, StatusCard};
 
 use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::Theme;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::tag::Tag;
@@ -113,7 +116,12 @@ impl Render for Dashboard {
             .p_6()
             .gap_4()
             .child(header)
-            .child(status_card("status-global".into(), &self.model.global, cx))
+            .child(status_card(
+                "status-global".into(),
+                "status-state-global".into(),
+                &self.model.global,
+                cx,
+            ))
             .child(div().text_sm().text_color(muted).child("Source folders"))
             .child(
                 div().flex().flex_row().flex_wrap().gap_4().children(
@@ -122,8 +130,9 @@ impl Render for Dashboard {
                         .iter()
                         .enumerate()
                         .map(|(index, folder)| {
-                            div().w(rems(17.5)).child(status_card(
+                            div().w(rems(17.5)).flex().child(status_card(
                                 ("status-folder", index).into(),
+                                ("status-state-folder", index).into(),
                                 folder,
                                 cx,
                             ))
@@ -133,10 +142,62 @@ impl Render for Dashboard {
     }
 }
 
+/// The theme tokens one dashboard card paints with.
+///
+/// The color choice lives here, so the WCAG contrast test measures the tokens
+/// the view actually paints rather than a copy of them.
+#[derive(Clone, Copy, Debug)]
+pub struct CardPalette {
+    /// The card fill.
+    pub surface: Hsla,
+    /// The card title and notice text.
+    pub text: Hsla,
+    /// The path, percentage, and counts text.
+    pub meta: Hsla,
+    /// The state pill fill.
+    pub pill_fill: Hsla,
+    /// The state pill text.
+    pub pill_text: Hsla,
+}
+
+impl CardPalette {
+    /// Reads the palette from the active theme.
+    #[must_use]
+    pub fn new(theme: &Theme) -> Self {
+        Self {
+            surface: theme.popover,
+            text: theme.foreground,
+            meta: theme.muted_foreground,
+            pill_fill: theme.secondary,
+            pill_text: theme.secondary_foreground,
+        }
+    }
+}
+
+/// The border color that carries one activity state's hue.
+///
+/// The pill label stays in the theme's paired pill ink, because the light
+/// accents are too bright to read as text on a light card.
+#[must_use]
+pub fn state_border(state: ActivityState, theme: &Theme) -> Hsla {
+    match state {
+        ActivityState::Idle => theme.muted_foreground,
+        ActivityState::Syncing => theme.info,
+        ActivityState::Paused => theme.warning,
+        ActivityState::NeedsAttention => theme.danger,
+    }
+}
+
 /// One status card. The text comes from [`StatusCard::content`], so the view
 /// does no formatting.
-fn status_card(id: ElementId, card: &StatusCard, cx: &App) -> impl IntoElement {
+fn status_card(
+    id: ElementId,
+    state_id: ElementId,
+    card: &StatusCard,
+    cx: &App,
+) -> impl IntoElement {
     let theme = cx.theme();
+    let palette = CardPalette::new(theme);
     let content = card.content();
     let title = content.title.clone();
     let mut root = div()
@@ -148,7 +209,8 @@ fn status_card(id: ElementId, card: &StatusCard, cx: &App) -> impl IntoElement {
         .p_4()
         .w_full()
         .rounded(theme.radius_lg)
-        .bg(theme.secondary)
+        .bg(palette.surface)
+        .text_color(palette.text)
         .border_1()
         .border_color(theme.border)
         .child(
@@ -166,6 +228,7 @@ fn status_card(id: ElementId, card: &StatusCard, cx: &App) -> impl IntoElement {
                         .min_w_0()
                         .child(
                             div()
+                                .truncate()
                                 .text_base()
                                 .font_weight(FontWeight::MEDIUM)
                                 .child(content.title),
@@ -173,13 +236,20 @@ fn status_card(id: ElementId, card: &StatusCard, cx: &App) -> impl IntoElement {
                         .when_some(content.path, |this, path| {
                             this.child(
                                 div()
+                                    .truncate()
                                     .text_xs()
-                                    .text_color(theme.muted_foreground)
+                                    .text_color(palette.meta)
                                     .child(path),
                             )
                         }),
                 )
-                .child(state_tag(card.activity)),
+                .child(
+                    div()
+                        .id(state_id)
+                        .test_support()
+                        .aria_label(content.state.clone())
+                        .child(state_tag(card.activity, content.state, &palette, theme)),
+                ),
         )
         .child(
             div()
@@ -196,38 +266,47 @@ fn status_card(id: ElementId, card: &StatusCard, cx: &App) -> impl IntoElement {
                 .child(
                     div()
                         .text_sm()
-                        .text_color(theme.muted_foreground)
+                        .text_color(palette.meta)
                         .child(content.progress_percent),
                 ),
         )
         .child(
             div()
                 .text_sm()
-                .text_color(theme.muted_foreground)
+                .text_color(palette.meta)
                 .child(content.counts),
         );
 
     if let Some(review) = content.review {
-        root = root.child(div().text_xs().text_color(theme.warning).child(review));
+        root = root.child(notice(review, theme.warning, &palette));
     }
     if let Some(error) = content.error {
-        root = root.child(
-            div()
-                .text_xs()
-                .text_color(theme.danger)
-                .child(format!("Last error: {error}")),
-        );
+        root = root.child(notice(
+            format!("Last error: {error}"),
+            theme.danger,
+            &palette,
+        ));
     }
     root
 }
 
 /// The activity-state pill on a card.
-fn state_tag(state: ActivityState) -> Tag {
-    let tag = match state {
-        ActivityState::Idle => Tag::secondary(),
-        ActivityState::Syncing => Tag::info(),
-        ActivityState::Paused => Tag::warning(),
-        ActivityState::NeedsAttention => Tag::danger(),
-    };
-    tag.outline().child(state.label())
+fn state_tag(state: ActivityState, label: String, palette: &CardPalette, theme: &Theme) -> Tag {
+    Tag::secondary()
+        .bg(palette.pill_fill)
+        .text_color(palette.pill_text)
+        .border_color(state_border(state, theme))
+        .child(label)
+}
+
+/// A card notice: a colored edge marks the kind, and the text keeps the
+/// card's readable ink.
+fn notice(text: String, accent: Hsla, palette: &CardPalette) -> impl IntoElement {
+    div()
+        .border_l_2()
+        .border_color(accent)
+        .pl_2()
+        .text_xs()
+        .text_color(palette.text)
+        .child(text)
 }
