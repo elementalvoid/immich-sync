@@ -381,11 +381,7 @@ impl SettingsView {
                 .justify_between()
                 .gap_6()
                 .min_h(rems(2.25))
-                .child(field_text(
-                    label,
-                    "Read-only. Resolved from the platform.",
-                    &palette,
-                ))
+                .child(field_text(label, "Resolved from the platform.", &palette))
                 .child(
                     div()
                         .flex_1()
@@ -401,7 +397,7 @@ impl SettingsView {
         section(
             "settings-storage",
             "Storage",
-            "The database stays on this computer; it never lives on a network share or in a cloud-sync folder.",
+            "Read-only. The database stays on this computer; it never lives on a network share or in a cloud-sync folder.",
             vec![
                 row(
                     "settings-path-config",
@@ -441,9 +437,28 @@ impl SettingsView {
                         .min_h(rems(2.25))
                         .child(field_text(key.label(), key.help(), &palette))
                         .child(
-                            NumberInput::new(&field.input)
-                                .w_32()
-                                .suffix(div().text_xs().text_color(muted).child(key.unit())),
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_3()
+                                .child(
+                                    // The component's root is `flex_1`, so the
+                                    // fixed width belongs on a non-growing
+                                    // wrapper.
+                                    div()
+                                        .w_32()
+                                        .flex_none()
+                                        .child(NumberInput::new(&field.input)),
+                                )
+                                .child(
+                                    div()
+                                        .w_16()
+                                        .flex_none()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .child(key.unit()),
+                                ),
                         )
                         .into_any_element(),
                 )
@@ -472,8 +487,8 @@ impl Render for SettingsView {
             .bg(background)
             .text_color(foreground)
             .overflow_y_scroll()
-            .p_5()
-            .gap_3()
+            .p_4()
+            .gap_2()
             .child(Self::header(cx))
             .children(notices)
             .child(general)
