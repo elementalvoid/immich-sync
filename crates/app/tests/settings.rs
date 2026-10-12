@@ -117,23 +117,54 @@ fn linux_paths_fall_back_to_the_home_directories() {
 }
 
 #[test]
-fn crates_sources_have_no_hardcoded_windows_path() {
+fn the_workspace_text_files_have_no_hardcoded_windows_path() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let sources = rust_sources(root.join("crates"));
+    let files = text_files(&root);
 
-    assert!(!sources.is_empty(), "found no crate source files");
-    for path in &sources {
-        let source = fs::read_to_string(path).expect("read a crate source file");
-        for (line_number, line) in source.lines().enumerate() {
-            if let Some(drive) = hardcoded_drive_path(line) {
-                panic!(
-                    "{}:{} hardcodes the Windows path `{drive}`: {line}",
-                    path.display(),
-                    line_number + 1
-                );
-            }
-        }
-    }
+    assert!(
+        files.contains(&root.join("Cargo.toml")),
+        "the workspace root's own files are scanned"
+    );
+    assert!(
+        files
+            .iter()
+            .any(|path| path.ends_with("crates/app/src/paths.rs")),
+        "the crate sources are still scanned"
+    );
+    assert!(
+        !files
+            .iter()
+            .any(|path| path.starts_with(root.join("target"))),
+        "build output is skipped"
+    );
+
+    let found = drive_paths_in(&root);
+    assert!(
+        found.is_empty(),
+        "hardcoded Windows paths:\n{}",
+        found.join("\n")
+    );
+}
+
+#[test]
+fn the_scan_catches_an_injected_drive_letter_path() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    // Built from parts so this test does not trip the scan it tests.
+    let injected = format!(
+        "the database is at {}:{}immich{}state.db\n",
+        'D', '\\', '\\'
+    );
+    fs::write(temp.path().join("notes.txt"), injected).expect("write the injected file");
+
+    let found = drive_paths_in(temp.path());
+
+    assert_eq!(
+        found.len(),
+        1,
+        "the scan reports the injected literal: {found:?}"
+    );
+    assert!(found[0].contains("notes.txt"), "{found:?}");
+    assert!(found[0].contains(&format!("{}:{}", 'D', '\\')), "{found:?}");
 }
 
 /// The first drive-letter path literal in `line`, if any.
@@ -384,19 +415,46 @@ fn the_platform_backend_resolves_the_xdg_autostart_directory() {
     assert!(!entry.exists());
 }
 
-/// Every `.rs` file under `root`.
-fn rust_sources(root: PathBuf) -> Vec<PathBuf> {
-    let mut sources = Vec::new();
-    let mut pending = vec![root];
+/// Every non-prose text file under `root`, skipping build output and Git
+/// internals. Documentation may quote a Windows path while describing the
+/// rule, so Markdown is left to the reader.
+fn text_files(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
     while let Some(directory) = pending.pop() {
         for entry in fs::read_dir(&directory).expect("read a source directory") {
             let path = entry.expect("read a source entry").path();
             if path.is_dir() {
-                pending.push(path);
-            } else if path.extension().is_some_and(|extension| extension == "rs") {
-                sources.push(path);
+                let skipped = path
+                    .file_name()
+                    .is_some_and(|name| name == "target" || name == ".git");
+                if !skipped {
+                    pending.push(path);
+                }
+            } else if !path.extension().is_some_and(|extension| extension == "md")
+                && fs::read_to_string(&path).is_ok()
+            {
+                files.push(path);
             }
         }
     }
-    sources
+    files
+}
+
+/// Every hardcoded drive-letter path in `root`'s text files.
+fn drive_paths_in(root: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    for path in text_files(root) {
+        let source = fs::read_to_string(&path).expect("read a text file");
+        for (line_number, line) in source.lines().enumerate() {
+            if let Some(drive) = hardcoded_drive_path(line) {
+                found.push(format!(
+                    "{}:{} hardcodes `{drive}`: {line}",
+                    path.display(),
+                    line_number + 1
+                ));
+            }
+        }
+    }
+    found
 }
