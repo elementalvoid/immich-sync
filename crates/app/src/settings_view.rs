@@ -177,8 +177,9 @@ fn bytes_per_second(megabytes: f64) -> u64 {
 
 /// The MB/s text for a stored bytes-per-second limit.
 ///
-/// Six decimals are one byte, so every stored value displays exactly and
-/// round-trips through the field. Trailing zeros are trimmed.
+/// Six decimals are one byte, so a stored value up to the field's 10,000 MB/s
+/// bound (10,000,000,000 bytes per second) displays exactly and round-trips
+/// through the field. Trailing zeros are trimmed.
 fn megabytes_per_second_text(bytes: u64) -> String {
     let whole = bytes / BYTES_PER_MEGABYTE;
     let fraction = bytes % BYTES_PER_MEGABYTE;
@@ -196,6 +197,8 @@ fn megabytes_per_second_text(bytes: u64) -> String {
 const SAVE_PROBLEM: &str = "Could not save the settings";
 /// The notice prefix for an autostart change that could not be applied.
 const AUTOSTART_PROBLEM: &str = "Could not update the autostart setting";
+/// The notice prefix for an autostart state that could not be read.
+const AUTOSTART_READ_PROBLEM: &str = "Could not read the autostart setting";
 
 /// One numeric row: its key and the input state that edits it.
 struct Field {
@@ -312,6 +315,12 @@ impl SettingsView {
     /// switch must show what the OS does, or turning it off would be a no-op
     /// against a file that already said off.
     fn reconcile_autostart(&mut self, cx: &mut Context<Self>) {
+        // A corrupt file holds defaults, so its flag is not a stored value. A
+        // write here would replace the unparsable bytes and clear the load
+        // problem, so leave the file and the notice alone until the user acts.
+        if self.store.problem().is_some() {
+            return;
+        }
         let stored = self.store.settings().autostart;
         let result = match self.autostart.is_enabled() {
             Ok(actual) if actual != stored => self
@@ -319,7 +328,14 @@ impl SettingsView {
                 .update(|settings| settings.autostart = actual)
                 .map_err(|error| error.context("record the OS autostart state")),
             Ok(_) => Ok(()),
-            Err(error) => Err(error.context("read the OS autostart state")),
+            Err(error) => {
+                self.record(
+                    AUTOSTART_READ_PROBLEM,
+                    Err(error.context("read the OS autostart state")),
+                    cx,
+                );
+                return;
+            }
         };
         self.record(AUTOSTART_PROBLEM, result, cx);
     }

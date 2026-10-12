@@ -27,6 +27,7 @@ use immich_sync::status;
 struct FakeAutostart {
     enabled: Cell<bool>,
     refuse: bool,
+    unreadable: bool,
 }
 
 impl FakeAutostart {
@@ -34,6 +35,7 @@ impl FakeAutostart {
         Rc::new(Self {
             enabled: Cell::new(false),
             refuse: false,
+            unreadable: false,
         })
     }
 
@@ -42,6 +44,7 @@ impl FakeAutostart {
         Rc::new(Self {
             enabled: Cell::new(enabled),
             refuse: false,
+            unreadable: false,
         })
     }
 
@@ -49,12 +52,25 @@ impl FakeAutostart {
         Rc::new(Self {
             enabled: Cell::new(false),
             refuse: true,
+            unreadable: false,
+        })
+    }
+
+    /// A backend whose OS entry cannot be read.
+    fn unreadable() -> Rc<Self> {
+        Rc::new(Self {
+            enabled: Cell::new(false),
+            refuse: false,
+            unreadable: true,
         })
     }
 }
 
 impl Autostart for FakeAutostart {
     fn is_enabled(&self) -> anyhow::Result<bool> {
+        if self.unreadable {
+            anyhow::bail!("the OS autostart state could not be read");
+        }
         Ok(self.enabled.get())
     }
 
@@ -533,6 +549,26 @@ fn the_view_reconciles_the_autostart_setting_with_the_os(cx: &mut TestAppContext
 }
 
 #[gpui_kit::test]
+fn an_unreadable_os_autostart_state_is_reported_as_a_read_failure(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let store = SettingsStore::open(paths.config_file.clone());
+    let window = open_settings(cx, store, paths.clone(), FakeAutostart::unreadable());
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let notice = window.find("settings-action-error");
+        assert!(notice.visible(), "the read failure is visible");
+        let message = notice.label().unwrap_or_default();
+        assert!(
+            message.starts_with("Could not read the autostart setting"),
+            "the notice names the failed read, not an update: {message}"
+        );
+    })
+    .expect("update the settings window");
+}
+
+#[gpui_kit::test]
 fn a_failed_settings_write_rolls_the_autostart_change_back(cx: &mut TestAppContext) {
     let temp = tempfile::tempdir().expect("create a temp dir");
     let paths = temporary_paths(temp.path());
@@ -685,6 +721,46 @@ fn corrupt_settings_load_defaults_and_show_a_problem_that_clears_after_a_save(
     let reloaded = SettingsStore::open(paths.config_file);
     assert_eq!(reloaded.settings().concurrency, 5);
     assert!(reloaded.problem().is_none());
+}
+
+#[gpui_kit::test]
+fn corrupt_settings_are_left_alone_when_the_os_autostart_is_enabled(cx: &mut TestAppContext) {
+    // The defaults a corrupt file falls back to are not a stored value, so
+    // reconciling them against an enabled OS entry must not rewrite the file:
+    // that would destroy the bytes and hide why they could not be loaded.
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let corrupt = "concurrency = \"four\"\n";
+    fs::create_dir_all(paths.config_file.parent().expect("a config directory"))
+        .expect("create the config directory");
+    fs::write(&paths.config_file, corrupt).expect("write the corrupt file");
+    let store = SettingsStore::open(paths.config_file.clone());
+    let backend = FakeAutostart::with_enabled(true);
+    let window = open_settings(cx, store, paths.clone(), backend);
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let notice = window
+            .try_find("settings-problem")
+            .expect("the corrupt file is still reported");
+        assert!(notice.visible(), "the problem notice stays visible");
+        assert!(
+            notice.label().unwrap_or_default().contains("settings.toml"),
+            "the notice names the file"
+        );
+        assert_eq!(
+            window.find("settings-autostart").checked(),
+            Some(false),
+            "the switch shows the defaults the store holds"
+        );
+    })
+    .expect("update the settings window");
+
+    assert_eq!(
+        fs::read_to_string(&paths.config_file).expect("read the file back"),
+        corrupt,
+        "reconciling left the corrupt file's bytes untouched"
+    );
 }
 
 #[gpui_kit::test]
