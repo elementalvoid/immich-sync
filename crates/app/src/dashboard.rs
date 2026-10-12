@@ -6,6 +6,7 @@
 use crate::status::{ActivityState, DashboardModel, StatusCard};
 
 use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::Colorize as _;
 use gpui_kit::component::Theme;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::progress::Progress;
@@ -174,18 +175,26 @@ impl CardPalette {
     }
 }
 
+/// How far a state hue is darkened to read as a 1px border on a card.
+///
+/// The kit's light accents are too bright for a border: the light `info` and
+/// `warning` tokens sit below the WCAG non-text contrast floor of 3:1 on the
+/// card surface. This factor clears it in both themes.
+const STATE_BORDER_DARKEN: f32 = 0.25;
+
 /// The border color that carries one activity state's hue.
 ///
 /// The pill label stays in the theme's paired pill ink, because the light
 /// accents are too bright to read as text on a light card.
 #[must_use]
 pub fn state_border(state: ActivityState, theme: &Theme) -> Hsla {
-    match state {
+    let accent = match state {
         ActivityState::Idle => theme.muted_foreground,
         ActivityState::Syncing => theme.info,
         ActivityState::Paused => theme.warning,
         ActivityState::NeedsAttention => theme.danger,
-    }
+    };
+    accent.darken(STATE_BORDER_DARKEN)
 }
 
 /// One status card. The text comes from [`StatusCard::content`], so the view
@@ -291,12 +300,15 @@ fn status_card(
 }
 
 /// The activity-state pill on a card.
+///
+/// The wrapper owns the accessible name and the visible copy is inaccessible
+/// to assistive technology, so the state is announced once, not twice.
 fn state_tag(state: ActivityState, label: String, palette: &CardPalette, theme: &Theme) -> Tag {
     Tag::secondary()
         .bg(palette.pill_fill)
         .text_color(palette.pill_text)
         .border_color(state_border(state, theme))
-        .child(label)
+        .child(Text::new_inaccessible(label.into()))
 }
 
 /// A card notice: a colored edge marks the kind, and the text keeps the
