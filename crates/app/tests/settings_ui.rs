@@ -696,11 +696,26 @@ fn long_storage_paths_stay_inside_their_card(cx: &mut TestAppContext) {
             "every section card keeps the same width"
         );
 
-        for id in ["settings-path-config", "settings-path-state"] {
+        for (id, value_id) in [
+            ("settings-path-config", "settings-path-config-value"),
+            ("settings-path-state", "settings-path-state-value"),
+        ] {
             let row = window.find(id).bounds();
             assert!(
                 row.right() <= storage.right() && row.left() >= storage.left(),
                 "{id} overflows its card: {row:?} vs {storage:?}"
+            );
+
+            // Only the text node itself proves the path was truncated: an
+            // unconstrained text child overflows its row while the row fits.
+            let value = window.find(value_id).bounds();
+            assert!(
+                value.right() <= storage.right() && value.left() >= storage.left(),
+                "{value_id} overflows its card: {value:?} vs {storage:?}"
+            );
+            assert!(
+                value.size.width < storage.size.width,
+                "{value_id} shrank to fit instead of keeping its full width: {value:?} vs {storage:?}"
             );
         }
     })

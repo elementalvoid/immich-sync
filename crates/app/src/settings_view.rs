@@ -476,7 +476,10 @@ impl SettingsView {
     fn storage(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let palette = CardPalette::new(cx.theme());
         let theme = cx.theme();
-        let row = |id: &'static str, label: &'static str, path: &std::path::Path| {
+        let row = |id: &'static str,
+                   value_id: &'static str,
+                   label: &'static str,
+                   path: &std::path::Path| {
             div()
                 .id(id)
                 .test_support()
@@ -488,15 +491,19 @@ impl SettingsView {
                 .min_h(rems(2.25))
                 .child(field_text(label, "Resolved from the platform.", &palette))
                 .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_right()
-                        .truncate()
-                        .font_family(theme.mono_font_family.clone())
-                        .text_xs()
-                        .text_color(palette.meta)
-                        .child(path.display().to_string()),
+                    div().flex_1().min_w_0().text_right().child(
+                        // The text node itself must shrink, or the path draws
+                        // past the card with no ellipsis.
+                        div()
+                            .id(value_id)
+                            .test_support()
+                            .min_w_0()
+                            .truncate()
+                            .font_family(theme.mono_font_family.clone())
+                            .text_xs()
+                            .text_color(palette.meta)
+                            .child(path.display().to_string()),
+                    ),
                 )
         };
         section(
@@ -506,12 +513,14 @@ impl SettingsView {
             vec![
                 row(
                     "settings-path-config",
+                    "settings-path-config-value",
                     "Settings file",
                     &self.paths.config_file,
                 )
                 .into_any_element(),
                 row(
                     "settings-path-state",
+                    "settings-path-state-value",
                     "State database",
                     &self.paths.state_db,
                 )
