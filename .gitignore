@@ -1,0 +1,5 @@
+target/
+.scratch/
+*.db
+*.db-wal
+*.db-shm
