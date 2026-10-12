@@ -3,6 +3,7 @@
 pub mod instance;
 pub mod shell;
 pub mod status;
+pub mod theme;
 
 use anyhow::Context as _;
 use async_channel::Receiver;
