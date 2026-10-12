@@ -7,10 +7,49 @@
 use async_channel::Sender;
 use interprocess::local_socket::prelude::*;
 use interprocess::local_socket::{GenericNamespaced, ListenerOptions};
-use std::io::{self, Read as _, Write as _};
+use std::fmt::Write as _;
+use std::io::{self, Read, Write as _};
 
 /// The per-user socket name that marks the running instance.
-pub const SOCKET_NAME: &str = "immich-sync.sock";
+///
+/// Namespaced sockets share one namespace between every user on the machine,
+/// so the name carries the user identity.
+#[must_use]
+pub fn socket_name() -> String {
+    socket_name_for(&current_user())
+}
+
+/// Builds the socket name for one user identity.
+///
+/// A socket name cannot carry every character an account name can (Windows
+/// rejects `\`, for one), so invalid bytes become `%xx` escapes. The escape is
+/// injective, so two distinct users never share a name.
+fn socket_name_for(user: &str) -> String {
+    let mut name = String::from("immich-sync-");
+    for byte in user.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.') {
+            name.push(char::from(byte));
+        } else {
+            write!(name, "%{byte:02x}").expect("writing to a `String` cannot fail");
+        }
+    }
+    name.push_str(".sock");
+    name
+}
+
+/// The OS user identity that scopes the socket name.
+///
+/// The desktop session sets these variables. Ticket #3 brings the
+/// platform-directory abstraction that replaces this environment lookup.
+fn current_user() -> String {
+    ["USERNAME", "USER", "LOGNAME"]
+        .into_iter()
+        .find_map(|key| std::env::var(key).ok())
+        .filter(|user| !user.is_empty())
+        // shortcut: with no user variable every user shares one name; #3
+        // replaces this lookup with the platform directories.
+        .unwrap_or_else(|| "unknown".to_owned())
+}
 
 /// A message a second launch sends to the running instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,12 +106,34 @@ pub fn next_request(listener: &LocalSocketListener) -> io::Result<Request> {
             return Err(io::Error::other("single-instance listener stopped"));
         };
         let mut connection = result?;
-        let mut buffer = [0u8; 64];
-        let read = connection.read(&mut buffer)?;
-        if let Some(request) = Request::parse(&buffer[..read]) {
+        if let Some(request) = read_request(&mut connection)? {
             return Ok(request);
         }
     }
+}
+
+/// Reads one request from `reader`.
+///
+/// A read can return a partial message, so accumulate until a newline or EOF,
+/// bounded by the buffer. An unrecognised or oversized message reads as `None`.
+///
+/// # Errors
+///
+/// Returns an error when the underlying reader fails.
+fn read_request(reader: &mut impl Read) -> io::Result<Option<Request>> {
+    let mut buffer = [0u8; 64];
+    let mut filled = 0;
+    while filled < buffer.len() {
+        let read = reader.read(&mut buffer[filled..])?;
+        if read == 0 {
+            break;
+        }
+        filled += read;
+        if buffer[..filled].contains(&b'\n') {
+            break;
+        }
+    }
+    Ok(Request::parse(&buffer[..filled]))
 }
 
 /// Forwards every request from `listener` to `requests`. Runs on its own thread.
@@ -95,6 +156,32 @@ pub fn forward(listener: LocalSocketListener, requests: Sender<Request>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn socket_names_are_scoped_to_the_user() {
+        assert_ne!(socket_name_for("alice"), socket_name_for("bob"));
+    }
+
+    #[test]
+    fn socket_name_escapes_characters_a_socket_name_cannot_carry() {
+        assert_eq!(
+            socket_name_for(r"corp\alice"),
+            "immich-sync-corp%5calice.sock"
+        );
+        assert_eq!(socket_name_for("alice"), "immich-sync-alice.sock");
+    }
+
+    #[test]
+    fn assembles_a_request_split_across_reads() {
+        // `chain` returns the first slice, then the second: one message
+        // arriving in two reads.
+        let mut reader = b"sh".as_slice().chain(b"ow\n".as_slice());
+
+        assert_eq!(
+            read_request(&mut reader).expect("read the handoff"),
+            Some(Request::Show)
+        );
+    }
 
     #[test]
     fn parses_the_show_request() {

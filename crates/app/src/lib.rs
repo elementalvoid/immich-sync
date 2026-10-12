@@ -17,7 +17,7 @@ use gpui_kit::App;
 /// Returns an error when the single-instance socket cannot be claimed.
 pub fn run() -> anyhow::Result<()> {
     let Some(listener) =
-        instance::claim(instance::SOCKET_NAME).context("claim the single-instance socket")?
+        instance::claim(&instance::socket_name()).context("claim the single-instance socket")?
     else {
         return Ok(());
     };
