@@ -10,8 +10,8 @@ use std::rc::Rc;
 
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, Bounds, Point, TestAppContext, Window, WindowBounds,
-    WindowOptions, px, size,
+    AnyWindowHandle, App, AppContext as _, Bounds, ElementId, Point, Role, TestAppContext, Window,
+    WindowBounds, WindowOptions, px, size,
 };
 use immich_sync::autostart::Autostart;
 use immich_sync::dashboard::Dashboard;
@@ -133,6 +133,20 @@ fn tab_to(window: &mut Window, id: &'static str, cx: &mut App) {
     );
 }
 
+/// The accessible name on the text input inside the row `id`.
+///
+/// The number input the kit renders nests the editable text field, so the row
+/// alone is not proof that assistive technology reaches the name.
+fn text_input_name(window: &Window, id: &'static str) -> Option<String> {
+    gpui_kit::base::test_support::snapshots(window)
+        .into_iter()
+        .find(|snapshot| {
+            snapshot.role() == Some(Role::TextInput)
+                && snapshot.path().contains(&ElementId::Name(id.into()))
+        })
+        .and_then(|snapshot| snapshot.label().map(str::to_owned))
+}
+
 #[test]
 fn field_keys_map_settings_to_the_displayed_text() {
     let mut settings = Settings::default();
@@ -205,6 +219,33 @@ fn settings_view_shows_the_stored_values(cx: &mut TestAppContext) {
             window.find("settings-path-state").visible(),
             "the state database location is shown"
         );
+    })
+    .expect("update the settings window");
+}
+
+#[gpui_kit::test]
+fn every_numeric_field_has_an_accessible_name(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let store = SettingsStore::open(paths.config_file.clone());
+    let window = open_settings(cx, store, paths, FakeAutostart::new());
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        for key in FieldKey::ALL {
+            assert_eq!(
+                window.find(key.id()).label(),
+                Some(key.label()),
+                "the {} row carries the field name",
+                key.label()
+            );
+            assert_eq!(
+                text_input_name(window, key.id()).as_deref(),
+                Some(key.label()),
+                "the {} text field is named for assistive technology",
+                key.label()
+            );
+        }
     })
     .expect("update the settings window");
 }

@@ -179,6 +179,9 @@ impl SettingsView {
         for key in FieldKey::ALL {
             let input = cx.new(|cx| {
                 InputState::new(window, cx)
+                    // The kit names the text field from the placeholder, and
+                    // the row's own name covers the whole control.
+                    .placeholder(key.label())
                     .default_value(key.value(store.settings()).to_string())
                     .step(f64::from(key.step()))
                     .min(f64::from(key.min()))
@@ -429,6 +432,7 @@ impl SettingsView {
                         .id(key.id())
                         .test_support()
                         .track_focus(&focus)
+                        .aria_label(key.label())
                         .flex()
                         .flex_row()
                         .items_center()
