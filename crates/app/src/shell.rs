@@ -57,13 +57,18 @@ pub fn hide_window(cx: &mut App) {
     }
 }
 
-/// Opens the main window.
+/// Opens the main window with the dashboard view.
 ///
 /// # Errors
 ///
 /// Returns an error when the platform cannot create the window.
 pub fn open_main_window(cx: &mut App) -> anyhow::Result<()> {
-    gpui_kit::open_window(WindowOptions::default(), cx, |_, cx| cx.new(|_| Root))?;
+    let (window, _view) = gpui_kit::open_window(WindowOptions::default(), cx, |_, cx| {
+        cx.new(|_| crate::dashboard::Dashboard::new(crate::status::sample()))
+    })?;
+    window.update(cx, |_, window, cx| {
+        crate::theme::follow_system_theme(window, cx)
+    })?;
     Ok(())
 }
 
@@ -93,33 +98,6 @@ pub fn tray_menu() -> Vec<MenuItem> {
         MenuItem::separator(),
         MenuItem::action("Quit", Quit),
     ]
-}
-
-struct Root;
-
-impl Render for Root {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .flex()
-            .flex_col()
-            .size_full()
-            .bg(rgb(0x101828))
-            .text_color(rgb(0xffffff))
-            .p_12()
-            .gap_6()
-            .child(
-                div()
-                    .text_color(rgb(0x22d3ee))
-                    .text_2xl()
-                    .child("Immich Sync"),
-            )
-            .child(
-                div()
-                    .text_color(rgb(0xfacc15))
-                    .text_xl()
-                    .child("Tray shell walking skeleton"),
-            )
-    }
 }
 
 /// A solid circular tray icon, drawn in code so the shell needs no asset.
