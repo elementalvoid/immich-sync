@@ -156,18 +156,21 @@ fn tab_to(window: &mut Window, id: &'static str, cx: &mut App) {
     );
 }
 
-/// The accessible name on the text input inside the row `id`.
+/// The text input the kit nests inside the row `id`.
 ///
 /// The number input the kit renders nests the editable text field, so the row
-/// alone is not proof that assistive technology reaches the name.
-fn text_input_name(window: &Window, id: &'static str) -> Option<String> {
+/// alone is not proof of what assistive technology reaches.
+fn row_text_input(
+    window: &Window,
+    id: &'static str,
+) -> gpui_kit::base::test_support::ElementSnapshot {
     gpui_kit::base::test_support::snapshots(window)
         .into_iter()
         .find(|snapshot| {
             snapshot.role() == Some(Role::TextInput)
                 && snapshot.path().contains(&ElementId::Name(id.into()))
         })
-        .and_then(|snapshot| snapshot.label().map(str::to_owned))
+        .expect("a text input inside the row")
 }
 
 #[test]
@@ -175,30 +178,50 @@ fn field_keys_map_settings_to_the_displayed_text() {
     let mut settings = Settings::default();
 
     assert_eq!(
-        FieldKey::Bandwidth.value(&settings),
-        0,
+        FieldKey::Bandwidth.display(&settings),
+        "0",
         "0 MB/s is unlimited"
     );
-    assert_eq!(FieldKey::Concurrency.value(&settings), 4);
-    assert_eq!(FieldKey::ScanInterval.value(&settings), 30);
-    assert_eq!(FieldKey::AttemptCap.value(&settings), 8);
+    assert_eq!(FieldKey::Concurrency.display(&settings), "4");
+    assert_eq!(FieldKey::ScanInterval.display(&settings), "30");
+    assert_eq!(FieldKey::AttemptCap.display(&settings), "8");
 
     assert_eq!(FieldKey::Concurrency.label(), "Concurrent uploads");
     assert_eq!(FieldKey::Concurrency.unit(), "uploads");
     assert_eq!(FieldKey::Bandwidth.unit(), "MB/s");
     assert_eq!(FieldKey::ScanInterval.unit(), "minutes");
 
-    FieldKey::Bandwidth.set(&mut settings, 3);
+    FieldKey::Bandwidth.set(&mut settings, 3.0);
     assert_eq!(
         settings.bandwidth_bytes_per_second, 3_000_000,
         "the UI's MB/s is stored as bytes per second (R7.1)"
     );
-    assert_eq!(FieldKey::Bandwidth.value(&settings), 3);
+    assert_eq!(FieldKey::Bandwidth.display(&settings), "3");
 
-    FieldKey::Concurrency.set(&mut settings, 999);
+    FieldKey::Concurrency.set(&mut settings, 999.0);
     assert_eq!(settings.concurrency, 64, "out-of-range input clamps");
-    FieldKey::Concurrency.set(&mut settings, 0);
+    FieldKey::Concurrency.set(&mut settings, 0.0);
     assert_eq!(settings.concurrency, 1);
+}
+
+#[test]
+fn the_bandwidth_field_round_trips_a_fractional_value() {
+    let mut settings = Settings::default();
+    settings.bandwidth_bytes_per_second = 1_500_000;
+
+    assert_eq!(
+        FieldKey::Bandwidth.display(&settings),
+        "1.5",
+        "bytes per second display as MB/s without losing the fraction (R7.1)"
+    );
+
+    // What the field shows must store back as the same number.
+    FieldKey::Bandwidth.set(&mut settings, 1.5);
+    assert_eq!(settings.bandwidth_bytes_per_second, 1_500_000);
+
+    // A hand-edited extreme value is shown, not silently replaced.
+    settings.bandwidth_bytes_per_second = u64::MAX;
+    assert_eq!(FieldKey::Bandwidth.display(&settings), "18446744073709.5");
 }
 
 #[gpui_kit::test]
@@ -263,7 +286,7 @@ fn every_numeric_field_has_an_accessible_name(cx: &mut TestAppContext) {
                 key.label()
             );
             assert_eq!(
-                text_input_name(window, key.id()).as_deref(),
+                row_text_input(window, key.id()).label(),
                 Some(key.label()),
                 "the {} text field is named for assistive technology",
                 key.label()
@@ -271,6 +294,66 @@ fn every_numeric_field_has_an_accessible_name(cx: &mut TestAppContext) {
         }
     })
     .expect("update the settings window");
+}
+
+#[gpui_kit::test]
+fn opening_the_view_leaves_a_fractional_bandwidth_alone(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let mut store = SettingsStore::open(paths.config_file.clone());
+    store
+        .update(|settings| settings.bandwidth_bytes_per_second = 1_500_000)
+        .expect("write a hand-edited value");
+    let before = fs::read_to_string(&paths.config_file).expect("read the settings file");
+
+    let window = open_settings(cx, store, paths.clone(), FakeAutostart::new());
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            row_text_input(window, FieldKey::Bandwidth.id()).value(),
+            Some("1.5"),
+            "the field shows the stored fraction, not a truncated whole number"
+        );
+    })
+    .expect("update the settings window");
+
+    assert_eq!(
+        fs::read_to_string(&paths.config_file).expect("read the settings file again"),
+        before,
+        "opening the view does not rewrite a hand-edited value"
+    );
+}
+
+#[gpui_kit::test]
+fn stepping_the_bandwidth_keeps_the_fraction(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let mut store = SettingsStore::open(paths.config_file.clone());
+    store
+        .update(|settings| settings.bandwidth_bytes_per_second = 1_500_000)
+        .expect("write a hand-edited value");
+    let window = open_settings(cx, store, paths.clone(), FakeAutostart::new());
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        tab_to(window, FieldKey::Bandwidth.id(), cx);
+        window.press("up", cx);
+        assert_eq!(
+            row_text_input(window, FieldKey::Bandwidth.id()).value(),
+            Some("2.5"),
+            "a step keeps the decimal place"
+        );
+    })
+    .expect("update the settings window");
+
+    assert_eq!(
+        SettingsStore::open(paths.config_file)
+            .settings()
+            .bandwidth_bytes_per_second,
+        2_500_000,
+        "the stepped value was saved in bytes per second"
+    );
 }
 
 #[gpui_kit::test]

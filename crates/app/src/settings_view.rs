@@ -19,7 +19,7 @@ use gpui_kit::component::switch::Switch;
 use gpui_kit::*;
 
 /// The number of bytes in a displayed megabyte. The stored limit stays bytes
-/// per second (SPEC R7.1); the UI shows whole MB/s at this size.
+/// per second (SPEC R7.1); the UI shows MB/s with one decimal place.
 pub const BYTES_PER_MEGABYTE: u64 = 1_000_000;
 
 /// One numeric setting the view edits, its text, and its bounds.
@@ -70,7 +70,7 @@ impl FieldKey {
     #[must_use]
     pub fn help(self) -> &'static str {
         match self {
-            Self::Bandwidth => "Zero means unlimited.",
+            Self::Bandwidth => "Zero means unlimited. Edit in 0.1 MB/s steps.",
             Self::Concurrency => "Uploads that run at the same time.",
             Self::ScanInterval => "How often a full scan runs, in minutes.",
             Self::AttemptCap => "Attempts per file before it needs attention.",
@@ -117,34 +117,73 @@ impl FieldKey {
         }
     }
 
-    /// The value the field shows for `settings`.
+    /// The text the field shows for `settings`.
     #[must_use]
-    pub fn value(self, settings: &Settings) -> u64 {
+    pub fn display(self, settings: &Settings) -> String {
         match self {
-            Self::Bandwidth => settings.bandwidth_bytes_per_second / BYTES_PER_MEGABYTE,
-            Self::Concurrency => u64::from(settings.concurrency),
-            Self::ScanInterval => u64::from(settings.scan_interval_minutes),
-            Self::AttemptCap => u64::from(settings.attempt_cap),
+            Self::Bandwidth => megabytes_per_second_text(settings.bandwidth_bytes_per_second),
+            Self::Concurrency => settings.concurrency.to_string(),
+            Self::ScanInterval => settings.scan_interval_minutes.to_string(),
+            Self::AttemptCap => settings.attempt_cap.to_string(),
         }
     }
 
     /// Stores a displayed value in `settings`, clamped to the field's bounds.
-    pub fn set(self, settings: &mut Settings, value: u64) {
+    pub fn set(self, settings: &mut Settings, value: f64) {
         match self {
             Self::Bandwidth => {
-                settings.bandwidth_bytes_per_second = value.saturating_mul(BYTES_PER_MEGABYTE);
+                settings.bandwidth_bytes_per_second = bytes_per_second(value);
             }
             Self::Concurrency => {
-                settings.concurrency = u32::try_from(value.clamp(1, 64)).unwrap_or(64);
+                settings.concurrency = rounded_clamp(value, 1, 64);
             }
             Self::ScanInterval => {
-                settings.scan_interval_minutes =
-                    u32::try_from(value.clamp(1, 1440)).unwrap_or(1440);
+                settings.scan_interval_minutes = rounded_clamp(value, 1, 1440);
             }
             Self::AttemptCap => {
-                settings.attempt_cap = u32::try_from(value.clamp(1, 100)).unwrap_or(100);
+                settings.attempt_cap = rounded_clamp(value, 1, 100);
             }
         }
+    }
+}
+
+/// `value` rounded to a whole number inside `[min, max]`.
+///
+/// The bounds check makes the cast exact and keeps NaN and infinities from
+/// becoming an out-of-range stored value.
+fn rounded_clamp(value: f64, min: u32, max: u32) -> u32 {
+    let rounded = value.round();
+    if rounded.is_nan() || rounded <= f64::from(min) {
+        min
+    } else if rounded >= f64::from(max) {
+        max
+    } else {
+        rounded as u32
+    }
+}
+
+/// The stored bytes per second for a displayed MB/s value.
+///
+/// One decimal place is the field's granularity: every value the field writes
+/// is a multiple of 0.1 MB/s and displays exactly.
+fn bytes_per_second(megabytes: f64) -> u64 {
+    if megabytes.is_nan() {
+        return 0;
+    }
+    let bytes = (megabytes.clamp(0.0, 10_000.0) * BYTES_PER_MEGABYTE as f64).round();
+    // The clamp above keeps the rounded value inside `u64`.
+    bytes as u64
+}
+
+/// The MB/s text for a stored bytes-per-second limit, with one decimal place
+/// when the value has one.
+fn megabytes_per_second_text(bytes: u64) -> String {
+    const TENTHS_PER_MEGABYTE: u64 = BYTES_PER_MEGABYTE / 10;
+    let tenths = bytes.saturating_add(TENTHS_PER_MEGABYTE / 2) / TENTHS_PER_MEGABYTE;
+    if tenths % 10 == 0 {
+        (tenths / 10).to_string()
+    } else {
+        format!("{}.{}", tenths / 10, tenths % 10)
     }
 }
 
@@ -190,7 +229,7 @@ impl SettingsView {
                     // The kit names the text field from the placeholder, and
                     // the row's own name covers the whole control.
                     .placeholder(key.label())
-                    .default_value(key.value(store.settings()).to_string())
+                    .default_value(key.display(store.settings()))
                     .step(f64::from(key.step()))
                     .min(f64::from(key.min()))
                     .max(f64::from(key.max()))
@@ -200,7 +239,7 @@ impl SettingsView {
                 window,
                 move |this, input, event: &InputEvent, _window, cx| {
                     if matches!(event, InputEvent::Change)
-                        && let Ok(value) = input.read(cx).value().trim().parse::<u64>()
+                        && let Ok(value) = input.read(cx).value().trim().parse::<f64>()
                     {
                         this.write_field(key, value, cx);
                     }
@@ -281,7 +320,7 @@ impl SettingsView {
     }
 
     /// Records one settings change and saves it.
-    fn write_field(&mut self, key: FieldKey, value: u64, cx: &mut Context<Self>) {
+    fn write_field(&mut self, key: FieldKey, value: f64, cx: &mut Context<Self>) {
         let result = self.store.update(|settings| key.set(settings, value));
         self.record(SAVE_PROBLEM, result, cx);
     }
