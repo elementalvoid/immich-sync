@@ -2,6 +2,7 @@
 
 pub mod instance;
 pub mod shell;
+pub mod status;
 
 use anyhow::Context as _;
 use async_channel::Receiver;
