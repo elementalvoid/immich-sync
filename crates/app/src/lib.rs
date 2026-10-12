@@ -1,7 +1,11 @@
 //! Immich Sync shell: a GPUI-Kit window, a tray icon, and a single instance.
 
+pub mod autostart;
 pub mod dashboard;
 pub mod instance;
+pub mod paths;
+pub mod settings;
+pub mod settings_view;
 pub mod shell;
 pub mod status;
 pub mod theme;

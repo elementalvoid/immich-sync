@@ -191,10 +191,11 @@ fn every_card_color_meets_wcag_aa_in_both_themes(cx: &mut TestAppContext) {
                 ActivityState::Paused,
                 ActivityState::NeedsAttention,
             ] {
-                assert_ne!(
-                    state_border(state, theme),
-                    palette.surface,
-                    "{system:?}: the {state:?} pill border must differ from the card surface"
+                let border = state_border(state, theme);
+                let ratio = contrast(border, palette.surface);
+                assert!(
+                    ratio >= 3.0,
+                    "{system:?}: the {state:?} pill border is {ratio:.2}:1 on the card surface, below the WCAG non-text minimum of 3:1"
                 );
             }
         });
