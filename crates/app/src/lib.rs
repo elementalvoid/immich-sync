@@ -5,6 +5,7 @@ pub mod dashboard;
 pub mod instance;
 pub mod paths;
 pub mod settings;
+pub mod settings_view;
 pub mod shell;
 pub mod status;
 pub mod theme;

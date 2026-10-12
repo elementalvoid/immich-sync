@@ -63,7 +63,9 @@ pub fn platform_autostart(_paths: &AppPaths) -> anyhow::Result<Rc<dyn Autostart>
 /// Never fails; the returned backend reports the missing platform.
 #[cfg(not(any(target_os = "linux", windows)))]
 pub fn platform_autostart(_paths: &AppPaths) -> anyhow::Result<Rc<dyn Autostart>> {
-    Ok(Rc::new(Unsupported))
+    Ok(Rc::new(UnavailableAutostart::new(
+        "autostart is not implemented on this platform yet".to_string(),
+    )))
 }
 
 /// The Linux XDG autostart entry (SPEC R9.3).
@@ -182,17 +184,26 @@ impl Autostart for RunKeyAutostart {
     }
 }
 
-/// The placeholder backend for platforms with no wired mechanism yet.
-#[cfg(not(any(target_os = "linux", windows)))]
-struct Unsupported;
+/// A backend that reports why autostart cannot be applied.
+#[derive(Clone, Debug)]
+pub struct UnavailableAutostart {
+    reason: String,
+}
 
-#[cfg(not(any(target_os = "linux", windows)))]
-impl Autostart for Unsupported {
+impl UnavailableAutostart {
+    /// Reports `reason` whenever the toggle is used.
+    #[must_use]
+    pub fn new(reason: String) -> Self {
+        Self { reason }
+    }
+}
+
+impl Autostart for UnavailableAutostart {
     fn is_enabled(&self) -> anyhow::Result<bool> {
         Ok(false)
     }
 
     fn set_enabled(&self, _enabled: bool) -> anyhow::Result<()> {
-        anyhow::bail!("autostart is not implemented on this platform yet")
+        anyhow::bail!("{}", self.reason)
     }
 }

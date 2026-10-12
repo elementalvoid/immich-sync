@@ -134,6 +134,8 @@ impl SettingsStore {
         }
         self.write(&next)?;
         self.settings = next;
+        // The file is valid again, so a load problem no longer describes it.
+        self.problem = None;
         Ok(())
     }
 

@@ -1,7 +1,13 @@
 //! The tray shell: one GPUI window, one tray icon, and the actions they share.
 
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use gpui_tray::{Icon, Tray};
+
+use crate::dashboard::Dashboard;
+use crate::settings_view::SettingsView;
 
 actions!(immich_sync, [Show, Hide, Quit]);
 
@@ -57,19 +63,123 @@ pub fn hide_window(cx: &mut App) {
     }
 }
 
-/// Opens the main window with the dashboard view.
+/// Opens the main window with the dashboard and settings views.
 ///
 /// # Errors
 ///
 /// Returns an error when the platform cannot create the window.
 pub fn open_main_window(cx: &mut App) -> anyhow::Result<()> {
-    let (window, _view) = gpui_kit::open_window(WindowOptions::default(), cx, |_, cx| {
-        cx.new(|_| crate::dashboard::Dashboard::new(crate::status::sample()))
+    let (window, _view) = gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+        let dashboard = cx.new(|_| Dashboard::new(crate::status::sample()));
+        let settings = cx.new(|cx| SettingsView::from_environment(window, cx));
+        cx.new(|_| AppShell::new(dashboard, settings))
     })?;
     window.update(cx, |_, window, cx| {
         crate::theme::follow_system_theme(window, cx)
     })?;
     Ok(())
+}
+
+/// Which surface the main window shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewMode {
+    /// The status dashboard.
+    Dashboard,
+    /// The settings surface.
+    Settings,
+}
+
+/// The main window's view: a view switch above the dashboard or the settings.
+pub struct AppShell {
+    mode: ViewMode,
+    dashboard: Entity<Dashboard>,
+    settings: Entity<SettingsView>,
+}
+
+impl AppShell {
+    /// A shell that starts on the dashboard.
+    #[must_use]
+    pub fn new(dashboard: Entity<Dashboard>, settings: Entity<SettingsView>) -> Self {
+        Self {
+            mode: ViewMode::Dashboard,
+            dashboard,
+            settings,
+        }
+    }
+
+    /// Switches the visible surface.
+    pub fn show(&mut self, mode: ViewMode, cx: &mut Context<Self>) {
+        self.mode = mode;
+        cx.notify();
+    }
+
+    /// The view switch. Both buttons are keyboard reachable tab stops.
+    fn switch(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let theme = cx.theme();
+        let background = theme.background;
+        let border = theme.border;
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_6()
+            .py_2()
+            .bg(background)
+            .border_b_1()
+            .border_color(border)
+            .child(view_button(
+                "nav-dashboard",
+                "Dashboard",
+                ViewMode::Dashboard,
+                self.mode,
+                cx,
+            ))
+            .child(view_button(
+                "nav-settings",
+                "Settings",
+                ViewMode::Settings,
+                self.mode,
+                cx,
+            ))
+    }
+}
+
+/// One view-switch button: the active surface is prominent, the other is not.
+fn view_button(
+    id: &'static str,
+    label: &'static str,
+    mode: ViewMode,
+    current: ViewMode,
+    cx: &mut Context<AppShell>,
+) -> impl IntoElement + use<> {
+    let active = mode == current;
+    Button::new(id)
+        .label(label)
+        .when(active, |button| button.primary())
+        .when(!active, |button| button.ghost())
+        .on_click(cx.listener(move |this, _, _, cx| this.show(mode, cx)))
+}
+
+impl Render for AppShell {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let background = theme.background;
+        let foreground = theme.foreground;
+        let content: AnyElement = match self.mode {
+            ViewMode::Dashboard => self.dashboard.clone().into_any_element(),
+            ViewMode::Settings => self.settings.clone().into_any_element(),
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(background)
+            .text_color(foreground)
+            .child(self.switch(cx))
+            .child(content)
+    }
 }
 
 /// Builds the tray icon and stores it for later actions.
