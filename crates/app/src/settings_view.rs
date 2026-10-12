@@ -117,7 +117,6 @@ impl FieldKey {
         }
     }
 
-
     /// The value the field shows for `settings`.
     #[must_use]
     pub fn value(self, settings: &Settings) -> u64 {
@@ -139,7 +138,8 @@ impl FieldKey {
                 settings.concurrency = u32::try_from(value.clamp(1, 64)).unwrap_or(64);
             }
             Self::ScanInterval => {
-                settings.scan_interval_minutes = u32::try_from(value.clamp(1, 1440)).unwrap_or(1440);
+                settings.scan_interval_minutes =
+                    u32::try_from(value.clamp(1, 1440)).unwrap_or(1440);
             }
             Self::AttemptCap => {
                 settings.attempt_cap = u32::try_from(value.clamp(1, 100)).unwrap_or(100);
@@ -333,11 +333,9 @@ impl SettingsView {
                         Switch::new("settings-autostart")
                             .checked(enabled)
                             .accessibility_label("Start Immich Sync at login")
-                            .on_change(
-                                cx.listener(|this, enabled, _, cx| {
-                                    this.toggle_autostart(*enabled, cx);
-                                }),
-                            ),
+                            .on_change(cx.listener(|this, enabled, _, cx| {
+                                this.toggle_autostart(*enabled, cx);
+                            })),
                     )
                     .into_any_element(),
             ],
@@ -383,7 +381,11 @@ impl SettingsView {
                 .justify_between()
                 .gap_6()
                 .min_h(rems(2.25))
-                .child(field_text(label, "Read-only. Resolved from the platform.", &palette))
+                .child(field_text(
+                    label,
+                    "Read-only. Resolved from the platform.",
+                    &palette,
+                ))
                 .child(
                     div()
                         .flex_1()
@@ -407,8 +409,12 @@ impl SettingsView {
                     &self.paths.config_file,
                 )
                 .into_any_element(),
-                row("settings-path-state", "State database", &self.paths.state_db)
-                    .into_any_element(),
+                row(
+                    "settings-path-state",
+                    "State database",
+                    &self.paths.state_db,
+                )
+                .into_any_element(),
             ],
             cx,
         )
@@ -437,12 +443,7 @@ impl SettingsView {
                         .child(
                             NumberInput::new(&field.input)
                                 .w_32()
-                                .suffix(
-                                    div()
-                                        .text_xs()
-                                        .text_color(muted)
-                                        .child(key.unit()),
-                                ),
+                                .suffix(div().text_xs().text_color(muted).child(key.unit())),
                         )
                         .into_any_element(),
                 )
@@ -544,12 +545,7 @@ fn section(
                         .font_weight(FontWeight::MEDIUM)
                         .child(title),
                 )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(palette.meta)
-                        .child(description),
-                ),
+                .child(div().text_xs().text_color(palette.meta).child(description)),
         )
         .children(rows)
         .into_any_element()
@@ -557,12 +553,7 @@ fn section(
 
 /// A notice with a colored edge. The accessible name carries the message, so
 /// the visible copy is not announced a second time.
-fn notice(
-    id: &'static str,
-    text: String,
-    accent: Hsla,
-    palette: &CardPalette,
-) -> impl IntoElement {
+fn notice(id: &'static str, text: String, accent: Hsla, palette: &CardPalette) -> impl IntoElement {
     div()
         .id(id)
         .test_support()

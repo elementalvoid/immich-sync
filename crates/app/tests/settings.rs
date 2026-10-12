@@ -168,7 +168,10 @@ fn default_settings_match_the_spec() {
         settings.scan_interval_minutes, 30,
         "R2.3: the scan runs every 30 minutes"
     );
-    assert_eq!(settings.attempt_cap, 8, "R6.1: the attempt cap defaults to 8");
+    assert_eq!(
+        settings.attempt_cap, 8,
+        "R6.1: the attempt cap defaults to 8"
+    );
 }
 
 #[test]
@@ -349,7 +352,9 @@ fn the_xdg_backend_writes_and_removes_the_autostart_entry() {
     assert!(!entry.exists(), "disabling removes the entry");
     assert!(!autostart.is_enabled().expect("read the disabled state"));
     // Disabling again is not an error.
-    autostart.set_enabled(false).expect("disable autostart again");
+    autostart
+        .set_enabled(false)
+        .expect("disable autostart again");
 }
 
 #[cfg(target_os = "linux")]

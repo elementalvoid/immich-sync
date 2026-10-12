@@ -10,8 +10,8 @@ use std::rc::Rc;
 
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, Bounds, Point, TestAppContext, Window,
-    WindowBounds, WindowOptions, px, size,
+    AnyWindowHandle, App, AppContext as _, Bounds, Point, TestAppContext, Window, WindowBounds,
+    WindowOptions, px, size,
 };
 use immich_sync::autostart::Autostart;
 use immich_sync::dashboard::Dashboard;
@@ -137,7 +137,11 @@ fn tab_to(window: &mut Window, id: &'static str, cx: &mut App) {
 fn field_keys_map_settings_to_the_displayed_text() {
     let mut settings = Settings::default();
 
-    assert_eq!(FieldKey::Bandwidth.value(&settings), 0, "0 MB/s is unlimited");
+    assert_eq!(
+        FieldKey::Bandwidth.value(&settings),
+        0,
+        "0 MB/s is unlimited"
+    );
     assert_eq!(FieldKey::Concurrency.value(&settings), 4);
     assert_eq!(FieldKey::ScanInterval.value(&settings), 30);
     assert_eq!(FieldKey::AttemptCap.value(&settings), 8);
@@ -330,7 +334,9 @@ fn a_refused_autostart_change_is_reported_and_not_recorded(cx: &mut TestAppConte
 }
 
 #[gpui_kit::test]
-fn corrupt_settings_load_defaults_and_show_a_problem_that_clears_after_a_save(cx: &mut TestAppContext) {
+fn corrupt_settings_load_defaults_and_show_a_problem_that_clears_after_a_save(
+    cx: &mut TestAppContext,
+) {
     let temp = tempfile::tempdir().expect("create a temp dir");
     let paths = temporary_paths(temp.path());
     fs::create_dir_all(paths.config_file.parent().expect("a config directory"))

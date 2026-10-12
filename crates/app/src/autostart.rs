@@ -104,7 +104,10 @@ impl Autostart for XdgAutostart {
         let entry = self.entry_path();
         if enabled {
             std::fs::create_dir_all(&self.directory).with_context(|| {
-                format!("create the autostart directory {}", self.directory.display())
+                format!(
+                    "create the autostart directory {}",
+                    self.directory.display()
+                )
             })?;
             std::fs::write(&entry, desktop_entry(&self.executable))
                 .with_context(|| format!("write {}", entry.display()))?;
