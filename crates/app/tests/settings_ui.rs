@@ -37,6 +37,14 @@ impl FakeAutostart {
         })
     }
 
+    /// A backend whose OS entry is already `enabled`.
+    fn with_enabled(enabled: bool) -> Rc<Self> {
+        Rc::new(Self {
+            enabled: Cell::new(enabled),
+            refuse: false,
+        })
+    }
+
     fn refusing() -> Rc<Self> {
         Rc::new(Self {
             enabled: Cell::new(false),
@@ -87,6 +95,21 @@ fn open_settings(
         gpui_kit::init(cx);
         gpui_kit::open_window(window_options(), cx, |window, cx| {
             cx.new(|cx| SettingsView::new(store, paths, autostart, window, cx))
+        })
+        .expect("open the settings window")
+        .0
+    })
+}
+
+/// Opens the settings over an explicit path-resolution result.
+fn open_settings_over_resolution(
+    cx: &mut TestAppContext,
+    resolved: anyhow::Result<AppPaths>,
+) -> AnyWindowHandle {
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        gpui_kit::open_window(window_options(), cx, |window, cx| {
+            cx.new(|cx| SettingsView::from_resolved_paths(resolved, window, cx))
         })
         .expect("open the settings window")
         .0
@@ -339,6 +362,154 @@ fn the_autostart_toggle_applies_to_the_os_and_persists(cx: &mut TestAppContext) 
         !SettingsStore::open(paths.config_file).settings().autostart,
         "turning it off persisted too"
     );
+}
+
+#[gpui_kit::test]
+fn a_failed_path_resolution_is_shown_through_the_problem_notice(cx: &mut TestAppContext) {
+    let window = open_settings_over_resolution(
+        cx,
+        Err(anyhow::anyhow!("the platform provided no home directory")),
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let notice = window.find("settings-problem");
+        assert!(notice.visible(), "the resolution failure is shown");
+        let message = notice.label().unwrap_or_default();
+        assert!(
+            message.contains("the platform provided no home directory"),
+            "the notice names the reason: {message}"
+        );
+        assert!(
+            window.find("settings-path-config").visible(),
+            "the fallback location stays visible"
+        );
+    })
+    .expect("update the settings window");
+}
+
+#[gpui_kit::test]
+fn the_view_reconciles_the_autostart_setting_with_the_os(cx: &mut TestAppContext) {
+    // The file says the client starts at login, but the OS has no entry, as if
+    // the user removed it outside the client. The file is corrected to off.
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let mut store = SettingsStore::open(paths.config_file.clone());
+    store
+        .update(|settings| settings.autostart = true)
+        .expect("seed the settings file");
+    let window = open_settings(cx, store, paths.clone(), FakeAutostart::new());
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("settings-autostart").checked(),
+            Some(false),
+            "the switch shows the OS state, not the stale file"
+        );
+    })
+    .expect("update the settings window");
+    assert!(
+        !SettingsStore::open(paths.config_file).settings().autostart,
+        "the file was corrected to match the OS"
+    );
+
+    // The reverse mismatch: a real OS entry with the file saying off. The
+    // switch shows on and the file is corrected, so toggling it off is real.
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let store = SettingsStore::open(paths.config_file.clone());
+    let backend = FakeAutostart::with_enabled(true);
+    let autostart: Rc<dyn Autostart> = backend.clone();
+    let window = open_settings(cx, store, paths.clone(), autostart);
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("settings-autostart").checked(),
+            Some(true),
+            "the switch shows the OS entry"
+        );
+    })
+    .expect("update the settings window");
+    assert!(
+        SettingsStore::open(paths.config_file).settings().autostart,
+        "the file was corrected to match the OS"
+    );
+    assert!(backend.enabled.get(), "the OS entry was left alone");
+}
+
+#[gpui_kit::test]
+fn a_failed_settings_write_rolls_the_autostart_change_back(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let store = SettingsStore::open(paths.config_file.clone());
+    // A directory where the atomic write puts its temporary file makes every
+    // save fail after the OS mechanism already changed.
+    fs::create_dir_all(paths.config_file.parent().expect("a config directory"))
+        .expect("create the config directory");
+    fs::create_dir(paths.config_file.with_extension("toml.tmp")).expect("block the temporary file");
+    let backend = FakeAutostart::new();
+    let autostart: Rc<dyn Autostart> = backend.clone();
+    let window = open_settings(cx, store, paths.clone(), autostart);
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        tab_to(window, "settings-autostart", cx);
+        window.press("space", cx);
+
+        assert!(
+            !backend.enabled.get(),
+            "the OS change is rolled back when the file cannot be saved"
+        );
+        assert_eq!(
+            window.find("settings-autostart").checked(),
+            Some(false),
+            "the switch keeps the value both stores agree on"
+        );
+        let notice = window.find("settings-action-error");
+        assert!(notice.visible(), "the failure is visible");
+        let message = notice.label().unwrap_or_default();
+        assert!(
+            message.starts_with("Could not update the autostart setting"),
+            "the notice names the failed action: {message}"
+        );
+    })
+    .expect("update the settings window");
+
+    assert!(
+        !SettingsStore::open(paths.config_file).settings().autostart,
+        "the failed save recorded nothing"
+    );
+}
+
+#[gpui_kit::test]
+fn a_failed_save_says_the_settings_could_not_be_saved(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let store = SettingsStore::open(paths.config_file.clone());
+    fs::create_dir_all(paths.config_file.parent().expect("a config directory"))
+        .expect("create the config directory");
+    fs::create_dir(paths.config_file.with_extension("toml.tmp")).expect("block the temporary file");
+    let window = open_settings(cx, store, paths, FakeAutostart::new());
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        tab_to(window, FieldKey::Concurrency.id(), cx);
+        window.press("up", cx);
+    })
+    .expect("update the settings window");
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let notice = window.find("settings-action-error");
+        let message = notice.label().unwrap_or_default();
+        assert!(
+            message.starts_with("Could not save the settings"),
+            "a number change reports a save failure: {message}"
+        );
+    })
+    .expect("update the settings window");
 }
 
 #[gpui_kit::test]

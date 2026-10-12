@@ -54,7 +54,7 @@ impl AppPaths {
     /// The paths used when [`Self::resolve`] fails: the current directory.
     ///
     /// This keeps the window usable so it can show the failure. The caller
-    /// records the reason in the settings problem it passes to the view.
+    /// shows the reason through the view's settings problem notice.
     #[must_use]
     pub fn fallback() -> Self {
         let current = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));

@@ -148,6 +148,11 @@ impl FieldKey {
     }
 }
 
+/// The notice prefix for a settings file that could not be written.
+const SAVE_PROBLEM: &str = "Could not save the settings";
+/// The notice prefix for an autostart change that could not be applied.
+const AUTOSTART_PROBLEM: &str = "Could not update the autostart setting";
+
 /// One numeric row: its key and the input state that edits it.
 struct Field {
     key: FieldKey,
@@ -162,6 +167,9 @@ pub struct SettingsView {
     fields: Vec<Field>,
     /// The last failed save or autostart change, shown with the load problem.
     action_error: Option<String>,
+    /// A failure before the store opened, such as path resolution. It stays
+    /// visible until the process restarts, because a later save cannot fix it.
+    environment_problem: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -201,24 +209,46 @@ impl SettingsView {
             fields.push(Field { key, input });
         }
 
-        Self {
+        let mut view = Self {
             store,
             paths,
             autostart,
             fields,
             action_error: None,
+            environment_problem: None,
             _subscriptions: subscriptions,
-        }
+        };
+        view.reconcile_autostart(cx);
+        view
     }
 
     /// Builds the view from the real platform directories and OS autostart.
     pub fn from_environment(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let (store, paths) = match AppPaths::resolve() {
-            Ok(paths) => (SettingsStore::open(paths.config_file.clone()), paths),
+        Self::from_resolved_paths(AppPaths::resolve(), window, cx)
+    }
+
+    /// Builds the view from an already-attempted path resolution.
+    ///
+    /// A resolution failure keeps the window usable on the fallback paths and
+    /// shows the reason through the same notice as a corrupt settings file.
+    pub fn from_resolved_paths(
+        resolved: anyhow::Result<AppPaths>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let (store, paths, environment_problem) = match resolved {
+            Ok(paths) => (SettingsStore::open(paths.config_file.clone()), paths, None),
             Err(error) => {
-                eprintln!("immich-sync: could not resolve the settings location: {error:#}");
                 let paths = AppPaths::fallback();
-                (SettingsStore::open(paths.config_file.clone()), paths)
+                let problem = format!(
+                    "Could not resolve the settings location, so the client uses {}: {error:#}",
+                    paths.config_file.display()
+                );
+                (
+                    SettingsStore::open(paths.config_file.clone()),
+                    paths,
+                    Some(problem),
+                )
             }
         };
         let autostart = crate::autostart::platform_autostart(&paths).unwrap_or_else(|error| {
@@ -227,34 +257,62 @@ impl SettingsView {
                 "{error:#}"
             )))
         });
-        Self::new(store, paths, autostart, window, cx)
+        let mut view = Self::new(store, paths, autostart, window, cx);
+        view.environment_problem = environment_problem;
+        view
+    }
+
+    /// Brings the stored autostart flag in line with the real OS mechanism.
+    ///
+    /// The Run key or `.desktop` entry can change outside the client. The
+    /// switch must show what the OS does, or turning it off would be a no-op
+    /// against a file that already said off.
+    fn reconcile_autostart(&mut self, cx: &mut Context<Self>) {
+        let stored = self.store.settings().autostart;
+        let result = match self.autostart.is_enabled() {
+            Ok(actual) if actual != stored => self
+                .store
+                .update(|settings| settings.autostart = actual)
+                .map_err(|error| error.context("record the OS autostart state")),
+            Ok(_) => Ok(()),
+            Err(error) => Err(error.context("read the OS autostart state")),
+        };
+        self.record(AUTOSTART_PROBLEM, result, cx);
     }
 
     /// Records one settings change and saves it.
     fn write_field(&mut self, key: FieldKey, value: u64, cx: &mut Context<Self>) {
         let result = self.store.update(|settings| key.set(settings, value));
-        self.record(result, cx);
+        self.record(SAVE_PROBLEM, result, cx);
     }
 
     /// Applies the autostart setting to the OS, then records it.
+    ///
+    /// The OS and the settings file are two stores. A failed file write rolls
+    /// the OS change back, so the switch never claims a state one store does
+    /// not hold.
     fn toggle_autostart(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        match self.autostart.set_enabled(enabled) {
-            Ok(()) => {
-                let result = self.store.update(|settings| settings.autostart = enabled);
-                self.record(result, cx);
-            }
-            Err(error) => {
-                let error = error.context("apply autostart");
-                self.record(Err(error), cx);
-            }
+        if let Err(error) = self.autostart.set_enabled(enabled) {
+            let error = error.context("apply the OS autostart change");
+            self.record(AUTOSTART_PROBLEM, Err(error), cx);
+            return;
         }
+        let result = self.store.update(|settings| settings.autostart = enabled);
+        let result = match result {
+            Ok(()) => Ok(()),
+            Err(error) => match self.autostart.set_enabled(!enabled) {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(error.context(format!(
+                    "and rolling the OS autostart change back failed: {rollback:#}"
+                ))),
+            },
+        };
+        self.record(AUTOSTART_PROBLEM, result, cx);
     }
 
     /// Shows a failure, or clears the previous one after a success.
-    fn record(&mut self, result: anyhow::Result<()>, cx: &mut Context<Self>) {
-        self.action_error = result
-            .err()
-            .map(|error| format!("Could not save the settings: {error:#}"));
+    fn record(&mut self, prefix: &'static str, result: anyhow::Result<()>, cx: &mut Context<Self>) {
+        self.action_error = result.err().map(|error| format!("{prefix}: {error:#}"));
         cx.notify();
     }
 
@@ -293,6 +351,11 @@ impl SettingsView {
                     &palette,
                 )
                 .into_any_element(),
+            );
+        } else if let Some(problem) = &self.environment_problem {
+            notices.push(
+                notice("settings-problem", problem.clone(), theme.warning, &palette)
+                    .into_any_element(),
             );
         }
         if let Some(error) = &self.action_error {
