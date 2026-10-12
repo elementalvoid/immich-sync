@@ -19,7 +19,8 @@ use gpui_kit::component::switch::Switch;
 use gpui_kit::*;
 
 /// The number of bytes in a displayed megabyte. The stored limit stays bytes
-/// per second (SPEC R7.1); the UI shows MB/s with one decimal place.
+/// per second (SPEC R7.1); the UI shows MB/s with up to six decimals, which is
+/// one byte.
 pub const BYTES_PER_MEGABYTE: u64 = 1_000_000;
 
 /// One numeric setting the view edits, its text, and its bounds.
@@ -70,7 +71,7 @@ impl FieldKey {
     #[must_use]
     pub fn help(self) -> &'static str {
         match self {
-            Self::Bandwidth => "Zero means unlimited. Edit in 0.1 MB/s steps.",
+            Self::Bandwidth => "Zero means unlimited.",
             Self::Concurrency => "Uploads that run at the same time.",
             Self::ScanInterval => "How often a full scan runs, in minutes.",
             Self::AttemptCap => "Attempts per file before it needs attention.",
@@ -164,8 +165,7 @@ fn rounded_clamp(value: f64, min: u32, max: u32) -> u32 {
 
 /// The stored bytes per second for a displayed MB/s value.
 ///
-/// One decimal place is the field's granularity: every value the field writes
-/// is a multiple of 0.1 MB/s and displays exactly.
+/// The value is rounded to the nearest whole byte, which is the stored unit.
 fn bytes_per_second(megabytes: f64) -> u64 {
     if megabytes.is_nan() {
         return 0;
@@ -175,16 +175,21 @@ fn bytes_per_second(megabytes: f64) -> u64 {
     bytes as u64
 }
 
-/// The MB/s text for a stored bytes-per-second limit, with one decimal place
-/// when the value has one.
+/// The MB/s text for a stored bytes-per-second limit.
+///
+/// Six decimals are one byte, so every stored value displays exactly and
+/// round-trips through the field. Trailing zeros are trimmed.
 fn megabytes_per_second_text(bytes: u64) -> String {
-    const TENTHS_PER_MEGABYTE: u64 = BYTES_PER_MEGABYTE / 10;
-    let tenths = bytes.saturating_add(TENTHS_PER_MEGABYTE / 2) / TENTHS_PER_MEGABYTE;
-    if tenths.is_multiple_of(10) {
-        (tenths / 10).to_string()
-    } else {
-        format!("{}.{}", tenths / 10, tenths % 10)
+    let whole = bytes / BYTES_PER_MEGABYTE;
+    let fraction = bytes % BYTES_PER_MEGABYTE;
+    if fraction == 0 {
+        return whole.to_string();
     }
+    let mut fraction_text = format!("{fraction:06}");
+    while fraction_text.ends_with('0') {
+        fraction_text.pop();
+    }
+    format!("{whole}.{fraction_text}")
 }
 
 /// The notice prefix for a settings file that could not be written.

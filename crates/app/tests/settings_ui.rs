@@ -217,13 +217,21 @@ fn the_bandwidth_field_round_trips_a_fractional_value() {
         "bytes per second display as MB/s without losing the fraction (R7.1)"
     );
 
-    // What the field shows must store back as the same number.
+    // What the field shows must store back as the same number, byte for byte.
     FieldKey::Bandwidth.set(&mut settings, 1.5);
     assert_eq!(settings.bandwidth_bytes_per_second, 1_500_000);
 
+    settings.bandwidth_bytes_per_second = 1_234_567;
+    assert_eq!(FieldKey::Bandwidth.display(&settings), "1.234567");
+    FieldKey::Bandwidth.set(&mut settings, 1.234567);
+    assert_eq!(settings.bandwidth_bytes_per_second, 1_234_567);
+
     // A hand-edited extreme value is shown, not silently replaced.
     settings.bandwidth_bytes_per_second = u64::MAX;
-    assert_eq!(FieldKey::Bandwidth.display(&settings), "18446744073709.5");
+    assert_eq!(
+        FieldKey::Bandwidth.display(&settings),
+        "18446744073709.551615"
+    );
 }
 
 #[gpui_kit::test]
