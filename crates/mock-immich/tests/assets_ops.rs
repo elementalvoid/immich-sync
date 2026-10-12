@@ -1,23 +1,24 @@
 use mock_immich::MockImmich;
 use reqwest::multipart::{Form, Part};
+use sha1::{Digest, Sha1};
 
-fn checksum(n: u64) -> String {
-    format!("{n:040x}")
+fn body_for(n: u64) -> Vec<u8> {
+    format!("asset-{n}").into_bytes()
+}
+
+fn checksum_for(n: u64) -> String {
+    hex::encode(Sha1::digest(body_for(n)))
 }
 
 async fn upload(client: &reqwest::Client, server: &MockImmich, n: u64) -> String {
-    let checksum = checksum(n);
     let form = Form::new()
-        .part(
-            "assetData",
-            Part::bytes(format!("asset-{n}").into_bytes()).file_name("a.txt"),
-        )
+        .part("assetData", Part::bytes(body_for(n)).file_name("a.txt"))
         .text("filename", "a.txt")
         .text("fileCreatedAt", "2026-01-01T00:00:00.000Z")
         .text("fileModifiedAt", "2026-01-01T00:00:00.000Z");
     let body: serde_json::Value = client
         .post(format!("{}/assets", server.base_url()))
-        .header("x-immich-checksum", checksum)
+        .header("x-immich-checksum", checksum_for(n))
         .multipart(form)
         .send()
         .await
@@ -113,6 +114,53 @@ async fn create_stack_returns_the_primary_asset() {
 }
 
 #[tokio::test]
+async fn create_stack_returns_conformant_asset_objects() {
+    let server = MockImmich::start().await;
+    let client = reqwest::Client::new();
+    let first = upload(&client, &server, 1).await;
+    let second = upload(&client, &server, 2).await;
+
+    let body: serde_json::Value = client
+        .post(format!("{}/stacks", server.base_url()))
+        .json(&serde_json::json!({ "assetIds": [first, second] }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let asset = &body["assets"][0];
+    for field in [
+        "checksum",
+        "createdAt",
+        "duration",
+        "fileCreatedAt",
+        "fileModifiedAt",
+        "hasMetadata",
+        "height",
+        "id",
+        "isArchived",
+        "isEdited",
+        "isFavorite",
+        "isOffline",
+        "isTrashed",
+        "localDateTime",
+        "originalFileName",
+        "originalPath",
+        "ownerId",
+        "thumbhash",
+        "type",
+        "updatedAt",
+        "visibility",
+        "width",
+    ] {
+        assert!(!asset[field].is_null(), "missing field {field}");
+    }
+    assert_eq!(asset["id"], first);
+}
+
+#[tokio::test]
 async fn tag_assets_reports_the_tagged_count() {
     let server = MockImmich::start().await;
     let client = reqwest::Client::new();
@@ -148,7 +196,7 @@ async fn delete_moves_an_asset_to_the_trash() {
         .unwrap();
     assert_eq!(response.status(), 204);
 
-    let result = bulk_action(&client, &server, &checksum(1)).await;
+    let result = bulk_action(&client, &server, &checksum_for(1)).await;
     assert_eq!(result["action"], "reject");
     assert_eq!(result["isTrashed"], true);
 }
@@ -166,6 +214,6 @@ async fn force_delete_removes_an_asset() {
         .await
         .unwrap();
 
-    let result = bulk_action(&client, &server, &checksum(1)).await;
+    let result = bulk_action(&client, &server, &checksum_for(1)).await;
     assert_eq!(result["action"], "accept");
 }

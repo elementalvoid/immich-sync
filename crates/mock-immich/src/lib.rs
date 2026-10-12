@@ -6,4 +6,4 @@
 
 mod server;
 
-pub use server::{Fault, MockImmich, MockImmichBuilder, Operation};
+pub use server::{Fault, MockImmich, Operation};
