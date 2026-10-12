@@ -16,7 +16,7 @@ A background sync client for Immich on Windows. The user selects local folders i
 - Automatic server-side deletion
 - Multiple Immich servers or accounts
 - OAuth login
-- macOS and Linux releases. The code stays portable, but v1 ships on Windows.
+- macOS releases. The code stays portable. Revisit after v1 ships.
 
 ## Decisions
 
@@ -38,6 +38,7 @@ A background sync client for Immich on Windows. The user selects local folders i
 | Carried state | Tags move to the new version. Faces, descriptions, and custom metadata stay on the old version. | this plan |
 | Settings store | TOML in the OS config directory. XDG-ready, no hardcoded Windows paths. | this plan |
 | Path layout | Config in the OS config directory. State in the local data directory. | this plan |
+| Platforms (v1) | Windows and Linux ship together. macOS is deferred. | this plan |
 | Sync-state store | SQLite via `rusqlite` (bundled), WAL, `synchronous=FULL`. | [ADR 0005](docs/adr/0005-sqlite-via-rusqlite-for-state.md) |
 | Album scope | User choice per mapped folder: leaf folders or the whole source folder. | this plan |
 | Tray display | Activity state, review count, upload progress, last error. | this plan |
@@ -60,7 +61,7 @@ Cargo workspace with three crates:
 | `sync-core` | Engine: discovery, hashing, queue, retry, limits, state DB, deletion detection. No UI imports. |
 | `app` | GPUI-Kit shell: config window, tray icon, deletion review, notifications, autostart. |
 
-Dependency rule: `app` calls `sync-core` and reads its events. `sync-core` never imports the shell. This rule keeps the shell replaceable.
+Dependency rule: `app` calls `sync-core` and reads its events. `sync-core` never imports the shell. This rule keeps the shell replaceable, and it keeps a later headless engine mode possible. A Linux server build is not in v1, but the engine must not need the shell to run.
 
 Engine components are hand-written on adopted crates: `notify` + `notify-debouncer-full` (watching), `ignore` (scan and skip rules), `sha1` + `base64` (checksums), `reqwest` (streaming multipart), `backon` (backoff), `tokio::sync::Semaphore` (concurrency), and a SQLite table plus worker loop for the queue. `governor` is available for request pacing and, with weighted cells, for bandwidth. See [Rust engine crates](docs/research/rust-sync-engine-crates.md).
 

@@ -25,7 +25,7 @@ Define the v1 requirements for Immich Sync: a Windows tray application that uplo
 - Download or two-way sync.
 - Multiple servers, accounts, or users per install.
 - OAuth login.
-- macOS and Linux releases. The code stays portable.
+- macOS releases. The code stays portable. Revisit after v1 ships.
 - Per-folder overrides of the default skip rules.
 - Copying faces, descriptions, or custom metadata to a new version.
 
@@ -134,9 +134,18 @@ Acceptance: on Windows, config resolves under `%APPDATA%` and state under `%LOCA
 
 Acceptance: a permanent error raises one notification. Grep of the log finds no credential. A rebuild recovers a state database deleted by hand.
 
+### R11 — Packaging and distribution
+
+- R11.1 `cargo-packager` produces an NSIS installer for Windows and deb and AppImage packages for Linux.
+- R11.2 Windows binaries are Authenticode-signed. The signing method is an open decision: Azure Artifact Signing, an OV certificate, or unsigned for v1.
+- R11.3 CI builds both platforms and publishes build provenance attestations plus a SHA256SUMS file. `gh attestation verify` works against the artifacts.
+- R11.4 The README documents install and verification steps for both platforms.
+
+Acceptance: a clean Windows machine installs from the NSIS installer. A clean Linux desktop installs from the deb or the AppImage. The provenance attestation verifies for both artifacts.
+
 ## 4. Non-functional requirements
 
-- N1 Platform: Windows 10 and 11, x64 first, arm64 if the toolchain permits. Code remains portable to macOS and Linux.
+- N1 Platform: Windows 10 and 11 (x64, arm64 if the toolchain permits) and Linux (deb and AppImage) ship in v1. macOS stays portable but deferred.
 - N2 Responsiveness: database reads never block the UI. The common views load in under 16 ms at 300k items. Measure this in M2.
 - N3 Security: TLS verification stays on. Credentials live in the OS credential store only. Logs are redacted.
 - N4 Data safety: WAL with `synchronous=FULL`, `PRAGMA quick_check` at startup, and a rebuild path. Server state changes only from user actions or the version flow in R4.
