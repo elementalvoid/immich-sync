@@ -163,6 +163,7 @@ fn upload_request<'a>(path: &'a std::path::Path, checksum: &'a str) -> AssetUplo
         checksum,
         created_at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
         modified_at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_040),
+        bandwidth: None,
     }
 }
 

@@ -9,6 +9,7 @@ use reqwest::{Body, Client, RequestBuilder, Response, StatusCode, Url};
 use serde::Serialize;
 use tokio_util::io::ReaderStream;
 
+use crate::bandwidth::MeteredReader;
 use crate::error::ClientError;
 use crate::model::{
     AssetUpload, Auth, AuthStatus, BulkAction, BulkCheckBody, BulkCheckItem, BulkCheckResult,
@@ -283,7 +284,11 @@ impl ImmichClient {
             .and_then(|name| name.to_str())
             .unwrap_or("asset")
             .to_string();
-        let part = Part::stream_with_length(Body::wrap_stream(ReaderStream::new(file)), length)
+        // The throttle is below the multipart reader, so it meters the file
+        // bytes themselves, and it is live: a settings change is read on the
+        // next poll (R7.1).
+        let reader = MeteredReader::new(file, upload.bandwidth.clone());
+        let part = Part::stream_with_length(Body::wrap_stream(ReaderStream::new(reader)), length)
             .file_name(filename.clone());
         // Immich requires the file's own dates on the asset. The caller reads
         // them from the local file (R3.1).
