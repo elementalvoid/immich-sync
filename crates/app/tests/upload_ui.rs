@@ -74,23 +74,39 @@ fn connected_model(cx: &mut TestAppContext, server: &MockImmich) -> Entity<Conne
     })
 }
 
-/// Opens the upload view over a model for `paths`.
+/// Opens the upload view over a model for `paths`, with the shared store the
+/// shell installs (N2).
 fn open_upload(
     cx: &mut TestAppContext,
     paths: &AppPaths,
     connection: Entity<ConnectionModel>,
-) -> AnyWindowHandle {
+) -> (AnyWindowHandle, Entity<immich_sync::store::StoreModel>) {
     let paths = paths.clone();
     cx.update(|cx| {
         gpui_kit::init(cx);
-        gpui_kit::open_window(window_options(), cx, |window, cx| {
-            let model =
-                cx.new(|_| immich_sync::upload::UploadModel::new(connection.clone(), &paths));
+        let store = cx.new(|cx| immich_sync::store::StoreModel::open(&paths, cx));
+        let window = gpui_kit::open_window(window_options(), cx, |window, cx| {
+            let model = cx.new(|cx| {
+                immich_sync::upload::UploadModel::new(connection.clone(), store.clone(), cx)
+            });
             cx.new(|cx| UploadView::new(model, window, cx))
         })
         .expect("open the upload window")
-        .0
+        .0;
+        (window, store)
     })
+}
+
+/// Pumps the executor until the shared store has opened.
+async fn wait_for_store(cx: &mut TestAppContext, store: &Entity<immich_sync::store::StoreModel>) {
+    for _ in 0..600 {
+        if cx.read(|cx| store.read(cx).store().is_some()) {
+            return;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    panic!("the state store never opened");
 }
 
 /// Moves focus to the next tab stop, as the Root's Tab binding does.
@@ -183,7 +199,7 @@ fn the_upload_view_names_its_controls(cx: &mut TestAppContext) {
         let store: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
         cx.new(|_| ConnectionModel::new(ServerProfile::default(), store))
     });
-    let window = open_upload(cx, &paths, connection);
+    let (window, _store) = open_upload(cx, &paths, connection);
 
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
@@ -219,7 +235,8 @@ async fn uploading_a_file_shows_the_asset_id_and_a_repeat_shows_the_duplicate(
     let temp = tempfile::tempdir().expect("create a temp dir");
     let paths = temporary_paths(temp.path());
     let connection = connected_model(cx, &server);
-    let window = open_upload(cx, &paths, connection.clone());
+    let (window, store) = open_upload(cx, &paths, connection.clone());
+    wait_for_store(cx, &store).await;
     cx.wait_for(window, Duration::from_secs(60), |_, cx| {
         connection.read(cx).state().is_connected()
     })
@@ -301,7 +318,8 @@ async fn a_second_enter_during_an_upload_starts_nothing(cx: &mut TestAppContext)
     let temp = tempfile::tempdir().expect("create a temp dir");
     let paths = temporary_paths(temp.path());
     let connection = connected_model(cx, &server);
-    let window = open_upload(cx, &paths, connection.clone());
+    let (window, store) = open_upload(cx, &paths, connection.clone());
+    wait_for_store(cx, &store).await;
     cx.wait_for(window, Duration::from_secs(60), |_, cx| {
         connection.read(cx).state().is_connected()
     })
@@ -342,7 +360,8 @@ async fn an_upload_without_a_session_is_unavailable_not_a_crash(cx: &mut TestApp
         let store: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
         cx.new(|_| ConnectionModel::new(ServerProfile::default(), store))
     });
-    let window = open_upload(cx, &paths, connection);
+    let (window, store) = open_upload(cx, &paths, connection);
+    wait_for_store(cx, &store).await;
     let file = temp.path().join("hello.txt");
     std::fs::write(&file, b"hello world").expect("write the fixture");
 

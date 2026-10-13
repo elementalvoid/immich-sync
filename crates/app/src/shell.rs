@@ -8,14 +8,20 @@ use gpui_tray::{Icon, Tray};
 
 use crate::connection::ConnectionModel;
 use crate::dashboard::Dashboard;
+use crate::engine::EngineModel;
 use crate::logs_view::LogsView;
 use crate::paths::AppPaths;
 use crate::settings_view::SettingsView;
+use crate::store::StoreModel;
 use crate::upload::UploadModel;
 use crate::upload_view::UploadView;
 use sync_core::connection::{ConnectionState, ServerProfile};
+use sync_core::engine::Activity;
+use sync_core::store::FolderCounts;
 
-actions!(immich_sync, [Show, Hide, Quit]);
+use std::sync::Mutex;
+
+actions!(immich_sync, [Show, Hide, Quit, Pause, Resume, SyncNow]);
 
 /// Global holding the tray icon so [`Quit`] can remove it.
 struct TrayHandle(Tray);
@@ -30,9 +36,14 @@ pub fn init(cx: &mut App) {
     // Without this, GPUI quits when the last window closes on Windows and
     // Linux, which would end the tray app.
     cx.set_quit_mode(QuitMode::Explicit);
-    cx.on_action(show).on_action(hide).on_action(quit);
+    cx.on_action(show)
+        .on_action(hide)
+        .on_action(quit)
+        .on_action(pause)
+        .on_action(resume)
+        .on_action(sync_now);
     let connection = install_connection_with(cx, show_connection_on_tray);
-    install_upload(cx, connection);
+    install_models(cx, connection);
 }
 
 /// The app-level handle to the one connection model (R1.4).
@@ -67,16 +78,63 @@ pub fn upload(cx: &App) -> Entity<UploadModel> {
     cx.global::<UploadHandle>().0.clone()
 }
 
-/// Creates the manual-upload model at App scope, with the state database the
-/// resolved paths name (N4).
-fn install_upload(cx: &mut App, connection: Entity<ConnectionModel>) -> Entity<UploadModel> {
+/// The app-level handle to the one engine model (issue #6).
+struct EngineHandle(Entity<EngineModel>);
+impl Global for EngineHandle {}
+
+/// The one engine model, created by [`init`].
+///
+/// # Panics
+///
+/// Panics when [`init`] has not run.
+#[must_use]
+pub fn engine(cx: &App) -> Entity<EngineModel> {
+    cx.global::<EngineHandle>().0.clone()
+}
+
+/// The app-level handle to the one shared state store.
+struct StoreHandle(Entity<StoreModel>);
+impl Global for StoreHandle {}
+
+/// The one shared store model, created by [`init`].
+///
+/// # Panics
+///
+/// Panics when [`init`] has not run.
+#[must_use]
+pub fn store(cx: &App) -> Entity<StoreModel> {
+    cx.global::<StoreHandle>().0.clone()
+}
+
+/// The last tooltip written to the tray, so the 250 ms status poll does not
+/// call the platform with an unchanged string.
+struct TrayTooltip(Mutex<String>);
+impl Global for TrayTooltip {}
+
+/// Creates the shared store, the engine, and the manual-upload model at App
+/// scope (N2, N4).
+///
+/// The database opens off the UI thread in [`StoreModel`]; the engine starts
+/// when the store and a credential are both ready.
+pub fn install_models(
+    cx: &mut App,
+    connection: Entity<ConnectionModel>,
+) -> (Entity<StoreModel>, Entity<EngineModel>) {
     let paths = AppPaths::resolve().unwrap_or_else(|error| {
         eprintln!("immich-sync: could not resolve the state location: {error:#}");
         AppPaths::fallback()
     });
-    let upload = cx.new(|_| UploadModel::new(connection, &paths));
+    let store = cx.new(|cx| StoreModel::open(&paths, cx));
+    let engine = cx.new(|cx| EngineModel::new(connection.clone(), store.clone(), &paths, cx));
+    let upload = cx.new(|cx| UploadModel::new(connection, store.clone(), cx));
+    cx.set_global(StoreHandle(store.clone()));
+    cx.set_global(EngineHandle(engine.clone()));
     cx.set_global(UploadHandle(upload.clone()));
-    upload
+    cx.set_global(TrayTooltip(Mutex::new(String::new())));
+    // The tooltip follows the engine's live activity as well as the connection.
+    cx.observe(&engine, |_, cx| show_status_on_tray(cx))
+        .detach();
+    (store, engine)
 }
 
 /// Creates the connection model and registers the tray observer at App scope.
@@ -111,6 +169,26 @@ fn show(_: &Show, cx: &mut App) {
 
 fn hide(_: &Hide, cx: &mut App) {
     hide_window(cx);
+}
+
+fn pause(_: &Pause, cx: &mut App) {
+    with_engine(cx, |engine, cx| engine.pause(cx));
+}
+
+fn resume(_: &Resume, cx: &mut App) {
+    with_engine(cx, |engine, cx| engine.resume(cx));
+}
+
+fn sync_now(_: &SyncNow, cx: &mut App) {
+    with_engine(cx, |engine, cx| engine.sync_now(cx));
+}
+
+/// Runs `change` on the app-scoped engine, when one exists.
+fn with_engine(cx: &mut App, change: impl FnOnce(&mut EngineModel, &mut Context<EngineModel>)) {
+    if let Some(handle) = cx.try_global::<EngineHandle>() {
+        let engine = handle.0.clone();
+        engine.update(cx, change);
+    }
 }
 
 fn quit(_: &Quit, cx: &mut App) {
@@ -163,11 +241,15 @@ pub fn open_main_window(cx: &mut App) -> anyhow::Result<()> {
     else {
         anyhow::bail!("the shell is not installed; call shell::init before opening a window");
     };
+    let engine = cx
+        .try_global::<EngineHandle>()
+        .map(|handle| handle.0.clone())
+        .ok_or_else(|| anyhow::anyhow!("the engine is not installed"))?;
     let (window, _view) = gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
         // The connection state is one entity both surfaces read, so the
         // dashboard's global card follows a sign-in from the settings form,
         // and reopening the window after a hide reuses the same state.
-        let dashboard = cx.new(|_| Dashboard::new(crate::status::sample()));
+        let dashboard = cx.new(|cx| Dashboard::with_engine(engine.clone(), window, cx));
         let settings = cx.new(|cx| SettingsView::from_environment(window, cx, connection.clone()));
         let upload_view = cx.new(|cx| UploadView::new(upload.clone(), window, cx));
         cx.new(|cx| AppShell::new(dashboard, settings, upload_view, connection, cx))
@@ -368,21 +450,21 @@ pub fn install_tray(cx: &mut App) -> gpui_tray::Result<()> {
         .menu(|_| tray_menu())
         .build(cx)?;
     cx.set_global(TrayHandle(tray));
-    // The model is created before the window, so push the state it already
-    // holds instead of waiting for the first transition.
-    if let Some(handle) = cx.try_global::<ConnectionHandle>() {
-        let state = handle.0.read(cx).state().clone();
-        show_connection_on_tray(&state, cx);
-    }
+    // The models are created before the window, so push the state they already
+    // hold instead of waiting for the first transition.
+    show_status_on_tray(cx);
     Ok(())
 }
 
-/// The tray menu: show, hide, and quit.
+/// The tray menu: Show, Pause, Resume, Sync now, and Quit (R8.3).
 #[must_use]
 pub fn tray_menu() -> Vec<MenuItem> {
     vec![
         MenuItem::action("Show", Show),
-        MenuItem::action("Hide", Hide),
+        MenuItem::separator(),
+        MenuItem::action("Pause", Pause),
+        MenuItem::action("Resume", Resume),
+        MenuItem::action("Sync now", SyncNow),
         MenuItem::separator(),
         MenuItem::action("Quit", Quit),
     ]
@@ -397,15 +479,71 @@ pub fn tray_tooltip(state: &ConnectionState) -> String {
     format!("Immich Sync — {}", state.message())
 }
 
+/// The tray tooltip for the live activity, the connection, and the progress
+/// (R8.2).
+#[must_use]
+pub fn tray_status_tooltip(
+    activity: Activity,
+    state: &ConnectionState,
+    counts: FolderCounts,
+    last_error: Option<&str>,
+) -> String {
+    let total = counts.uploaded + counts.pending;
+    let mut text = format!("Immich Sync — {} — {}", activity.label(), state.message());
+    if total > 0 {
+        text.push_str(&format!(" — {}/{} uploaded", counts.uploaded, total));
+    }
+    if let Some(error) = last_error {
+        text.push_str(&format!(" — last error: {error}"));
+    }
+    text
+}
+
 /// Shows a connection state on the tray tooltip, when a tray is installed.
 ///
 /// The tray can be absent (a desktop without one, or a failed install), so a
 /// missing tray is not an error.
-pub fn show_connection_on_tray(state: &ConnectionState, cx: &mut App) {
+pub fn show_connection_on_tray(_state: &ConnectionState, cx: &mut App) {
+    show_status_on_tray(cx);
+}
+
+/// Pushes the engine's activity and the connection state to the tray tooltip
+/// (R8.2).
+///
+/// The status poll runs four times a second, so an unchanged string is not
+/// written to the platform again.
+pub fn show_status_on_tray(cx: &mut App) {
     let Some(tray) = cx.try_global::<TrayHandle>().map(|handle| handle.0.clone()) else {
         return;
     };
-    let _ = tray.set_tooltip(Some(tray_tooltip(state)), cx);
+    let Some(engine) = cx
+        .try_global::<EngineHandle>()
+        .map(|handle| handle.0.clone())
+    else {
+        return;
+    };
+    let state = cx
+        .try_global::<ConnectionHandle>()
+        .map(|handle| handle.0.read(cx).state().clone())
+        .unwrap_or(ConnectionState::NotConfigured);
+    let status = engine.read(cx).status().clone();
+    let tooltip = tray_status_tooltip(
+        status.activity,
+        &state,
+        status.counts,
+        status.last_error.as_deref(),
+    );
+    let changed = cx.try_global::<TrayTooltip>().is_none_or(|cache| {
+        let mut cached = cache.0.lock().expect("the tray tooltip lock");
+        if *cached == tooltip {
+            return false;
+        }
+        *cached = tooltip.clone();
+        true
+    });
+    if changed {
+        let _ = tray.set_tooltip(Some(tooltip), cx);
+    }
 }
 
 /// A solid circular tray icon, drawn in code so the shell needs no asset.
@@ -427,7 +565,7 @@ fn icon() -> gpui_tray::Result<Icon> {
 
 #[cfg(test)]
 mod tests {
-    use super::{hide_window, install_connection_with, install_upload, show_window};
+    use super::{hide_window, install_connection_with, install_models, show_window};
     use gpui_kit::TestAppContext;
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -442,9 +580,10 @@ mod tests {
             let connection = install_connection_with(cx, move |state, _| {
                 seen.borrow_mut().push(state.message());
             });
-            // `open_main_window` builds every surface, so the upload model the
-            // window needs is installed here too, as `init` does.
-            install_upload(cx, connection.clone());
+            // `open_main_window` builds every surface, so the store, engine,
+            // and upload models the window needs are installed here too, as
+            // `init` does.
+            install_models(cx, connection.clone());
             connection
         });
 

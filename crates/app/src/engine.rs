@@ -1,0 +1,346 @@
+//! The app-scoped folder sync engine (SPEC R2.1–R2.5, R8.1–R8.3, R8.7).
+//!
+//! The model owns the engine for the process lifetime, so hiding the window
+//! does not stop a sync. It starts the engine when a credential is available,
+//! persists folder changes while the client is signed out, and republishes the
+//! engine's status to the dashboard on a short poll.
+
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+
+use gpui_kit::*;
+use sync_core::engine::{Activity, Engine, EngineConfig, EngineStatus, FolderStatus};
+use sync_core::store::{FolderCounts, SourceFolder, StateStore};
+
+use crate::connection::{ConnectionModel, worker};
+use crate::paths::AppPaths;
+use crate::settings::SettingsStore;
+use crate::status::DashboardModel;
+use crate::store::StoreModel;
+
+/// How often the dashboard picks up the engine's live counts.
+const STATUS_POLL: Duration = Duration::from_millis(250);
+
+/// The app-scoped engine and the status the views render.
+pub struct EngineModel {
+    connection: Entity<ConnectionModel>,
+    store_model: Entity<StoreModel>,
+    paths: AppPaths,
+    engine: Option<Arc<Engine>>,
+    status: EngineStatus,
+    paused: bool,
+    problem: Option<String>,
+    generation: u64,
+    _subscriptions: Vec<Subscription>,
+    _poll: Task<()>,
+}
+
+impl EngineModel {
+    /// Builds the model and starts watching for a usable credential.
+    pub fn new(
+        connection: Entity<ConnectionModel>,
+        store_model: Entity<StoreModel>,
+        paths: &AppPaths,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let subscriptions = vec![
+            cx.observe(&store_model, |this, _, cx| this.try_start_engine(cx)),
+            cx.observe(&connection, |this, _, cx| this.try_start_engine(cx)),
+        ];
+        let poll = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(STATUS_POLL).await;
+                let alive = this
+                    .update(cx, |model, cx| {
+                        if model.engine.is_some() {
+                            model.refresh_status(cx);
+                        }
+                    })
+                    .is_ok();
+                if !alive {
+                    break;
+                }
+            }
+        });
+        Self {
+            connection,
+            store_model,
+            paths: paths.clone(),
+            engine: None,
+            status: empty_status(),
+            paused: false,
+            problem: None,
+            generation: 0,
+            _subscriptions: subscriptions,
+            _poll: poll,
+        }
+    }
+
+    /// The engine's latest status.
+    #[must_use]
+    pub fn status(&self) -> &EngineStatus {
+        &self.status
+    }
+
+    /// The last model problem, if any.
+    #[must_use]
+    pub fn problem(&self) -> Option<&str> {
+        self.problem.as_deref()
+    }
+
+    /// The one dashboard model the view renders (R8.1).
+    #[must_use]
+    pub fn dashboard_model(&self, cx: &App) -> DashboardModel {
+        let connection = self.connection.read(cx).summary();
+        DashboardModel::from_engine(&self.status, Some(connection))
+    }
+
+    /// Starts the engine once both the store and a credential are ready.
+    pub fn start(&mut self, cx: &mut Context<Self>) {
+        self.try_start_engine(cx);
+    }
+
+    /// Holds new uploads (R8.7).
+    pub fn pause(&mut self, cx: &mut Context<Self>) {
+        self.paused = true;
+        if let Some(engine) = &self.engine {
+            engine.pause();
+            self.refresh_status(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// Lets uploads start again (R8.7).
+    pub fn resume(&mut self, cx: &mut Context<Self>) {
+        self.paused = false;
+        if let Some(engine) = &self.engine {
+            engine.resume();
+            self.refresh_status(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// Whether new uploads are held.
+    #[must_use]
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    /// Asks for a reconciliation scan now (R8.3).
+    pub fn sync_now(&mut self, cx: &mut Context<Self>) {
+        if let Some(engine) = &self.engine {
+            engine.sync_now();
+        } else {
+            self.try_start_engine(cx);
+        }
+    }
+
+    /// Adds a source folder and starts discovering it (R2.1).
+    pub fn add_folder(&mut self, path: String, recursive: bool, cx: &mut Context<Self>) {
+        let path = path.trim().to_string();
+        if path.is_empty() {
+            self.problem = Some("Enter the path of a folder to add.".to_string());
+            cx.notify();
+            return;
+        }
+        if let Some(engine) = &self.engine {
+            if let Err(error) = engine.add_folder(&path, recursive) {
+                self.problem = Some(error.to_string());
+            } else {
+                self.problem = None;
+            }
+        } else if let Some(store) = self.store_model.read(cx).store() {
+            if let Err(error) = store.add_folder(&SourceFolder {
+                path: path.clone(),
+                recursive,
+            }) {
+                self.problem = Some(error.to_string());
+            } else {
+                let folders = store.folders().unwrap_or_default();
+                self.store_model
+                    .update(cx, |model, cx| model.set_folders(folders, cx));
+                self.problem = None;
+            }
+        } else {
+            self.problem = Some("The state database is still opening.".to_string());
+        }
+        self.refresh_status(cx);
+    }
+
+    /// Removes a source folder; its items stay in the store (R2.1).
+    pub fn remove_folder(&mut self, path: String, cx: &mut Context<Self>) {
+        if let Some(engine) = &self.engine {
+            if let Err(error) = engine.remove_folder(&path) {
+                self.problem = Some(error.to_string());
+            } else {
+                self.problem = None;
+            }
+        } else if let Some(store) = self.store_model.read(cx).store() {
+            match store.remove_folder(&path) {
+                Ok(_) => {
+                    let folders = store.folders().unwrap_or_default();
+                    self.store_model
+                        .update(cx, |model, cx| model.set_folders(folders, cx));
+                    self.problem = None;
+                }
+                Err(error) => self.problem = Some(error.to_string()),
+            }
+        }
+        self.refresh_status(cx);
+    }
+
+    /// Starts the engine when it is not running yet and both inputs exist.
+    fn try_start_engine(&mut self, cx: &mut Context<Self>) {
+        if self.engine.is_some() || !self.connection.read(cx).state().is_connected() {
+            self.refresh_status(cx);
+            return;
+        }
+        let Some(store) = self.store_model.read(cx).store() else {
+            self.refresh_status(cx);
+            return;
+        };
+        let (Some(client), Some(credential)) = (
+            self.connection.read(cx).client(),
+            self.connection.read(cx).credential(),
+        ) else {
+            self.refresh_status(cx);
+            return;
+        };
+        let Ok(runtime) = worker() else {
+            self.problem = Some("The network runtime could not start.".to_string());
+            cx.notify();
+            return;
+        };
+        let config_file = self.paths.config_file.clone();
+        let generation = self.generation;
+        let (results, incoming) = async_channel::bounded(1);
+        runtime.spawn(async move {
+            // The settings file is small; reading it here keeps the UI thread
+            // out of the file system (N2).
+            let settings = SettingsStore::open(config_file).settings().clone();
+            let config = EngineConfig {
+                concurrency: usize::try_from(settings.concurrency.max(1)).unwrap_or(4),
+                scan_interval: Duration::from_secs(
+                    u64::from(settings.scan_interval_minutes.max(1)) * 60,
+                ),
+                ..EngineConfig::default()
+            };
+            let started = match Engine::new(store, client, credential, config) {
+                Ok(engine) => {
+                    let engine = Arc::new(engine);
+                    engine.start();
+                    Ok(engine)
+                }
+                Err(error) => Err(error.to_string()),
+            };
+            let _ = results.send(started).await;
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(started) = incoming.recv().await else {
+                return;
+            };
+            let _ = this.update(cx, |model, cx| {
+                if model.generation != generation {
+                    return;
+                }
+                match started {
+                    Ok(engine) => {
+                        model.engine = Some(engine);
+                        model.problem = None;
+                        tracing::info!("the sync engine is running");
+                    }
+                    Err(problem) => {
+                        tracing::error!(error = %problem, "the sync engine could not start");
+                        model.problem = Some(problem);
+                    }
+                }
+                model.refresh_status(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Republishes the engine's status, or a folder-only status before it runs.
+    fn refresh_status(&mut self, cx: &mut Context<Self>) {
+        self.status = match &self.engine {
+            Some(engine) => engine.status(),
+            None => {
+                let store = self.store_model.read(cx);
+                let folders = store
+                    .folders()
+                    .iter()
+                    .zip(store.folder_counts())
+                    .map(|(folder, counts)| FolderStatus {
+                        path: folder.path.clone(),
+                        recursive: folder.recursive,
+                        available: Path::new(&folder.path).is_dir(),
+                        // The last known counts from the store (R8.1).
+                        counts: *counts,
+                        last_error: None,
+                    })
+                    .collect::<Vec<_>>();
+                let paused = self.paused;
+                let unavailable = folders.iter().any(|folder| !folder.available);
+                let mut counts = FolderCounts::default();
+                for folder in &folders {
+                    counts.pending += folder.counts.pending;
+                    counts.uploaded += folder.counts.uploaded;
+                    counts.failed += folder.counts.failed;
+                }
+                EngineStatus {
+                    activity: if paused {
+                        Activity::Paused
+                    } else if unavailable {
+                        Activity::NeedsAttention
+                    } else if counts.pending > 0 {
+                        Activity::Syncing
+                    } else if counts.failed > 0 {
+                        Activity::NeedsAttention
+                    } else {
+                        Activity::Idle
+                    },
+                    folders,
+                    counts,
+                    last_error: None,
+                }
+            }
+        };
+        cx.notify();
+    }
+
+    /// The shared store, once it has opened.
+    #[must_use]
+    pub fn store(&self, cx: &App) -> Option<Arc<StateStore>> {
+        self.store_model.read(cx).store()
+    }
+
+    /// The current source folders, from the engine or the stored list.
+    #[must_use]
+    pub fn folders(&self, cx: &App) -> Vec<SourceFolder> {
+        match &self.engine {
+            Some(engine) => engine
+                .status()
+                .folders
+                .iter()
+                .map(|folder| SourceFolder {
+                    path: folder.path.clone(),
+                    recursive: folder.recursive,
+                })
+                .collect(),
+            None => self.store_model.read(cx).folders().to_vec(),
+        }
+    }
+}
+
+/// The status before the engine has anything.
+fn empty_status() -> EngineStatus {
+    EngineStatus {
+        activity: Activity::Idle,
+        folders: Vec::new(),
+        counts: FolderCounts::default(),
+        last_error: None,
+    }
+}

@@ -69,7 +69,7 @@ impl FieldKey {
         match self {
             Self::Bandwidth => "Bandwidth limit",
             Self::Concurrency => "Concurrent uploads",
-            Self::ScanInterval => "Scan interval",
+            Self::ScanInterval => "Reconciliation scan interval",
             Self::AttemptCap => "Retry attempt cap",
         }
     }
@@ -80,7 +80,9 @@ impl FieldKey {
         match self {
             Self::Bandwidth => "Zero means unlimited.",
             Self::Concurrency => "Uploads that run at the same time.",
-            Self::ScanInterval => "How often a full scan runs, in minutes.",
+            Self::ScanInterval => {
+                "The watcher uploads changes as they happen; this scan finds what the watcher missed."
+            }
             Self::AttemptCap => "Attempts per file before it needs attention.",
         }
     }

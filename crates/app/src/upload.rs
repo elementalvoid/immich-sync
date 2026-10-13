@@ -1,20 +1,19 @@
 //! The manual one-file upload (issue #5): the app-scoped state behind the
 //! Upload view.
 //!
-//! The model owns the state store and the last result. The network work runs on
-//! the same Tokio runtime as the connection, and the result comes back to the
-//! model through an `async_channel`, so a hidden window loses nothing.
+//! The model reads the shared state store and keeps the last result. The
+//! network work runs on the same Tokio runtime as the connection, and the
+//! result comes back to the model through an `async_channel`, so a hidden
+//! window loses nothing.
 
 use std::path::Path;
-use std::sync::Arc;
 
 use gpui_kit::*;
 use sync_core::failure::FailureClass;
-use sync_core::store::StateStore;
 use sync_core::upload::{UploadOutcome, Uploader};
 
 use crate::connection::{ConnectionModel, worker};
-use crate::paths::AppPaths;
+use crate::store::StoreModel;
 
 /// What the window shows for the last manual upload.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -119,8 +118,8 @@ impl UploadReport {
 /// The app-scoped manual upload.
 pub struct UploadModel {
     connection: Entity<ConnectionModel>,
-    /// The state store, or why it could not be opened.
-    store: Result<Arc<StateStore>, String>,
+    /// The shared store, opened off the UI thread by [`StoreModel`] (N2).
+    store: Entity<StoreModel>,
     report: UploadReport,
     /// Changes with every report, so a result from an upload the user
     /// superseded is dropped instead of overwriting the newer report.
@@ -128,21 +127,22 @@ pub struct UploadModel {
 }
 
 impl UploadModel {
-    /// Opens the state database and prepares the model.
+    /// Reads the shared state database and prepares the model.
     ///
     /// A database that cannot be opened does not stop the window: every upload
     /// then reports why. The store lives for the process, so the startup
     /// integrity check runs once (N4).
     #[must_use]
-    pub fn new(connection: Entity<ConnectionModel>, paths: &AppPaths) -> Self {
-        let store = StateStore::open(&paths.state_db)
-            .map(Arc::new)
-            .map_err(|error| error.to_string());
-        let report = match &store {
-            Ok(_) => UploadReport::Idle,
-            Err(message) => UploadReport::CannotRun {
-                message: format!("The state database could not be opened: {message}"),
+    pub fn new(
+        connection: Entity<ConnectionModel>,
+        store: Entity<StoreModel>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let report = match store.read(cx).problem() {
+            Some(problem) => UploadReport::CannotRun {
+                message: format!("The state database could not be opened: {problem}"),
             },
+            None => UploadReport::Idle,
         };
         Self {
             connection,
@@ -177,15 +177,16 @@ impl UploadModel {
             );
             return;
         }
-        let store = match &self.store {
-            Ok(store) => store.clone(),
-            Err(message) => {
-                self.set(
-                    UploadReport::CannotRun {
-                        message: message.clone(),
-                    },
-                    cx,
-                );
+        let store = match self.store.read(cx).store() {
+            Some(store) => store,
+            None => {
+                let message = match self.store.read(cx).problem() {
+                    Some(problem) => {
+                        format!("The state database could not be opened: {problem}")
+                    }
+                    None => "The state database is still opening.".to_string(),
+                };
+                self.set(UploadReport::CannotRun { message }, cx);
                 return;
             }
         };
@@ -266,6 +267,11 @@ pub fn report_from_outcome(outcome: UploadOutcome) -> UploadReport {
             permanent: failure.is_permanent(),
             message: failure.message,
         },
+        // The manual path never pauses, so this is unreachable here; it still
+        // reads as a state rather than a panic.
+        UploadOutcome::Deferred => UploadReport::CannotRun {
+            message: "Uploads are paused.".to_string(),
+        },
     }
 }
 
@@ -337,7 +343,9 @@ mod tests {
             .update(|cx| connection.update(cx, |model, cx| model.handle_unauthorized_for_test(cx)));
         assert_eq!(first, Unauthorized::Retry, "the first 401 re-logs in");
 
-        let model = cx.update(|cx| cx.new(|_| UploadModel::new(connection.clone(), &paths)));
+        let store = cx.update(|cx| cx.new(|cx| crate::store::StoreModel::open(&paths, cx)));
+        wait_until(cx, |cx| store.read(cx).store().is_some()).await;
+        let model = cx.update(|cx| cx.new(|cx| UploadModel::new(connection.clone(), store, cx)));
         let file = temp.path().join("hello.txt");
         std::fs::write(&file, b"hello world").expect("write the fixture");
         let path_text = file.display().to_string();
