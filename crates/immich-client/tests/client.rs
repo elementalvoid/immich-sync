@@ -165,3 +165,18 @@ fn an_invalid_server_url_is_rejected() {
     let error = ImmichClient::new("not a url").expect_err("not a URL");
     assert!(matches!(error, ClientError::InvalidUrl(_)), "{error:?}");
 }
+
+#[test]
+fn a_url_that_is_not_http_is_rejected_instead_of_panicking() {
+    // `Url::parse` accepts all of these, but no endpoint can be joined to
+    // them: the server URL field and a hand-edited settings file can hold one.
+    for url in [
+        "mailto:foo@bar",
+        "data:text/plain,hello",
+        "tel:+15551234",
+        "urn:isbn:0451450523",
+    ] {
+        let error = ImmichClient::new(url).expect_err("only http and https are usable");
+        assert!(matches!(error, ClientError::InvalidUrl(_)), "{url}: {error:?}");
+    }
+}

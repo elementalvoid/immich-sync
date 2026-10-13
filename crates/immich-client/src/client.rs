@@ -38,11 +38,21 @@ impl ImmichClient {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError::InvalidUrl`] for a URL that cannot be parsed, and
-    /// [`ClientError::HttpClient`] when the TLS backend cannot start.
+    /// Returns [`ClientError::InvalidUrl`] for a URL that is not `http` or
+    /// `https`, or that cannot be parsed, and [`ClientError::HttpClient`] when
+    /// the TLS backend cannot start.
     pub fn new(base_url: &str) -> Result<Self, ClientError> {
         let mut base = Url::parse(base_url.trim())
             .map_err(|error| ClientError::InvalidUrl(error.to_string()))?;
+        // `Url::parse` also accepts `mailto:`, `data:`, `tel:`, and `urn:`
+        // URLs. They have no host to join an endpoint onto, and `Url::join`
+        // panics on them, so the value from the server URL field and from a
+        // hand-edited settings file is refused here instead.
+        if !matches!(base.scheme(), "http" | "https") || base.cannot_be_a_base() {
+            return Err(ClientError::InvalidUrl(
+                "the server URL must start with http:// or https://".to_string(),
+            ));
+        }
         // A base with a path prefix (`https://host/immich`) must keep the
         // prefix when an endpoint is joined to it.
         if !base.path().ends_with('/') {
@@ -171,8 +181,8 @@ impl ImmichClient {
         let message = server_message(response).await;
         match status {
             // The server answers 401 for both a wrong password and a disabled
-            // password login; only the message separates them (R1.6).
-            StatusCode::UNAUTHORIZED if message.contains("disabled") => {
+            // password login; only Immich's own message separates them (R1.6).
+            StatusCode::UNAUTHORIZED if password_login_disabled(&message) => {
                 Err(ClientError::PasswordLoginDisabled)
             }
             StatusCode::UNAUTHORIZED => Err(ClientError::WrongCredentials),
@@ -228,6 +238,17 @@ async fn server_message(response: Response) -> String {
     message.chars().take(MESSAGE_LIMIT).collect()
 }
 
+/// Whether a 401 message is Immich's disabled-password-login refusal.
+///
+/// The real server throws `UnauthorizedException('Password login has been
+/// disabled')`. A proxy or WAF 401 that merely contains the word "disabled"
+/// is a wrong credential, not this refusal.
+fn password_login_disabled(message: &str) -> bool {
+    message
+        .to_ascii_lowercase()
+        .contains("password login has been disabled")
+}
+
 /// Records the outcome of one request as structured, secret-free fields.
 fn log_outcome<T>(operation: &'static str, result: &Result<T, ClientError>) {
     match result {
@@ -240,5 +261,24 @@ fn log_outcome<T>(operation: &'static str, result: &Result<T, ClientError>) {
                 "Immich request finished"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_immichs_disabled_message_is_a_disabled_server() {
+        assert!(password_login_disabled("Password login has been disabled"));
+        assert!(password_login_disabled(
+            "UnauthorizedException: Password login has been disabled"
+        ));
+        assert!(!password_login_disabled("Invalid user credentials"));
+        assert!(
+            !password_login_disabled("access disabled by the proxy"),
+            "a proxy 401 is not Immich's refusal"
+        );
+        assert!(!password_login_disabled("this account is disabled"));
     }
 }
