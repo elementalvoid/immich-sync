@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::path::Path;
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
@@ -118,6 +119,10 @@ pub struct AssetUpload<'a> {
     pub path: &'a Path,
     /// The SHA-1 checksum for the `x-immich-checksum` header. Base64 or hex.
     pub checksum: &'a str,
+    /// The local creation time, sent as `fileCreatedAt`. Immich requires it.
+    pub created_at: SystemTime,
+    /// The local modification time, sent as `fileModifiedAt`.
+    pub modified_at: SystemTime,
 }
 
 /// The result of `POST /assets` (R3.6).

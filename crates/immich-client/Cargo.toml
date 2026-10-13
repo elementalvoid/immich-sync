@@ -7,6 +7,8 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+# ISO 8601 timestamps for the multipart fields Immich requires (R3.1).
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 # Default TLS is rustls with the platform verifier, so a self-hosted Immich
 # behind a private CA validates against the OS certificate store. Verification
 # is never disabled (SPEC N3).
