@@ -23,3 +23,9 @@ gpui-kit = "=0.7.2"
 # the workspace with `--all-features`.
 gpui-tray = { version = "=0.1.4", default-features = false, features = ["gpui-kit", "menu-state"] }
 interprocess = "=2.4.5"
+
+[profile.dev.package."*"]
+# The dependency tree (GPUI and friends, ~850 crates) is recompiled often and its
+# DWARF dominates compile and link time. Third-party debug info is not needed;
+# workspace crates keep theirs so backtraces stay useful.
+debug = false
