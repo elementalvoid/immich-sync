@@ -6,7 +6,7 @@
 
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{Action, AppContext as _, MenuItem, TestAppContext};
-use immich_sync::shell::{self, Hide, Show};
+use immich_sync::shell::{self, Hide, Pause, Resume, Show, SyncNow};
 use sync_core::connection::{Attention, ConnectionState};
 
 fn boot(cx: &mut TestAppContext) {
@@ -125,16 +125,54 @@ fn tray_menu_labels_match_their_actions() {
         })
         .collect();
 
-    assert_eq!(entries.len(), 3, "Show, Hide, and Quit");
+    assert_eq!(
+        entries.len(),
+        5,
+        "R8.3: Show, Pause, Resume, Sync now, and Quit"
+    );
     assert_eq!(entries[0].0, "Show");
     assert!(entries[0].1.partial_eq(&Show));
-    assert_eq!(entries[1].0, "Hide");
-    assert!(entries[1].1.partial_eq(&Hide));
-    assert_eq!(entries[2].0, "Quit");
-    assert!(entries[2].1.partial_eq(&shell::Quit));
+    assert_eq!(entries[1].0, "Pause");
+    assert!(entries[1].1.partial_eq(&Pause));
+    assert_eq!(entries[2].0, "Resume");
+    assert!(entries[2].1.partial_eq(&Resume));
+    assert_eq!(entries[3].0, "Sync now");
+    assert!(entries[3].1.partial_eq(&SyncNow));
+    assert_eq!(entries[4].0, "Quit");
+    assert!(entries[4].1.partial_eq(&shell::Quit));
     assert!(
-        matches!(items[2], MenuItem::Separator),
-        "a separator divides the window actions from Quit"
+        matches!(items[1], MenuItem::Separator) && matches!(items[5], MenuItem::Separator),
+        "separators divide the window action, the sync controls, and Quit"
+    );
+}
+
+#[test]
+fn the_tray_tooltip_carries_the_activity_and_the_progress() {
+    let counts = sync_core::store::FolderCounts {
+        uploaded: 3,
+        pending: 1,
+        failed: 0,
+    };
+    let tooltip = shell::tray_status_tooltip(
+        sync_core::engine::Activity::Syncing,
+        &ConnectionState::Connected,
+        counts,
+        None,
+    );
+    assert!(tooltip.contains("Syncing"), "R8.2: {tooltip}");
+    assert!(tooltip.contains("Connected"), "{tooltip}");
+    assert!(tooltip.contains("3/4 uploaded"), "R8.2: {tooltip}");
+
+    let attention = shell::tray_status_tooltip(
+        sync_core::engine::Activity::NeedsAttention,
+        &ConnectionState::NeedsAttention(Attention::Rejected),
+        sync_core::store::FolderCounts::default(),
+        Some("unsupported_format"),
+    );
+    assert!(attention.contains("Needs attention"), "{attention}");
+    assert!(
+        attention.contains("last error: unsupported_format"),
+        "R8.2: the last error reaches the tooltip: {attention}"
     );
 }
 

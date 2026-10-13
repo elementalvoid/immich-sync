@@ -79,7 +79,8 @@ fn open_shell(cx: &mut TestAppContext, store: SettingsStore, paths: AppPaths) ->
             let settings = cx.new(|cx| {
                 SettingsView::new(store, paths, autostart(), connection.clone(), window, cx)
             });
-            let upload_model = cx.new(|_| UploadModel::new(connection.clone(), &upload_paths));
+            let store_model = cx.new(|cx| immich_sync::store::StoreModel::open(&upload_paths, cx));
+            let upload_model = cx.new(|cx| UploadModel::new(connection.clone(), store_model, cx));
             let upload = cx.new(|cx| UploadView::new(upload_model, window, cx));
             cx.new(|cx| AppShell::new(dashboard, settings, upload, connection.clone(), cx))
         })

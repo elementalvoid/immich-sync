@@ -11,8 +11,8 @@ use gpui_kit::component::Theme;
 use gpui_kit::component::ThemeMode;
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
-    AnyWindowHandle, AppContext as _, Bounds, Hsla, Point, TestAppContext, WindowAppearance,
-    WindowBounds, WindowOptions, px, size,
+    AnyWindowHandle, App, AppContext as _, Bounds, Entity, Hsla, Point, TestAppContext, Window,
+    WindowAppearance, WindowBounds, WindowOptions, px, size,
 };
 use immich_sync::dashboard::{CardPalette, Dashboard, state_border};
 use immich_sync::status::{ActivityState, DashboardModel, StatusCard, sample};
@@ -104,6 +104,39 @@ fn sample_data_covers_several_folders_and_states() {
         states.len() >= 3,
         "the sample data exercises several states"
     );
+}
+
+#[gpui_kit::test]
+fn folder_progress_survives_counts_above_a_u16() {
+    use sync_core::engine::{Activity, EngineStatus, FolderStatus};
+    use sync_core::store::FolderCounts;
+
+    let counts = FolderCounts {
+        uploaded: 100_000,
+        pending: 100_000,
+        failed: 0,
+    };
+    let status = EngineStatus {
+        activity: Activity::Syncing,
+        folders: vec![FolderStatus {
+            path: "/photos".to_string(),
+            recursive: true,
+            available: true,
+            counts,
+            last_error: None,
+        }],
+        counts,
+        last_error: None,
+    };
+
+    let model = DashboardModel::from_engine(&status, None);
+
+    assert!(
+        (model.folders[0].progress - 0.5).abs() < 0.001,
+        ">65 535 items must not saturate the percentage: {}",
+        model.folders[0].progress
+    );
+    assert_eq!(model.folders[0].content().progress_percent, "50%");
 }
 
 #[gpui_kit::test]
@@ -327,4 +360,210 @@ fn pause_control_renames_itself_and_flips_the_global_state(cx: &mut TestAppConte
         );
     })
     .expect("update the dashboard window");
+}
+
+/// The live dashboard over a real (initially disconnected) engine model.
+fn open_live_dashboard(
+    cx: &mut TestAppContext,
+    temp: &std::path::Path,
+) -> (AnyWindowHandle, Entity<immich_sync::store::StoreModel>) {
+    let paths = immich_sync::paths::AppPaths {
+        config_file: temp.join("config").join("settings.toml"),
+        state_db: temp.join("data").join("state.db"),
+        autostart_dir: temp.join("config").join("autostart"),
+    };
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        let credentials: std::sync::Arc<dyn sync_core::credential::CredentialStore> =
+            std::sync::Arc::new(sync_core::credential::MemoryCredentialStore::new());
+        let connection = cx.new(|_| {
+            immich_sync::connection::ConnectionModel::new(
+                sync_core::connection::ServerProfile::default(),
+                credentials,
+            )
+        });
+        let store = cx.new(|cx| immich_sync::store::StoreModel::open(&paths, cx));
+        let engine = cx
+            .new(|cx| immich_sync::engine::EngineModel::new(connection, store.clone(), &paths, cx));
+        let window = gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: Point::default(),
+                    size: size(px(1200.), px(800.)),
+                })),
+                ..Default::default()
+            },
+            cx,
+            |window, cx| {
+                let engine = engine.clone();
+                cx.new(|cx| Dashboard::with_engine(engine, window, cx))
+            },
+        )
+        .expect("open the live dashboard window")
+        .0;
+        (window, store)
+    })
+}
+
+/// Moves focus to the next tab stop, as the Root's Tab binding does.
+fn tab_to(window: &mut Window, id: &'static str, cx: &mut App) {
+    for _ in 0..16 {
+        if window.find(id).focused() == Some(true) {
+            return;
+        }
+        window.focus_next(cx);
+        window.render_frame(cx);
+    }
+    assert_eq!(
+        window.find(id).focused(),
+        Some(true),
+        "{id} is not keyboard reachable"
+    );
+}
+
+#[gpui_kit::test]
+fn engine_status_maps_to_the_global_card_and_one_card_per_folder() {
+    use sync_core::engine::{Activity, EngineStatus, FolderStatus};
+    use sync_core::store::FolderCounts;
+
+    let status = EngineStatus {
+        activity: Activity::Syncing,
+        folders: vec![
+            FolderStatus {
+                path: "/home/you/Pictures".to_string(),
+                recursive: true,
+                available: true,
+                counts: FolderCounts {
+                    uploaded: 7,
+                    pending: 3,
+                    failed: 1,
+                },
+                last_error: None,
+            },
+            FolderStatus {
+                path: "/mnt/unplugged".to_string(),
+                recursive: false,
+                available: false,
+                counts: FolderCounts::default(),
+                last_error: None,
+            },
+        ],
+        counts: FolderCounts {
+            uploaded: 7,
+            pending: 3,
+            failed: 1,
+        },
+        last_error: Some("unsupported_format: the file type".to_string()),
+    };
+
+    let model = DashboardModel::from_engine(&status, Some("Connected".to_string()));
+
+    assert_eq!(model.global.title, "All folders");
+    assert_eq!(model.global.activity, ActivityState::Syncing);
+    assert_eq!(model.global.counts.uploaded, 7);
+    assert_eq!(model.global.connection.as_deref(), Some("Connected"));
+    assert_eq!(
+        model.global.last_error.as_deref(),
+        Some("unsupported_format: the file type")
+    );
+    assert!((model.global.progress - 0.7).abs() < 0.01);
+    assert_eq!(model.folders.len(), 2, "one card per source folder");
+
+    let pictures = &model.folders[0];
+    assert_eq!(pictures.title, "Pictures");
+    assert_eq!(pictures.path.as_deref(), Some("/home/you/Pictures"));
+    assert_eq!(pictures.activity, ActivityState::Syncing);
+    assert_eq!(
+        pictures.content().counts,
+        "7 uploaded · 3 pending · 1 failed"
+    );
+
+    // R2.5: a folder that disappeared is a folder status, not per-file errors.
+    let missing = &model.folders[1];
+    assert_eq!(missing.activity, ActivityState::NeedsAttention);
+    assert!(!missing.available);
+    assert_eq!(missing.content().counts, "Folder unavailable");
+}
+
+#[gpui_kit::test]
+async fn folder_add_and_remove_controls_reach_the_store(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the fixture folder");
+    let (window, store) = open_live_dashboard(cx, temp.path());
+    for _ in 0..600 {
+        if cx.read(|cx| store.read(cx).store().is_some()) {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+        cx.run_until_parked();
+    }
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("dashboard-add-folder").label(),
+            Some("Add folder"),
+            "the add control is named for assistive technology"
+        );
+        assert_eq!(
+            window.find("dashboard-folder-path").label(),
+            Some("Source folder path"),
+            "the path field is named for assistive technology"
+        );
+        tab_to(window, "dashboard-folder-path", cx);
+        window.input(photos.to_str().expect("a UTF-8 path"), cx);
+        window.click("dashboard-add-folder", cx);
+    })
+    .expect("add the folder through the dashboard");
+
+    // The add runs on the worker runtime now (N2), so wait for the store.
+    let mut added = Vec::new();
+    for _ in 0..600 {
+        added = cx.read(|cx| store.read(cx).folders().to_vec());
+        if !added.is_empty() {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        added,
+        vec![sync_core::store::SourceFolder {
+            path: photos.display().to_string(),
+            recursive: true,
+        }],
+        "R2.1: the add control persisted the folder"
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let card = window.find(("status-folder", 0_usize));
+        assert!(card.visible(), "the new folder has a card");
+        assert_eq!(
+            window.find(("folder-remove", 0_usize)).label(),
+            Some("Remove photos"),
+            "the remove control is named for assistive technology"
+        );
+        window.click(("folder-remove", 0_usize), cx);
+    })
+    .expect("remove the folder through the dashboard");
+
+    let mut removed = false;
+    for _ in 0..600 {
+        removed = cx.read(|cx| store.read(cx).folders().is_empty());
+        if removed {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+        cx.run_until_parked();
+    }
+    assert!(removed, "R2.1: the remove control deleted the folder");
 }

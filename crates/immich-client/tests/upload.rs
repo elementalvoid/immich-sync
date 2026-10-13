@@ -153,6 +153,19 @@ async fn a_401_on_bulk_check_is_an_invalid_token() {
     assert!(matches!(error, ClientError::InvalidToken), "{error:?}");
 }
 
+/// 2023-11-14T22:13:20Z, a known instant, as the multipart fields carry it.
+const FILE_CREATED_AT: &str = "2023-11-14T22:13:20.000Z";
+const FILE_MODIFIED_AT: &str = "2023-11-14T22:14:00.000Z";
+
+fn upload_request<'a>(path: &'a std::path::Path, checksum: &'a str) -> AssetUpload<'a> {
+    AssetUpload {
+        path,
+        checksum,
+        created_at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+        modified_at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_040),
+    }
+}
+
 async fn upload(
     client: &ImmichClient,
     token: &SessionToken,
@@ -160,7 +173,7 @@ async fn upload(
     checksum: &str,
 ) -> Result<immich_client::UploadResponse, ClientError> {
     client
-        .upload_asset(Auth::Token(token), &AssetUpload { path, checksum })
+        .upload_asset(Auth::Token(token), &upload_request(path, checksum))
         .await
 }
 
@@ -173,10 +186,7 @@ async fn an_api_key_uploads_too() {
     let response = client
         .upload_asset(
             Auth::ApiKey("api-key-1234"),
-            &AssetUpload {
-                path: &path,
-                checksum: HELLO_WORLD_SHA1_BASE64,
-            },
+            &upload_request(&path, HELLO_WORLD_SHA1_BASE64),
         )
         .await
         .expect("the mock accepts any non-empty API key");
@@ -202,6 +212,24 @@ async fn uploading_a_new_file_returns_created_with_the_asset_id() {
     );
     assert!(!response.duplicate, "a 201 is a created asset");
     assert_eq!(server.upload_requests(), 1);
+}
+
+#[tokio::test]
+async fn the_upload_carries_the_file_dates_immich_requires() {
+    let server = MockImmich::start().await;
+    let client = client(&server);
+    let token = token(&client).await;
+    let (_directory, path) = hello_world_file();
+
+    upload(&client, &token, &path, HELLO_WORLD_SHA1_BASE64)
+        .await
+        .expect("the mock accepts the upload");
+
+    assert_eq!(
+        server.last_upload_file_dates(),
+        Some((FILE_CREATED_AT.to_string(), FILE_MODIFIED_AT.to_string())),
+        "R3.1: fileCreatedAt and fileModifiedAt must arrive as ISO 8601"
+    );
 }
 
 #[tokio::test]

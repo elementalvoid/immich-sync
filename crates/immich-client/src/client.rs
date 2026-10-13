@@ -1,6 +1,8 @@
 //! The hand-written Immich HTTP client (ADR 0006).
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
+
+use chrono::{DateTime, SecondsFormat, Utc};
 
 use reqwest::multipart::{Form, Part};
 use reqwest::{Body, Client, RequestBuilder, Response, StatusCode, Url};
@@ -275,17 +277,15 @@ impl ImmichClient {
             .to_string();
         let part = Part::stream_with_length(Body::wrap_stream(ReaderStream::new(file)), length)
             .file_name(filename.clone());
-        // Immich requires these multipart fields. fileCreatedAt and
-        // fileModifiedAt are also required by a real server; the offline double
-        // ignores them, and the versioned-change flow (#11) will supply them
-        // from the stored mtime.
-        // shortcut: no fileCreatedAt/fileModifiedAt, add them before the first
-        // real-server upload test.
+        // Immich requires the file's own dates on the asset. The caller reads
+        // them from the local file (R3.1).
         let form = Form::new()
             .part("assetData", part)
             .text("filename", filename)
             .text("deviceAssetId", upload.path.display().to_string())
-            .text("deviceId", "immich-sync");
+            .text("deviceId", "immich-sync")
+            .text("fileCreatedAt", iso8601(upload.created_at))
+            .text("fileModifiedAt", iso8601(upload.modified_at));
         let response = self
             .authorize(self.http.post(self.endpoint("assets")), auth)
             .header("x-immich-checksum", upload.checksum)
@@ -412,6 +412,17 @@ impl ImmichClient {
     }
 }
 
+/// One local timestamp in the ISO 8601 form Immich stores, in UTC.
+///
+/// Immich parses `fileCreatedAt` and `fileModifiedAt` as ISO 8601, so a
+/// numeric timestamp is not accepted; the trailing `Z` and millisecond
+/// precision match what the server and its own uploaders send.
+#[must_use]
+fn iso8601(time: SystemTime) -> String {
+    let datetime: DateTime<Utc> = time.into();
+    datetime.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
 /// The server's message from an error response, shortened and without secrets.
 async fn server_message(response: Response) -> String {
     let text = response.text().await.unwrap_or_default();
@@ -458,6 +469,14 @@ fn log_outcome<T>(operation: &'static str, result: &Result<T, ClientError>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_times_are_formatted_as_iso8601_utc() {
+        // 1_700_000_000 seconds after the epoch is 2023-11-14T22:13:20Z.
+        let time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        assert_eq!(iso8601(time), "2023-11-14T22:13:20.000Z");
+        assert_eq!(iso8601(SystemTime::UNIX_EPOCH), "1970-01-01T00:00:00.000Z");
+    }
 
     #[test]
     fn only_immichs_quota_message_is_a_quota_refusal() {

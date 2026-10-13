@@ -80,6 +80,8 @@ struct Inner {
     tokens: HashSet<String>,
     /// When set, only an issued, unrevoked token validates.
     require_known_credentials: bool,
+    /// The `fileCreatedAt` and `fileModifiedAt` fields of the last upload.
+    last_upload_dates: Option<(String, String)>,
 }
 
 struct Asset {
@@ -278,6 +280,20 @@ impl MockImmich {
             .lock()
             .expect("mock state poisoned")
             .bulk_check_requests
+    }
+
+    /// The `fileCreatedAt` and `fileModifiedAt` fields the last upload sent.
+    ///
+    /// Immich requires both; the double records them so a test can prove the
+    /// client sent them (R3.1).
+    #[must_use]
+    pub fn last_upload_file_dates(&self) -> Option<(String, String)> {
+        self.state
+            .inner
+            .lock()
+            .expect("mock state poisoned")
+            .last_upload_dates
+            .clone()
     }
 
     /// The number of `POST /assets` requests that arrived. A request that the
@@ -597,6 +613,8 @@ async fn upload(
     let mut asset_data = Vec::new();
     let mut has_sidecar = false;
     let mut live_photo_video_id = None;
+    let mut file_created_at = None;
+    let mut file_modified_at = None;
     loop {
         let field = match multipart.next_field().await {
             Ok(Some(field)) => field,
@@ -617,8 +635,23 @@ async fn upload(
                 Ok(text) => live_photo_video_id = Some(text),
                 Err(error) => return message(StatusCode::BAD_REQUEST, &error.to_string()),
             },
+            Some("fileCreatedAt") => match field.text().await {
+                Ok(text) => file_created_at = Some(text),
+                Err(error) => return message(StatusCode::BAD_REQUEST, &error.to_string()),
+            },
+            Some("fileModifiedAt") => match field.text().await {
+                Ok(text) => file_modified_at = Some(text),
+                Err(error) => return message(StatusCode::BAD_REQUEST, &error.to_string()),
+            },
             _ => {}
         }
+    }
+    if let (Some(created), Some(modified)) = (file_created_at, file_modified_at) {
+        state
+            .inner
+            .lock()
+            .expect("mock state poisoned")
+            .last_upload_dates = Some((created, modified));
     }
 
     if let Some(response) = guard(&state, Operation::Upload).await {

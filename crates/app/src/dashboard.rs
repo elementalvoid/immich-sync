@@ -3,47 +3,143 @@
 //!
 //! Keyboard navigation stays out until the form controls land in #3.
 
+use crate::engine::EngineModel;
 use crate::status::{ActivityState, DashboardModel, StatusCard};
 
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::Colorize as _;
 use gpui_kit::component::Theme;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::tag::Tag;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-/// The dashboard view. It holds the view model and nothing else.
+/// The dashboard view: a status card per source folder, the global card, and
+/// the folder controls (R8.1).
+///
+/// With an [`EngineModel`] the view renders the live engine status and sends
+/// every control straight to the engine. Without one (the layout tests) it
+/// renders the injected model and keeps the pause state locally.
 pub struct Dashboard {
     model: DashboardModel,
+    engine: Option<Entity<EngineModel>>,
+    folder_input: Option<Entity<InputState>>,
     paused: bool,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl Dashboard {
-    /// Builds the dashboard from a view model.
+    /// Builds the dashboard from a fixed view model, with no engine attached.
     #[must_use]
     pub fn new(model: DashboardModel) -> Self {
         Self {
             model,
+            engine: None,
+            folder_input: None,
             paused: false,
+            _subscriptions: Vec::new(),
+        }
+    }
+
+    /// Builds the live dashboard over the app-scoped engine (R8.1).
+    pub fn with_engine(
+        engine: Entity<EngineModel>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let folder_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("/home/you/Pictures")
+                .masked(false)
+        });
+        let mut subscriptions = Vec::with_capacity(2);
+        subscriptions.push(cx.observe(&engine, |this, engine, cx| {
+            this.model = engine.read(cx).dashboard_model(cx);
+            cx.notify();
+        }));
+        subscriptions.push(cx.subscribe_in(
+            &folder_input,
+            window,
+            |this, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.add_folder(window, cx);
+                }
+            },
+        ));
+        let model = engine.read(cx).dashboard_model(cx);
+        Self {
+            model,
+            engine: Some(engine),
+            folder_input: Some(folder_input),
+            paused: false,
+            _subscriptions: subscriptions,
+        }
+    }
+
+    /// Whether new uploads are held (R8.7).
+    fn is_paused(&self, cx: &App) -> bool {
+        match &self.engine {
+            Some(engine) => engine.read(cx).is_paused(),
+            None => self.paused,
         }
     }
 
     fn sync_now(&mut self, cx: &mut Context<Self>) {
-        self.paused = false;
-        self.model.global.activity = ActivityState::Syncing;
-        cx.notify();
+        match &self.engine {
+            Some(engine) => engine.update(cx, |model, cx| model.sync_now(cx)),
+            None => {
+                self.paused = false;
+                self.model.global.activity = ActivityState::Syncing;
+                cx.notify();
+            }
+        }
     }
 
     fn toggle_paused(&mut self, cx: &mut Context<Self>) {
-        self.paused = !self.paused;
-        self.model.global.activity = if self.paused {
-            ActivityState::Paused
-        } else {
-            ActivityState::Syncing
+        match &self.engine {
+            Some(engine) => {
+                let paused = engine.read(cx).is_paused();
+                engine.update(cx, |model, cx| {
+                    if paused {
+                        model.resume(cx);
+                    } else {
+                        model.pause(cx);
+                    }
+                });
+                self.model = engine.read(cx).dashboard_model(cx);
+                cx.notify();
+            }
+            None => {
+                self.paused = !self.paused;
+                self.model.global.activity = if self.paused {
+                    ActivityState::Paused
+                } else {
+                    ActivityState::Syncing
+                };
+                cx.notify();
+            }
+        }
+    }
+
+    /// Adds the path the field holds (R2.1).
+    fn add_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(input) = self.folder_input.clone() else {
+            return;
         };
-        cx.notify();
+        let path = input.read(cx).value().trim().to_string();
+        if let Some(engine) = &self.engine {
+            engine.update(cx, |model, cx| model.add_folder(path, true, cx));
+        }
+        input.update(cx, |state, cx| state.set_value("", window, cx));
+    }
+
+    /// Removes one source folder (R2.1).
+    fn remove_folder(&mut self, path: String, cx: &mut Context<Self>) {
+        if let Some(engine) = &self.engine {
+            engine.update(cx, |model, cx| model.remove_folder(path, cx));
+        }
     }
 
     /// Shows the connection state on the global card (SPEC R8.1).
@@ -54,9 +150,49 @@ impl Dashboard {
         }
     }
 
-    fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The folder add field and its button (R2.1).
+    fn folder_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let muted = cx.theme().muted_foreground;
-        let (pause_label, pause_name) = if self.paused {
+        let input = self.folder_input.clone();
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(muted)
+                    .child("Add a folder to sync"),
+            )
+            .when_some(input, |this, input| {
+                let focus = input.read(cx).focus_handle(cx);
+                this.child(
+                    div()
+                        .id("dashboard-folder-path")
+                        .test_support()
+                        .track_focus(&focus)
+                        .aria_label("Source folder path")
+                        .flex_1()
+                        .min_w_0()
+                        .child(Input::new(&input).aria_label("Source folder path")),
+                )
+                .child(
+                    Button::new("dashboard-add-folder")
+                        .primary()
+                        .label("Add folder")
+                        .accessibility_label("Add folder")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.add_folder(window, cx);
+                        })),
+                )
+            })
+    }
+
+    fn header(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let muted = cx.theme().muted_foreground;
+        let paused = self.is_paused(cx);
+        let (pause_label, pause_name) = if paused {
             ("Resume", "Resume syncing")
         } else {
             ("Pause", "Pause syncing")
@@ -116,6 +252,9 @@ impl Render for Dashboard {
         let muted = cx.theme().muted_foreground;
         let header = self.header(cx);
 
+        let folder_bar = self.folder_bar(cx);
+        let removed = self.engine.is_some();
+
         div()
             .flex()
             .flex_col()
@@ -130,8 +269,10 @@ impl Render for Dashboard {
                 "status-state-global".into(),
                 Some("status-connection-global".into()),
                 &self.model.global,
+                None,
                 cx,
             ))
+            .child(folder_bar)
             .child(div().text_sm().text_color(muted).child("Source folders"))
             .child(
                 div().flex().flex_row().flex_wrap().gap_4().children(
@@ -140,11 +281,24 @@ impl Render for Dashboard {
                         .iter()
                         .enumerate()
                         .map(|(index, folder)| {
+                            let remove = removed.then(|| {
+                                let path = folder.path.clone().unwrap_or_default();
+                                let title = folder.title.clone();
+                                Button::new(("folder-remove", index))
+                                    .ghost()
+                                    .label("Remove")
+                                    .accessibility_label(format!("Remove {title}"))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.remove_folder(path.clone(), cx);
+                                    }))
+                                    .into_any_element()
+                            });
                             div().w(rems(17.5)).flex().child(status_card(
                                 ("status-folder", index).into(),
                                 ("status-state-folder", index).into(),
                                 None,
                                 folder,
+                                remove,
                                 cx,
                             ))
                         }),
@@ -208,12 +362,14 @@ pub fn state_border(state: ActivityState, theme: &Theme) -> Hsla {
 }
 
 /// One status card. The text comes from [`StatusCard::content`], so the view
-/// does no formatting.
+/// does no formatting. `remove` is the per-folder remove control, when the
+/// dashboard is attached to an engine (R2.1).
 fn status_card(
     id: ElementId,
     state_id: ElementId,
     connection_id: Option<ElementId>,
     card: &StatusCard,
+    remove: Option<AnyElement>,
     cx: &App,
 ) -> impl IntoElement {
     let theme = cx.theme();
@@ -319,6 +475,9 @@ fn status_card(
             theme.danger,
             &palette,
         ));
+    }
+    if let Some(remove) = remove {
+        root = root.child(div().flex().flex_row().justify_end().child(remove));
     }
     root
 }

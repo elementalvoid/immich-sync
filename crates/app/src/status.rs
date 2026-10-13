@@ -1,7 +1,11 @@
 //! The dashboard view model: plain data with no UI imports.
 //!
-//! The real engine fills these types later. Until then [`sample`] supplies fake
-//! data so the dashboard layout is exercised.
+//! [`DashboardModel::from_engine`] maps the live engine status onto the cards
+//! (R8.1). [`sample`] is the layout fixture the view tests render; the shell
+//! never uses it.
+
+use sync_core::engine::{Activity, EngineStatus};
+use sync_core::store::FolderCounts;
 
 /// The activity state of the client or one source folder (SPEC R8.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -47,6 +51,9 @@ pub struct StatusCard {
     pub counts: Counts,
     /// The deletion review items that await a decision.
     pub review_count: u32,
+    /// Whether the source folder is readable (R2.5); always `true` for the
+    /// global card.
+    pub available: bool,
     /// The connection state, on the global card (R8.1).
     pub connection: Option<String>,
     /// The last error, already classified by the engine.
@@ -66,6 +73,8 @@ pub struct CardContent {
     pub progress_percent: String,
     pub counts: String,
     pub review: Option<String>,
+    /// Whether the folder is readable; the counts line says so when it is not.
+    pub available: bool,
     /// The connection line, on the global card.
     pub connection: Option<String>,
     pub error: Option<String>,
@@ -84,15 +93,109 @@ impl StatusCard {
                 "{}%",
                 (self.progress.clamp(0.0, 1.0) * 100.0).round() as u32
             ),
-            counts: format!(
-                "{} uploaded · {} pending · {} failed",
-                self.counts.uploaded, self.counts.pending, self.counts.failed
-            ),
+            counts: if self.available {
+                format!(
+                    "{} uploaded · {} pending · {} failed",
+                    self.counts.uploaded, self.counts.pending, self.counts.failed
+                )
+            } else {
+                "Folder unavailable".to_string()
+            },
             review: (self.review_count > 0)
                 .then(|| format!("{} missing files to review", self.review_count)),
+            available: self.available,
             connection: self.connection.clone(),
             error: self.last_error.clone(),
         }
+    }
+}
+
+impl From<Activity> for ActivityState {
+    fn from(activity: Activity) -> Self {
+        match activity {
+            Activity::Idle => Self::Idle,
+            Activity::Syncing => Self::Syncing,
+            Activity::Paused => Self::Paused,
+            Activity::NeedsAttention => Self::NeedsAttention,
+        }
+    }
+}
+
+/// The card counts from the engine's counts.
+fn counts_from(counts: FolderCounts) -> Counts {
+    Counts {
+        pending: counts.pending,
+        uploaded: counts.uploaded,
+        failed: counts.failed,
+    }
+}
+
+/// The card title for a folder path: the last component, or the path itself.
+///
+/// The split accepts both separators, so a Windows path mapped on Linux still
+/// names its folder in a test.
+#[must_use]
+pub fn folder_name(path: &str) -> String {
+    let trimmed = path.trim_end_matches(['/', '\\']);
+    trimmed
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
+/// The upload progress for one folder, 0.0 to 1.0.
+fn folder_progress(counts: FolderCounts) -> f32 {
+    let total = counts.uploaded + counts.pending;
+    if total == 0 {
+        return 0.0;
+    }
+    counts.uploaded as f32 / total as f32
+}
+
+impl DashboardModel {
+    /// Maps the live engine status onto the global card and one card per
+    /// source folder (R8.1, R8.2).
+    #[must_use]
+    pub fn from_engine(status: &EngineStatus, connection: Option<String>) -> Self {
+        let global = StatusCard {
+            title: "All folders".to_string(),
+            path: None,
+            activity: status.activity.into(),
+            progress: status.progress(),
+            counts: counts_from(status.counts),
+            review_count: 0,
+            available: true,
+            connection,
+            last_error: status.last_error.clone(),
+        };
+        let folders = status
+            .folders
+            .iter()
+            .map(|folder| StatusCard {
+                title: folder_name(&folder.path),
+                path: Some(folder.path.clone()),
+                activity: if !folder.available {
+                    ActivityState::NeedsAttention
+                } else if status.activity == Activity::Paused {
+                    ActivityState::Paused
+                } else if folder.counts.pending > 0 {
+                    ActivityState::Syncing
+                } else if folder.last_error.is_some() {
+                    ActivityState::NeedsAttention
+                } else {
+                    ActivityState::Idle
+                },
+                progress: folder_progress(folder.counts),
+                counts: counts_from(folder.counts),
+                review_count: 0,
+                available: folder.available,
+                connection: None,
+                last_error: folder.last_error.clone(),
+            })
+            .collect();
+        Self { global, folders }
     }
 }
 
@@ -118,6 +221,7 @@ pub fn sample() -> DashboardModel {
                 failed: 2,
             },
             review_count: 3,
+            available: true,
             connection: Some("Connected".to_string()),
             last_error: None,
         },
@@ -133,6 +237,7 @@ pub fn sample() -> DashboardModel {
                     failed: 0,
                 },
                 review_count: 0,
+                available: true,
                 connection: None,
                 last_error: None,
             },
@@ -147,6 +252,7 @@ pub fn sample() -> DashboardModel {
                     failed: 0,
                 },
                 review_count: 3,
+                available: true,
                 connection: None,
                 last_error: None,
             },
@@ -161,6 +267,7 @@ pub fn sample() -> DashboardModel {
                     failed: 2,
                 },
                 review_count: 0,
+                available: true,
                 connection: None,
                 last_error: Some(
                     "permission_denied: the API key cannot write to this album".to_string(),
@@ -177,6 +284,7 @@ pub fn sample() -> DashboardModel {
                     failed: 0,
                 },
                 review_count: 0,
+                available: true,
                 connection: None,
                 last_error: None,
             },

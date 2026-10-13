@@ -10,6 +10,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use immich_client::{
@@ -37,6 +38,56 @@ pub enum UploadOutcome {
     },
     /// The run failed.
     Failed(UploadFailure),
+    /// New uploads are paused (R8.7). The item stays queued and uploads after
+    /// [`UploadGate::resume`].
+    Deferred,
+}
+
+/// Whether new uploads may start (R8.7).
+///
+/// Pause stops new upload requests inside the acceptance window; an upload
+/// already on the wire finishes. The flag is shared with the engine's worker
+/// pool, so a resume takes effect without a restart.
+#[derive(Clone, Debug, Default)]
+pub struct UploadGate {
+    paused: Arc<AtomicBool>,
+}
+
+impl UploadGate {
+    /// A gate that lets uploads through.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Stops new uploads (R8.7).
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::SeqCst);
+    }
+
+    /// Lets new uploads start again (R8.7).
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether new uploads are held right now.
+    #[must_use]
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
+    }
+}
+
+/// One file that was hashed and is ready to upload (R3.1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedItem {
+    /// The local path.
+    pub path: PathBuf,
+    /// The size at the time of hashing.
+    pub size: u64,
+    /// The modification time in nanoseconds since the Unix epoch.
+    pub mtime_ns: i64,
+    /// The SHA-1 of the content.
+    pub sha1: Sha1,
 }
 
 /// Why one pipeline run failed.
@@ -197,13 +248,69 @@ impl Uploader {
             }
         }
 
+        self.send_upload(&mut item, &checksum, credential).await
+    }
+
+    /// Uploads a file the caller already hashed and the server already
+    /// accepted, marking the row `uploading` first so a crash mid-request
+    /// leaves it re-queueable (R6.7).
+    ///
+    /// The gate is checked immediately before the request, so a pause stops
+    /// the next upload even inside an already-dispatched worker (R8.7).
+    pub async fn upload_prepared(
+        &self,
+        prepared: &PreparedItem,
+        credential: &RequestCredential,
+        gate: &UploadGate,
+    ) -> UploadOutcome {
+        let mut item = ItemRecord {
+            path: prepared.path.to_string_lossy().into_owned(),
+            size: prepared.size,
+            mtime_ns: prepared.mtime_ns,
+            sha1: prepared.sha1,
+            asset_id: None,
+            state: ItemState::Uploading,
+            error_class: None,
+        };
+        if gate.is_paused() {
+            item.state = ItemState::Pending;
+            self.record(&item);
+            tracing::debug!(path = %item.path, "the upload was deferred while paused");
+            return UploadOutcome::Deferred;
+        }
+        self.record(&item);
+        self.send_upload(&mut item, &prepared.sha1.base64(), credential)
+            .await
+    }
+
+    /// Sends one accepted file and records the outcome (R3.2, R3.6).
+    async fn send_upload(
+        &self,
+        item: &mut ItemRecord,
+        checksum: &str,
+        credential: &RequestCredential,
+    ) -> UploadOutcome {
+        // Immich requires the file's own dates on the asset (R3.1). The
+        // creation time is missing on some platforms and filesystems; the
+        // modification time is the honest fallback.
+        let metadata = std::fs::metadata(Path::new(&item.path)).ok();
+        let modified_at = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.modified().ok())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let created_at = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.created().ok())
+            .unwrap_or(modified_at);
         match self
             .client
             .upload_asset(
                 credential.auth(),
                 &AssetUpload {
-                    path,
-                    checksum: &checksum,
+                    path: Path::new(&item.path),
+                    checksum,
+                    created_at,
+                    modified_at,
                 },
             )
             .await
@@ -216,14 +323,14 @@ impl Uploader {
                 } else {
                     ItemState::Uploaded
                 };
-                self.record(&item);
+                self.record(item);
                 let outcome = if response.duplicate {
                     "duplicate"
                 } else {
                     "created"
                 };
                 tracing::info!(
-                    path = %path_text,
+                    path = %item.path,
                     asset_id = %asset_id,
                     outcome,
                     "the upload finished"
@@ -234,7 +341,7 @@ impl Uploader {
                     UploadOutcome::Created { asset_id }
                 }
             }
-            Err(error) => self.failed(&mut item, &error),
+            Err(error) => self.failed(item, &error),
         }
     }
 
@@ -302,7 +409,7 @@ impl Uploader {
 
 /// Hashes the file on a blocking thread, so the async worker is not stalled by
 /// the disk (rust-skills async-spawn-blocking).
-async fn hash_in_background(path: PathBuf) -> Result<Sha1, HashError> {
+pub(crate) async fn hash_in_background(path: PathBuf) -> Result<Sha1, HashError> {
     let display = path.display().to_string();
     tokio::task::spawn_blocking(move || crate::hash::sha1_file(&path))
         .await
