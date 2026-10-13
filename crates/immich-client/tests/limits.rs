@@ -52,6 +52,29 @@ fn upload_request<'a>(path: &'a std::path::Path, limit: &BandwidthLimit) -> Asse
 }
 
 #[tokio::test]
+async fn zero_is_unlimited() {
+    let server = MockImmich::start().await;
+    let (client, token) = client(&server).await;
+    let (_directory, path) = fixture(FILE_BYTES);
+    let limit = BandwidthLimit::new(0);
+
+    let started = Instant::now();
+    client
+        .upload_asset(Auth::Token(&token), &upload_request(&path, &limit))
+        .await
+        .expect("the mock accepts the upload");
+    let elapsed = started.elapsed();
+
+    // The tight half of R7.1. 1 MB/s needs 1.47 s of the upload on its own,
+    // and an unlimited one takes milliseconds; the ceiling leaves a wide
+    // margin for a loaded machine without measuring anything but the body.
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "R7.1: 0 means unlimited, but {FILE_BYTES} bytes took {elapsed:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_bandwidth_limit_paces_the_upload_body() {
     let server = MockImmich::start().await;
     let (client, token) = client(&server).await;
