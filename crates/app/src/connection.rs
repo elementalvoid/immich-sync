@@ -12,8 +12,9 @@ use crate::settings::Settings;
 use gpui_kit::*;
 use sync_core::connection::{
     Attention, AuthMethod, Connection, ConnectionState, RequestCredential, ServerProfile, SignIn,
-    Unauthorized,
 };
+#[cfg(test)]
+use sync_core::connection::Unauthorized;
 
 /// The saved connection profile, from the settings file. It holds no secret.
 #[must_use]
