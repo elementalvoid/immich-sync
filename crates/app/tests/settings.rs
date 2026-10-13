@@ -1,30 +1,42 @@
 //! Headless tests for the settings seams: platform paths, the TOML store, and
 //! autostart.
 //!
-//! Only tests that resolve real platform directories touch the process
+//! Only the tests that resolve real platform directories touch the process
 //! environment; [`EnvGuard`] serializes them.
+//!
+//! The path tests split in two. Mapping the platform base directories to the
+//! application's paths is our own code and runs on every platform. Resolving
+//! those base directories is the platform's, and only Linux lets a test steer
+//! it, so the end-to-end resolution tests are Linux-only.
 
+#[cfg(target_os = "linux")]
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
 use std::sync::{Mutex, MutexGuard};
 
 #[cfg(target_os = "linux")]
 use immich_sync::autostart::{Autostart, XdgAutostart, platform_autostart};
 use immich_sync::logging::LogLevel;
-use immich_sync::paths::{APP_DIR, AppPaths, SETTINGS_FILE, STATE_FILE};
+use immich_sync::paths::AppPaths;
+#[cfg(target_os = "linux")]
+use immich_sync::paths::{APP_DIR, SETTINGS_FILE, STATE_FILE};
 use immich_sync::settings::{Settings, SettingsStore};
 use sync_core::connection::AuthMethod;
 
 /// Serializes the tests that mutate the process environment.
+#[cfg(target_os = "linux")]
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 /// Sets process environment variables for one test, then restores them.
+#[cfg(target_os = "linux")]
 struct EnvGuard {
     _lock: MutexGuard<'static, ()>,
     saved: Vec<(&'static str, Option<OsString>)>,
 }
 
+#[cfg(target_os = "linux")]
 impl EnvGuard {
     fn new(changes: &[(&'static str, Option<&Path>)]) -> Self {
         let lock = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -43,6 +55,7 @@ impl EnvGuard {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for EnvGuard {
     fn drop(&mut self) {
         for (name, value) in self.saved.drain(..).rev() {
@@ -55,6 +68,53 @@ impl Drop for EnvGuard {
             }
         }
     }
+}
+
+#[test]
+fn the_base_dirs_map_to_the_paths_the_spec_names() {
+    // Handed base directories, so the mapping is checked on every platform
+    // instead of only where the environment can redirect resolution.
+    let config_dir = Path::new("/fake/appdata/roaming");
+    let data_local_dir = Path::new("/fake/appdata/local");
+
+    let paths = AppPaths::from_base_dirs(config_dir, data_local_dir);
+
+    assert_eq!(
+        paths.config_file,
+        config_dir.join("immich-sync").join("settings.toml"),
+        "R9.1: the settings file sits under the platform config directory"
+    );
+    assert_eq!(
+        paths.state_db,
+        data_local_dir.join("immich-sync").join("state.db"),
+        "R9.2: the state database sits under the local data directory"
+    );
+    assert_eq!(
+        paths.autostart_dir,
+        config_dir.join("autostart"),
+        "the autostart entry sits under the platform config directory"
+    );
+    assert!(
+        paths.state_db.starts_with(data_local_dir),
+        "R9.2/N4: the state never leaves the local data directory"
+    );
+}
+
+#[test]
+fn the_log_file_sits_beside_the_state_database() {
+    let data_local_dir = Path::new("/fake/appdata/local");
+
+    let paths = AppPaths::from_base_dirs(Path::new("/fake/appdata/roaming"), data_local_dir);
+
+    assert_eq!(
+        paths.log_directory(),
+        data_local_dir.join("immich-sync"),
+        "R10.3: the rotating log sits in the state database's own directory"
+    );
+    assert!(
+        paths.log_directory().starts_with(data_local_dir),
+        "R9.2: the log stays with the state, on this machine"
+    );
 }
 
 #[cfg(target_os = "linux")]

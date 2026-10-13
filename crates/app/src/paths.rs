@@ -30,12 +30,14 @@ pub struct AppPaths {
 
 impl AppPaths {
     /// Maps the platform base directories to the application's paths.
+    ///
+    /// The two base directories are plain paths, so the mapping is testable on
+    /// every platform; [`Self::resolve`] is where the OS is asked for them.
     #[must_use]
-    pub fn from_base_dirs(base: &BaseDirs) -> Self {
-        let config_dir = base.config_dir();
+    pub fn from_base_dirs(config_dir: &Path, data_local_dir: &Path) -> Self {
         Self {
             config_file: config_dir.join(APP_DIR).join(SETTINGS_FILE),
-            state_db: base.data_local_dir().join(APP_DIR).join(STATE_FILE),
+            state_db: data_local_dir.join(APP_DIR).join(STATE_FILE),
             autostart_dir: config_dir.join("autostart"),
         }
     }
@@ -48,7 +50,10 @@ impl AppPaths {
     pub fn resolve() -> anyhow::Result<Self> {
         let base = BaseDirs::new()
             .context("the platform did not provide a home directory for the client")?;
-        Ok(Self::from_base_dirs(&base))
+        Ok(Self::from_base_dirs(
+            base.config_dir(),
+            base.data_local_dir(),
+        ))
     }
 
     /// The directory the rotating log file lives in (SPEC R10.3).
