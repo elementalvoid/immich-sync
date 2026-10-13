@@ -24,6 +24,8 @@ use immich_sync::paths::AppPaths;
 use immich_sync::settings::SettingsStore;
 use immich_sync::settings_view::SettingsView;
 use immich_sync::shell::{self, AppShell, ViewMode};
+use immich_sync::upload::UploadModel;
+use immich_sync::upload_view::UploadView;
 use immich_sync::{status, theme};
 use sync_core::credential::{MemoryCredentialStore, SharedCredentialStore};
 
@@ -64,6 +66,7 @@ fn write_log(paths: &AppPaths, lines: &[&str]) -> PathBuf {
 
 /// Opens the real shell over the real settings and dashboard views.
 fn open_shell(cx: &mut TestAppContext, store: SettingsStore, paths: AppPaths) -> AnyWindowHandle {
+    let upload_paths = paths.clone();
     cx.update(|cx| {
         gpui_kit::init(cx);
         let profile = profile_from_settings(store.settings());
@@ -76,7 +79,9 @@ fn open_shell(cx: &mut TestAppContext, store: SettingsStore, paths: AppPaths) ->
             let settings = cx.new(|cx| {
                 SettingsView::new(store, paths, autostart(), connection.clone(), window, cx)
             });
-            cx.new(|cx| AppShell::new(dashboard, settings, connection.clone(), cx))
+            let upload_model = cx.new(|_| UploadModel::new(connection.clone(), &upload_paths));
+            let upload = cx.new(|cx| UploadView::new(upload_model, window, cx));
+            cx.new(|cx| AppShell::new(dashboard, settings, upload, connection.clone(), cx))
         })
         .expect("open the shell window")
         .0
