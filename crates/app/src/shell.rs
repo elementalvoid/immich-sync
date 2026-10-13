@@ -6,8 +6,10 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use gpui_tray::{Icon, Tray};
 
+use crate::connection::ConnectionModel;
 use crate::dashboard::Dashboard;
 use crate::settings_view::SettingsView;
+use sync_core::connection::ServerProfile;
 
 actions!(immich_sync, [Show, Hide, Quit]);
 
@@ -70,9 +72,17 @@ pub fn hide_window(cx: &mut App) {
 /// Returns an error when the platform cannot create the window.
 pub fn open_main_window(cx: &mut App) -> anyhow::Result<()> {
     let (window, _view) = gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+        // The connection state is one entity both surfaces read, so the
+        // dashboard's global card follows a sign-in from the settings form.
+        let connection = cx.new(|_| {
+            ConnectionModel::new(
+                ServerProfile::default(),
+                crate::credentials::platform_credential_store(),
+            )
+        });
         let dashboard = cx.new(|_| Dashboard::new(crate::status::sample()));
-        let settings = cx.new(|cx| SettingsView::from_environment(window, cx));
-        cx.new(|_| AppShell::new(dashboard, settings))
+        let settings = cx.new(|cx| SettingsView::from_environment(window, cx, connection.clone()));
+        cx.new(|cx| AppShell::new(dashboard, settings, connection, cx))
     })?;
     window.update(cx, |_, window, cx| {
         crate::theme::follow_system_theme(window, cx)
@@ -94,16 +104,35 @@ pub struct AppShell {
     mode: ViewMode,
     dashboard: Entity<Dashboard>,
     settings: Entity<SettingsView>,
+    _connection: Entity<ConnectionModel>,
+    _connection_subscription: Subscription,
 }
 
 impl AppShell {
-    /// A shell that starts on the dashboard.
-    #[must_use]
-    pub fn new(dashboard: Entity<Dashboard>, settings: Entity<SettingsView>) -> Self {
+    /// A shell that starts on the dashboard and mirrors the connection state
+    /// onto the global status card (R8.1).
+    pub fn new(
+        dashboard: Entity<Dashboard>,
+        settings: Entity<SettingsView>,
+        connection: Entity<ConnectionModel>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let subscription = cx.observe(&connection, |this, connection, cx| {
+            let summary = connection.read(cx).summary();
+            this.dashboard.update(cx, |dashboard, cx| {
+                dashboard.set_connection(Some(summary), cx)
+            });
+        });
+        let summary = connection.read(cx).summary();
+        dashboard.update(cx, |dashboard, cx| {
+            dashboard.set_connection(Some(summary), cx);
+        });
         Self {
             mode: ViewMode::Dashboard,
             dashboard,
             settings,
+            _connection: connection,
+            _connection_subscription: subscription,
         }
     }
 

@@ -45,8 +45,10 @@ pub struct StatusCard {
     /// Upload progress, 0.0 to 1.0.
     pub progress: f32,
     pub counts: Counts,
-    /// Deletion review items that await a decision.
+    /// The deletion review items that await a decision.
     pub review_count: u32,
+    /// The connection state, on the global card (R8.1).
+    pub connection: Option<String>,
     /// The last error, already classified by the engine.
     pub last_error: Option<String>,
 }
@@ -64,6 +66,8 @@ pub struct CardContent {
     pub progress_percent: String,
     pub counts: String,
     pub review: Option<String>,
+    /// The connection line, on the global card.
+    pub connection: Option<String>,
     pub error: Option<String>,
 }
 
@@ -86,6 +90,7 @@ impl StatusCard {
             ),
             review: (self.review_count > 0)
                 .then(|| format!("{} missing files to review", self.review_count)),
+            connection: self.connection.clone(),
             error: self.last_error.clone(),
         }
     }
@@ -113,6 +118,7 @@ pub fn sample() -> DashboardModel {
                 failed: 2,
             },
             review_count: 3,
+            connection: Some("Connected".to_string()),
             last_error: None,
         },
         folders: vec![
@@ -127,6 +133,7 @@ pub fn sample() -> DashboardModel {
                     failed: 0,
                 },
                 review_count: 0,
+                connection: None,
                 last_error: None,
             },
             StatusCard {
@@ -140,6 +147,7 @@ pub fn sample() -> DashboardModel {
                     failed: 0,
                 },
                 review_count: 3,
+                connection: None,
                 last_error: None,
             },
             StatusCard {
@@ -153,6 +161,7 @@ pub fn sample() -> DashboardModel {
                     failed: 2,
                 },
                 review_count: 0,
+                connection: None,
                 last_error: Some(
                     "permission_denied: the API key cannot write to this album".to_string(),
                 ),
@@ -168,6 +177,7 @@ pub fn sample() -> DashboardModel {
                     failed: 0,
                 },
                 review_count: 0,
+                connection: None,
                 last_error: None,
             },
         ],

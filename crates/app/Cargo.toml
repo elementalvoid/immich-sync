@@ -13,12 +13,24 @@ directories = "6"
 gpui-kit.workspace = true
 gpui-tray.workspace = true
 interprocess.workspace = true
+keyring-core = "=1.0.1"
 serde = { version = "1", features = ["derive"] }
+sync-core = { path = "../sync-core" }
+tokio = { version = "1", features = ["rt-multi-thread"] }
 toml = "1"
 
 [dev-dependencies]
 gpui-kit = { workspace = true, features = ["test-support"] }
+mock-immich = { path = "../mock-immich" }
 tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[target."cfg(target_os = \"linux\")".dependencies]
+# The Secret Service store, pinned: the keyring ecosystem restructured in 2026
+# (ADR 0006 research §3.2). `crypto-rust` keeps the D-Bus transport encryption
+# in Rust, so the build needs no OpenSSL.
+dbus-secret-service-keyring-store = { version = "=1.0.1", features = ["crypto-rust"] }
 
 [target."cfg(windows)".dependencies]
+windows-native-keyring-store = "=1.1.0"
 windows-registry = "0.6"

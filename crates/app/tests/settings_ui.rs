@@ -7,19 +7,23 @@ use std::cell::Cell;
 use std::fs;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, Bounds, ElementId, Point, Role, TestAppContext, Window,
-    WindowBounds, WindowOptions, px, size,
+    AnyWindowHandle, App, AppContext as _, Bounds, ElementId, Entity, Point, Role, TestAppContext,
+    Window, WindowBounds, WindowOptions, px, size,
 };
 use immich_sync::autostart::Autostart;
+use immich_sync::connection::{ConnectionModel, profile_from_settings};
 use immich_sync::dashboard::Dashboard;
 use immich_sync::paths::AppPaths;
 use immich_sync::settings::{Settings, SettingsStore};
 use immich_sync::settings_view::{FieldKey, SettingsView};
 use immich_sync::shell::AppShell;
 use immich_sync::status;
+use sync_core::connection::{Attention, ConnectionState, ServerProfile};
+use sync_core::credential::{MemoryCredentialStore, SharedCredentialStore};
 
 /// A stand-in for the OS autostart mechanism, so the settings-to-OS wiring is
 /// testable on every platform. On Linux the real XDG backend is covered by
@@ -95,7 +99,9 @@ fn window_options() -> WindowOptions {
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds {
             origin: Point::default(),
-            size: size(px(1200.), px(900.)),
+            // Tall enough for every settings section to be laid out at once,
+            // so a visibility assertion measures the section, not the scroll.
+            size: size(px(1200.), px(1400.)),
         })),
         ..Default::default()
     }
@@ -107,13 +113,29 @@ fn open_settings(
     paths: AppPaths,
     autostart: Rc<dyn Autostart>,
 ) -> AnyWindowHandle {
+    open_settings_with_connection(cx, store, paths, autostart).0
+}
+
+/// Opens the settings and returns the connection model next to the window.
+fn open_settings_with_connection(
+    cx: &mut TestAppContext,
+    store: SettingsStore,
+    paths: AppPaths,
+    autostart: Rc<dyn Autostart>,
+) -> (AnyWindowHandle, Entity<ConnectionModel>) {
+    let profile = profile_from_settings(store.settings());
     cx.update(|cx| {
         gpui_kit::init(cx);
-        gpui_kit::open_window(window_options(), cx, |window, cx| {
-            cx.new(|cx| SettingsView::new(store, paths, autostart, window, cx))
+        let connection = cx.new(|_| {
+            let store: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+            ConnectionModel::new(profile, store)
+        });
+        let window = gpui_kit::open_window(window_options(), cx, |window, cx| {
+            cx.new(|cx| SettingsView::new(store, paths, autostart, connection.clone(), window, cx))
         })
         .expect("open the settings window")
-        .0
+        .0;
+        (window, connection)
     })
 }
 
@@ -124,8 +146,12 @@ fn open_settings_over_resolution(
 ) -> AnyWindowHandle {
     cx.update(|cx| {
         gpui_kit::init(cx);
+        let connection = cx.new(|_| {
+            let store: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+            ConnectionModel::new(ServerProfile::default(), store)
+        });
         gpui_kit::open_window(window_options(), cx, |window, cx| {
-            cx.new(|cx| SettingsView::from_resolved_paths(resolved, window, cx))
+            cx.new(|cx| SettingsView::from_resolved_paths(resolved, window, cx, connection.clone()))
         })
         .expect("open the settings window")
         .0
@@ -137,16 +163,24 @@ fn open_shell(
     store: SettingsStore,
     paths: AppPaths,
     autostart: Rc<dyn Autostart>,
-) -> AnyWindowHandle {
+) -> (AnyWindowHandle, Entity<ConnectionModel>) {
+    let profile = profile_from_settings(store.settings());
     cx.update(|cx| {
         gpui_kit::init(cx);
-        gpui_kit::open_window(window_options(), cx, |window, cx| {
+        let connection = cx.new(|_| {
+            let store: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+            ConnectionModel::new(profile, store)
+        });
+        let window = gpui_kit::open_window(window_options(), cx, |window, cx| {
             let dashboard = cx.new(|_| Dashboard::new(status::sample()));
-            let settings = cx.new(|cx| SettingsView::new(store, paths, autostart, window, cx));
-            cx.new(|_| AppShell::new(dashboard, settings))
+            let settings = cx.new(|cx| {
+                SettingsView::new(store, paths, autostart, connection.clone(), window, cx)
+            });
+            cx.new(|cx| AppShell::new(dashboard, settings, connection.clone(), cx))
         })
         .expect("open the shell window")
-        .0
+        .0;
+        (window, connection)
     })
 }
 
@@ -813,7 +847,7 @@ fn the_shell_switch_shows_the_dashboard_and_the_settings(cx: &mut TestAppContext
     let temp = tempfile::tempdir().expect("create a temp dir");
     let paths = temporary_paths(temp.path());
     let store = SettingsStore::open(paths.config_file.clone());
-    let window = open_shell(cx, store, paths, FakeAutostart::new());
+    let (window, _connection) = open_shell(cx, store, paths, FakeAutostart::new());
 
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
@@ -845,4 +879,184 @@ fn the_shell_switch_shows_the_dashboard_and_the_settings(cx: &mut TestAppContext
         );
     })
     .expect("update the shell window");
+}
+
+#[gpui_kit::test]
+fn the_connection_form_names_its_controls(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let store = SettingsStore::open(paths.config_file.clone());
+    let window = open_settings(cx, store, paths, FakeAutostart::new());
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+
+        assert!(
+            window.find("settings-connection").visible(),
+            "the connection section is on the settings surface"
+        );
+        for (id, label) in [
+            ("settings-server-url", "Server URL"),
+            ("settings-email", "Email address"),
+            ("settings-secret", "Password"),
+            ("settings-auth-method", "Credential"),
+            ("settings-sign-in", "Sign in"),
+        ] {
+            let row = window.find(id);
+            assert!(row.visible(), "{id} is visible");
+            assert_eq!(row.label(), Some(label), "{id} is named");
+        }
+        // The nested text fields carry the same names to assistive technology.
+        for (id, label) in [
+            ("settings-server-url", "Server URL"),
+            ("settings-email", "Email address"),
+            ("settings-secret", "Password"),
+        ] {
+            assert_eq!(
+                row_text_input(window, id).label(),
+                Some(label),
+                "{id} names its text field"
+            );
+        }
+        // The secret field is masked, so its value is never announced.
+        assert!(
+            row_text_input(window, "settings-secret").value().is_none(),
+            "the password field is masked"
+        );
+        assert_eq!(
+            window.find("settings-auth-password").label(),
+            Some("Sign in with a password"),
+            "the password method is named"
+        );
+        assert_eq!(
+            window.find("settings-auth-apikey").label(),
+            Some("Sign in with an API key"),
+            "the API-key method is named"
+        );
+
+        // Switching the credential relabels the secret field (R1.5).
+        window.click("settings-auth-apikey", cx);
+        assert_eq!(
+            row_text_input(window, "settings-secret").label(),
+            Some("API key"),
+            "the secret field follows the credential choice"
+        );
+    })
+    .expect("update the settings window");
+}
+
+#[gpui_kit::test]
+fn the_connection_state_shows_on_the_form_and_the_global_card(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let store = SettingsStore::open(paths.config_file.clone());
+    let (window, connection) = open_shell(cx, store, paths, FakeAutostart::new());
+    let attention = ConnectionState::NeedsAttention(Attention::PasswordLoginDisabled);
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("status-connection-global").label(),
+            Some(ConnectionState::NotConfigured.message().as_str()),
+            "the global card carries the live connection state, not the sample"
+        );
+    })
+    .expect("update the shell window");
+
+    // A state change travels through the shell's observation of the model.
+    cx.update(|cx| {
+        connection.update(cx, |model, cx| model.set_state(attention.clone(), cx));
+    });
+    cx.run_until_parked();
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("status-connection-global").label(),
+            Some(attention.message().as_str()),
+            "the global card follows a state change"
+        );
+
+        tab_to(window, "nav-settings", cx);
+        window.press("enter", cx);
+        assert_eq!(
+            window.find("settings-connection-state").label(),
+            Some(attention.message().as_str()),
+            "the form shows the same state"
+        );
+        assert!(
+            window.find("settings-connection-hint").visible(),
+            "a disabled password login points at the API key (R1.6)"
+        );
+    })
+    .expect("update the shell window");
+}
+
+#[gpui_kit::test]
+fn a_wrong_password_shows_an_error_and_the_form_stays_usable(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let store = SettingsStore::open(paths.config_file.clone());
+    let (window, connection) =
+        open_settings_with_connection(cx, store, paths, FakeAutostart::new());
+
+    cx.update_window(window, |_, window, cx| {
+        connection.update(cx, |model, cx| {
+            model.set_state(
+                ConnectionState::NeedsAttention(Attention::WrongPassword),
+                cx,
+            );
+        });
+        window.render_frame(cx);
+
+        let notice = window.find("settings-connection-state");
+        let label = notice.label();
+        assert!(
+            label.is_some_and(|text| text.contains("rejected the password")),
+            "the wrong password is reported: {label:?}"
+        );
+        // The form itself stays enabled, so the user can try again.
+        assert_ne!(window.find("settings-sign-in").disabled(), Some(true));
+        assert_ne!(
+            row_text_input(window, "settings-secret").disabled(),
+            Some(true),
+            "the secret field stays enabled"
+        );
+        assert!(
+            window.try_find("settings-connection-hint").is_none(),
+            "a wrong password does not point at the API key"
+        );
+
+        connection.update(cx, |model, cx| {
+            model.set_state(ConnectionState::Connected, cx);
+        });
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("settings-connection-state").label(),
+            Some("Connected"),
+            "a successful sign-in clears the error"
+        );
+    })
+    .expect("update the settings window");
+}
+
+#[gpui_kit::test]
+fn the_connection_form_reports_empty_fields_without_signing_in(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let store = SettingsStore::open(paths.config_file.clone());
+    let window = open_settings(cx, store, paths, FakeAutostart::new());
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("settings-sign-in", cx);
+
+        let error = window.find("settings-connection-error");
+        let label = error.label();
+        assert!(
+            label.is_some_and(|text| text.contains("server URL")),
+            "the empty form is reported: {label:?}"
+        );
+    })
+    .expect("update the settings window");
 }
