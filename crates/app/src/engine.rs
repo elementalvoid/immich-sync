@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_kit::*;
-use sync_core::engine::{Activity, Engine, EngineConfig, EngineStatus, FolderStatus};
+use sync_core::engine::{Activity, Engine, EngineConfig, EngineStatus, FolderStatus, Limits};
 use sync_core::store::{FolderCounts, SourceFolder, StateStore};
 
 use crate::connection::{ConnectionModel, worker};
@@ -148,6 +148,40 @@ impl EngineModel {
     #[must_use]
     pub fn is_running(&self) -> bool {
         self.engine.is_some()
+    }
+
+    /// The live limits of the running engine (R7.1, R7.2). `None` before it
+    /// starts; the start path reads the stored values.
+    #[must_use]
+    pub fn limits(&self) -> Option<Limits> {
+        self.engine.as_ref().map(|engine| engine.limits())
+    }
+
+    /// Applies both limits to the running engine without a restart (R7.1,
+    /// R7.2). Before it starts this is a no-op: the settings file it reads at
+    /// start already holds the value the view wrote.
+    pub fn set_limits(
+        &mut self,
+        bandwidth_bytes_per_second: u64,
+        concurrency: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(engine) = self.engine.clone() else {
+            return;
+        };
+        let Ok(runtime) = worker() else {
+            self.problem = Some("The network runtime could not start.".to_string());
+            cx.notify();
+            return;
+        };
+        runtime.spawn(async move {
+            engine
+                .set_limits(Limits {
+                    bandwidth_bytes_per_second,
+                    concurrency,
+                })
+                .await;
+        });
     }
 
     /// Adds a source folder and starts discovering it (R2.1).
@@ -303,6 +337,7 @@ impl EngineModel {
             let settings = SettingsStore::open(config_file).settings().clone();
             let config = EngineConfig {
                 concurrency: usize::try_from(settings.concurrency.max(1)).unwrap_or(4),
+                bandwidth_bytes_per_second: settings.bandwidth_bytes_per_second,
                 scan_interval: Duration::from_secs(
                     u64::from(settings.scan_interval_minutes.max(1)) * 60,
                 ),

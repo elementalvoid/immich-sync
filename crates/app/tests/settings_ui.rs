@@ -21,11 +21,13 @@ use immich_sync::autostart::Autostart;
 use immich_sync::connection::{ConnectionModel, profile_from_settings};
 use immich_sync::credentials::CredentialStoreProvider;
 use immich_sync::dashboard::Dashboard;
+use immich_sync::engine::EngineModel;
 use immich_sync::paths::AppPaths;
 use immich_sync::settings::{Settings, SettingsStore};
 use immich_sync::settings_view::{FieldKey, SettingsView};
 use immich_sync::shell::AppShell;
 use immich_sync::status;
+use immich_sync::store::StoreModel;
 use immich_sync::upload::UploadModel;
 use immich_sync::upload_view::UploadView;
 use mock_immich::MockImmich;
@@ -35,6 +37,7 @@ use sync_core::connection::{
 use sync_core::credential::{
     CredentialError, CredentialStore, MemoryCredentialStore, SharedCredentialStore,
 };
+use sync_core::engine::Limits;
 
 /// A stand-in for the OS autostart mechanism, so the settings-to-OS wiring is
 /// testable on every platform. On Linux the real XDG backend is covered by
@@ -1612,4 +1615,117 @@ async fn a_failed_sign_in_does_not_replace_the_saved_profile(cx: &mut TestAppCon
         "a failed sign-in must not replace the saved profile: {text}"
     );
     drop(runtime);
+}
+
+/// The Limits card is the writer of both values, and the running engine
+/// follows it without a restart (SPEC R7.1, R7.2, R7.3).
+#[gpui_kit::test]
+async fn a_limits_change_reaches_the_running_engine(cx: &mut TestAppContext) {
+    let (_runtime, server) = mock_server();
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let mut stored = SettingsStore::open(paths.config_file.clone());
+    stored
+        .update(|settings| {
+            settings.bandwidth_bytes_per_second = 2_000_000;
+            settings.concurrency = 6;
+        })
+        .expect("write the stored limits");
+
+    let credentials: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+    let (window, view, connection) =
+        open_settings_view(cx, stored, paths.clone(), FakeAutostart::new(), credentials);
+
+    // Sign in on the model the view already holds, so the engine can start.
+    let profile = ServerProfile {
+        server_url: server.base_url().to_string(),
+        email: "sync@example.com".to_string(),
+        method: AuthMethod::Password,
+    };
+    cx.update(|cx| {
+        connection.update(cx, |model, cx| {
+            model.sign_in(
+                SignIn {
+                    email: profile.email.clone(),
+                    secret: Secret::new("correct horse"),
+                    method: AuthMethod::Password,
+                },
+                profile,
+                cx,
+            );
+        });
+    });
+
+    let store_model = cx.update(|cx| cx.new(|cx| StoreModel::open(&paths, cx)));
+    let engine_model = cx.update(|cx| {
+        let engine = cx.new(|cx| EngineModel::new(connection, store_model, &paths, cx));
+        engine.update(cx, |model, cx| model.start(cx));
+        engine
+    });
+    for _ in 0..600 {
+        if cx.read(|cx| engine_model.read(cx).is_running()) {
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    assert!(
+        cx.read(|cx| engine_model.read(cx).is_running()),
+        "the engine never started"
+    );
+    assert_eq!(
+        cx.read(|cx| engine_model.read(cx).limits()),
+        Some(Limits {
+            bandwidth_bytes_per_second: 2_000_000,
+            concurrency: 6,
+        }),
+        "R7.1/R7.2/R7.3: the engine starts with the stored limits"
+    );
+
+    // The shell hands the view the engine it must push changes to; this is
+    // that same call.
+    cx.update(|cx| view.update(cx, |view, _| view.set_engine(engine_model.clone())));
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        tab_to(window, FieldKey::Bandwidth.id(), cx);
+        retype(window, "1", cx);
+        tab_to(window, FieldKey::Concurrency.id(), cx);
+        retype(window, "3", cx);
+    })
+    .expect("edit the limits");
+
+    for _ in 0..600 {
+        if cx.read(|cx| engine_model.read(cx).limits())
+            == Some(Limits {
+                bandwidth_bytes_per_second: 1_000_000,
+                concurrency: 3,
+            })
+        {
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        cx.read(|cx| engine_model.read(cx).limits()),
+        Some(Limits {
+            bandwidth_bytes_per_second: 1_000_000,
+            concurrency: 3,
+        }),
+        "R7.1/R7.2: a change in the window reaches the running engine"
+    );
+
+    let reloaded = SettingsStore::open(paths.config_file.clone());
+    assert_eq!(
+        reloaded.settings().bandwidth_bytes_per_second,
+        1_000_000,
+        "R7.3: the bandwidth limit was written back"
+    );
+    assert_eq!(
+        reloaded.settings().concurrency,
+        3,
+        "R7.3: the concurrency limit was written back"
+    );
 }
