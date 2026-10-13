@@ -76,6 +76,10 @@ jobs:
           unset WAYLAND_DISPLAY
           dbus-run-session -- xvfb-run -a -s "-screen 0 1280x800x24" bash -c '
             set -euo pipefail
+            # Give this run its own log and state directory: a log left by an
+            # earlier run would satisfy the started poll below before this app
+            # ever starts, and a stale state database would hand off instead.
+            export XDG_DATA_HOME="$PWD/xdg-data"
             target/debug/immich-sync >shot.png.log 2>&1 &
             APP=$!
             # The app logs here, not to stdout.
@@ -105,7 +109,9 @@ jobs:
             waited=$SECONDS
             while :; do
               alive || { echo "the app exited before it painted:" >&2; cat shot.png.log >&2; exit 1; }
-              import -window root shot.png
+              # Bound the capture: a wedged import must not block the loop past
+              # the deadline below.
+              timeout 30 import -window root shot.png
               colors=$(identify -format %k shot.png)
               if [ "$colors" -gt 1 ]; then break; fi
               if [ $((SECONDS - waited)) -ge $PAINT_TIMEOUT ]; then
@@ -140,8 +146,8 @@ jobs:
           colors=$(identify -format %k shot.png)
           mean=$(convert shot.png -colorspace gray -format '%[fx:mean]' info:)
           echo "screenshot gray mean=$mean"
-          # One colour means nothing was drawn; a mean of 0 only means black,
-          # so both reject a bare root (a lit pixel in a black frame passes the
-          # mean alone).
+          # The colour test is what rejects a flat frame whatever its
+          # brightness: a uniform grey frame is colors=1 with mean~0.5, so the
+          # mean test alone would pass it. Together they reject a bare root.
           test "$colors" -gt 1
           test "$mean" != "0"
