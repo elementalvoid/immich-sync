@@ -18,12 +18,13 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use immich_client::{BulkAction, BulkCheckItem, ClientError, ImmichClient, RejectReason};
 use tokio::sync::{Notify, Semaphore, mpsc};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 
 use crate::connection::RequestCredential;
 use crate::failure::{FailureClass, classify};
@@ -168,6 +169,11 @@ struct EngineInner {
     upload_slots: Arc<Semaphore>,
     watcher: Mutex<Option<FolderWatcher>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// Set by `stop` before it aborts, so no worker is spawned afterwards.
+    stopped: AtomicBool,
+    /// The upload workers the dispatcher spawned, so `stop` can abort the ones
+    /// still on the wire instead of leaving them running after the engine.
+    uploads: Mutex<JoinSet<()>>,
 }
 
 /// The folder sync engine (R2, R3, R6.7, R8.7).
@@ -227,6 +233,8 @@ impl Engine {
             sync_now: Notify::new(),
             watcher: Mutex::new(None),
             tasks: Mutex::new(Vec::new()),
+            stopped: AtomicBool::new(false),
+            uploads: Mutex::new(JoinSet::new()),
         });
         Ok(Self {
             inner,
@@ -298,15 +306,24 @@ impl Engine {
         );
     }
 
-    /// Stops the watcher and every engine task. A later run re-queues what was
-    /// unfinished (R6.7).
+    /// Stops the watcher, the scan and dispatch tasks, and the upload workers.
+    /// A later run re-queues what was unfinished (R6.7). Safe before the first
+    /// start and safe to call twice.
     pub fn stop(&self) {
+        // Set before the abort, so a dispatcher already past its last await
+        // cannot spawn a worker behind the abort.
+        self.inner.stopped.store(true, Ordering::SeqCst);
         if let Some(watcher) = self.inner.watcher.lock().expect("the watcher lock").take() {
             drop(watcher);
         }
         for task in self.inner.tasks.lock().expect("the task list").drain(..) {
             task.abort();
         }
+        self.inner
+            .uploads
+            .lock()
+            .expect("the upload list")
+            .abort_all();
         tracing::info!("the sync engine stopped");
     }
 
@@ -884,12 +901,20 @@ async fn spawn_upload(inner: &Arc<EngineInner>, item: PreparedItem) {
         return;
     }
     let inner = Arc::clone(inner);
-    tokio::spawn(async move {
-        let outcome = inner
+    let mut uploads = inner.uploads.lock().expect("the upload list");
+    if inner.stopped.load(Ordering::SeqCst) {
+        // `stop` ran first: the item stays pending for the next engine (R6.7).
+        return;
+    }
+    // Reap finished workers first, so a long run does not accumulate handles.
+    while uploads.try_join_next().is_some() {}
+    let worker = Arc::clone(&inner);
+    uploads.spawn(async move {
+        let outcome = worker
             .uploader
-            .upload_prepared(&item, &inner.credential, &inner.gate)
+            .upload_prepared(&item, &worker.credential, &worker.gate)
             .await;
-        inner.finish_item(&item, &outcome);
+        worker.finish_item(&item, &outcome);
         match &outcome {
             UploadOutcome::Created { asset_id } | UploadOutcome::Duplicate { asset_id } => {
                 tracing::info!(path = %item.path.display(), asset_id = %asset_id, "the item finished");

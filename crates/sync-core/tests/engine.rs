@@ -362,6 +362,59 @@ async fn pause_stops_new_uploads_within_five_seconds_and_resume_continues() {
 }
 
 #[tokio::test]
+async fn stopping_the_engine_aborts_its_running_upload_workers() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let photo = write_file(&photos, "slow.jpg", b"slow bytes");
+    add_folder(&store, &photos, true);
+    // The worker sits on the wire long enough to stop the engine underneath it.
+    server.fail(Operation::Upload, Fault::Slow(Duration::from_millis(800)));
+    let config = EngineConfig {
+        concurrency: 1,
+        watch: false,
+        ..EngineConfig::default()
+    };
+    let engine = start_engine(&server, &store, config).await;
+
+    assert!(
+        wait_until(|| server.upload_requests() == 1, Duration::from_secs(5)).await,
+        "the upload worker did not start"
+    );
+    engine.stop();
+    drop(engine);
+
+    // The slow response is due well within this wait. A worker that `stop` did
+    // not abort finishes the upload and records the success; an aborted one
+    // leaves the row for the next run to requeue (R6.7).
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let row = store
+        .item(&photo.display().to_string())
+        .expect("read the row")
+        .expect("the row exists");
+    assert!(
+        !row.state.is_terminal_success(),
+        "a stopped engine's upload worker must not keep running: {:?}",
+        row.state
+    );
+}
+
+#[tokio::test]
+async fn stopping_an_engine_that_never_started_is_safe() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let (client, credential) = signed_in(&server).await;
+    let engine =
+        Engine::new(store, client, credential, EngineConfig::default()).expect("build the engine");
+
+    engine.stop();
+    // Drop stops it again; neither call may panic with nothing to abort.
+    drop(engine);
+}
+
+#[tokio::test]
 async fn a_restart_resumes_without_reuploading_completed_items() {
     let server = MockImmich::start().await;
     let temp = tempfile::tempdir().expect("create a temp dir");

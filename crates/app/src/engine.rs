@@ -328,6 +328,12 @@ impl EngineModel {
             };
             let _ = this.update(cx, |model, cx| {
                 if model.start_generation != start_generation {
+                    // A newer start won the race. Stop the engine this attempt
+                    // built before discarding it, so its watcher and workers
+                    // do not keep running behind the surviving engine.
+                    if let Ok(engine) = &started {
+                        engine.stop();
+                    }
                     return;
                 }
                 match started {
