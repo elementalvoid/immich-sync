@@ -29,10 +29,23 @@ pub fn platform_credential_store() -> SharedCredentialStore {
     static STORE: OnceLock<SharedCredentialStore> = OnceLock::new();
     STORE
         .get_or_init(|| match install_platform_store() {
-            Ok(()) => Arc::new(KeyringStore),
+            Ok(()) => keyring_store(SERVICE, ACCOUNT),
             Err(message) => Arc::new(UnavailableStore::new(message)),
         })
         .clone()
+}
+
+/// A store for one keyring entry, over the platform store
+/// [`platform_credential_store`] installed.
+///
+/// The opt-in integration test uses a test-only service and account, so it
+/// never touches the entry the application stores.
+#[must_use]
+pub fn keyring_store(service: &str, account: &str) -> SharedCredentialStore {
+    Arc::new(KeyringStore {
+        service: service.to_string(),
+        account: account.to_string(),
+    })
 }
 
 /// The message for a Linux desktop with no Secret Service provider.
@@ -87,7 +100,10 @@ fn install_platform_store() -> Result<(), String> {
 }
 
 /// The real store: one entry in the process-wide keyring store.
-struct KeyringStore;
+struct KeyringStore {
+    service: String,
+    account: String,
+}
 
 impl CredentialStore for KeyringStore {
     fn get(&self) -> Result<Option<Secret>, CredentialError> {
@@ -120,7 +136,8 @@ impl KeyringStore {
     /// Returns [`CredentialError::Failed`] when the keyring rejects the entry
     /// specifier.
     fn entry(&self, action: &'static str) -> Result<keyring_core::Entry, CredentialError> {
-        keyring_core::Entry::new(SERVICE, ACCOUNT).map_err(|error| failed(action, error))
+        keyring_core::Entry::new(&self.service, &self.account)
+            .map_err(|error| failed(action, error))
     }
 }
 

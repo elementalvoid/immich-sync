@@ -24,7 +24,7 @@ jobs:
             gcc g++ clang pkg-config \
             libfontconfig-dev libfreetype-dev libwayland-dev libxkbcommon-dev \
             libxkbcommon-x11-dev libx11-xcb-dev libxcb1-dev libvulkan1 \
-            libssl-dev libzstd-dev
+            libssl-dev libzstd-dev libdbus-1-dev
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
@@ -57,7 +57,7 @@ jobs:
             gcc g++ clang pkg-config \
             libfontconfig-dev libfreetype-dev libwayland-dev libxkbcommon-dev \
             libxkbcommon-x11-dev libx11-xcb-dev libxcb1-dev \
-            libvulkan1 mesa-vulkan-drivers \
+            libvulkan1 mesa-vulkan-drivers libdbus-1-dev \
             xvfb xvfb-run xauth imagemagick x11-utils
       - run: cargo build --bin immich-sync
       - name: Capture a real frame
