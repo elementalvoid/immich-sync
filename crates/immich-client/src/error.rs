@@ -32,7 +32,26 @@ pub enum ClientError {
     /// The server rejected the session token.
     #[error("the server rejected the session token")]
     InvalidToken,
+    /// The server cannot accept this format (HTTP 415, R6.3).
+    #[error("the server does not accept this file format: {0}")]
+    UnsupportedFormat(String),
+    /// The account is over its storage quota (HTTP 400 with Immich's quota
+    /// message, R6.4).
+    #[error("the account is over its storage quota: {0}")]
+    QuotaExceeded(String),
+    /// The credential lacks the required permission (HTTP 403, R6.3).
+    #[error("the credential lacks the required permission: {0}")]
+    PermissionDenied(String),
+    /// The file is larger than the server accepts (HTTP 413, R6.3).
+    #[error("the file is too large for the server: {0}")]
+    TooLarge(String),
+    /// The local file could not be read (R6.4). It is not a network failure,
+    /// so the retry policy must not treat it like one.
+    #[error("the local file could not be read: {0}")]
+    LocalRead(#[source] std::io::Error),
     /// The server answered with a status or body the client does not understand.
+    /// A permanent 4xx that has no named class of its own (404, 409, 422, and a
+    /// 400 that is not Immich's quota refusal) also lands here.
     #[error("the server answered {status} in a form this client does not understand: {message}")]
     Protocol {
         /// The HTTP status the server returned.

@@ -9,7 +9,10 @@ use gpui_tray::{Icon, Tray};
 use crate::connection::ConnectionModel;
 use crate::dashboard::Dashboard;
 use crate::logs_view::LogsView;
+use crate::paths::AppPaths;
 use crate::settings_view::SettingsView;
+use crate::upload::UploadModel;
+use crate::upload_view::UploadView;
 use sync_core::connection::{ConnectionState, ServerProfile};
 
 actions!(immich_sync, [Show, Hide, Quit]);
@@ -28,7 +31,8 @@ pub fn init(cx: &mut App) {
     // Linux, which would end the tray app.
     cx.set_quit_mode(QuitMode::Explicit);
     cx.on_action(show).on_action(hide).on_action(quit);
-    install_connection_with(cx, show_connection_on_tray);
+    let connection = install_connection_with(cx, show_connection_on_tray);
+    install_upload(cx, connection);
 }
 
 /// The app-level handle to the one connection model (R1.4).
@@ -47,6 +51,32 @@ impl Global for ConnectionHandle {}
 #[must_use]
 pub fn connection(cx: &App) -> Entity<ConnectionModel> {
     cx.global::<ConnectionHandle>().0.clone()
+}
+
+/// The app-level handle to the one manual-upload model (issue #5).
+struct UploadHandle(Entity<UploadModel>);
+impl Global for UploadHandle {}
+
+/// The one manual-upload model, created by [`init`].
+///
+/// # Panics
+///
+/// Panics when [`init`] has not run.
+#[must_use]
+pub fn upload(cx: &App) -> Entity<UploadModel> {
+    cx.global::<UploadHandle>().0.clone()
+}
+
+/// Creates the manual-upload model at App scope, with the state database the
+/// resolved paths name (N4).
+fn install_upload(cx: &mut App, connection: Entity<ConnectionModel>) -> Entity<UploadModel> {
+    let paths = AppPaths::resolve().unwrap_or_else(|error| {
+        eprintln!("immich-sync: could not resolve the state location: {error:#}");
+        AppPaths::fallback()
+    });
+    let upload = cx.new(|_| UploadModel::new(connection, &paths));
+    cx.set_global(UploadHandle(upload.clone()));
+    upload
 }
 
 /// Creates the connection model and registers the tray observer at App scope.
@@ -127,13 +157,20 @@ pub fn open_main_window(cx: &mut App) -> anyhow::Result<()> {
     else {
         anyhow::bail!("the shell is not installed; call shell::init before opening a window");
     };
+    let Some(upload) = cx
+        .try_global::<UploadHandle>()
+        .map(|handle| handle.0.clone())
+    else {
+        anyhow::bail!("the shell is not installed; call shell::init before opening a window");
+    };
     let (window, _view) = gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
         // The connection state is one entity both surfaces read, so the
         // dashboard's global card follows a sign-in from the settings form,
         // and reopening the window after a hide reuses the same state.
         let dashboard = cx.new(|_| Dashboard::new(crate::status::sample()));
         let settings = cx.new(|cx| SettingsView::from_environment(window, cx, connection.clone()));
-        cx.new(|cx| AppShell::new(dashboard, settings, connection, cx))
+        let upload_view = cx.new(|cx| UploadView::new(upload.clone(), window, cx));
+        cx.new(|cx| AppShell::new(dashboard, settings, upload_view, connection, cx))
     })?;
     window.update(cx, |_, window, cx| {
         crate::theme::follow_system_theme(window, cx)
@@ -148,15 +185,17 @@ pub enum ViewMode {
     Dashboard,
     /// The settings surface.
     Settings,
+    /// The manual one-file upload.
+    Upload,
     /// The log file and its level control (R10.3).
     Logs,
 }
 
 /// The environment variable that pins the visible surface.
 ///
-/// Set it to `dashboard`, `settings`, or `logs` to open the window on that
-/// surface and skip the observer that would otherwise decide. A screenshot run
-/// uses it so the capture is reproducible.
+/// Set it to `dashboard`, `settings`, `upload`, or `logs` to open the window on
+/// that surface and skip the observer that would otherwise decide. A screenshot
+/// run uses it so the capture is reproducible.
 pub const FORCE_VIEW_ENV: &str = "IMMICH_SYNC_VIEW";
 
 /// The surface a pinned value names, when one is set.
@@ -171,18 +210,20 @@ pub fn view_for_name(value: &str) -> Option<ViewMode> {
     match value {
         "dashboard" => Some(ViewMode::Dashboard),
         "settings" => Some(ViewMode::Settings),
+        "upload" => Some(ViewMode::Upload),
         "logs" => Some(ViewMode::Logs),
         _ => None,
     }
 }
 
-/// The main window's view: a view switch above the dashboard, the settings, or
-/// the logs.
+/// The main window's view: a view switch above the dashboard, the settings, the
+/// upload, or the logs.
 pub struct AppShell {
     mode: ViewMode,
     dashboard: Entity<Dashboard>,
     settings: Entity<SettingsView>,
     logs: Entity<LogsView>,
+    upload: Entity<UploadView>,
     _connection: Entity<ConnectionModel>,
     _connection_subscription: Subscription,
 }
@@ -194,6 +235,7 @@ impl AppShell {
     pub fn new(
         dashboard: Entity<Dashboard>,
         settings: Entity<SettingsView>,
+        upload: Entity<UploadView>,
         connection: Entity<ConnectionModel>,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -215,6 +257,7 @@ impl AppShell {
             dashboard,
             settings,
             logs,
+            upload,
             _connection: connection,
             _connection_subscription: subscription,
         }
@@ -245,6 +288,13 @@ impl AppShell {
                 "nav-dashboard",
                 "Dashboard",
                 ViewMode::Dashboard,
+                self.mode,
+                cx,
+            ))
+            .child(view_button(
+                "nav-upload",
+                "Upload",
+                ViewMode::Upload,
                 self.mode,
                 cx,
             ))
@@ -289,6 +339,7 @@ impl Render for AppShell {
         let content: AnyElement = match self.mode {
             ViewMode::Dashboard => self.dashboard.clone().into_any_element(),
             ViewMode::Settings => self.settings.clone().into_any_element(),
+            ViewMode::Upload => self.upload.clone().into_any_element(),
             ViewMode::Logs => self.logs.clone().into_any_element(),
         };
 
@@ -376,7 +427,7 @@ fn icon() -> gpui_tray::Result<Icon> {
 
 #[cfg(test)]
 mod tests {
-    use super::{hide_window, install_connection_with, show_window};
+    use super::{hide_window, install_connection_with, install_upload, show_window};
     use gpui_kit::TestAppContext;
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -388,9 +439,13 @@ mod tests {
         let connection = cx.update(|cx| {
             gpui_kit::init(cx);
             let seen = seen.clone();
-            install_connection_with(cx, move |state, _| {
+            let connection = install_connection_with(cx, move |state, _| {
                 seen.borrow_mut().push(state.message());
-            })
+            });
+            // `open_main_window` builds every surface, so the upload model the
+            // window needs is installed here too, as `init` does.
+            install_upload(cx, connection.clone());
+            connection
         });
 
         // A window opens and closes; the observer lives at App scope, not in

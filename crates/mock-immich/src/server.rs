@@ -65,7 +65,13 @@ struct Inner {
     faults: HashMap<Operation, VecDeque<Fault>>,
     assets: HashMap<String, Asset>,
     checksums: HashMap<Vec<u8>, String>,
+    /// Checksums `bulk-upload-check` rejects as an unsupported format.
+    unsupported: HashSet<Vec<u8>>,
     albums: HashMap<String, Album>,
+    /// How many `POST /assets/bulk-upload-check` requests arrived.
+    bulk_check_requests: u64,
+    /// How many `POST /assets` requests arrived, whether or not one uploaded.
+    upload_requests: u64,
     /// Immich's `passwordLogin.enabled` system config.
     password_login_disabled: bool,
     /// The key `x-api-key` must carry, once one is configured.
@@ -249,6 +255,41 @@ impl MockImmich {
             .expect("mock state poisoned")
             .tokens
             .clear();
+    }
+
+    /// Reject `checksum` in `bulk-upload-check` as an unsupported format, as
+    /// the real server does for a file type it cannot accept (R6.3).
+    pub fn reject_format(&self, checksum: &str) {
+        if let Some(checksum) = canonical_checksum(checksum) {
+            self.state
+                .inner
+                .lock()
+                .expect("mock state poisoned")
+                .unsupported
+                .insert(checksum);
+        }
+    }
+
+    /// The number of `POST /assets/bulk-upload-check` requests that arrived.
+    #[must_use]
+    pub fn bulk_check_requests(&self) -> u64 {
+        self.state
+            .inner
+            .lock()
+            .expect("mock state poisoned")
+            .bulk_check_requests
+    }
+
+    /// The number of `POST /assets` requests that arrived. A request that the
+    /// server refused before reading a body still counts: what a test wants to
+    /// prove is that the client never opened the upload at all.
+    #[must_use]
+    pub fn upload_requests(&self) -> u64 {
+        self.state
+            .inner
+            .lock()
+            .expect("mock state poisoned")
+            .upload_requests
     }
 
     /// Configure the one API key the server accepts. Without one the mock
@@ -481,6 +522,11 @@ async fn bulk_upload_check(
     AxumState(state): AxumState<Arc<State>>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
+    state
+        .inner
+        .lock()
+        .expect("mock state poisoned")
+        .bulk_check_requests += 1;
     if let Some(response) = guard(&state, Operation::BulkUploadCheck).await {
         return response;
     }
@@ -499,6 +545,9 @@ async fn bulk_upload_check(
                 .get("checksum")
                 .and_then(|value| value.as_str())
                 .and_then(canonical_checksum);
+            let unsupported = checksum
+                .as_ref()
+                .is_some_and(|checksum| inner.unsupported.contains(checksum));
             match checksum.and_then(|checksum| inner.asset_by_checksum(&checksum)) {
                 Some(asset) => json!({
                     "id": id,
@@ -506,6 +555,11 @@ async fn bulk_upload_check(
                     "reason": "duplicate",
                     "assetId": asset.id,
                     "isTrashed": asset.trashed,
+                }),
+                None if unsupported => json!({
+                    "id": id,
+                    "action": "reject",
+                    "reason": "unsupported-format",
                 }),
                 None => json!({ "id": id, "action": "accept" }),
             }
@@ -519,9 +573,11 @@ async fn upload(
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Response {
-    if let Some(response) = guard(&state, Operation::Upload).await {
-        return response;
-    }
+    state
+        .inner
+        .lock()
+        .expect("mock state poisoned")
+        .upload_requests += 1;
 
     // Immich answers a known checksum from the header before it reads the body.
     let header_checksum = headers
@@ -535,6 +591,9 @@ async fn upload(
         }
     }
 
+    // The real server buffers the upload before it validates the format or the
+    // quota, so a fault response never races the streaming request body. Only
+    // the checksum short-circuit above answers earlier.
     let mut asset_data = Vec::new();
     let mut has_sidecar = false;
     let mut live_photo_video_id = None;
@@ -560,6 +619,10 @@ async fn upload(
             },
             _ => {}
         }
+    }
+
+    if let Some(response) = guard(&state, Operation::Upload).await {
+        return response;
     }
 
     // Immich stores the checksum it computes from the body, not the header.

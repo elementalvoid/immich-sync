@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use immich_client::{ClientError, ImmichClient, SessionToken};
+use immich_client::{Auth, ClientError, ImmichClient, SessionToken};
 use serde::{Deserialize, Serialize};
 
 pub use crate::credential::Secret;
@@ -187,6 +187,17 @@ pub enum RequestCredential {
     Session(SessionToken),
     /// An API key, sent as `x-api-key` (R1.5).
     ApiKey(Secret),
+}
+
+impl RequestCredential {
+    /// The credential for one Immich client request (R1.3, R1.5).
+    #[must_use]
+    pub fn auth(&self) -> Auth<'_> {
+        match self {
+            Self::Session(token) => Auth::Token(token),
+            Self::ApiKey(secret) => Auth::ApiKey(secret.expose()),
+        }
+    }
 }
 
 impl std::fmt::Debug for RequestCredential {

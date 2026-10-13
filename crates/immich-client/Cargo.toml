@@ -10,13 +10,17 @@ publish = false
 # Default TLS is rustls with the platform verifier, so a self-hosted Immich
 # behind a private CA validates against the OS certificate store. Verification
 # is never disabled (SPEC N3).
-reqwest = { version = "0.13", features = ["json"] }
+reqwest = { version = "0.13", features = ["json", "multipart", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+# Streaming the file part without buffering it in memory (R3.1).
+tokio = { version = "1", features = ["fs"] }
+tokio-util = { version = "0.7", features = ["io"] }
 tracing = "0.1"
 
 [dev-dependencies]
 mock-immich = { path = "../mock-immich" }
+tempfile = "3"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
 tracing-subscriber = "0.3"

@@ -10,8 +10,10 @@ use std::sync::OnceLock;
 use crate::credentials::CredentialStoreProvider;
 use crate::settings::Settings;
 use gpui_kit::*;
+#[cfg(test)]
+use sync_core::connection::Unauthorized;
 use sync_core::connection::{
-    Attention, AuthMethod, Connection, ConnectionState, ServerProfile, SignIn,
+    Attention, AuthMethod, Connection, ConnectionState, RequestCredential, ServerProfile, SignIn,
 };
 
 /// The saved connection profile, from the settings file. It holds no secret.
@@ -32,7 +34,7 @@ pub fn apply_profile(settings: &mut Settings, profile: &ServerProfile) {
 }
 
 /// The Tokio runtime that carries HTTP work, or the reason it could not start.
-fn worker() -> Result<&'static tokio::runtime::Runtime, String> {
+pub(crate) fn worker() -> Result<&'static tokio::runtime::Runtime, String> {
     static WORKER: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
     WORKER
         .get_or_init(|| {
@@ -123,10 +125,51 @@ impl ConnectionModel {
         cx.notify();
     }
 
-    /// Remembers a profile without signing in, for a first run.
-    pub fn set_profile(&mut self, profile: ServerProfile, cx: &mut Context<Self>) {
-        self.profile = profile;
-        cx.notify();
+    /// The HTTP client of the live session, for an upload request.
+    #[must_use]
+    pub fn client(&self) -> Option<sync_core::ImmichClient> {
+        self.connection
+            .as_ref()
+            .map(|connection| connection.client().clone())
+    }
+
+    /// The credential the live session attaches to a request.
+    #[must_use]
+    pub fn credential(&self) -> Option<RequestCredential> {
+        self.connection
+            .as_ref()
+            .and_then(|connection| connection.credential().cloned())
+    }
+
+    /// Records that an authenticated request succeeded with the current
+    /// credential, which restores the one re-login budget (R1.4).
+    pub fn note_authenticated(&mut self) {
+        if let Some(connection) = &mut self.connection {
+            connection.note_authenticated();
+        }
+    }
+
+    /// A test seam onto the session's own 401 handling, so the upload tests can
+    /// exhaust the re-login budget and then observe it restored. No request
+    /// path calls it yet; the retried request belongs to #7.
+    #[cfg(test)]
+    pub(crate) fn handle_unauthorized_for_test(&mut self, cx: &mut Context<Self>) -> Unauthorized {
+        let outcome = worker()
+            .expect("the worker runtime starts in tests")
+            .block_on(
+                self.connection
+                    .as_mut()
+                    .expect("a live session before the 401")
+                    .handle_unauthorized(),
+            );
+        let state = self
+            .connection
+            .as_ref()
+            .expect("the session outlives the re-login")
+            .state()
+            .clone();
+        self.set_state(state, cx);
+        outcome
     }
 
     /// Logs in at startup with the saved profile and the stored credential, with

@@ -112,11 +112,12 @@ async fn an_unreachable_server_is_its_own_error() {
 }
 
 #[tokio::test]
-async fn an_unusable_response_is_a_protocol_error() {
+async fn an_empty_success_body_is_a_transient_failure() {
     let server = MockImmich::start().await;
     let client = client(&server);
 
-    // A 201 with no JSON body is a response the client cannot use.
+    // A 201 whose body never arrived is transport noise: the status alone does
+    // not describe the login result, so a later attempt may succeed.
     server.fail(
         Operation::Login,
         Fault::Status {
@@ -128,10 +129,13 @@ async fn an_unusable_response_is_a_protocol_error() {
         .login("sync@example.com", "correct horse")
         .await
         .expect_err("the body is not a login response");
-    assert!(
-        matches!(error, ClientError::Protocol { status: 201, .. }),
-        "{error:?}"
-    );
+    assert!(matches!(error, ClientError::Unreachable(_)), "{error:?}");
+}
+
+#[tokio::test]
+async fn a_500_stays_a_protocol_error_with_its_status() {
+    let server = MockImmich::start().await;
+    let client = client(&server);
 
     server.fail(
         Operation::About,
