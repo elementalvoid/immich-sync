@@ -134,10 +134,42 @@ pub struct UploadResponse {
     pub duplicate: bool,
 }
 
+/// One Immich album (GLOSSARY).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Album {
+    /// The album id the server assigned.
+    pub id: String,
+    /// The album name, as the server kept it (R3.4).
+    pub name: String,
+}
+
 /// The `POST /assets` response body.
 #[derive(Deserialize)]
 pub(crate) struct UploadBody {
     pub(crate) id: String,
+}
+
+/// The `POST /albums` request body.
+#[derive(Serialize)]
+pub(crate) struct CreateAlbumRequest<'a> {
+    #[serde(rename = "albumName")]
+    pub(crate) album_name: &'a str,
+    #[serde(rename = "assetIds")]
+    pub(crate) asset_ids: &'a [String],
+}
+
+/// The `PUT /albums/{id}/assets` request body.
+#[derive(Serialize)]
+pub(crate) struct AlbumAssetsRequest<'a> {
+    pub(crate) ids: &'a [String],
+}
+
+/// The `POST /albums` response body.
+#[derive(Deserialize)]
+pub(crate) struct AlbumBody {
+    pub(crate) id: String,
+    #[serde(rename = "albumName")]
+    pub(crate) album_name: String,
 }
 
 /// The `POST /assets/bulk-upload-check` response body.

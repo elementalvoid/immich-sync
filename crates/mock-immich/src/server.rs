@@ -74,11 +74,10 @@ struct Inner {
     bulk_check_requests: u64,
     /// How many `POST /assets` requests arrived, whether or not one uploaded.
     upload_requests: u64,
-    /// How many `POST /albums` requests the double answered, whether or not
-    /// one created an album (R3.4). A request an injected fault short-circuits
-    /// is the fault's answer and is not counted here.
+    /// How many `POST /albums` requests arrived, whether or not one created an
+    /// album (R3.4).
     create_album_requests: u64,
-    /// How many `PUT /albums/{id}/assets` requests the double answered.
+    /// How many `PUT /albums/{id}/assets` requests arrived.
     add_album_requests: u64,
     /// Immich's `passwordLogin.enabled` system config.
     password_login_disabled: bool,
@@ -379,9 +378,9 @@ impl MockImmich {
             .album_names()
     }
 
-    /// How many `POST /albums` requests the double answered, whether or not
-    /// one created an album. A client that must create no album asserts this is
-    /// 0 (R3.4), which no album row alone can prove.
+    /// How many `POST /albums` requests arrived, whether or not one created an
+    /// album. A client that must create no album asserts this is 0 (R3.4),
+    /// which no album row alone can prove.
     #[must_use]
     pub fn create_album_requests(&self) -> u64 {
         self.state
@@ -886,10 +885,18 @@ async fn delete_assets(
     StatusCode::NO_CONTENT.into_response()
 }
 
+/// The `POST /albums` handler counts its request before the fault runs, the
+/// way `upload` does: a client that must create no album is proven by the
+/// request count, so a faulted request must not hide from it.
 async fn create_album(
     AxumState(state): AxumState<Arc<State>>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
+    state
+        .inner
+        .lock()
+        .expect("mock state poisoned")
+        .create_album_requests += 1;
     if let Some(response) = guard(&state, Operation::CreateAlbum).await {
         return response;
     }
@@ -898,23 +905,27 @@ async fn create_album(
     };
     let asset_ids = id_list(body.get("assetIds"));
     let mut inner = state.inner.lock().expect("mock state poisoned");
-    inner.create_album_requests += 1;
     let id = inner.create_album(name.to_string(), asset_ids);
     let album = inner.albums.get(&id).expect("album just created");
     (StatusCode::CREATED, Json(album_response(album))).into_response()
 }
 
+/// `PUT /albums/{id}/assets` counts its request the way `create_album` does.
 async fn add_assets_to_album(
     AxumState(state): AxumState<Arc<State>>,
     Path(album_id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
+    state
+        .inner
+        .lock()
+        .expect("mock state poisoned")
+        .add_album_requests += 1;
     if let Some(response) = guard(&state, Operation::AddAssetsToAlbum).await {
         return response;
     }
     let ids = id_list(body.get("ids"));
     let mut inner = state.inner.lock().expect("mock state poisoned");
-    inner.add_album_requests += 1;
     let Some(added) = inner.add_assets_to_album(&album_id, &ids) else {
         return message(StatusCode::NOT_FOUND, "Album not found");
     };
