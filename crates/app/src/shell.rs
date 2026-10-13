@@ -8,6 +8,7 @@ use gpui_tray::{Icon, Tray};
 
 use crate::connection::ConnectionModel;
 use crate::dashboard::Dashboard;
+use crate::logs_view::LogsView;
 use crate::settings_view::SettingsView;
 use sync_core::connection::{ConnectionState, ServerProfile};
 
@@ -96,7 +97,10 @@ pub fn show_window(cx: &mut App) {
         let _ = window.update(cx, |_, window, _| window.activate_window());
         cx.refresh_windows();
     } else if let Err(error) = open_main_window(cx) {
-        eprintln!("immich-sync: could not open the main window: {error:#}");
+        tracing::error!(
+            error = %format!("{error:#}"),
+            "could not reopen the main window"
+        );
     }
 }
 
@@ -144,20 +148,49 @@ pub enum ViewMode {
     Dashboard,
     /// The settings surface.
     Settings,
+    /// The log file and its level control (R10.3).
+    Logs,
 }
 
-/// The main window's view: a view switch above the dashboard or the settings.
+/// The environment variable that pins the visible surface.
+///
+/// Set it to `dashboard`, `settings`, or `logs` to open the window on that
+/// surface and skip the observer that would otherwise decide. A screenshot run
+/// uses it so the capture is reproducible.
+pub const FORCE_VIEW_ENV: &str = "IMMICH_SYNC_VIEW";
+
+/// The surface a pinned value names, when one is set.
+#[must_use]
+pub fn forced_view() -> Option<ViewMode> {
+    view_for_name(std::env::var(FORCE_VIEW_ENV).ok()?.as_str())
+}
+
+/// The surface a value names, when it names one.
+#[must_use]
+pub fn view_for_name(value: &str) -> Option<ViewMode> {
+    match value {
+        "dashboard" => Some(ViewMode::Dashboard),
+        "settings" => Some(ViewMode::Settings),
+        "logs" => Some(ViewMode::Logs),
+        _ => None,
+    }
+}
+
+/// The main window's view: a view switch above the dashboard, the settings, or
+/// the logs.
 pub struct AppShell {
     mode: ViewMode,
     dashboard: Entity<Dashboard>,
     settings: Entity<SettingsView>,
+    logs: Entity<LogsView>,
     _connection: Entity<ConnectionModel>,
     _connection_subscription: Subscription,
 }
 
 impl AppShell {
-    /// A shell that starts on the dashboard and mirrors the connection state
-    /// onto the global status card (R8.1).
+    /// A shell that starts on the dashboard, or on the surface
+    /// [`FORCE_VIEW_ENV`] pins, and mirrors the connection state onto the
+    /// global status card (R8.1).
     pub fn new(
         dashboard: Entity<Dashboard>,
         settings: Entity<SettingsView>,
@@ -176,10 +209,12 @@ impl AppShell {
         dashboard.update(cx, |dashboard, cx| {
             dashboard.set_connection(Some(summary), cx);
         });
+        let logs = cx.new(|cx| LogsView::new(settings.clone(), cx));
         Self {
-            mode: ViewMode::Dashboard,
+            mode: forced_view().unwrap_or(ViewMode::Dashboard),
             dashboard,
             settings,
+            logs,
             _connection: connection,
             _connection_subscription: subscription,
         }
@@ -191,7 +226,7 @@ impl AppShell {
         cx.notify();
     }
 
-    /// The view switch. Both buttons are keyboard reachable tab stops.
+    /// The view switch. Every button is a keyboard reachable tab stop.
     fn switch(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let background = theme.background;
@@ -217,6 +252,13 @@ impl AppShell {
                 "nav-settings",
                 "Settings",
                 ViewMode::Settings,
+                self.mode,
+                cx,
+            ))
+            .child(view_button(
+                "nav-logs",
+                "Logs",
+                ViewMode::Logs,
                 self.mode,
                 cx,
             ))
@@ -247,6 +289,7 @@ impl Render for AppShell {
         let content: AnyElement = match self.mode {
             ViewMode::Dashboard => self.dashboard.clone().into_any_element(),
             ViewMode::Settings => self.settings.clone().into_any_element(),
+            ViewMode::Logs => self.logs.clone().into_any_element(),
         };
 
         div()
