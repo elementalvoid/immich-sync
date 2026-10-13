@@ -118,6 +118,35 @@ pub fn skip_reason_below(
     None
 }
 
+/// Whether any directory between `root` (exclusive) and `path` itself is a
+/// symlink or reparse point (R2.2).
+///
+/// The watcher sees a file reported under a symlinked directory as an ordinary
+/// file, because `symlink_metadata` follows the intermediate components. The
+/// reconciliation scan prunes symlinked directories instead, so this keeps the
+/// two discovery paths agreeing on what a file is. `root` is the user's own
+/// choice and is never checked.
+#[must_use]
+pub fn has_symlink_ancestor(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let components: Vec<Component<'_>> = relative.components().collect();
+    let mut current = root.to_path_buf();
+    // The last component is the file itself; only its ancestors matter.
+    for component in components.iter().take(components.len().saturating_sub(1)) {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if is_symlink_metadata(&metadata) => return true,
+            Ok(_) => {}
+            // A missing ancestor cannot be a symlink; the file's own read is
+            // what reports the missing path.
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
 /// Whether plain metadata describes a symlink or a Windows reparse point.
 ///
 /// The caller passes the metadata of `std::fs::symlink_metadata`, which does
@@ -234,6 +263,29 @@ mod tests {
                 None
             ),
             None
+        );
+    }
+
+    #[test]
+    fn a_file_under_a_symlinked_directory_has_a_symlink_ancestor() {
+        let directory = tempfile::tempdir().expect("create a temp dir");
+        let real = directory.path().join("real");
+        std::fs::create_dir_all(&real).expect("create the fixture directory");
+        let file = real.join("photo.jpg");
+        std::fs::write(&file, b"bytes").expect("write the fixture");
+        let link = directory.path().join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).expect("create the fixture symlink");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&real, &link).expect("create the fixture symlink");
+
+        assert!(
+            has_symlink_ancestor(directory.path(), &link.join("photo.jpg")),
+            "R2.2: a file below a symlinked directory is refused"
+        );
+        assert!(
+            !has_symlink_ancestor(directory.path(), &file),
+            "a real directory chain is not refused"
         );
     }
 

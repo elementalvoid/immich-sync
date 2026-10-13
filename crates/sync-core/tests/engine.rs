@@ -13,7 +13,7 @@ use mock_immich::{Fault, MockImmich, Operation};
 use sync_core::connection::{AuthMethod, Connection, RequestCredential, Secret, SignIn};
 use sync_core::credential::MemoryCredentialStore;
 use sync_core::engine::{Activity, Engine, EngineConfig};
-use sync_core::hash::sha1_file;
+use sync_core::hash::{Sha1, sha1_file};
 use sync_core::store::{ItemRecord, ItemState, SourceFolder, StateStore};
 
 /// Starts the mock and signs in, returning the client and credential the
@@ -86,6 +86,21 @@ fn all_terminal(store: &StateStore, paths: &[PathBuf]) -> bool {
             Ok(Some(row)) if row.state.is_terminal_success()
         )
     })
+}
+
+/// The modification time the engine records, in nanoseconds since the epoch.
+fn mtime_ns_of(path: &Path) -> i64 {
+    let modified = std::fs::metadata(path)
+        .expect("read the metadata")
+        .modified()
+        .expect("a modification time");
+    i64::try_from(
+        modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a time after the epoch")
+            .as_nanos(),
+    )
+    .expect("the nanoseconds fit")
 }
 
 /// Writes `bytes` to `root/name`, creating parent directories.
@@ -572,6 +587,168 @@ async fn a_restart_requeues_a_pending_row_whose_file_is_unchanged() {
         "R6.7: the pending row was not resumed"
     );
     assert_eq!(server.upload_requests(), 1);
+    engine.stop();
+}
+
+#[tokio::test]
+async fn an_unchanged_size_and_mtime_skips_the_hash_of_a_finished_row() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let file = write_file(&photos, "settled.jpg", b"settled bytes");
+    add_folder(&store, &photos, true);
+    let meta = std::fs::metadata(&file).expect("read the fixture metadata");
+    // A finished row whose recorded SHA-1 differs from the file, but whose
+    // size and mtime match. R4.5 reads the row first, so the bytes are never
+    // hashed and the stale checksum is never compared.
+    store
+        .record(&ItemRecord {
+            path: file.display().to_string(),
+            size: meta.len(),
+            mtime_ns: mtime_ns_of(&file),
+            sha1: Sha1::from_hex("0000000000000000000000000000000000000000").expect("a hex SHA-1"),
+            asset_id: Some("asset-1".to_string()),
+            state: ItemState::Uploaded,
+            error_class: None,
+        })
+        .expect("write the settled row");
+    let config = EngineConfig {
+        watch: false,
+        ..EngineConfig::default()
+    };
+    let engine = start_engine(&server, &store, config).await;
+    engine.sync_now();
+    // Let the scan and any would-be upload run.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert_eq!(
+        server.upload_requests(),
+        0,
+        "R4.5: an unchanged settled file must not be re-read"
+    );
+    assert_eq!(server.bulk_check_requests(), 0);
+    assert_eq!(engine.status().counts.pending, 0);
+    engine.stop();
+}
+
+#[tokio::test]
+async fn a_transient_failure_that_later_succeeds_clears_the_folder_error() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    write_file(&photos, "retry.jpg", b"first bytes");
+    add_folder(&store, &photos, true);
+    // The first upload fails with a retryable server error.
+    server.fail(
+        Operation::Upload,
+        Fault::Status {
+            code: 500,
+            retry_after: None,
+        },
+    );
+    let config = EngineConfig {
+        watch: false,
+        ..EngineConfig::default()
+    };
+    let engine = start_engine(&server, &store, config).await;
+
+    assert!(
+        wait_until(
+            || engine
+                .status()
+                .folders
+                .iter()
+                .any(|folder| folder.last_error.is_some()),
+            Duration::from_secs(10)
+        )
+        .await,
+        "the transient failure was not surfaced"
+    );
+
+    // The file changes; a later scan re-uploads it, this time successfully.
+    let file = write_file(&photos, "retry.jpg", b"changed bytes that succeed");
+    engine.sync_now();
+
+    assert!(
+        wait_until(
+            || all_terminal(&store, std::slice::from_ref(&file)),
+            Duration::from_secs(15)
+        )
+        .await,
+        "the changed file did not upload"
+    );
+    assert!(
+        wait_until(
+            || engine
+                .status()
+                .folders
+                .iter()
+                .all(|folder| folder.last_error.is_none()),
+            Duration::from_secs(5)
+        )
+        .await,
+        "a later success must clear the parked error: {:?}",
+        engine.status()
+    );
+    assert_ne!(engine.status().activity, Activity::NeedsAttention);
+    engine.stop();
+}
+
+#[tokio::test]
+async fn a_restart_with_a_pending_row_does_not_double_count_the_pending_item() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let file = write_file(&photos, "pending.jpg", b"pending bytes");
+    add_folder(&store, &photos, true);
+    // A row a previous run left pending, exactly as the store seeds the
+    // dashboard's count at construction.
+    let meta = std::fs::metadata(&file).expect("read the fixture metadata");
+    store
+        .record(&ItemRecord {
+            path: file.display().to_string(),
+            size: meta.len(),
+            mtime_ns: 1,
+            sha1: sha1_file(&file).expect("hash the fixture"),
+            asset_id: None,
+            state: ItemState::Pending,
+            error_class: None,
+        })
+        .expect("write the pending row");
+    let config = EngineConfig {
+        watch: false,
+        ..EngineConfig::default()
+    };
+    let engine = start_engine(&server, &store, config).await;
+
+    assert!(
+        wait_until(
+            || all_terminal(&store, std::slice::from_ref(&file)),
+            Duration::from_secs(15)
+        )
+        .await,
+        "the pending row was not resumed"
+    );
+    assert_eq!(server.upload_requests(), 1);
+    // R8.1: the seed already counted the pending row, so `prepare` must not
+    // count it a second time and leak the count past its one `finish_item`.
+    assert!(
+        wait_until(
+            || engine.status().counts.pending == 0,
+            Duration::from_secs(5)
+        )
+        .await,
+        "the pending count leaked: {:?}",
+        engine.status().counts
+    );
+    assert_eq!(
+        engine.status().progress(),
+        1.0,
+        "the drained queue must read as complete"
+    );
     engine.stop();
 }
 

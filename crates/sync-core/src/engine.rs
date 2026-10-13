@@ -30,7 +30,7 @@ use crate::failure::{FailureClass, classify};
 use crate::hash::Sha1;
 use crate::paths::{PathCase, is_within, path_key};
 use crate::scan::{ScanError, scan_folder};
-use crate::skip::skip_reason_below;
+use crate::skip::{has_symlink_ancestor, skip_reason_below};
 use crate::store::{FolderCounts, ItemRecord, ItemState, SourceFolder, StateStore, StoreError};
 use crate::upload::{PreparedItem, UploadGate, UploadOutcome, Uploader, hash_in_background};
 use crate::watch::FolderWatcher;
@@ -249,16 +249,14 @@ impl Engine {
             let inner = Arc::clone(&inner);
             async move { dispatch_loop(inner, queue_rx).await }
         });
-        let scanner = tokio::spawn({
-            let inner = Arc::clone(&inner);
-            async move { scan_loop(inner).await }
-        });
         self.inner
             .tasks
             .lock()
             .expect("the task list")
-            .extend([dispatcher, scanner]);
+            .push(dispatcher);
 
+        // Install the watcher before the first scan (R2.3), so a file created
+        // in between is reported by one path or the other, never neither.
         if self.inner.config.watch {
             let weak: Weak<EngineInner> = Arc::downgrade(&self.inner);
             match FolderWatcher::new(self.inner.config.watch_debounce, move |paths| {
@@ -283,6 +281,15 @@ impl Engine {
                 }
             }
         }
+        let scanner = tokio::spawn({
+            let inner = Arc::clone(&inner);
+            async move { scan_loop(inner).await }
+        });
+        self.inner
+            .tasks
+            .lock()
+            .expect("the task list")
+            .push(scanner);
         tracing::info!(
             folders = self.inner.folders.lock().expect("the folder lock").len(),
             batch_size = self.inner.config.batch_size,
@@ -482,7 +489,11 @@ impl EngineInner {
             let Some(root) = self.folder_root_for(&path) else {
                 continue;
             };
-            if skip_reason_below(&root, &path, Some(&metadata)).is_some() {
+            // R2.2: the scan prunes symlinked directories, but the watcher
+            // reports a file under one as an ordinary file, so refuse it too.
+            if has_symlink_ancestor(&root, &path)
+                || skip_reason_below(&root, &path, Some(&metadata)).is_some()
+            {
                 continue;
             }
             let _ = self.queue.send(path);
@@ -521,7 +532,8 @@ impl EngineInner {
         }
     }
 
-    /// Records that a file entered the queue for one folder.
+    /// Records that a newly queued file entered one folder, adding to the
+    /// dashboard's pending count.
     fn note_pending(&self, path: &Path) {
         if let Some(index) = self.folder_index_for(path) {
             let mut folders = self.folders.lock().expect("the folder lock");
@@ -539,6 +551,10 @@ impl EngineInner {
                 UploadOutcome::Created { .. } | UploadOutcome::Duplicate { .. } => {
                     entry.counts.pending = entry.counts.pending.saturating_sub(1);
                     entry.counts.uploaded += 1;
+                    // R8.2: a later success clears the parked error, so a
+                    // transient failure does not read as attention for a full
+                    // scan interval.
+                    entry.last_error = None;
                 }
                 UploadOutcome::Failed(failure) => {
                     entry.counts.pending = entry.counts.pending.saturating_sub(1);
@@ -765,6 +781,25 @@ async fn prepare(inner: &Arc<EngineInner>, path: &Path) -> Option<PreparedItem> 
             .remove(&key);
         return None;
     }
+    let path_text = path.to_string_lossy().into_owned();
+    let size = metadata.len();
+    let mtime_ns = mtime_ns(&metadata);
+    // Read the recorded outcome before hashing (R4.5): a finished file whose
+    // size and mtime are unchanged needs no bytes read, so a reconciliation
+    // scan does not re-hash an entire settled library.
+    let existing = inner.store.item(&path_text).ok().flatten();
+    if let Some(row) = &existing
+        && row.size == size
+        && row.mtime_ns == mtime_ns
+        && is_settled(row.state)
+    {
+        inner
+            .in_flight
+            .lock()
+            .expect("the in-flight lock")
+            .remove(&key);
+        return None;
+    }
     let sha1: Sha1 = match hash_in_background(path.to_path_buf()).await {
         Ok(sha1) => sha1,
         Err(error) => {
@@ -777,11 +812,9 @@ async fn prepare(inner: &Arc<EngineInner>, path: &Path) -> Option<PreparedItem> 
             return None;
         }
     };
-    let path_text = path.to_string_lossy().into_owned();
-    if let Ok(Some(row)) = inner.store.item(&path_text)
+    if let Some(row) = &existing
         && row.sha1 == sha1
-        && row.state != ItemState::Pending
-        && row.state != ItemState::Uploading
+        && is_settled(row.state)
     {
         // R4.5: the same SHA-1 with a recorded outcome never runs again. A
         // failed row is parked until #7 adds the retry policy.
@@ -794,8 +827,8 @@ async fn prepare(inner: &Arc<EngineInner>, path: &Path) -> Option<PreparedItem> 
     }
     let item = PreparedItem {
         path: path.to_path_buf(),
-        size: metadata.len(),
-        mtime_ns: mtime_ns(&metadata),
+        size,
+        mtime_ns,
         sha1,
     };
     let record = ItemRecord {
@@ -810,8 +843,25 @@ async fn prepare(inner: &Arc<EngineInner>, path: &Path) -> Option<PreparedItem> 
     if let Err(error) = inner.store.record(&record) {
         tracing::error!(error = %error, "the state database could not record the pending item");
     }
-    inner.note_pending(path);
+    // The dashboard seed already counts a pending or uploading row (R8.1);
+    // only a row this run newly queued adds to the pending total.
+    if !existing.is_some_and(|row| matches!(row.state, ItemState::Pending | ItemState::Uploading)) {
+        inner.note_pending(path);
+    }
     Some(item)
+}
+
+/// Whether a recorded row is finished on its own: a terminal success or a
+/// failure parked for the retry policy (#7). A pending or uploading row is
+/// still work the pipeline owns.
+fn is_settled(state: ItemState) -> bool {
+    matches!(
+        state,
+        ItemState::Uploaded
+            | ItemState::Duplicate
+            | ItemState::FailedPermanent
+            | ItemState::RetryWait
+    )
 }
 
 /// Hands one accepted file to the upload pool, holding a semaphore permit for
