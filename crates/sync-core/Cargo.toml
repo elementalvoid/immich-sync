@@ -8,6 +8,8 @@ publish = false
 
 [dependencies]
 base64 = "0.22"
+# The jitter draw for the retry backoff (R6.1). Already in the tree via tempfile.
+fastrand = "2"
 # The reconciliation scan: one parallel walk plus the hidden-entry filter
 # (docs/research/rust-sync-engine-crates.md §5).
 ignore = "0.4"

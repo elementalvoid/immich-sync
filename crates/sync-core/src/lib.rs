@@ -5,6 +5,8 @@
 //! and the credential store live here so the upload engine reuses them; the
 //! remaining engine tickets fill in discovery, the queue, and retry.
 
+pub mod backoff;
+pub mod breaker;
 pub mod connection;
 pub mod credential;
 pub mod engine;
