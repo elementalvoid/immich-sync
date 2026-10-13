@@ -14,7 +14,7 @@ use sync_core::connection::{AuthMethod, Connection, RequestCredential, Secret, S
 use sync_core::credential::MemoryCredentialStore;
 use sync_core::engine::{Activity, Engine, EngineConfig};
 use sync_core::hash::{Sha1, sha1_file};
-use sync_core::store::{FolderCounts, ItemRecord, ItemState, SourceFolder, StateStore};
+use sync_core::store::{AlbumScope, FolderCounts, ItemRecord, ItemState, SourceFolder, StateStore};
 
 /// Starts the mock and signs in, returning the client and credential the
 /// engine attaches to every request.
@@ -47,8 +47,22 @@ fn add_folder(store: &StateStore, path: &Path, recursive: bool) {
         .add_folder(&SourceFolder {
             path: path.display().to_string(),
             recursive,
+            album_mapping: false,
+            album_scope: AlbumScope::Leaf,
         })
         .expect("add the source folder");
+}
+
+/// Adds a folder whose files join an album (R3.4).
+fn add_mapped_folder(store: &StateStore, path: &Path, recursive: bool, scope: AlbumScope) {
+    store
+        .add_folder(&SourceFolder {
+            path: path.display().to_string(),
+            recursive,
+            album_mapping: true,
+            album_scope: scope,
+        })
+        .expect("add the mapped source folder");
 }
 
 /// Builds and starts an engine over `store`.
@@ -891,6 +905,8 @@ async fn adding_a_folder_through_the_engine_syncs_its_existing_files() {
         vec![SourceFolder {
             path: photos.display().to_string(),
             recursive: true,
+            album_mapping: false,
+            album_scope: AlbumScope::Leaf,
         }]
     );
 

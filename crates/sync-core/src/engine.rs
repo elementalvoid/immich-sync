@@ -32,7 +32,9 @@ use crate::hash::Sha1;
 use crate::paths::{PathCase, is_within, path_key};
 use crate::scan::{ScanError, scan_folder};
 use crate::skip::{has_symlink_ancestor, skip_reason_below};
-use crate::store::{FolderCounts, ItemRecord, ItemState, SourceFolder, StateStore, StoreError};
+use crate::store::{
+    AlbumScope, FolderCounts, ItemRecord, ItemState, SourceFolder, StateStore, StoreError,
+};
 use crate::upload::{PreparedItem, UploadGate, UploadOutcome, Uploader, hash_in_background};
 use crate::watch::FolderWatcher;
 
@@ -364,6 +366,10 @@ impl Engine {
         let folder = SourceFolder {
             path: path.to_string(),
             recursive,
+            // R3.4: adding a folder never opts it into album mapping; the
+            // config window does that on purpose.
+            album_mapping: false,
+            album_scope: AlbumScope::default(),
         };
         self.inner.store.add_folder(&folder)?;
         // R8.1: a folder new to this engine starts from what the store already
