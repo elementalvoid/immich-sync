@@ -167,6 +167,22 @@ fn an_invalid_server_url_is_rejected() {
 }
 
 #[test]
+fn a_url_with_embedded_credentials_is_rejected() {
+    // The password in `user:password@` would reach the settings file, a log
+    // line, and a request error, so the client refuses it up front.
+    for url in [
+        "https://alice:hunter2@immich.example.com",
+        "https://alice@immich.example.com",
+    ] {
+        let error = ImmichClient::new(url).expect_err("credentials belong in the credential field");
+        assert!(
+            matches!(error, ClientError::InvalidUrl(_)),
+            "{url}: {error:?}"
+        );
+    }
+}
+
+#[test]
 fn a_url_that_is_not_http_is_rejected_instead_of_panicking() {
     // `Url::parse` accepts all of these, but no endpoint can be joined to
     // them: the server URL field and a hand-edited settings file can hold one.

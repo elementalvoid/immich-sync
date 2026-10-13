@@ -222,6 +222,22 @@ impl MockImmich {
             .require_known_credentials = true;
     }
 
+    /// The session tokens this server issued and has not revoked.
+    ///
+    /// The redaction test greps the log file for these, so it greps the token
+    /// the real login actually received rather than a placeholder.
+    #[must_use]
+    pub fn issued_tokens(&self) -> Vec<String> {
+        self.state
+            .inner
+            .lock()
+            .expect("mock state poisoned")
+            .tokens
+            .iter()
+            .cloned()
+            .collect()
+    }
+
     /// Delete every session, as an admin "log out all devices" does.
     pub fn revoke_tokens(&self) {
         self.state

@@ -434,4 +434,22 @@ mod tests {
         let session = RequestCredential::Session(token);
         assert_eq!(format!("{session:?}"), "Session(SessionToken(<redacted>))");
     }
+
+    #[test]
+    fn sign_in_debug_is_redacted() {
+        // The form's request is the one value that holds the secret and could
+        // reach a log through a `{:?}` in a future event.
+        let request = SignIn {
+            email: "sync@example.com".to_string(),
+            secret: Secret::new("correct horse"),
+            method: AuthMethod::Password,
+        };
+
+        let text = format!("{request:?}");
+        assert!(
+            !text.contains("correct horse"),
+            "a debug dump of the sign-in request leaks the secret: {text}"
+        );
+        assert!(text.contains("Secret(<redacted>)"), "{text}");
+    }
 }

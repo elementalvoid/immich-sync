@@ -53,6 +53,16 @@ impl ImmichClient {
                 "the server URL must start with http:// or https://".to_string(),
             ));
         }
+        // A URL can carry `user:password@`. That password would reach the
+        // settings file, a log line, and a request error, so it is refused at
+        // the one place a server URL enters the client (R10.3, N3).
+        if !base.username().is_empty() || base.password().is_some() {
+            return Err(ClientError::InvalidUrl(
+                "the server URL must not contain a user name or password; sign in with the \
+                 credential fields instead"
+                    .to_string(),
+            ));
+        }
         // A base with a path prefix (`https://host/immich`) must keep the
         // prefix when an endpoint is joined to it.
         if !base.path().ends_with('/') {
