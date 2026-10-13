@@ -7,8 +7,8 @@ use std::cell::Cell;
 use std::fs;
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gpui_kit::test::TestAppContextExt as _;
@@ -27,8 +27,12 @@ use immich_sync::settings_view::{FieldKey, SettingsView};
 use immich_sync::shell::AppShell;
 use immich_sync::status;
 use mock_immich::MockImmich;
-use sync_core::connection::{Attention, AuthMethod, ConnectionState, Secret, ServerProfile};
-use sync_core::credential::{CredentialStore as _, MemoryCredentialStore, SharedCredentialStore};
+use sync_core::connection::{
+    Attention, AuthMethod, ConnectionState, Secret, ServerProfile, SignIn,
+};
+use sync_core::credential::{
+    CredentialError, CredentialStore, MemoryCredentialStore, SharedCredentialStore,
+};
 
 /// A stand-in for the OS autostart mechanism, so the settings-to-OS wiring is
 /// testable on every platform. On Linux the real XDG backend is covered by
@@ -1106,6 +1110,186 @@ fn reopening_the_window_does_not_restart_the_startup_login(cx: &mut TestAppConte
         );
     })
     .expect("render the reopened window");
+}
+
+#[gpui_kit::test]
+async fn a_first_run_does_not_restart_the_login_on_reopen(cx: &mut TestAppContext) {
+    let (runtime, server) = mock_server();
+    // The sign-in result arrives from the HTTP worker thread.
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let server_url = server.base_url().to_string();
+
+    // A genuine first launch: the settings file holds no saved profile (R1.3).
+    let store = SettingsStore::open(paths.config_file.clone());
+    let credentials: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+    let connection = cx.update(|cx| {
+        cx.new(|_| ConnectionModel::new(profile_from_settings(store.settings()), credentials))
+    });
+    let (window, _first) = open_settings_over_connection(
+        cx,
+        store.clone(),
+        paths.clone(),
+        FakeAutostart::new(),
+        connection.clone(),
+    );
+    assert_eq!(
+        cx.read(|cx| connection.read(cx).state().clone()),
+        ConnectionState::NotConfigured,
+        "a first launch has no saved login to restore"
+    );
+
+    // The user signs in through the form, and the view persists the connected
+    // profile, so the settings file now holds the login a later launch reads.
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        tab_to(window, "settings-server-url", cx);
+        window.input(&server_url, cx);
+        tab_to(window, "settings-email", cx);
+        window.input("sync@example.com", cx);
+        tab_to(window, "settings-secret", cx);
+        window.input("correct horse", cx);
+        window.click("settings-sign-in", cx);
+    })
+    .expect("fill in the form and sign in");
+    cx.wait_for(window, Duration::from_secs(30), |window, _| {
+        window.find("settings-connection-state").label() == Some("Connected")
+    })
+    .await;
+    cx.run_until_parked();
+    let text = fs::read_to_string(&paths.config_file).expect("the connected profile was saved");
+    assert!(text.contains(&server_url), "{text}");
+
+    // Hide and reopen the window: the profile is now saved, but the app-scoped
+    // model already owns the live session. The first open consumed the restore
+    // guard, so the reopen must not start the saved login again. A later launch
+    // reads the persisted profile from the file, not the stale first-run store.
+    let store = SettingsStore::open(paths.config_file.clone());
+    let reopened =
+        open_settings_over_connection(cx, store, paths, FakeAutostart::new(), connection.clone()).0;
+    assert_eq!(
+        cx.read(|cx| connection.read(cx).state().clone()),
+        ConnectionState::Connected,
+        "reopening after a first-run sign-in keeps the live session"
+    );
+    cx.update_window(reopened, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("settings-connection-state").label(),
+            Some("Connected"),
+            "the reopened form shows the surviving session"
+        );
+    })
+    .expect("render the reopened window");
+    drop(runtime);
+}
+
+/// A credential store whose drop is observable. The connection model holds one
+/// while an attempt is in flight; a result a newer state superseded drops the
+/// connection instead of storing it, so the drop proves the branch ran.
+struct DropSignalingStore {
+    secret: Mutex<Option<Secret>>,
+    dropped: Arc<AtomicBool>,
+}
+
+impl CredentialStore for DropSignalingStore {
+    fn get(&self) -> Result<Option<Secret>, CredentialError> {
+        Ok(self
+            .secret
+            .lock()
+            .expect("the store is not poisoned")
+            .clone())
+    }
+
+    fn set(&self, secret: &Secret) -> Result<(), CredentialError> {
+        *self.secret.lock().expect("the store is not poisoned") = Some(secret.clone());
+        Ok(())
+    }
+
+    fn delete(&self) -> Result<(), CredentialError> {
+        *self.secret.lock().expect("the store is not poisoned") = None;
+        Ok(())
+    }
+}
+
+impl Drop for DropSignalingStore {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
+#[gpui_kit::test]
+async fn a_superseded_sign_in_result_is_dropped(cx: &mut TestAppContext) {
+    let (runtime, server) = mock_server();
+    // The sign-in result arrives from the HTTP worker thread.
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+
+    // Every resolve makes a fresh store whose drop this test observes.
+    let dropped = Arc::new(AtomicBool::new(false));
+    let provider = CredentialStoreProvider::new({
+        let dropped = dropped.clone();
+        move || {
+            Arc::new(DropSignalingStore {
+                secret: Mutex::new(None),
+                dropped: dropped.clone(),
+            })
+        }
+    });
+    let connection =
+        cx.update(|cx| cx.new(|_| ConnectionModel::new(ServerProfile::default(), provider)));
+    let window = open_settings_over_connection(
+        cx,
+        SettingsStore::open(paths.config_file.clone()),
+        paths,
+        FakeAutostart::new(),
+        connection.clone(),
+    )
+    .0;
+
+    // A sign-in starts, and a newer state supersedes it while it is in flight.
+    let profile = ServerProfile {
+        server_url: server.base_url().to_string(),
+        email: "sync@example.com".to_string(),
+        method: AuthMethod::Password,
+    };
+    cx.update(|cx| {
+        connection.update(cx, |model, cx| {
+            model.sign_in(
+                SignIn {
+                    email: profile.email.clone(),
+                    secret: Secret::new("correct horse"),
+                    method: AuthMethod::Password,
+                },
+                profile.clone(),
+                cx,
+            );
+        });
+    });
+    let attention = ConnectionState::NeedsAttention(Attention::Rejected);
+    cx.update(|cx| {
+        connection.update(cx, |model, cx| model.set_state(attention.clone(), cx));
+    });
+
+    // The result arrives after the newer state. The connection is dropped
+    // rather than stored; without the generation check the predicate would see
+    // the overwritten state and the assertion would fail.
+    cx.wait_for(window, Duration::from_secs(30), |_, cx| {
+        dropped.load(Ordering::SeqCst) || connection.read(cx).state().clone() != attention
+    })
+    .await;
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "the superseded result must be dropped instead of overwriting the newer state"
+    );
+    assert_eq!(
+        cx.read(|cx| connection.read(cx).state().clone()),
+        attention,
+        "the newer state survives the superseded result"
+    );
+    drop(runtime);
 }
 
 #[gpui_kit::test]

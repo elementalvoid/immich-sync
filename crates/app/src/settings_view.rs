@@ -318,15 +318,12 @@ impl SettingsView {
         view.reconcile_autostart(cx);
         // A saved profile logs in at startup with no user input (R1.3).
         // Reopening the window rebuilds this view, so the model's once guard
-        // keeps that restore from restarting the saved session.
+        // keeps that restore from restarting the saved session. A first run
+        // has nothing to restore, but it must consume the guard too, or the
+        // first reopen would restore the profile the first sign-in just saved.
         let profile = profile_from_settings(view.store.settings());
-        if profile.is_configured() {
-            view.connection
-                .update(cx, |model, cx| model.restore_once(profile, cx));
-        } else {
-            view.connection
-                .update(cx, |model, cx| model.set_profile(profile, cx));
-        }
+        view.connection
+            .update(cx, |model, cx| model.restore_once(profile, cx));
         view
     }
 
