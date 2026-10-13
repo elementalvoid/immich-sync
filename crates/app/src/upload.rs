@@ -163,6 +163,10 @@ impl UploadModel {
     /// The request runs on the HTTP worker; the result comes back on the UI
     /// thread. A successful request restores the one re-login budget (R1.4).
     pub fn upload(&mut self, path: String, cx: &mut Context<Self>) {
+        // The button disables itself while busy; Enter must not slip past it.
+        if self.report.is_busy() {
+            return;
+        }
         let path = path.trim().to_string();
         if path.is_empty() {
             self.set(

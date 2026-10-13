@@ -295,6 +295,46 @@ async fn uploading_a_file_shows_the_asset_id_and_a_repeat_shows_the_duplicate(
 }
 
 #[gpui_kit::test]
+async fn a_second_enter_during_an_upload_starts_nothing(cx: &mut TestAppContext) {
+    let (_runtime, server) = mock_server();
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let connection = connected_model(cx, &server);
+    let window = open_upload(cx, &paths, connection.clone());
+    cx.wait_for(window, Duration::from_secs(60), |_, cx| {
+        connection.read(cx).state().is_connected()
+    })
+    .await;
+
+    let file = temp.path().join("hello.txt");
+    std::fs::write(&file, b"hello world").expect("write the fixture");
+    let path_text = file.display().to_string();
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        tab_to(window, "upload-path", cx);
+        window.input(&path_text, cx);
+        window.press("enter", cx);
+        // A second Enter while the first pipeline runs must be a no-op, not a
+        // second upload of the same file.
+        window.press("enter", cx);
+    })
+    .expect("submit twice");
+    cx.wait_for(window, Duration::from_secs(60), |window, _| {
+        window.find("upload-result").label().is_some_and(|label| {
+            !label.starts_with("Uploading") && label != "No file has been uploaded yet."
+        })
+    })
+    .await;
+
+    assert_eq!(
+        server.upload_requests(),
+        1,
+        "a second Enter during an in-flight upload must not start a second pipeline"
+    );
+}
+
+#[gpui_kit::test]
 async fn an_upload_without_a_session_is_unavailable_not_a_crash(cx: &mut TestAppContext) {
     let temp = tempfile::tempdir().expect("create a temp dir");
     let paths = temporary_paths(temp.path());
