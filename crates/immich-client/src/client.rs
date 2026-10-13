@@ -9,7 +9,7 @@ use reqwest::{Body, Client, RequestBuilder, Response, StatusCode, Url};
 use serde::Serialize;
 use tokio_util::io::ReaderStream;
 
-use crate::bandwidth::MeteredReader;
+use crate::bandwidth::{BandwidthLimit, MeteredReader};
 use crate::error::ClientError;
 use crate::model::{
     AssetUpload, Auth, AuthStatus, BulkAction, BulkCheckBody, BulkCheckItem, BulkCheckResult,
@@ -22,6 +22,22 @@ const MESSAGE_LIMIT: usize = 200;
 
 /// A request that has not finished within this window is unreachable.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The deadline for one upload.
+///
+/// The client-wide deadline would abort any throttled upload larger than
+/// `limit × 30 s` (30 MB at 1 MB/s), so a limited upload gets three times
+/// the time its bytes need at the rate in force when the request is built,
+/// plus the ordinary window for connecting and for the server's own work
+/// (R7.1). An unlimited upload keeps the ordinary window.
+fn upload_deadline(length: u64, bandwidth: Option<&BandwidthLimit>) -> Duration {
+    let rate = bandwidth.map_or(0, BandwidthLimit::bytes_per_second);
+    if rate == 0 {
+        return REQUEST_TIMEOUT;
+    }
+    let streaming = Duration::from_secs_f64(length as f64 / rate as f64);
+    streaming.saturating_mul(3).saturating_add(REQUEST_TIMEOUT)
+}
 
 /// A typed client for the Immich Stable operations the client uses.
 ///
@@ -302,6 +318,7 @@ impl ImmichClient {
         let sent = self
             .authorize(self.http.post(self.endpoint("assets")), auth)
             .header("x-immich-checksum", upload.checksum)
+            .timeout(upload_deadline(length, upload.bandwidth.as_ref()))
             .multipart(form)
             .send()
             .await;
@@ -524,6 +541,26 @@ fn log_outcome<T>(operation: &'static str, result: &Result<T, ClientError>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unlimited_upload_keeps_the_client_wide_deadline() {
+        assert_eq!(upload_deadline(10_000_000, None), REQUEST_TIMEOUT);
+        assert_eq!(
+            upload_deadline(10_000_000, Some(&BandwidthLimit::new(0))),
+            REQUEST_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn a_limited_upload_gets_a_deadline_that_covers_its_bytes() {
+        // 10 MB at 1 MB/s needs ten seconds of streaming; the 30 s client
+        // deadline would still fit here, but a 100 MB file would not.
+        let deadline = upload_deadline(100_000_000, Some(&BandwidthLimit::new(1_000_000)));
+        assert!(
+            deadline >= Duration::from_secs(300),
+            "three times the 100 s of streaming, plus the ordinary window: {deadline:?}"
+        );
+    }
 
     #[test]
     fn local_times_are_formatted_as_iso8601_utc() {

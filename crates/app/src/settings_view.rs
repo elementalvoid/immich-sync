@@ -530,7 +530,7 @@ impl SettingsView {
             let settings = self.store.settings();
             let bandwidth = settings.bandwidth_bytes_per_second;
             let concurrency = usize::try_from(settings.concurrency.max(1)).unwrap_or(4);
-            engine.update(cx, |model, cx| model.set_limits(bandwidth, concurrency, cx));
+            engine.update(cx, |model, _| model.set_limits(bandwidth, concurrency));
         }
     }
 

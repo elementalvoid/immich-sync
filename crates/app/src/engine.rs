@@ -28,6 +28,9 @@ pub struct EngineModel {
     store_model: Entity<StoreModel>,
     paths: AppPaths,
     engine: Option<Arc<Engine>>,
+    /// The newest limit change for the running engine. One applier task per
+    /// engine drains it, so two quick edits cannot land out of order.
+    limits: Option<tokio::sync::watch::Sender<Limits>>,
     status: EngineStatus,
     paused: bool,
     problem: Option<String>,
@@ -73,6 +76,7 @@ impl EngineModel {
             store_model,
             paths: paths.clone(),
             engine: None,
+            limits: None,
             status: empty_status(),
             paused: false,
             problem: None,
@@ -160,28 +164,15 @@ impl EngineModel {
     /// Applies both limits to the running engine without a restart (R7.1,
     /// R7.2). Before it starts this is a no-op: the settings file it reads at
     /// start already holds the value the view wrote.
-    pub fn set_limits(
-        &mut self,
-        bandwidth_bytes_per_second: u64,
-        concurrency: usize,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(engine) = self.engine.clone() else {
-            return;
-        };
-        let Ok(runtime) = worker() else {
-            self.problem = Some("The network runtime could not start.".to_string());
-            cx.notify();
-            return;
-        };
-        runtime.spawn(async move {
-            engine
-                .set_limits(Limits {
-                    bandwidth_bytes_per_second,
-                    concurrency,
-                })
-                .await;
-        });
+    pub fn set_limits(&mut self, bandwidth_bytes_per_second: u64, concurrency: usize) {
+        // The applier task wakes on the newest value, so a change that
+        // overtakes this one cannot be overwritten by it.
+        if let Some(limits) = &self.limits {
+            let _ = limits.send(Limits {
+                bandwidth_bytes_per_second,
+                concurrency: concurrency.max(1),
+            });
+        }
     }
 
     /// Adds a source folder and starts discovering it (R2.1).
@@ -380,6 +371,23 @@ impl EngineModel {
                             engine.pause();
                         } else {
                             engine.resume();
+                        }
+                        // One limits applier per engine (R7.1, R7.2). Its
+                        // channel lives in the model, so replacing the engine
+                        // drops the old sender and ends the old task.
+                        if let Ok(runtime) = worker() {
+                            let (changes, mut incoming) =
+                                tokio::sync::watch::channel(engine.limits());
+                            let applier = Arc::clone(&engine);
+                            runtime.spawn(async move {
+                                while incoming.changed().await.is_ok() {
+                                    // Copy first: the borrow is not `Send`, so
+                                    // it must not live across the await.
+                                    let limits = *incoming.borrow_and_update();
+                                    applier.set_limits(limits).await;
+                                }
+                            });
+                            model.limits = Some(changes);
                         }
                         model.engine = Some(engine);
                         model.problem = None;
