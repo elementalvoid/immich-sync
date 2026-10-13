@@ -138,6 +138,12 @@ impl EngineModel {
         }
     }
 
+    /// Whether the engine has been built and is owned by this model.
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        self.engine.is_some()
+    }
+
     /// Adds a source folder and starts discovering it (R2.1).
     pub fn add_folder(&mut self, path: String, recursive: bool, cx: &mut Context<Self>) {
         let path = path.trim().to_string();
@@ -146,6 +152,8 @@ impl EngineModel {
             cx.notify();
             return;
         }
+        // A newer edit supersedes an older result still in flight.
+        self.generation = self.generation.wrapping_add(1);
         let engine = self.engine.clone();
         let store = self.store_model.read(cx).store();
         let Ok(runtime) = worker() else {
@@ -203,6 +211,8 @@ impl EngineModel {
 
     /// Removes a source folder; its items stay in the store (R2.1).
     pub fn remove_folder(&mut self, path: String, cx: &mut Context<Self>) {
+        // A newer edit supersedes an older result still in flight.
+        self.generation = self.generation.wrapping_add(1);
         let engine = self.engine.clone();
         let store = self.store_model.read(cx).store();
         let Ok(runtime) = worker() else {
@@ -315,6 +325,11 @@ impl EngineModel {
                 }
                 match started {
                     Ok(engine) => {
+                        // R8.7: a pause clicked while the engine was being
+                        // built still holds when it arrives here.
+                        if model.paused {
+                            engine.pause();
+                        }
                         model.engine = Some(engine);
                         model.problem = None;
                         tracing::info!("the sync engine is running");
