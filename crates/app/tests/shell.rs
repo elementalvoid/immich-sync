@@ -4,7 +4,8 @@
 //! cannot observe, so those are checked by the probe and the GUI smoke job.
 //! The state-to-tooltip mapping is pure, so it is tested here.
 
-use gpui_kit::{Action, MenuItem, TestAppContext};
+use gpui_kit::test::TestWindowExt as _;
+use gpui_kit::{Action, AppContext as _, MenuItem, TestAppContext};
 use immich_sync::shell::{self, Hide, Show};
 use sync_core::connection::{Attention, ConnectionState};
 
@@ -55,6 +56,45 @@ fn show_reopens_the_window_after_a_hide(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     assert_eq!(windows(cx), 1);
+}
+
+#[gpui_kit::test]
+fn the_connection_model_outlives_the_window(cx: &mut TestAppContext) {
+    boot(cx);
+    cx.update(|cx| cx.dispatch_action(&Show));
+    cx.run_until_parked();
+    assert_eq!(windows(cx), 1);
+
+    // Hide closes the window and drops its root view, which used to drop the
+    // model and its tray observation with it.
+    cx.update(|cx| cx.dispatch_action(&Hide));
+    cx.run_until_parked();
+    assert_eq!(windows(cx), 0);
+
+    // The app-level model is still alive and can transition while hidden.
+    let connection = cx.read(shell::connection);
+    let attention = ConnectionState::NeedsAttention(Attention::Rejected);
+    cx.update(|cx| {
+        connection.update(cx, |model, cx| model.set_state(attention.clone(), cx));
+    });
+    cx.run_until_parked();
+
+    // The reopened window renders from that same model, not a fresh one that
+    // would have forgotten the transition.
+    cx.update(|cx| cx.dispatch_action(&Show));
+    cx.run_until_parked();
+    let window = cx
+        .read(|cx| cx.windows().first().copied())
+        .expect("the window is open again");
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("status-connection-global").label(),
+            Some(attention.message().as_str()),
+            "the reopened window shows the state the app-level model holds"
+        );
+    })
+    .expect("update the reopened window");
 }
 
 #[gpui_kit::test]

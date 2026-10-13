@@ -17,7 +17,8 @@ actions!(immich_sync, [Show, Hide, Quit]);
 struct TrayHandle(Tray);
 impl Global for TrayHandle {}
 
-/// Registers the shell actions.
+/// Installs the shell: the window actions, the app-level connection model, and
+/// the app-scoped tray observer (R1.4).
 ///
 /// Call it once, after [`gpui_kit::init`].
 pub fn init(cx: &mut App) {
@@ -26,6 +27,51 @@ pub fn init(cx: &mut App) {
     // Linux, which would end the tray app.
     cx.set_quit_mode(QuitMode::Explicit);
     cx.on_action(show).on_action(hide).on_action(quit);
+    install_connection_with(cx, show_connection_on_tray);
+}
+
+/// The app-level handle to the one connection model (R1.4).
+///
+/// The model is app state, not window state: hiding the window must not stop
+/// the tray tooltip from following state transitions. The engine state that
+/// later tickets push to the tray attaches here too.
+struct ConnectionHandle(Entity<ConnectionModel>);
+impl Global for ConnectionHandle {}
+
+/// The one connection model, created by [`init`].
+///
+/// # Panics
+///
+/// Panics when [`init`] has not run.
+#[must_use]
+pub fn connection(cx: &App) -> Entity<ConnectionModel> {
+    cx.global::<ConnectionHandle>().0.clone()
+}
+
+/// Creates the connection model and registers the tray observer at App scope.
+///
+/// `present` is the production [`show_connection_on_tray`]; the parameter lets
+/// a test record what the app scope pushes without a native tray.
+fn install_connection_with(
+    cx: &mut App,
+    present: impl Fn(&ConnectionState, &mut App) + 'static,
+) -> Entity<ConnectionModel> {
+    let connection = cx.new(|_| {
+        ConnectionModel::new(
+            ServerProfile::default(),
+            crate::credentials::CredentialStoreProvider::new(
+                crate::credentials::platform_credential_store,
+            ),
+        )
+    });
+    cx.set_global(ConnectionHandle(connection.clone()));
+    // App scope, not the window's view context: `hide_window` drops the root
+    // view, and a window-scoped observer would die with it (R1.4).
+    cx.observe(&connection, move |connection, cx| {
+        present(&connection.read(cx).state().clone(), cx);
+    })
+    .detach();
+    connection
 }
 
 fn show(_: &Show, cx: &mut App) {
@@ -71,15 +117,16 @@ pub fn hide_window(cx: &mut App) {
 ///
 /// Returns an error when the platform cannot create the window.
 pub fn open_main_window(cx: &mut App) -> anyhow::Result<()> {
+    let Some(connection) = cx
+        .try_global::<ConnectionHandle>()
+        .map(|handle| handle.0.clone())
+    else {
+        anyhow::bail!("the shell is not installed; call shell::init before opening a window");
+    };
     let (window, _view) = gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
         // The connection state is one entity both surfaces read, so the
-        // dashboard's global card follows a sign-in from the settings form.
-        let connection = cx.new(|_| {
-            ConnectionModel::new(
-                ServerProfile::default(),
-                crate::credentials::platform_credential_store(),
-            )
-        });
+        // dashboard's global card follows a sign-in from the settings form,
+        // and reopening the window after a hide reuses the same state.
         let dashboard = cx.new(|_| Dashboard::new(crate::status::sample()));
         let settings = cx.new(|cx| SettingsView::from_environment(window, cx, connection.clone()));
         cx.new(|cx| AppShell::new(dashboard, settings, connection, cx))
@@ -117,20 +164,18 @@ impl AppShell {
         connection: Entity<ConnectionModel>,
         cx: &mut Context<Self>,
     ) -> Self {
+        // The tray is observed at App scope in `install_connection_with`, so
+        // it keeps working while this window (and this observer) is gone.
         let subscription = cx.observe(&connection, |this, connection, cx| {
             let summary = connection.read(cx).summary();
-            let state = connection.read(cx).state().clone();
             this.dashboard.update(cx, |dashboard, cx| {
                 dashboard.set_connection(Some(summary), cx)
             });
-            show_connection_on_tray(&state, cx);
         });
         let summary = connection.read(cx).summary();
-        let state = connection.read(cx).state().clone();
         dashboard.update(cx, |dashboard, cx| {
             dashboard.set_connection(Some(summary), cx);
         });
-        show_connection_on_tray(&state, cx);
         Self {
             mode: ViewMode::Dashboard,
             dashboard,
@@ -229,6 +274,12 @@ pub fn install_tray(cx: &mut App) -> gpui_tray::Result<()> {
         .menu(|_| tray_menu())
         .build(cx)?;
     cx.set_global(TrayHandle(tray));
+    // The model is created before the window, so push the state it already
+    // holds instead of waiting for the first transition.
+    if let Some(handle) = cx.try_global::<ConnectionHandle>() {
+        let state = handle.0.read(cx).state().clone();
+        show_connection_on_tray(&state, cx);
+    }
     Ok(())
 }
 
@@ -278,4 +329,46 @@ fn icon() -> gpui_tray::Result<Icon> {
         }
     }
     Icon::from_rgba(rgba, SIZE, SIZE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{hide_window, install_connection_with, show_window};
+    use gpui_kit::TestAppContext;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use sync_core::connection::{Attention, ConnectionState};
+
+    #[gpui_kit::test]
+    fn the_tray_mapping_follows_a_state_change_with_no_window(cx: &mut TestAppContext) {
+        let seen: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let connection = cx.update(|cx| {
+            gpui_kit::init(cx);
+            let seen = seen.clone();
+            install_connection_with(cx, move |state, _| {
+                seen.borrow_mut().push(state.message());
+            })
+        });
+
+        // A window opens and closes; the observer lives at App scope, not in
+        // the root view that `remove_window` drops.
+        cx.update(show_window);
+        cx.run_until_parked();
+        assert_eq!(cx.read(|cx| cx.windows().len()), 1);
+        cx.update(hide_window);
+        cx.run_until_parked();
+        assert_eq!(cx.read(|cx| cx.windows().len()), 0);
+
+        let attention = ConnectionState::NeedsAttention(Attention::Rejected);
+        cx.update(|cx| {
+            connection.update(cx, |model, cx| model.set_state(attention.clone(), cx));
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            seen.borrow().last().map(String::as_str),
+            Some(attention.message().as_str()),
+            "a state change with no window still reached the tray mapping"
+        );
+    }
 }
