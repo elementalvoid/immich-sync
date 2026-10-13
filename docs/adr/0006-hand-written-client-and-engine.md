@@ -15,5 +15,6 @@ The Immich client is hand-written for the Stable operations the app uses, and th
 
 - The client covers `POST /auth/login`, `POST /auth/validateToken`, `GET /server/about`, `POST /assets/bulk-upload-check`, `POST /assets`, `PUT /assets/copy`, `POST /stacks`, tag endpoints, and `DELETE /assets`.
 - Component crates: `notify`, `notify-debouncer-full`, `ignore`, `sha1`, `base64`, `reqwest`, `backon`, `tokio`, `rusqlite`.
+- TLS: `reqwest` 0.13 with its default rustls and platform verifier rather than the research's `native-tls` suggestion; both validate against the OS certificate store, and rustls drops the OpenSSL dependency (SPEC N3).
 - Bandwidth shaping is a hand-written byte bucket over the body stream. `governor` remains a valid alternative through its weighted-cell API.
 - If the API surface grows far beyond these operations, revisit generation on a pruned spec.
