@@ -154,3 +154,27 @@ impl CredentialStore for MemoryCredentialStore {
 
 /// A shared credential store, as the shell and the engine hand it around.
 pub type SharedCredentialStore = Arc<dyn CredentialStore>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secret_debug_is_redacted() {
+        let secret = Secret::new("correct horse battery staple");
+
+        let formatted = format!("{secret:?}");
+        assert!(
+            !formatted.contains("correct horse"),
+            "the secret leaked through Debug: {formatted}"
+        );
+        assert!(
+            !formatted.contains("battery staple"),
+            "the secret leaked through Debug: {formatted}"
+        );
+        assert!(
+            formatted.contains("redacted"),
+            "Debug must show that it is redacted: {formatted}"
+        );
+    }
+}

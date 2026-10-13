@@ -57,3 +57,27 @@ pub struct ServerAbout {
 pub(crate) struct AuthStatus {
     pub(crate) auth_status: bool,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_token_debug_is_redacted() {
+        let token = SessionToken("eyJhbGciOiJIUzI1NiJ9.secret-token".to_string());
+
+        let formatted = format!("{token:?}");
+        assert!(
+            !formatted.contains("eyJhbGciOiJIUzI1NiJ9"),
+            "the token leaked through Debug: {formatted}"
+        );
+        assert!(
+            !formatted.contains("secret-token"),
+            "the token leaked through Debug: {formatted}"
+        );
+        assert!(
+            formatted.contains("redacted"),
+            "Debug must show that it is redacted: {formatted}"
+        );
+    }
+}

@@ -416,3 +416,35 @@ impl AttentionSource for CredentialError {
         Attention::from(self)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_credential_debug_is_redacted() {
+        let api_key = RequestCredential::ApiKey(Secret::new("api-key-abc123"));
+        let formatted = format!("{api_key:?}");
+        assert!(
+            !formatted.contains("api-key-abc123"),
+            "the API key leaked through Debug: {formatted}"
+        );
+        assert!(
+            formatted.contains("redacted"),
+            "Debug must show that it is redacted: {formatted}"
+        );
+
+        let token: SessionToken =
+            serde_json::from_str("\"session-token-abc123\"").expect("a token deserializes");
+        let session = RequestCredential::Session(token);
+        let formatted = format!("{session:?}");
+        assert!(
+            !formatted.contains("session-token-abc123"),
+            "the session token leaked through Debug: {formatted}"
+        );
+        assert!(
+            formatted.contains("redacted"),
+            "Debug must show that it is redacted: {formatted}"
+        );
+    }
+}

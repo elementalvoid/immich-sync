@@ -14,5 +14,6 @@ tracing = "0.1"
 
 [dev-dependencies]
 mock-immich = { path = "../mock-immich" }
+serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tracing-subscriber = "0.3"

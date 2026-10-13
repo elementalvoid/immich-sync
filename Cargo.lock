@@ -7426,6 +7426,7 @@ dependencies = [
  "immich-client",
  "mock-immich",
  "serde",
+ "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
