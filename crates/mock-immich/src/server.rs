@@ -41,6 +41,9 @@ pub enum Operation {
 pub enum Fault {
     /// Reply with an HTTP status; `retry_after` adds the `Retry-After` header.
     Status { code: u16, retry_after: Option<u64> },
+    /// Reply with an HTTP status and a JSON `message` body, as a broken or
+    /// hostile server that echoes the request would.
+    ServerMessage { code: u16, message: String },
     /// 400 with the Immich quota message.
     Quota,
     /// 403 with the Immich missing-permission message.
@@ -347,6 +350,13 @@ async fn guard(state: &State, operation: Operation) -> Option<Response> {
             }
             Some(response)
         }
+        Fault::ServerMessage {
+            code,
+            message: text,
+        } => Some(message(
+            StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            &text,
+        )),
         Fault::Quota => Some(message(StatusCode::BAD_REQUEST, "Quota has been exceeded!")),
         Fault::PermissionDenied => Some(message(
             StatusCode::FORBIDDEN,
