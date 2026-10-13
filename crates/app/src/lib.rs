@@ -5,6 +5,8 @@ pub mod connection;
 pub mod credentials;
 pub mod dashboard;
 pub mod engine;
+pub mod failed;
+pub mod failed_view;
 pub mod instance;
 pub mod logging;
 pub mod logs_view;

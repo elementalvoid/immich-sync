@@ -13,7 +13,8 @@ use gpui_kit::*;
 #[cfg(test)]
 use sync_core::connection::Unauthorized;
 use sync_core::connection::{
-    Attention, AuthMethod, Connection, ConnectionState, RequestCredential, ServerProfile, SignIn,
+    Attention, AuthMethod, Connection, ConnectionState, RequestCredential, ServerProfile,
+    SharedSession, SignIn,
 };
 
 /// The saved connection profile, from the settings file. It holds no secret.
@@ -54,7 +55,9 @@ pub struct ConnectionModel {
     profile: ServerProfile,
     state: ConnectionState,
     form_error: Option<String>,
-    connection: Option<Connection>,
+    /// The live session, shared with the sync engine so a 401 on an upload is
+    /// answered by the same one re-login rule the form uses (R1.4).
+    session: Option<SharedSession>,
     provider: CredentialStoreProvider,
     /// Whether the startup restore already ran. The model outlives every
     /// window, so a reopen must not reset the session (R1.3).
@@ -81,7 +84,7 @@ impl ConnectionModel {
             profile,
             state,
             form_error: None,
-            connection: None,
+            session: None,
             provider: store.into(),
             startup_restore_started: false,
             generation: 0,
@@ -128,24 +131,39 @@ impl ConnectionModel {
     /// The HTTP client of the live session, for an upload request.
     #[must_use]
     pub fn client(&self) -> Option<sync_core::ImmichClient> {
-        self.connection
-            .as_ref()
-            .map(|connection| connection.client().clone())
+        self.session.as_ref().map(SharedSession::client)
     }
 
     /// The credential the live session attaches to a request.
     #[must_use]
     pub fn credential(&self) -> Option<RequestCredential> {
-        self.connection
-            .as_ref()
-            .and_then(|connection| connection.credential().cloned())
+        self.session.as_ref().and_then(SharedSession::credential)
+    }
+
+    /// The live session, for a request path that answers its own 401s (R1.4).
+    #[must_use]
+    pub fn session(&self) -> Option<SharedSession> {
+        self.session.clone()
+    }
+
+    /// Adopts the session's state after a request path changed it (R1.4).
+    ///
+    /// The engine's 401 handling runs off this model's thread, so the model
+    /// pulls the state it produced on its own poll instead of being notified.
+    pub fn refresh_state(&mut self, cx: &mut Context<Self>) {
+        if let Some(session) = &self.session {
+            let state = session.state();
+            if state != self.state {
+                self.set_state(state, cx);
+            }
+        }
     }
 
     /// Records that an authenticated request succeeded with the current
     /// credential, which restores the one re-login budget (R1.4).
     pub fn note_authenticated(&mut self) {
-        if let Some(connection) = &mut self.connection {
-            connection.note_authenticated();
+        if let Some(session) = &self.session {
+            session.note_authenticated();
         }
     }
 
@@ -154,21 +172,11 @@ impl ConnectionModel {
     /// path calls it yet; the retried request belongs to #7.
     #[cfg(test)]
     pub(crate) fn handle_unauthorized_for_test(&mut self, cx: &mut Context<Self>) -> Unauthorized {
+        let session = self.session.clone().expect("a live session before the 401");
         let outcome = worker()
             .expect("the worker runtime starts in tests")
-            .block_on(
-                self.connection
-                    .as_mut()
-                    .expect("a live session before the 401")
-                    .handle_unauthorized(),
-            );
-        let state = self
-            .connection
-            .as_ref()
-            .expect("the session outlives the re-login")
-            .state()
-            .clone();
-        self.set_state(state, cx);
+            .block_on(session.handle_unauthorized());
+        self.set_state(session.state(), cx);
         outcome
     }
 
@@ -186,7 +194,7 @@ impl ConnectionModel {
         self.startup_restore_started = true;
         self.profile = profile.clone();
         if !profile.is_configured() {
-            self.connection = None;
+            self.session = None;
             self.set_state(ConnectionState::NotConfigured, cx);
             return;
         }
@@ -262,23 +270,24 @@ impl ConnectionModel {
         let store = self.provider.resolve();
         let (results, incoming) = async_channel::bounded(1);
         runtime.spawn(async move {
-            let (state, connection) = match Connection::new(&server_url, store) {
-                Ok(mut connection) => {
+            let (state, session) = match Connection::new(&server_url, store) {
+                Ok(connection) => {
+                    let session = connection.shared();
                     let state = match request {
-                        Some(request) => connection.sign_in(request).await,
-                        None => connection.restore(&profile).await,
+                        Some(request) => session.sign_in(request).await,
+                        None => session.restore(&profile).await,
                     };
-                    (state, Some(connection))
+                    (state, Some(session))
                 }
                 Err(error) => (
                     ConnectionState::NeedsAttention(Attention::from(&error)),
                     None,
                 ),
             };
-            let _ = results.send((state, connection)).await;
+            let _ = results.send((state, session)).await;
         });
         cx.spawn(async move |this, cx| {
-            let Ok((state, connection)) = incoming.recv().await else {
+            let Ok((state, session)) = incoming.recv().await else {
                 return;
             };
             // The model can be gone while the request runs; the result is then
@@ -287,7 +296,7 @@ impl ConnectionModel {
                 if model.generation != generation {
                     return;
                 }
-                model.connection = connection;
+                model.session = session;
                 log_outcome(&state);
                 model.set_state(state, cx);
             });

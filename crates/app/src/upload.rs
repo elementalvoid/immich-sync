@@ -194,11 +194,8 @@ impl UploadModel {
                 return;
             }
         };
-        let (client, credential) = {
-            let connection = self.connection.read(cx);
-            (connection.client(), connection.credential())
-        };
-        let (Some(client), Some(credential)) = (client, credential) else {
+        let session = self.connection.read(cx).session();
+        let Some(session) = session else {
             self.set(
                 UploadReport::CannotRun {
                     message: "Sign in to a server before uploading a file.".to_string(),
@@ -225,8 +222,10 @@ impl UploadModel {
         // Exempt from the engine's pause gate by design (R8.7); see the method
         // doc comment.
         runtime.spawn(async move {
-            let outcome = Uploader::new(client, store)
-                .upload_one(Path::new(&path), &credential)
+            // R1.4: the session answers a 401 with its one re-login and retries
+            // the request, so the manual path uses the same rule as the engine.
+            let outcome = Uploader::new(session, store)
+                .upload_one(Path::new(&path))
                 .await;
             let _ = results.send(outcome).await;
         });
@@ -238,16 +237,12 @@ impl UploadModel {
                 if model.generation != generation {
                     return;
                 }
-                // R1.4: a request that succeeded with the current credential
-                // restores the re-login budget.
-                if matches!(
-                    outcome,
-                    UploadOutcome::Created { .. } | UploadOutcome::Duplicate { .. }
-                ) {
-                    model
-                        .connection
-                        .update(cx, |connection, _| connection.note_authenticated());
-                }
+                // The session restored the re-login budget itself when the
+                // request succeeded (R1.4); the model only needs the new state
+                // if the request left it needing attention.
+                model
+                    .connection
+                    .update(cx, |connection, cx| connection.refresh_state(cx));
                 model.set(report_from_outcome(outcome), cx);
             });
         })
@@ -268,11 +263,13 @@ pub fn report_from_outcome(outcome: UploadOutcome) -> UploadReport {
     match outcome {
         UploadOutcome::Created { asset_id } => UploadReport::Created { asset_id },
         UploadOutcome::Duplicate { asset_id } => UploadReport::Duplicate { asset_id },
-        UploadOutcome::Failed(failure) => UploadReport::Failed {
-            class: failure.class,
-            permanent: failure.is_permanent(),
-            message: failure.message,
-        },
+        UploadOutcome::Failed(failure) | UploadOutcome::DeadLetter(failure) => {
+            UploadReport::Failed {
+                class: failure.class,
+                permanent: failure.is_permanent(),
+                message: failure.message,
+            }
+        }
         // The manual path never pauses, so this is unreachable here; it still
         // reads as a state rather than a panic.
         UploadOutcome::Deferred => UploadReport::CannotRun {

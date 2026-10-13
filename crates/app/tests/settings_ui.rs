@@ -239,9 +239,20 @@ fn open_shell(
                 SettingsView::new(store, paths, autostart, connection.clone(), window, cx)
             });
             let store_model = cx.new(|cx| immich_sync::store::StoreModel::open(&upload_paths, cx));
-            let upload_model = cx.new(|cx| UploadModel::new(connection.clone(), store_model, cx));
+            let upload_model =
+                cx.new(|cx| UploadModel::new(connection.clone(), store_model.clone(), cx));
             let upload = cx.new(|cx| UploadView::new(upload_model, window, cx));
-            cx.new(|cx| AppShell::new(dashboard, settings, upload, connection.clone(), cx))
+            let engine_model = cx.new(|cx| {
+                immich_sync::engine::EngineModel::new(
+                    connection.clone(),
+                    store_model.clone(),
+                    &upload_paths,
+                    cx,
+                )
+            });
+            let failed =
+                cx.new(|cx| immich_sync::failed_view::FailedView::new(engine_model, window, cx));
+            cx.new(|cx| AppShell::new(dashboard, settings, upload, failed, connection.clone(), cx))
         })
         .expect("open the shell window")
         .0;
