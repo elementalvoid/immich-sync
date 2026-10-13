@@ -338,10 +338,13 @@ impl EngineModel {
                 }
                 match started {
                     Ok(engine) => {
-                        // R8.7: a pause clicked while the engine was being
-                        // built still holds when it arrives here.
+                        // R8.7: the pause state, whichever way it was clicked
+                        // while the engine was being built, holds when it
+                        // arrives here. Resume on a running gate is a no-op.
                         if model.paused {
                             engine.pause();
+                        } else {
+                            engine.resume();
                         }
                         model.engine = Some(engine);
                         model.problem = None;

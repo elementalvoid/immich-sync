@@ -122,6 +122,74 @@ async fn a_pause_during_engine_startup_still_holds(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+async fn a_resume_during_engine_startup_leaves_uploads_flowing(cx: &mut TestAppContext) {
+    let (_runtime, server) = mock_server();
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+
+    let connection = signed_in(cx, &server);
+    let store = cx.update(|cx| cx.new(|cx| StoreModel::open(&paths, cx)));
+    wait_for_inputs(cx, &connection, &store).await;
+    // The folder is in the store before any engine exists, so the engine this
+    // start builds watches it.
+    cx.read(|cx| store.read(cx).store().expect("the store is open"))
+        .add_folder(&SourceFolder {
+            path: photos.display().to_string(),
+            recursive: true,
+        })
+        .expect("add the source folder");
+
+    let engine = cx.update(|cx| cx.new(|cx| EngineModel::new(connection, store, &paths, cx)));
+    // The start captures "paused", so the engine is built paused. The resume
+    // lands before the handoff, and only the handoff can lift that pause.
+    cx.update(|cx| {
+        engine.update(cx, |model, cx| {
+            model.pause(cx);
+            model.start(cx);
+            model.resume(cx);
+        });
+    });
+
+    for _ in 0..600 {
+        if cx.read(|cx| engine.read(cx).is_running()) {
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    assert!(
+        cx.read(|cx| engine.read(cx).is_running()),
+        "the engine never started"
+    );
+    assert_ne!(
+        cx.read(|cx| engine.read(cx).status().activity),
+        Activity::Paused,
+        "R8.7: a resume clicked while the engine was being built must hold"
+    );
+
+    std::fs::write(
+        photos.join("resumed.jpg"),
+        b"the resume must reach the engine",
+    )
+    .expect("write the file");
+    for _ in 0..600 {
+        if server.upload_requests() >= 1 {
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(20)).await;
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        server.upload_requests(),
+        1,
+        "R8.7: uploads must flow once the resume reaches the engine"
+    );
+}
+
+#[gpui_kit::test]
 async fn a_superseded_engine_start_leaves_exactly_one_engine_watching(cx: &mut TestAppContext) {
     let (_runtime, server) = mock_server();
     cx.executor().allow_parking();
