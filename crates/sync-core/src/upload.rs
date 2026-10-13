@@ -56,12 +56,6 @@ impl UploadFailure {
     pub fn is_permanent(&self) -> bool {
         self.kind == FailureKind::Permanent
     }
-
-    /// The class as the state database stores it, for a message.
-    #[must_use]
-    pub fn class_label(&self) -> &'static str {
-        self.class.map_or("permanent", FailureClass::as_str)
-    }
 }
 
 /// Runs the pipeline for one file over one shared state store.

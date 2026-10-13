@@ -21,12 +21,6 @@ const DIGEST_LEN: usize = 20;
 pub struct Sha1([u8; DIGEST_LEN]);
 
 impl Sha1 {
-    /// Wraps a digest that was computed elsewhere.
-    #[must_use]
-    pub fn from_bytes(bytes: [u8; DIGEST_LEN]) -> Self {
-        Self(bytes)
-    }
-
     /// Reads a digest from a byte slice, for a value read back from the store.
     #[must_use]
     pub fn from_slice(bytes: &[u8]) -> Option<Self> {
