@@ -26,6 +26,8 @@ use immich_sync::settings::{Settings, SettingsStore};
 use immich_sync::settings_view::{FieldKey, SettingsView};
 use immich_sync::shell::AppShell;
 use immich_sync::status;
+use immich_sync::upload::UploadModel;
+use immich_sync::upload_view::UploadView;
 use mock_immich::MockImmich;
 use sync_core::connection::{
     Attention, AuthMethod, ConnectionState, Secret, ServerProfile, SignIn,
@@ -224,6 +226,7 @@ fn open_shell(
     autostart: Rc<dyn Autostart>,
 ) -> (AnyWindowHandle, Entity<ConnectionModel>) {
     let profile = profile_from_settings(store.settings());
+    let upload_paths = paths.clone();
     cx.update(|cx| {
         gpui_kit::init(cx);
         let connection = cx.new(|_| {
@@ -235,7 +238,9 @@ fn open_shell(
             let settings = cx.new(|cx| {
                 SettingsView::new(store, paths, autostart, connection.clone(), window, cx)
             });
-            cx.new(|cx| AppShell::new(dashboard, settings, connection.clone(), cx))
+            let upload_model = cx.new(|_| UploadModel::new(connection.clone(), &upload_paths));
+            let upload = cx.new(|cx| UploadView::new(upload_model, window, cx));
+            cx.new(|cx| AppShell::new(dashboard, settings, upload, connection.clone(), cx))
         })
         .expect("open the shell window")
         .0;
@@ -935,6 +940,17 @@ fn the_shell_switch_shows_the_dashboard_and_the_settings(cx: &mut TestAppContext
         assert!(
             window.find("status-global").visible(),
             "the dashboard is shown again"
+        );
+
+        tab_to(window, "nav-upload", cx);
+        window.press("enter", cx);
+        assert!(
+            window.find("upload-path").visible(),
+            "the upload surface is shown"
+        );
+        assert!(
+            window.try_find("status-global").is_none(),
+            "the dashboard is not rendered while the upload is shown"
         );
     })
     .expect("update the shell window");
