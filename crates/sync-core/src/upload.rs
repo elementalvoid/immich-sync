@@ -1,9 +1,10 @@
 //! The one-file upload pipeline (SPEC R3, R3.2, R3.6, R4.5).
 //!
 //! SHA-1 the file, look the checksum up, upload only what the server accepts,
-//! and record the outcome. The pipeline is one file and one attempt: it has no
-//! retry loop, because #7 owns classification-backed retries. It records the
-//! class and the state that the retry work will read.
+//! and record the outcome. The pipeline is one file and one attempt: the
+//! engine's retry loop owns the backoff and the attempt cap, and the session
+//! owns the one re-login of a 401 (R1.4), so a run here either finishes or
+//! reports the class the retry policy reads.
 //!
 //! The shape is what #6 batches: one [`Uploader`] over the shared state store,
 //! called once per item from a worker.

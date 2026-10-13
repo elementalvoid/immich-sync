@@ -1,4 +1,4 @@
-//! The folder sync engine (SPEC R2, R3, R6.7, R8.7).
+//! The folder sync engine (SPEC R2, R3, R6, R8.7).
 //!
 //! The engine owns discovery, the durable queue, and the upload worker pool:
 //!
@@ -10,7 +10,11 @@
 //! 3. `POST /assets/bulk-upload-check` runs in configurable batches (R3.1).
 //! 4. Accepted files stream through a `tokio::sync::Semaphore` worker pool.
 //!    `created` and `duplicate` are both terminal success (R3.2).
-//! 5. Pause holds new upload requests inside the acceptance window; an upload
+//! 5. A transient failure waits the retry policy's delay and is tried again;
+//!    the attempt cap parks the item in the dead letter, and a run of
+//!    connection failures holds the queue until the credential probe says the
+//!    server is back (R6.1, R6.5, R6.6).
+//! 6. Pause holds new upload requests inside the acceptance window; an upload
 //!    already on the wire finishes (R8.7).
 //!
 //! The engine has no UI imports (N6, PLAN). The shell reads [`Engine::status`]
