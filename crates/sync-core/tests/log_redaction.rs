@@ -1,4 +1,4 @@
-//! The login path must not log a secret (SPEC N3, R1.2, R10.3).
+//! The network path must not log a secret (SPEC N3, R1.2, R10.3).
 //!
 //! This test lives in its own binary because it installs the process-wide
 //! tracing subscriber: `tracing` caches whether each call site is enabled for
@@ -6,9 +6,12 @@
 
 use std::sync::{Arc, Mutex};
 
-use mock_immich::MockImmich;
-use sync_core::connection::{AuthMethod, Connection, Secret, SignIn};
+use immich_client::ImmichClient;
+use mock_immich::{Fault, MockImmich, Operation};
+use sync_core::connection::{AuthMethod, Connection, RequestCredential, Secret, SignIn};
 use sync_core::credential::MemoryCredentialStore;
+use sync_core::store::StateStore;
+use sync_core::upload::{UploadOutcome, Uploader};
 
 /// A `MakeWriter` that keeps every log line in memory.
 #[derive(Clone, Default)]
@@ -37,7 +40,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
 }
 
 #[tokio::test]
-async fn the_login_path_never_logs_a_secret() {
+async fn the_network_path_never_logs_a_secret() {
     let buffer = LogBuffer::default();
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
@@ -82,6 +85,48 @@ async fn the_login_path_never_logs_a_secret() {
         })
         .await;
 
+    // A hostile server echoes a marker in the error body of both upload
+    // endpoints: the checksum check (415) and the upload itself (403). The
+    // client's own events and the pipeline's failure event must each drop it.
+    let marker = "hostile-echo-9911";
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = Arc::new(
+        StateStore::open(temp.path().join("data").join("state.db")).expect("open the store"),
+    );
+    let uploader = Uploader::new(
+        ImmichClient::new(server.base_url()).expect("a valid mock URL"),
+        store,
+    );
+    let asset = temp.path().join("asset.txt");
+    std::fs::write(&asset, b"hello world").expect("write the fixture");
+    let credential = RequestCredential::ApiKey(Secret::new("api-key-abc123"));
+
+    server.fail(
+        Operation::BulkUploadCheck,
+        Fault::ServerMessage {
+            code: 415,
+            message: format!("unsupported: {marker}"),
+        },
+    );
+    let check_outcome = uploader.upload_one(&asset, &credential).await;
+    assert!(
+        matches!(check_outcome, UploadOutcome::Failed(_)),
+        "the checksum refusal is a failure: {check_outcome:?}"
+    );
+
+    server.fail(
+        Operation::Upload,
+        Fault::ServerMessage {
+            code: 403,
+            message: format!("forbidden: {marker}"),
+        },
+    );
+    let upload_outcome = uploader.upload_one(&asset, &credential).await;
+    assert!(
+        matches!(upload_outcome, UploadOutcome::Failed(_)),
+        "the upload refusal is a failure: {upload_outcome:?}"
+    );
+
     let log = String::from_utf8(
         buffer
             .0
@@ -91,7 +136,11 @@ async fn the_login_path_never_logs_a_secret() {
     )
     .expect("the log is UTF-8");
 
-    assert!(!log.is_empty(), "the login path logs its outcome");
+    assert!(!log.is_empty(), "the network path logs its outcome");
+    assert!(
+        !log.contains(marker),
+        "the log must not contain the server's own text ({marker:?}):\n{log}"
+    );
     for secret in [
         "correct horse",
         "hunter2-wrong",

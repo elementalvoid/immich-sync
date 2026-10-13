@@ -439,23 +439,17 @@ fn password_login_disabled(message: &str) -> bool {
 
 /// Records the outcome of one request as structured, secret-free fields.
 ///
-/// A protocol error carries the server's own message, which a broken or
-/// hostile server can fill with a submitted credential, so only its status is
-/// recorded. The other variants describe the local transport and are safe
-/// (SPEC N3).
+/// Every failure variant can carry a server-supplied message — the protocol
+/// error, and the typed refusals that quote the body (403, 415, 413, and the
+/// quota 400) — and a broken or hostile server can fill it with a submitted
+/// credential. Only [`ClientError::redacted_reason`] is recorded (SPEC N3).
 fn log_outcome<T>(operation: &'static str, result: &Result<T, ClientError>) {
     match result {
         Ok(_) => tracing::debug!(operation, outcome = "ok", "Immich request finished"),
-        Err(ClientError::Protocol { status, .. }) => tracing::debug!(
-            operation,
-            outcome = "error",
-            status,
-            "Immich request finished"
-        ),
         Err(error) => tracing::debug!(
             operation,
             outcome = "error",
-            error = %error,
+            reason = %error.redacted_reason(),
             "Immich request finished"
         ),
     }

@@ -252,7 +252,7 @@ impl Uploader {
             path = %item.path,
             class = class.map_or("none", FailureClass::as_str),
             permanent = kind == FailureKind::Permanent,
-            error = %error,
+            reason = %error.redacted_reason(),
             "the upload failed"
         );
         let message = error.to_string();
