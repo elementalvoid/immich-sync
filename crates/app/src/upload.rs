@@ -162,6 +162,10 @@ impl UploadModel {
     ///
     /// The request runs on the HTTP worker; the result comes back on the UI
     /// thread. A successful request restores the one re-login budget (R1.4).
+    ///
+    /// A manual upload is deliberately exempt from the sync pause (R8.7): the
+    /// user picked this one file and pressed Upload, so it is an explicit
+    /// request rather than background sync work.
     pub fn upload(&mut self, path: String, cx: &mut Context<Self>) {
         // The button disables itself while busy; Enter must not slip past it.
         if self.report.is_busy() {
@@ -218,6 +222,8 @@ impl UploadModel {
         // supersedes it.
         let generation = self.generation;
         let (results, incoming) = async_channel::bounded(1);
+        // Exempt from the engine's pause gate by design (R8.7); see the method
+        // doc comment.
         runtime.spawn(async move {
             let outcome = Uploader::new(client, store)
                 .upload_one(Path::new(&path), &credential)

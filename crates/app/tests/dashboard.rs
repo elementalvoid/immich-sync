@@ -107,6 +107,39 @@ fn sample_data_covers_several_folders_and_states() {
 }
 
 #[gpui_kit::test]
+fn folder_progress_survives_counts_above_a_u16() {
+    use sync_core::engine::{Activity, EngineStatus, FolderStatus};
+    use sync_core::store::FolderCounts;
+
+    let counts = FolderCounts {
+        uploaded: 100_000,
+        pending: 100_000,
+        failed: 0,
+    };
+    let status = EngineStatus {
+        activity: Activity::Syncing,
+        folders: vec![FolderStatus {
+            path: "/photos".to_string(),
+            recursive: true,
+            available: true,
+            counts,
+            last_error: None,
+        }],
+        counts,
+        last_error: None,
+    };
+
+    let model = DashboardModel::from_engine(&status, None);
+
+    assert!(
+        (model.folders[0].progress - 0.5).abs() < 0.001,
+        ">65 535 items must not saturate the percentage: {}",
+        model.folders[0].progress
+    );
+    assert_eq!(model.folders[0].content().progress_percent, "50%");
+}
+
+#[gpui_kit::test]
 fn system_theme_maps_to_the_kit_theme_mode() {
     assert_eq!(theme_mode(SystemTheme::Light), ThemeMode::Light);
     assert_eq!(theme_mode(SystemTheme::Dark), ThemeMode::Dark);
@@ -487,7 +520,18 @@ async fn folder_add_and_remove_controls_reach_the_store(cx: &mut TestAppContext)
     })
     .expect("add the folder through the dashboard");
 
-    let added = cx.read(|cx| store.read(cx).folders().to_vec());
+    // The add runs on the worker runtime now (N2), so wait for the store.
+    let mut added = Vec::new();
+    for _ in 0..600 {
+        added = cx.read(|cx| store.read(cx).folders().to_vec());
+        if !added.is_empty() {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+        cx.run_until_parked();
+    }
     assert_eq!(
         added,
         vec![sync_core::store::SourceFolder {
@@ -510,8 +554,16 @@ async fn folder_add_and_remove_controls_reach_the_store(cx: &mut TestAppContext)
     })
     .expect("remove the folder through the dashboard");
 
-    assert!(
-        cx.read(|cx| store.read(cx).folders().is_empty()),
-        "R2.1: the remove control deleted the folder"
-    );
+    let mut removed = false;
+    for _ in 0..600 {
+        removed = cx.read(|cx| store.read(cx).folders().is_empty());
+        if removed {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+        cx.run_until_parked();
+    }
+    assert!(removed, "R2.1: the remove control deleted the folder");
 }

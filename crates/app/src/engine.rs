@@ -146,50 +146,112 @@ impl EngineModel {
             cx.notify();
             return;
         }
-        if let Some(engine) = &self.engine {
-            if let Err(error) = engine.add_folder(&path, recursive) {
-                self.problem = Some(error.to_string());
-            } else {
-                self.problem = None;
-            }
-        } else if let Some(store) = self.store_model.read(cx).store() {
-            if let Err(error) = store.add_folder(&SourceFolder {
-                path: path.clone(),
-                recursive,
-            }) {
-                self.problem = Some(error.to_string());
-            } else {
-                let folders = store.folders().unwrap_or_default();
-                self.store_model
-                    .update(cx, |model, cx| model.set_folders(folders, cx));
-                self.problem = None;
-            }
-        } else {
-            self.problem = Some("The state database is still opening.".to_string());
-        }
-        self.refresh_status(cx);
+        let engine = self.engine.clone();
+        let store = self.store_model.read(cx).store();
+        let Ok(runtime) = worker() else {
+            self.problem = Some("The network runtime could not start.".to_string());
+            cx.notify();
+            return;
+        };
+        let generation = self.generation;
+        let (results, incoming) = async_channel::bounded(1);
+        runtime.spawn(async move {
+            // The store write runs on the worker runtime, so the UI thread
+            // never waits behind a worker's `BEGIN IMMEDIATE` (N2).
+            let result = match engine {
+                Some(engine) => engine
+                    .add_folder(&path, recursive)
+                    .map(|()| None)
+                    .map_err(|error| error.to_string()),
+                None => match store {
+                    Some(store) => match store.add_folder(&SourceFolder {
+                        path: path.clone(),
+                        recursive,
+                    }) {
+                        Ok(()) => store.folders().map(Some).map_err(|error| error.to_string()),
+                        Err(error) => Err(error.to_string()),
+                    },
+                    None => Err("The state database is still opening.".to_string()),
+                },
+            };
+            let _ = results.send(result).await;
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(result) = incoming.recv().await else {
+                return;
+            };
+            let _ = this.update(cx, |model, cx| {
+                if model.generation != generation {
+                    return;
+                }
+                match result {
+                    Ok(folders) => {
+                        if let Some(folders) = folders {
+                            model.store_model.update(cx, |store, cx| {
+                                store.set_folders(folders, cx);
+                            });
+                        }
+                        model.problem = None;
+                    }
+                    Err(problem) => model.problem = Some(problem),
+                }
+                model.refresh_status(cx);
+            });
+        })
+        .detach();
     }
 
     /// Removes a source folder; its items stay in the store (R2.1).
     pub fn remove_folder(&mut self, path: String, cx: &mut Context<Self>) {
-        if let Some(engine) = &self.engine {
-            if let Err(error) = engine.remove_folder(&path) {
-                self.problem = Some(error.to_string());
-            } else {
-                self.problem = None;
-            }
-        } else if let Some(store) = self.store_model.read(cx).store() {
-            match store.remove_folder(&path) {
-                Ok(_) => {
-                    let folders = store.folders().unwrap_or_default();
-                    self.store_model
-                        .update(cx, |model, cx| model.set_folders(folders, cx));
-                    self.problem = None;
+        let engine = self.engine.clone();
+        let store = self.store_model.read(cx).store();
+        let Ok(runtime) = worker() else {
+            self.problem = Some("The network runtime could not start.".to_string());
+            cx.notify();
+            return;
+        };
+        let generation = self.generation;
+        let (results, incoming) = async_channel::bounded(1);
+        runtime.spawn(async move {
+            // N2: the store write belongs on the worker, not the UI thread.
+            let result = match engine {
+                Some(engine) => engine
+                    .remove_folder(&path)
+                    .map(|()| None)
+                    .map_err(|error| error.to_string()),
+                None => match store {
+                    Some(store) => match store.remove_folder(&path) {
+                        Ok(_) => store.folders().map(Some).map_err(|error| error.to_string()),
+                        Err(error) => Err(error.to_string()),
+                    },
+                    None => Ok(None),
+                },
+            };
+            let _ = results.send(result).await;
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(result) = incoming.recv().await else {
+                return;
+            };
+            let _ = this.update(cx, |model, cx| {
+                if model.generation != generation {
+                    return;
                 }
-                Err(error) => self.problem = Some(error.to_string()),
-            }
-        }
-        self.refresh_status(cx);
+                match result {
+                    Ok(folders) => {
+                        if let Some(folders) = folders {
+                            model.store_model.update(cx, |store, cx| {
+                                store.set_folders(folders, cx);
+                            });
+                        }
+                        model.problem = None;
+                    }
+                    Err(problem) => model.problem = Some(problem),
+                }
+                model.refresh_status(cx);
+            });
+        })
+        .detach();
     }
 
     /// Starts the engine when it is not running yet and both inputs exist.
@@ -215,6 +277,7 @@ impl EngineModel {
             return;
         };
         let config_file = self.paths.config_file.clone();
+        let paused = self.paused;
         let generation = self.generation;
         let (results, incoming) = async_channel::bounded(1);
         runtime.spawn(async move {
@@ -231,6 +294,10 @@ impl EngineModel {
             let started = match Engine::new(store, client, credential, config) {
                 Ok(engine) => {
                     let engine = Arc::new(engine);
+                    // R8.7: a pause set before the engine existed still holds.
+                    if paused {
+                        engine.pause();
+                    }
                     engine.start();
                     Ok(engine)
                 }

@@ -151,8 +151,7 @@ fn folder_progress(counts: FolderCounts) -> f32 {
     if total == 0 {
         return 0.0;
     }
-    f32::from(u16::try_from(counts.uploaded).unwrap_or(u16::MAX))
-        / f32::from(u16::try_from(total).unwrap_or(u16::MAX))
+    counts.uploaded as f32 / total as f32
 }
 
 impl DashboardModel {
