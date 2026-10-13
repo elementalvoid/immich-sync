@@ -279,6 +279,36 @@ async fn a_transient_server_failure_waits_for_a_later_attempt() {
 }
 
 #[tokio::test]
+async fn a_disconnected_upload_body_is_a_transient_network_failure() {
+    let server = MockImmich::start().await;
+    server.fail(Operation::Upload, Fault::Disconnect);
+    let (uploader, credential, store, temp) = uploader(&server).await;
+    let path = hello_world_file(temp.path(), "hello.txt");
+
+    let outcome = uploader.upload_one(&path, &credential).await;
+
+    let UploadOutcome::Failed(failure) = &outcome else {
+        panic!("expected a failure, got {outcome:?}");
+    };
+    assert_eq!(
+        failure.class,
+        Some(FailureClass::NetworkTransient),
+        "a 200 header followed by a reset body is transport noise: {outcome:?}"
+    );
+    assert_eq!(failure.kind, FailureKind::Transient);
+    let row = store
+        .item(&path.display().to_string())
+        .expect("read the row")
+        .expect("the failure was recorded");
+    assert_eq!(
+        row.state,
+        ItemState::RetryWait,
+        "a cut-off body must not become a permanent verdict"
+    );
+    assert_eq!(row.error_class, Some(FailureClass::NetworkTransient));
+}
+
+#[tokio::test]
 async fn a_missing_file_is_a_local_read_error_and_writes_no_row() {
     let server = MockImmich::start().await;
     let (uploader, credential, store, temp) = uploader(&server).await;
@@ -346,7 +376,7 @@ async fn a_revoked_token_is_a_permanent_auth_failure() {
 }
 
 #[tokio::test]
-async fn a_checksum_the_server_never_answers_for_is_permanent() {
+async fn an_empty_checksum_check_body_is_a_transient_network_failure() {
     let server = MockImmich::start().await;
     server.fail(
         Operation::BulkUploadCheck,
@@ -355,15 +385,51 @@ async fn a_checksum_the_server_never_answers_for_is_permanent() {
             retry_after: None,
         },
     );
-    let (uploader, credential, _store, temp) = uploader(&server).await;
+    let (uploader, credential, store, temp) = uploader(&server).await;
     let path = hello_world_file(temp.path(), "hello.txt");
 
     let outcome = uploader.upload_one(&path, &credential).await;
 
-    // A 200 with no usable body is a protocol failure, not a transport one.
+    // A 200 whose body was cut short before the JSON arrived proved nothing
+    // about the file, so a later attempt may succeed.
     let UploadOutcome::Failed(failure) = &outcome else {
         panic!("expected a failure, got {outcome:?}");
     };
-    assert_eq!(failure.kind, FailureKind::Permanent);
+    assert_eq!(failure.class, Some(FailureClass::NetworkTransient));
+    assert_eq!(failure.kind, FailureKind::Transient);
+    let row = store
+        .item(&path.display().to_string())
+        .expect("read the row")
+        .expect("the failure was recorded");
+    assert_eq!(row.state, ItemState::RetryWait);
+    assert_eq!(row.error_class, Some(FailureClass::NetworkTransient));
     assert_eq!(server.upload_requests(), 0);
+}
+
+#[tokio::test]
+async fn an_empty_upload_response_body_is_a_transient_network_failure() {
+    let server = MockImmich::start().await;
+    server.fail(
+        Operation::Upload,
+        Fault::Status {
+            code: 200,
+            retry_after: None,
+        },
+    );
+    let (uploader, credential, store, temp) = uploader(&server).await;
+    let path = hello_world_file(temp.path(), "hello.txt");
+
+    let outcome = uploader.upload_one(&path, &credential).await;
+
+    let UploadOutcome::Failed(failure) = &outcome else {
+        panic!("expected a failure, got {outcome:?}");
+    };
+    assert_eq!(failure.class, Some(FailureClass::NetworkTransient));
+    assert_eq!(failure.kind, FailureKind::Transient);
+    let row = store
+        .item(&path.display().to_string())
+        .expect("read the row")
+        .expect("the failure was recorded");
+    assert_eq!(row.state, ItemState::RetryWait);
+    assert_eq!(row.error_class, Some(FailureClass::NetworkTransient));
 }

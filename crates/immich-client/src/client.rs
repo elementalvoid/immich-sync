@@ -65,6 +65,23 @@ async fn failure(response: Response) -> ClientError {
     }
 }
 
+/// Maps a 2xx body the client could not read as JSON (R6.3).
+///
+/// A body that was cut short, that timed out, or that does not parse as the
+/// schema expects is transport noise: the server proved nothing about the
+/// request, so a later attempt may succeed. [`ClientError::Unreachable`] is the
+/// transient class the retry policy acts on.
+fn body_failure(status: StatusCode, error: reqwest::Error) -> ClientError {
+    if error.is_body() || error.is_decode() || error.is_timeout() {
+        ClientError::Unreachable(error)
+    } else {
+        ClientError::Protocol {
+            status: status.as_u16(),
+            message: error.to_string(),
+        }
+    }
+}
+
 /// Whether a 400 message is Immich's quota refusal.
 fn quota_exceeded(message: &str) -> bool {
     message.to_ascii_lowercase().contains("quota")
@@ -182,10 +199,7 @@ impl ImmichClient {
             response
                 .json::<ServerAbout>()
                 .await
-                .map_err(|error| ClientError::Protocol {
-                    status: status.as_u16(),
-                    message: error.to_string(),
-                })
+                .map_err(|error| body_failure(status, error))
         } else {
             Err(ClientError::Protocol {
                 status: status.as_u16(),
@@ -291,14 +305,10 @@ impl ImmichClient {
         if !status.is_success() {
             return Err(failure(response).await);
         }
-        let body =
-            response
-                .json::<BulkCheckBody>()
-                .await
-                .map_err(|error| ClientError::Protocol {
-                    status: status.as_u16(),
-                    message: error.to_string(),
-                })?;
+        let body = response
+            .json::<BulkCheckBody>()
+            .await
+            .map_err(|error| body_failure(status, error))?;
         body.results
             .into_iter()
             .map(|entry| {
@@ -319,10 +329,7 @@ impl ImmichClient {
         let body = response
             .json::<UploadBody>()
             .await
-            .map_err(|error| ClientError::Protocol {
-                status: status.as_u16(),
-                message: error.to_string(),
-            })?;
+            .map_err(|error| body_failure(status, error))?;
         if body.id.is_empty() {
             return Err(ClientError::Protocol {
                 status: status.as_u16(),
@@ -350,10 +357,7 @@ impl ImmichClient {
             return response
                 .json::<LoginResponse>()
                 .await
-                .map_err(|error| ClientError::Protocol {
-                    status: status.as_u16(),
-                    message: error.to_string(),
-                });
+                .map_err(|error| body_failure(status, error));
         }
         let message = server_message(response).await;
         match status {
@@ -389,10 +393,7 @@ impl ImmichClient {
         let body = response
             .json::<AuthStatus>()
             .await
-            .map_err(|error| ClientError::Protocol {
-                status: status.as_u16(),
-                message: error.to_string(),
-            })?;
+            .map_err(|error| body_failure(status, error))?;
         if body.auth_status {
             Ok(())
         } else {
