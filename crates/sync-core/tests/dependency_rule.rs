@@ -21,6 +21,24 @@ fn sync_core_does_not_depend_on_the_shell() {
 }
 
 #[test]
+fn immich_client_does_not_depend_on_the_shell() {
+    // The engine reaches the shell through sync-core's dependencies. The HTTP
+    // client is on that path, so a GPUI dependency here would leak the shell
+    // into the engine just the same.
+    let manifest = include_str!("../../immich-client/Cargo.toml");
+    let dependencies = manifest
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'));
+
+    for line in dependencies {
+        assert!(
+            !line.contains("gpui"),
+            "immich-client must not depend on the GPUI shell: {line}"
+        );
+    }
+}
+
+#[test]
 fn sync_core_sources_do_not_import_the_shell() {
     let sources = rust_sources(Path::new(env!("CARGO_MANIFEST_DIR")).join("src"));
 

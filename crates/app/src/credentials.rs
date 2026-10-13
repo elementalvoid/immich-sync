@@ -24,15 +24,32 @@ pub const ACCOUNT: &str = "immich-sync";
 /// The process-wide platform credential store.
 ///
 /// The keyring's default store is a process-global, so it is installed once.
+/// A failure to install is not cached: the provider can appear later (the user
+/// starts GNOME Keyring), and the next call installs it then.
 #[must_use]
 pub fn platform_credential_store() -> SharedCredentialStore {
     static STORE: OnceLock<SharedCredentialStore> = OnceLock::new();
-    STORE
-        .get_or_init(|| match install_platform_store() {
-            Ok(()) => keyring_store(SERVICE, ACCOUNT),
-            Err(message) => Arc::new(UnavailableStore::new(message)),
-        })
-        .clone()
+    cached_platform_store(&STORE, || {
+        install_platform_store()?;
+        Ok(keyring_store(SERVICE, ACCOUNT))
+    })
+}
+
+/// The store `install` produces, cached in `cache` only after a success.
+///
+/// A failed install is returned fresh every time, so a later sign-in retries.
+/// A retry is safe because `set_default_store` replaces the process-wide store.
+fn cached_platform_store(
+    cache: &OnceLock<SharedCredentialStore>,
+    install: impl FnOnce() -> Result<SharedCredentialStore, String>,
+) -> SharedCredentialStore {
+    if let Some(store) = cache.get() {
+        return store.clone();
+    }
+    match install() {
+        Ok(store) => cache.get_or_init(|| store).clone(),
+        Err(message) => Arc::new(UnavailableStore::new(message)),
+    }
 }
 
 /// A store for one keyring entry, over the platform store
@@ -54,7 +71,7 @@ pub fn secret_service_message(reason: &str) -> String {
     format!(
         "No Secret Service provider is available, so the password cannot be stored on this \
          computer. Install or start GNOME Keyring (or another Secret Service provider), then sign \
-         in again. ({reason})"
+         in again: the client retries the credential store on every sign-in. ({reason})"
     )
 }
 
@@ -187,6 +204,39 @@ impl CredentialStore for UnavailableStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use sync_core::credential::MemoryCredentialStore;
+
+    #[test]
+    fn a_missing_provider_is_retried_until_one_is_installed() {
+        let cache: OnceLock<SharedCredentialStore> = OnceLock::new();
+        let attempts = Cell::new(0);
+
+        let unavailable = cached_platform_store(&cache, || {
+            attempts.set(attempts.get() + 1);
+            Err("no provider yet".to_string())
+        });
+        let error = unavailable.get().expect_err("the provider is missing");
+        assert!(matches!(error, CredentialError::Unavailable(_)), "{error:?}");
+        assert_eq!(attempts.get(), 1);
+
+        let installed = cached_platform_store(&cache, || {
+            attempts.set(attempts.get() + 1);
+            Ok(Arc::new(MemoryCredentialStore::new()) as SharedCredentialStore)
+        });
+        assert_eq!(attempts.get(), 2, "the failure was not cached");
+        assert!(
+            installed.get().expect("the installed store works").is_none(),
+            "the second attempt installed a real store"
+        );
+
+        let cached = cached_platform_store(&cache, || {
+            attempts.set(attempts.get() + 1);
+            Ok(Arc::new(MemoryCredentialStore::new()) as SharedCredentialStore)
+        });
+        assert_eq!(attempts.get(), 2, "a success is cached");
+        assert!(Arc::ptr_eq(&installed, &cached));
+    }
 
     #[test]
     fn the_secret_service_message_names_the_provider_and_the_next_step() {
@@ -195,6 +245,10 @@ mod tests {
         assert!(message.contains("Secret Service"), "{message}");
         assert!(message.contains("GNOME Keyring"), "{message}");
         assert!(message.contains("D-Bus was not reachable"), "{message}");
+        assert!(
+            message.contains("retries the credential store on every sign-in"),
+            "the recovery step names the retry: {message}"
+        );
     }
 
     #[test]
