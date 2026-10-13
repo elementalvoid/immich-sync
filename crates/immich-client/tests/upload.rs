@@ -250,6 +250,145 @@ async fn uploading_a_known_checksum_returns_the_existing_asset_as_duplicate() {
     assert_eq!(second.asset_id, first.asset_id);
 }
 
+/// A server that never reads a request body, which is what a duplicate
+/// short-circuit does to a real Immich: it answers from the header and hangs
+/// up while the body is still being sent (#19). One entry per connection:
+/// `None` closes without a reply, `Some` answers `200` with that JSON body.
+async fn server_that_never_reads_a_body(answers: &'static [Option<&'static str>]) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the misbehaving server");
+    let address = listener.local_addr().expect("a loopback address");
+    tokio::spawn(async move {
+        for answer in answers {
+            let (mut socket, _) = listener.accept().await.expect("the client connects");
+            let mut head = [0_u8; 4096];
+            let _ = socket.read(&mut head).await;
+            if let Some(answer) = answer {
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n",
+                    answer.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(answer.as_bytes()).await;
+            }
+            // Closing a socket that never read the request body resets the
+            // connection, so an answer can also be lost in flight.
+            drop(socket);
+        }
+    });
+    format!("http://{address}")
+}
+
+/// `bulk-upload-check` answering that the server holds the asset under
+/// `asset_id`.
+const SERVER_HOLDS_IT: &str = r#"{"results":[{"id":"hello.txt","action":"reject",
+    "reason":"duplicate","assetId":"kept","isTrashed":false}]}"#;
+
+/// The same answer, about a file this upload knows nothing of.
+const SERVER_HOLDS_ANOTHER_FILE: &str = r#"{"results":[{"id":"other.txt","action":"reject",
+    "reason":"duplicate","assetId":"someone-elses","isTrashed":false}]}"#;
+
+#[tokio::test]
+async fn a_cut_off_upload_is_resolved_by_asking_whether_the_server_kept_it() {
+    let base_url = server_that_never_reads_a_body(&[None, Some(SERVER_HOLDS_IT)]).await;
+    let client = ImmichClient::new(&base_url).expect("a loopback URL is valid");
+    let (_directory, path) = hello_world_file();
+
+    let response = client
+        .upload_asset(
+            Auth::ApiKey("api-key-1234"),
+            &upload_request(&path, HELLO_WORLD_SHA1_BASE64),
+        )
+        .await
+        .expect("the server says it already has these bytes");
+
+    assert!(
+        response.duplicate,
+        "an upload the server hung up on is the duplicate it reported (#19)"
+    );
+    assert_eq!(response.asset_id, "kept");
+}
+
+#[tokio::test]
+async fn an_answer_about_another_file_does_not_resolve_the_upload() {
+    let base_url = server_that_never_reads_a_body(&[None, Some(SERVER_HOLDS_ANOTHER_FILE)]).await;
+    let client = ImmichClient::new(&base_url).expect("a loopback URL is valid");
+    let (_directory, path) = hello_world_file();
+
+    let error = client
+        .upload_asset(
+            Auth::ApiKey("api-key-1234"),
+            &upload_request(&path, HELLO_WORLD_SHA1_BASE64),
+        )
+        .await
+        .expect_err("another file's answer says nothing about this upload");
+
+    // A row that already carries an asset id is never uploaded again, so
+    // another file's id would be trusted and persisted (#19). What is left is
+    // the transport failure the upload started with.
+    assert!(
+        matches!(error, ClientError::Unreachable(_)),
+        "an answer for another id leaves the upload unanswered (#19): {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_server_that_answers_nothing_at_all_is_a_transient_failure() {
+    let base_url = server_that_never_reads_a_body(&[None, None]).await;
+    let client = ImmichClient::new(&base_url).expect("a loopback URL is valid");
+    let (_directory, path) = hello_world_file();
+
+    let error = client
+        .upload_asset(
+            Auth::ApiKey("api-key-1234"),
+            &upload_request(&path, HELLO_WORLD_SHA1_BASE64),
+        )
+        .await
+        .expect_err("neither the upload nor the question is answered");
+
+    // Never an invented success: with nothing to go on, the transport failure
+    // stays transient, so #7's retry uploads the same bytes again.
+    assert!(
+        matches!(error, ClientError::Unreachable(_)),
+        "an unanswered upload is transient (#19): {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_answer_to_an_upload_the_server_never_read_is_only_ever_a_duplicate() {
+    let base_url = server_that_never_reads_a_body(&[
+        Some(r#"{"id":"hostile","status":"duplicate"}"#),
+        Some(SERVER_HOLDS_IT),
+    ])
+    .await;
+    let client = ImmichClient::new(&base_url).expect("a loopback URL is valid");
+    let (_directory, path) = hello_world_file();
+
+    // The answer races the upload it never read, and the race can go either
+    // way. Both outcomes are safe, and both must be: never an asset the server
+    // did not store (#19).
+    match client
+        .upload_asset(
+            Auth::ApiKey("api-key-1234"),
+            &upload_request(&path, HELLO_WORLD_SHA1_BASE64),
+        )
+        .await
+    {
+        Ok(response) => assert!(
+            response.duplicate,
+            "only a duplicate claim is believable here (#19): {response:?}"
+        ),
+        Err(error) => assert!(
+            matches!(error, ClientError::Unreachable(_)),
+            "a lost answer is transient, so the retry resolves it (#19): {error:?}"
+        ),
+    }
+}
+
 #[tokio::test]
 async fn an_unsupported_format_upload_is_its_own_error() {
     let server = MockImmich::start().await;

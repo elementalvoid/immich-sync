@@ -595,7 +595,9 @@ async fn upload(
         .expect("mock state poisoned")
         .upload_requests += 1;
 
-    // Immich answers a known checksum from the header before it reads the body.
+    // Immich answers a known checksum from the header before it reads the
+    // body: `AssetUploadInterceptor` checks `x-immich-checksum` and runs before
+    // `FileUploadInterceptor`, so multer never parses the form of a duplicate.
     let header_checksum = headers
         .get("x-immich-checksum")
         .and_then(|value| value.to_str().ok())
