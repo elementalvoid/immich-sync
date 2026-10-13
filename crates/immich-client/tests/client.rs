@@ -177,6 +177,9 @@ fn a_url_that_is_not_http_is_rejected_instead_of_panicking() {
         "urn:isbn:0451450523",
     ] {
         let error = ImmichClient::new(url).expect_err("only http and https are usable");
-        assert!(matches!(error, ClientError::InvalidUrl(_)), "{url}: {error:?}");
+        assert!(
+            matches!(error, ClientError::InvalidUrl(_)),
+            "{url}: {error:?}"
+        );
     }
 }

@@ -217,7 +217,10 @@ mod tests {
             Err("no provider yet".to_string())
         });
         let error = unavailable.get().expect_err("the provider is missing");
-        assert!(matches!(error, CredentialError::Unavailable(_)), "{error:?}");
+        assert!(
+            matches!(error, CredentialError::Unavailable(_)),
+            "{error:?}"
+        );
         assert_eq!(attempts.get(), 1);
 
         let installed = cached_platform_store(&cache, || {
@@ -226,7 +229,10 @@ mod tests {
         });
         assert_eq!(attempts.get(), 2, "the failure was not cached");
         assert!(
-            installed.get().expect("the installed store works").is_none(),
+            installed
+                .get()
+                .expect("the installed store works")
+                .is_none(),
             "the second attempt installed a real store"
         );
 
