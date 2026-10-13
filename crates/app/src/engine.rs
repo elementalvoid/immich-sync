@@ -31,7 +31,12 @@ pub struct EngineModel {
     status: EngineStatus,
     paused: bool,
     problem: Option<String>,
+    /// Bumped by every folder edit, so an older edit result cannot overwrite a
+    /// newer one.
     generation: u64,
+    /// Bumped by every engine start attempt, kept apart from `generation` so a
+    /// folder edit cannot discard an engine that is already being built.
+    start_generation: u64,
     _subscriptions: Vec<Subscription>,
     _poll: Task<()>,
 }
@@ -72,6 +77,7 @@ impl EngineModel {
             paused: false,
             problem: None,
             generation: 0,
+            start_generation: 0,
             _subscriptions: subscriptions,
             _poll: poll,
         }
@@ -288,7 +294,8 @@ impl EngineModel {
         };
         let config_file = self.paths.config_file.clone();
         let paused = self.paused;
-        let generation = self.generation;
+        self.start_generation = self.start_generation.wrapping_add(1);
+        let start_generation = self.start_generation;
         let (results, incoming) = async_channel::bounded(1);
         runtime.spawn(async move {
             // The settings file is small; reading it here keeps the UI thread
@@ -320,7 +327,7 @@ impl EngineModel {
                 return;
             };
             let _ = this.update(cx, |model, cx| {
-                if model.generation != generation {
+                if model.start_generation != start_generation {
                     return;
                 }
                 match started {
