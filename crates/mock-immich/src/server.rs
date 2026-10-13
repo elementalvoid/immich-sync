@@ -70,6 +70,10 @@ struct Inner {
     albums: HashMap<String, Album>,
     /// How many `POST /assets/bulk-upload-check` requests arrived.
     bulk_check_requests: u64,
+    /// How many `POST /auth/login` requests arrived.
+    login_requests: u64,
+    /// How many `POST /auth/validateToken` requests arrived (R6.6).
+    validate_token_requests: u64,
     /// How many `POST /assets` requests arrived, whether or not one uploaded.
     upload_requests: u64,
     /// Immich's `passwordLogin.enabled` system config.
@@ -282,6 +286,27 @@ impl MockImmich {
             .bulk_check_requests
     }
 
+    /// The number of `POST /auth/login` requests that arrived (R1.4).
+    #[must_use]
+    pub fn login_requests(&self) -> u64 {
+        self.state
+            .inner
+            .lock()
+            .expect("mock state poisoned")
+            .login_requests
+    }
+
+    /// The number of `POST /auth/validateToken` requests that arrived, which is
+    /// how many times the client probed the server (R6.6).
+    #[must_use]
+    pub fn validate_token_requests(&self) -> u64 {
+        self.state
+            .inner
+            .lock()
+            .expect("mock state poisoned")
+            .validate_token_requests
+    }
+
     /// The `fileCreatedAt` and `fileModifiedAt` fields the last upload sent.
     ///
     /// Immich requires both; the double records them so a test can prove the
@@ -454,6 +479,11 @@ async fn login(
     AxumState(state): AxumState<Arc<State>>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
+    state
+        .inner
+        .lock()
+        .expect("mock state poisoned")
+        .login_requests += 1;
     if let Some(response) = guard(&state, Operation::Login).await {
         return response;
     }
@@ -501,6 +531,11 @@ async fn login(
 }
 
 async fn validate_token(AxumState(state): AxumState<Arc<State>>, headers: HeaderMap) -> Response {
+    state
+        .inner
+        .lock()
+        .expect("mock state poisoned")
+        .validate_token_requests += 1;
     if let Some(response) = guard(&state, Operation::ValidateToken).await {
         return response;
     }

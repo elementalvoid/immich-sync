@@ -6,9 +6,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use immich_client::ImmichClient;
 use mock_immich::{Fault, MockImmich, Operation};
-use sync_core::connection::{AuthMethod, Connection, RequestCredential, Secret, SignIn};
+use sync_core::connection::{AuthMethod, Connection, Secret, SignIn};
 use sync_core::credential::MemoryCredentialStore;
 use sync_core::store::StateStore;
 use sync_core::upload::{UploadOutcome, Uploader};
@@ -93,13 +92,10 @@ async fn the_network_path_never_logs_a_secret() {
     let store = Arc::new(
         StateStore::open(temp.path().join("data").join("state.db")).expect("open the store"),
     );
-    let uploader = Uploader::new(
-        ImmichClient::new(server.base_url()).expect("a valid mock URL"),
-        store,
-    );
+    let session = keyed.shared();
+    let uploader = Uploader::new(session, store.clone());
     let asset = temp.path().join("asset.txt");
     std::fs::write(&asset, b"hello world").expect("write the fixture");
-    let credential = RequestCredential::ApiKey(Secret::new("api-key-abc123"));
 
     server.fail(
         Operation::BulkUploadCheck,
@@ -108,7 +104,7 @@ async fn the_network_path_never_logs_a_secret() {
             message: format!("unsupported: {marker}"),
         },
     );
-    let check_outcome = uploader.upload_one(&asset, &credential).await;
+    let check_outcome = uploader.upload_one(&asset).await;
     assert!(
         matches!(check_outcome, UploadOutcome::Failed(_)),
         "the checksum refusal is a failure: {check_outcome:?}"
@@ -121,7 +117,7 @@ async fn the_network_path_never_logs_a_secret() {
             message: format!("forbidden: {marker}"),
         },
     );
-    let upload_outcome = uploader.upload_one(&asset, &credential).await;
+    let upload_outcome = uploader.upload_one(&asset).await;
     assert!(
         matches!(upload_outcome, UploadOutcome::Failed(_)),
         "the upload refusal is a failure: {upload_outcome:?}"

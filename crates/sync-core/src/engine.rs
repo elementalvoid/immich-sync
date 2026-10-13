@@ -22,21 +22,28 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use immich_client::{BulkAction, BulkCheckItem, ClientError, ImmichClient, RejectReason};
+use immich_client::{BulkAction, BulkCheckItem, ClientError, RejectReason};
 use tokio::sync::{Notify, Semaphore, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
 
-use crate::connection::RequestCredential;
-use crate::failure::{FailureClass, classify};
+use crate::backoff::RetryPolicy;
+use crate::breaker::CircuitBreaker;
+use crate::connection::SharedSession;
+use crate::failure::{FailureClass, FailureKind, classify};
 use crate::hash::Sha1;
 use crate::paths::{PathCase, is_within, path_key};
 use crate::scan::{ScanError, scan_folder};
 use crate::skip::{has_symlink_ancestor, skip_reason_below};
-use crate::store::{FolderCounts, ItemRecord, ItemState, SourceFolder, StateStore, StoreError};
-use crate::upload::{PreparedItem, UploadGate, UploadOutcome, Uploader, hash_in_background};
+use crate::store::{
+    AttemptOutcome, AttemptRecord, FailedItem, FolderCounts, ItemRecord, ItemState, SourceFolder,
+    StateStore, StoreError,
+};
+use crate::upload::{
+    PreparedItem, UploadFailure, UploadGate, UploadOutcome, Uploader, hash_in_background,
+};
 use crate::watch::FolderWatcher;
 
-/// How the engine decides what to do and when (SPEC R2.3, R3.1, R7.2).
+/// How the engine decides what to do and when (SPEC R2.3, R3.1, R6, R7.2).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EngineConfig {
     /// How many checksums one `bulk-upload-check` carries (R3.1). Default 100.
@@ -51,6 +58,16 @@ pub struct EngineConfig {
     /// Whether to watch folders at all; a test can turn the watcher off to
     /// prove the scan finds what the watcher missed (R2.3).
     pub watch: bool,
+    /// How many automatic attempts one item may spend before it is parked in
+    /// the dead letter (R6.1, R6.5). Default 8, from the settings.
+    pub attempt_cap: u32,
+    /// The wait before a later attempt (R6.1, R6.2).
+    pub retry: RetryPolicy,
+    /// How many connection failures in a row trip the circuit breaker (R6.6).
+    pub breaker_threshold: u32,
+    /// How long the queue waits between credential probes while the breaker is
+    /// open (R6.6).
+    pub breaker_cooldown: Duration,
 }
 
 impl Default for EngineConfig {
@@ -61,6 +78,10 @@ impl Default for EngineConfig {
             scan_interval: Duration::from_secs(30 * 60),
             watch_debounce: Duration::from_secs(2),
             watch: true,
+            attempt_cap: 8,
+            retry: RetryPolicy::default(),
+            breaker_threshold: 5,
+            breaker_cooldown: Duration::from_secs(10),
         }
     }
 }
@@ -153,11 +174,14 @@ struct FolderEntry {
 /// The shared engine state. Tasks and the shell hold it through an `Arc`.
 struct EngineInner {
     store: Arc<StateStore>,
-    client: ImmichClient,
-    credential: RequestCredential,
+    /// The connection session, so every request carries the current credential
+    /// and a 401 is answered by the one re-login rule (R1.4).
+    session: SharedSession,
     uploader: Uploader,
     config: EngineConfig,
     gate: UploadGate,
+    /// Trips after a run of connection failures (R6.6).
+    breaker: CircuitBreaker,
     queue: mpsc::UnboundedSender<PathBuf>,
     /// Paths a worker is currently preparing or uploading, so a scan and a
     /// watcher event for the same file do not run the pipeline twice.
@@ -183,7 +207,7 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Builds the engine over the open state store and a signed-in client.
+    /// Builds the engine over the open state store and a live session.
     ///
     /// The queue is re-seeded with what a previous run left unfinished
     /// (R6.7); completed rows are never re-queued. The folders and their
@@ -195,11 +219,16 @@ impl Engine {
     /// Returns a [`StoreError`] when the folders or the queue cannot be read.
     pub fn new(
         store: Arc<StateStore>,
-        client: ImmichClient,
-        credential: RequestCredential,
+        session: SharedSession,
         config: EngineConfig,
     ) -> Result<Self, StoreError> {
         let mut entries = Vec::new();
+        // Re-queue what a previous run left unfinished before the counts are
+        // read, so a row this run will work on is not seeded as parked (R6.7).
+        let (queue, queue_rx) = mpsc::unbounded_channel();
+        for path in store.requeue_unfinished()? {
+            let _ = queue.send(PathBuf::from(path));
+        }
         for folder in store.folders()? {
             let counts = store.folder_counts(&folder.path).unwrap_or_else(|error| {
                 tracing::warn!(folder = %folder.path, error = %error, "the folder counts could not be read");
@@ -212,16 +241,13 @@ impl Engine {
                 last_error: None,
             });
         }
-        let (queue, queue_rx) = mpsc::unbounded_channel();
-        for path in store.requeue_unfinished()? {
-            let _ = queue.send(PathBuf::from(path));
-        }
-        let uploader = Uploader::new(client.clone(), store.clone());
+        let uploader = Uploader::new(session.clone(), store.clone());
+        let breaker = CircuitBreaker::new(config.breaker_threshold, config.breaker_cooldown);
         let inner = Arc::new(EngineInner {
             store,
-            client,
-            credential,
+            session,
             uploader,
+            breaker,
             upload_slots: Arc::new(Semaphore::new(config.concurrency.max(1))),
             config,
             gate: UploadGate::new(),
@@ -451,9 +477,10 @@ impl Engine {
         }
         let activity = if self.inner.gate.is_paused() {
             Activity::Paused
-        } else if folders
-            .iter()
-            .any(|folder| !folder.available || folder.last_error.is_some())
+        } else if !self.inner.session.state().is_connected()
+            || folders
+                .iter()
+                .any(|folder| !folder.available || folder.last_error.is_some())
         {
             Activity::NeedsAttention
         } else if counts.pending > 0 {
@@ -478,6 +505,33 @@ impl Engine {
     #[must_use]
     pub fn store(&self) -> &Arc<StateStore> {
         &self.inner.store
+    }
+
+    /// The items the retry policy gave up on, in path order (R6.5).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StoreError`] when the query fails.
+    pub fn failed_items(&self) -> Result<Vec<FailedItem>, StoreError> {
+        self.inner.store.failed_items()
+    }
+
+    /// Puts one parked item back in the queue for a manual retry (R6.5).
+    ///
+    /// The item gets a fresh attempt budget, so a retry the user asked for is
+    /// not parked again by a cap the previous run already spent. Returns
+    /// whether the store held a parked item for the path.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StoreError`] when the write fails.
+    pub fn retry_failed(&self, path: &str) -> Result<bool, StoreError> {
+        let queued = self.inner.store.retry_item(path)?;
+        if queued {
+            tracing::info!(path, "a parked item was queued for a manual retry");
+            let _ = self.inner.queue.send(PathBuf::from(path));
+        }
+        Ok(queued)
     }
 
     /// A copy of the folder entries' identity, for the watcher setup.
@@ -558,10 +612,18 @@ impl EngineInner {
 
     /// Records that a newly queued file entered one folder, adding to the
     /// dashboard's pending count.
-    fn note_pending(&self, path: &Path) {
+    ///
+    /// `previous` is the row's state before this run queued it: a row the
+    /// pipeline re-prepares out of `retry_wait` was counted as failed when it
+    /// was parked, so it moves back to pending rather than being counted twice.
+    fn note_pending(&self, path: &Path, previous: Option<ItemState>) {
         if let Some(index) = self.folder_index_for(path) {
             let mut folders = self.folders.lock().expect("the folder lock");
-            folders[index].counts.pending += 1;
+            let counts = &mut folders[index].counts;
+            if previous == Some(ItemState::RetryWait) {
+                counts.failed = counts.failed.saturating_sub(1);
+            }
+            counts.pending += 1;
         }
     }
 
@@ -580,15 +642,10 @@ impl EngineInner {
                     // scan interval.
                     entry.last_error = None;
                 }
-                UploadOutcome::Failed(failure) => {
+                UploadOutcome::Failed(failure) | UploadOutcome::DeadLetter(failure) => {
                     entry.counts.pending = entry.counts.pending.saturating_sub(1);
                     entry.counts.failed += 1;
-                    entry.last_error = Some(match failure.class {
-                        Some(class) => {
-                            format!("{}: {}", FailureClass::as_str(class), failure.message)
-                        }
-                        None => failure.message.clone(),
-                    });
+                    entry.last_error = Some(failure_text(failure));
                 }
                 // Deferred keeps the item queued and its pending count.
                 UploadOutcome::Deferred => {}
@@ -603,8 +660,84 @@ impl EngineInner {
         }
     }
 
-    /// Records a failure that happened before an upload could start.
+    /// Records a transient failure that is about to be retried, so the
+    /// dashboard shows why the item is waiting (R8.2) without finishing it.
+    fn note_retrying(&self, item: &PreparedItem, failure: &UploadFailure) {
+        if let Some(index) = self.folder_index_for(&item.path) {
+            let mut folders = self.folders.lock().expect("the folder lock");
+            folders[index].last_error = Some(failure_text(failure));
+        }
+    }
+
+    /// Parks one item in the dead letter after the attempt cap (R6.5).
+    ///
+    /// The last reason the store holds is kept when this call has no failure of
+    /// its own, which is how a restart that finds the cap already spent still
+    /// shows why the item is parked.
+    fn park_dead_letter(
+        &self,
+        item: &PreparedItem,
+        failure: Option<&UploadFailure>,
+    ) -> UploadOutcome {
+        let path = item.path.to_string_lossy().into_owned();
+        let existing = self.store.item(&path).ok().flatten();
+        let (error_class, error_message) = match failure {
+            Some(failure) => (failure.class, Some(failure.message.clone())),
+            None => (
+                existing.as_ref().and_then(|row| row.error_class),
+                existing.as_ref().and_then(|row| row.error_message.clone()),
+            ),
+        };
+        let record = ItemRecord {
+            path: path.clone(),
+            size: item.size,
+            mtime_ns: item.mtime_ns,
+            sha1: item.sha1,
+            asset_id: None,
+            state: ItemState::DeadLetter,
+            error_class,
+            error_message,
+            attempts: 0,
+        };
+        if let Err(error) = self.store.record(&record) {
+            tracing::error!(error = %error, "the state database could not record the dead letter");
+        }
+        let failure = failure.cloned().unwrap_or(UploadFailure {
+            class: error_class,
+            kind: FailureKind::Transient,
+            message: "the attempt cap was reached".to_string(),
+            retry_after: None,
+            connection: false,
+        });
+        tracing::warn!(
+            path,
+            attempts = self
+                .store
+                .item(&path)
+                .ok()
+                .flatten()
+                .map_or(0, |row| row.attempts),
+            "R6.5: the item is in the dead letter and needs a manual retry"
+        );
+        UploadOutcome::DeadLetter(failure)
+    }
+
+    /// Records a failure that happened before an upload could start, and
+    /// finishes the item's bookkeeping with it.
     fn fail_item(&self, item: &PreparedItem, error: &ClientError) {
+        let outcome = self.park_row(item, error);
+        self.finish_item(item, &outcome);
+        tracing::warn!(
+            path = %item.path.display(),
+            class = classify(error).0.map_or("none", FailureClass::as_str),
+            reason = %error.redacted_reason(),
+            "the file was parked after a failure"
+        );
+    }
+
+    /// Records one failure without finishing the item, so a caller that still
+    /// holds the item (the retry loop) keeps its own bookkeeping.
+    fn park_row(&self, item: &PreparedItem, error: &ClientError) -> UploadOutcome {
         let (class, kind) = classify(error);
         let state = match kind {
             crate::failure::FailureKind::Permanent => ItemState::FailedPermanent,
@@ -618,23 +751,64 @@ impl EngineInner {
             asset_id: None,
             state,
             error_class: class,
+            error_message: Some(error.to_string()),
+            attempts: 0,
         };
         if let Err(store_error) = self.store.record(&record) {
             tracing::error!(error = %store_error, "the state database could not record the failure");
         }
-        let outcome = UploadOutcome::Failed(crate::upload::UploadFailure {
+        UploadOutcome::Failed(crate::upload::UploadFailure {
             class,
             kind,
             message: error.to_string(),
-        });
-        self.finish_item(item, &outcome);
-        tracing::warn!(
-            path = %item.path.display(),
-            class = class.map_or("none", FailureClass::as_str),
-            reason = %error.redacted_reason(),
-            "the file was parked after a failure"
-        );
+            retry_after: error.retry_after(),
+            connection: matches!(error, ClientError::Unreachable(_)),
+        })
     }
+}
+
+/// The user-facing line for one failure: the class, when there is one, and the
+/// reason.
+fn failure_text(failure: &UploadFailure) -> String {
+    match failure.class {
+        Some(class) => format!("{}: {}", FailureClass::as_str(class), failure.message),
+        None => failure.message.clone(),
+    }
+}
+
+/// Waits while the circuit breaker is open, probing with the
+/// credential-validation endpoint until the server answers (R6.6).
+///
+/// A server that is merely gone is waited out, so the queue resumes as soon as
+/// it is back without spending an item's attempt. The probe's failure is
+/// returned only when the session needs the user: a credential the server
+/// refuses cannot be waited out.
+async fn wait_for_the_server(inner: &Arc<EngineInner>) -> Result<(), ClientError> {
+    while let Some(wait) = inner.breaker.open_for() {
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
+        match inner.session.validate().await {
+            Ok(()) => {
+                inner.breaker.record_success();
+                tracing::info!("the server answered the credential probe, so the queue resumes");
+                return Ok(());
+            }
+            Err(ClientError::InvalidToken) => {
+                tracing::warn!("the credential probe was refused; the connection needs the user");
+                return Err(ClientError::InvalidToken);
+            }
+            Err(error) => {
+                // A failed probe restarts the cooldown, so this loop is paced.
+                inner.breaker.record_failure();
+                tracing::warn!(
+                    reason = %error.redacted_reason(),
+                    "the server did not answer the credential probe"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The dispatcher: batches queued paths, hashes them, checks them in one
@@ -676,67 +850,103 @@ async fn process_batch(inner: &Arc<EngineInner>, batch: Vec<PathBuf>) {
             checksum: item.sha1.base64(),
         })
         .collect();
-    let checked = inner
-        .client
-        .bulk_upload_check(inner.credential.auth(), &checks)
-        .await;
-    match checked {
-        Ok(results) => {
-            for item in prepared {
-                let id = item.path.to_string_lossy().into_owned();
-                let action = results
-                    .iter()
-                    .find(|result| result.id == id)
-                    .map(|result| result.action.clone());
-                match action {
-                    Some(BulkAction::Accept) => spawn_upload(inner, item).await,
-                    Some(BulkAction::Reject {
-                        reason: RejectReason::Duplicate,
-                        asset_id: Some(asset_id),
-                        ..
-                    }) => {
-                        record_terminal(inner, &item, &asset_id, ItemState::Duplicate);
-                        inner.finish_item(&item, &UploadOutcome::Duplicate { asset_id });
+    let cap = inner.config.attempt_cap.max(1);
+    let mut attempt = 0_u32;
+    let results = loop {
+        // R6.6: while the breaker is open, the batch waits for the credential
+        // probe instead of asking a dead server again.
+        if let Err(error) = wait_for_the_server(inner).await {
+            for item in &prepared {
+                inner.fail_item(item, &error);
+            }
+            return;
+        }
+        attempt += 1;
+        let client = inner.session.client();
+        let checked = inner
+            .session
+            .request(|credential| {
+                let client = client.clone();
+                let checks = checks.clone();
+                async move { client.bulk_upload_check(credential.auth(), &checks).await }
+            })
+            .await;
+        match checked {
+            Ok(results) => break results,
+            Err(error) => {
+                let (_, kind) = classify(&error);
+                if kind == FailureKind::Permanent || attempt >= cap {
+                    // The checksum check could not be made, so no item spent an
+                    // upload attempt: they stay for the next scan (R6.1).
+                    for item in &prepared {
+                        inner.fail_item(item, &error);
                     }
-                    Some(BulkAction::Reject {
-                        reason: RejectReason::UnsupportedFormat,
-                        ..
-                    }) => {
-                        inner.fail_item(
-                            &item,
-                            &ClientError::UnsupportedFormat(
-                                "the checksum check refused the format".to_string(),
-                            ),
-                        );
-                    }
-                    Some(BulkAction::Reject {
-                        reason: RejectReason::Duplicate,
-                        asset_id: None,
-                        ..
-                    }) => {
-                        inner.fail_item(&item, &missing_asset_error());
-                    }
-                    Some(BulkAction::Reject {
-                        reason: RejectReason::Other(reason),
-                        ..
-                    }) => {
-                        inner.fail_item(
-                            &item,
-                            &ClientError::Protocol {
-                                status: 200,
-                                message: format!("the checksum check refused it: {reason}"),
-                            },
-                        );
-                    }
-                    None => {
-                        inner.fail_item(&item, &missing_result_error());
-                    }
+                    return;
                 }
+                if matches!(error, ClientError::Unreachable(_)) {
+                    inner.breaker.record_failure();
+                }
+                let delay = inner.config.retry.delay(attempt, error.retry_after());
+                tracing::warn!(
+                    attempt,
+                    of = cap,
+                    wait_ms = delay.as_millis() as u64,
+                    reason = %error.redacted_reason(),
+                    "the checksum check failed; the batch waits before it is tried again"
+                );
+                tokio::time::sleep(delay).await;
             }
         }
-        Err(error) => {
-            for item in prepared {
-                inner.fail_item(&item, &error);
+    };
+    for item in prepared {
+        let id = item.path.to_string_lossy().into_owned();
+        let action = results
+            .iter()
+            .find(|result| result.id == id)
+            .map(|result| result.action.clone());
+        match action {
+            Some(BulkAction::Accept) => spawn_upload(inner, item).await,
+            Some(BulkAction::Reject {
+                reason: RejectReason::Duplicate,
+                asset_id: Some(asset_id),
+                ..
+            }) => {
+                record_terminal(inner, &item, &asset_id, ItemState::Duplicate);
+                inner.finish_item(&item, &UploadOutcome::Duplicate { asset_id });
+            }
+            Some(BulkAction::Reject {
+                reason: RejectReason::UnsupportedFormat,
+                ..
+            }) => {
+                inner.fail_item(
+                    &item,
+                    &ClientError::UnsupportedFormat(
+                        "the checksum check refused the format".to_string(),
+                    ),
+                );
+            }
+            Some(BulkAction::Reject {
+                reason: RejectReason::Duplicate,
+                asset_id: None,
+                ..
+            }) => {
+                inner.fail_item(&item, &missing_asset_error());
+            }
+            Some(BulkAction::Reject {
+                reason: RejectReason::Other(reason),
+                ..
+            }) => {
+                inner.fail_item(
+                    &item,
+                    &ClientError::Protocol {
+                        status: 200,
+                        message: format!("the checksum check refused it: {reason}"),
+                        retry_after: None,
+                    },
+                );
+            }
+            None => {
+                inner.fail_item(&item, &missing_result_error());
             }
         }
     }
@@ -747,6 +957,7 @@ fn missing_asset_error() -> ClientError {
     ClientError::Protocol {
         status: 200,
         message: "the server reported a duplicate without an asset id".to_string(),
+        retry_after: None,
     }
 }
 
@@ -755,6 +966,7 @@ fn missing_result_error() -> ClientError {
     ClientError::Protocol {
         status: 200,
         message: "the checksum check answered for a different id".to_string(),
+        retry_after: None,
     }
 }
 
@@ -768,6 +980,8 @@ fn record_terminal(inner: &EngineInner, item: &PreparedItem, asset_id: &str, sta
         asset_id: Some(asset_id.to_string()),
         state,
         error_class: None,
+        error_message: None,
+        attempts: 0,
     };
     if let Err(error) = inner.store.record(&record) {
         tracing::error!(error = %error, "the state database could not record the outcome");
@@ -841,7 +1055,7 @@ async fn prepare(inner: &Arc<EngineInner>, path: &Path) -> Option<PreparedItem> 
         && is_settled(row.state)
     {
         // R4.5: the same SHA-1 with a recorded outcome never runs again. A
-        // failed row is parked until #7 adds the retry policy.
+        // parked failure is retried by the retry policy, not by this skip.
         inner
             .in_flight
             .lock()
@@ -863,28 +1077,33 @@ async fn prepare(inner: &Arc<EngineInner>, path: &Path) -> Option<PreparedItem> 
         asset_id: None,
         state: ItemState::Pending,
         error_class: None,
+        error_message: None,
+        attempts: 0,
     };
     if let Err(error) = inner.store.record(&record) {
         tracing::error!(error = %error, "the state database could not record the pending item");
     }
     // The dashboard seed already counts a pending or uploading row (R8.1);
     // only a row this run newly queued adds to the pending total.
-    if !existing.is_some_and(|row| matches!(row.state, ItemState::Pending | ItemState::Uploading)) {
-        inner.note_pending(path);
+    if !existing
+        .as_ref()
+        .is_some_and(|row| matches!(row.state, ItemState::Pending | ItemState::Uploading))
+    {
+        inner.note_pending(path, existing.as_ref().map(|row| row.state));
     }
     Some(item)
 }
 
-/// Whether a recorded row is finished on its own: a terminal success or a
-/// failure parked for the retry policy (#7). A pending or uploading row is
-/// still work the pipeline owns.
+/// Whether a recorded row is finished on its own: a terminal success, or a
+/// failure no automatic retry can fix. A pending, uploading, or `retry_wait`
+/// row is still work the pipeline owns, so a scan may pick it up again.
 fn is_settled(state: ItemState) -> bool {
     matches!(
         state,
         ItemState::Uploaded
             | ItemState::Duplicate
             | ItemState::FailedPermanent
-            | ItemState::RetryWait
+            | ItemState::DeadLetter
     )
 }
 
@@ -910,16 +1129,13 @@ async fn spawn_upload(inner: &Arc<EngineInner>, item: PreparedItem) {
     while uploads.try_join_next().is_some() {}
     let worker = Arc::clone(&inner);
     uploads.spawn(async move {
-        let outcome = worker
-            .uploader
-            .upload_prepared(&item, &worker.credential, &worker.gate)
-            .await;
+        let outcome = upload_with_retries(&worker, &item).await;
         worker.finish_item(&item, &outcome);
         match &outcome {
             UploadOutcome::Created { asset_id } | UploadOutcome::Duplicate { asset_id } => {
                 tracing::info!(path = %item.path.display(), asset_id = %asset_id, "the item finished");
             }
-            UploadOutcome::Failed(failure) => {
+            UploadOutcome::Failed(failure) | UploadOutcome::DeadLetter(failure) => {
                 tracing::warn!(
                     path = %item.path.display(),
                     permanent = failure.is_permanent(),
@@ -931,6 +1147,91 @@ async fn spawn_upload(inner: &Arc<EngineInner>, item: PreparedItem) {
         }
         drop(permit);
     });
+}
+
+/// Uploads one prepared item, retrying a transient failure with backoff until
+/// the attempt cap parks it in the dead letter (R6.1, R6.3, R6.5, R6.6).
+///
+/// Every attempt that reached the wire is written to the attempt log (SPEC §5),
+/// so a restart continues the count instead of starting a fresh budget.
+async fn upload_with_retries(inner: &Arc<EngineInner>, item: &PreparedItem) -> UploadOutcome {
+    let path_text = item.path.to_string_lossy().into_owned();
+    let mut attempts = inner
+        .store
+        .item(&path_text)
+        .ok()
+        .flatten()
+        .map_or(0, |row| row.attempts);
+    let cap = inner.config.attempt_cap.max(1);
+    loop {
+        // R6.6: a run of connection failures holds the queue until the
+        // credential probe says the server is back.
+        if let Err(error) = wait_for_the_server(inner).await {
+            // The credential is refused, not merely gone: the item needs the
+            // user, so it is parked rather than retried (R1.4).
+            return inner.park_row(item, &error);
+        }
+        if attempts >= cap {
+            // The cap was already spent before this run, so the item is parked
+            // without a request (R6.5, R6.7).
+            return inner.park_dead_letter(item, None);
+        }
+        let started_ns = now_ns();
+        attempts += 1;
+        let outcome = inner.uploader.upload_prepared(item, &inner.gate).await;
+        let (attempt_outcome, failure) = match &outcome {
+            UploadOutcome::Created { .. } | UploadOutcome::Duplicate { .. } => {
+                (AttemptOutcome::Succeeded, None)
+            }
+            UploadOutcome::Failed(failure) | UploadOutcome::DeadLetter(failure) => {
+                (AttemptOutcome::Failed, Some(failure))
+            }
+            // A paused upload never reached the wire, so it is not an attempt.
+            UploadOutcome::Deferred => return outcome,
+        };
+        if let Err(error) = inner.store.record_attempt(&AttemptRecord {
+            path: path_text.clone(),
+            started_ns,
+            outcome: attempt_outcome,
+            error_class: failure.and_then(|failure| failure.class),
+        }) {
+            tracing::error!(error = %error, "the state database could not record the attempt");
+        }
+        let Some(failure) = failure else {
+            return outcome;
+        };
+        if failure.connection {
+            // R6.6: only a connection failure feeds the breaker; a 429 or a
+            // 503 is the server answering, not the server being gone.
+            inner.breaker.record_failure();
+        }
+        if failure.is_permanent() || attempts >= cap {
+            if !failure.is_permanent() {
+                return inner.park_dead_letter(item, Some(failure));
+            }
+            return outcome;
+        }
+        inner.note_retrying(item, failure);
+        let delay = inner.config.retry.delay(attempts, failure.retry_after);
+        tracing::warn!(
+            path = %item.path.display(),
+            attempt = attempts,
+            of = cap,
+            wait_ms = delay.as_millis() as u64,
+            class = failure.class.map_or("none", FailureClass::as_str),
+            "the upload failed and will be tried again"
+        );
+        tokio::time::sleep(delay).await;
+    }
+}
+
+/// The current time in nanoseconds since the Unix epoch, as the attempt log
+/// records it.
+fn now_ns() -> i64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX),
+        Err(error) => -i64::try_from(error.duration().as_nanos()).unwrap_or(i64::MAX),
+    }
 }
 
 /// The reconciliation scan loop: startup, the configured interval, and
