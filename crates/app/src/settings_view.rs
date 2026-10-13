@@ -283,7 +283,7 @@ impl SettingsView {
         });
         let secret_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Password or API key")
+                .placeholder(secret_placeholder_for(initial.auth_method))
                 .masked(true)
         });
         subscriptions.push(cx.subscribe_in(
@@ -295,6 +295,11 @@ impl SettingsView {
                 }
             },
         ));
+        // The profile is persisted only once the model reaches connected, so
+        // a refused sign-in leaves the saved profile and credential in step.
+        subscriptions.push(cx.observe(&connection, |this, _, cx| {
+            this.save_connected_profile(cx);
+        }));
 
         let mut view = Self {
             store,
@@ -368,8 +373,9 @@ impl SettingsView {
         view
     }
 
-    /// Signs in with the form's values and saves the profile when the form was
-    /// valid. The secret itself never reaches the settings file (R1.2).
+    /// Signs in with the form's values. The profile is saved only once the
+    /// session reaches connected (see [`Self::save_connected_profile`]), and
+    /// the secret itself never reaches the settings file (R1.2).
     fn sign_in(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let profile = ServerProfile {
             server_url: self.server_url_input.read(cx).value().trim().to_string(),
@@ -381,21 +387,49 @@ impl SettingsView {
             secret: Secret::new(self.secret_input.read(cx).value().to_string()),
             method: profile.method,
         };
-        let accepted = self
-            .connection
-            .update(cx, |model, cx| model.sign_in(request, profile.clone(), cx));
-        if accepted {
-            let result = self
-                .store
-                .update(|settings| apply_profile(settings, &profile));
-            self.record(SAVE_PROBLEM, result, cx);
+        self.connection
+            .update(cx, |model, cx| model.sign_in(request, profile, cx));
+    }
+
+    /// Saves the profile the session actually connected with.
+    ///
+    /// Saving it when the form was merely valid would persist a new server or
+    /// email while the credential store still held the old credential, so the
+    /// next start would retry a mismatched pair and break a working setup
+    /// (R1.2). The session reaches connected only after the credential store
+    /// accepted the new secret (R1.3).
+    fn save_connected_profile(&mut self, cx: &mut Context<Self>) {
+        if self.connection.read(cx).state() != &ConnectionState::Connected {
+            return;
         }
+        let profile = self.connection.read(cx).profile().clone();
+        if profile_from_settings(self.store.settings()) == profile {
+            return;
+        }
+        let result = self
+            .store
+            .update(|settings| apply_profile(settings, &profile));
+        self.record(SAVE_PROBLEM, result, cx);
     }
 
     /// Switches the credential kind the form signs in with.
-    fn set_auth_method(&mut self, method: AuthMethod, cx: &mut Context<Self>) {
+    fn set_auth_method(&mut self, method: AuthMethod, window: &mut Window, cx: &mut Context<Self>) {
         self.auth_method = method;
+        self.secret_input.update(cx, |input, cx| {
+            input.set_placeholder(secret_placeholder_for(method), window, cx);
+        });
         cx.notify();
+    }
+
+    /// The placeholder the secret field currently shows, for a test and for
+    /// assistive technology.
+    #[must_use]
+    pub fn secret_placeholder(&self, cx: &App) -> String {
+        self.secret_input
+            .read(cx)
+            .presentation()
+            .placeholder()
+            .to_string()
     }
 
     /// Brings the stored autostart flag in line with the real OS mechanism.
@@ -674,9 +708,9 @@ impl SettingsView {
                             .label("Password")
                             .accessibility_label("Sign in with a password")
                             .checked(self.auth_method == AuthMethod::Password)
-                            .on_change(cx.listener(|this, checked, _, cx| {
+                            .on_change(cx.listener(|this, checked, window, cx| {
                                 if *checked {
-                                    this.set_auth_method(AuthMethod::Password, cx);
+                                    this.set_auth_method(AuthMethod::Password, window, cx);
                                 }
                             })),
                     )
@@ -685,9 +719,9 @@ impl SettingsView {
                             .label("API key")
                             .accessibility_label("Sign in with an API key")
                             .checked(self.auth_method == AuthMethod::ApiKey)
-                            .on_change(cx.listener(|this, checked, _, cx| {
+                            .on_change(cx.listener(|this, checked, window, cx| {
                                 if *checked {
-                                    this.set_auth_method(AuthMethod::ApiKey, cx);
+                                    this.set_auth_method(AuthMethod::ApiKey, window, cx);
                                 }
                             })),
                     ),
@@ -936,6 +970,17 @@ impl Render for SettingsView {
                     .text_color(palette.meta)
                     .child("Every control is reachable with the Tab key."),
             )
+    }
+}
+
+/// The placeholder the secret field shows for one credential kind.
+///
+/// The field follows the radio, so the empty password field does not advertise
+/// an API key while the password radio is selected (R1.1, R1.5).
+fn secret_placeholder_for(method: AuthMethod) -> &'static str {
+    match method {
+        AuthMethod::Password => "Password",
+        AuthMethod::ApiKey => "API key",
     }
 }
 

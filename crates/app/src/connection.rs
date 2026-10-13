@@ -100,12 +100,6 @@ impl ConnectionModel {
         self.form_error.as_deref()
     }
 
-    /// The session, once a sign-in or a restore produced one.
-    #[must_use]
-    pub fn connection(&self) -> Option<&Connection> {
-        self.connection.as_ref()
-    }
-
     /// Replaces the state and notifies the views.
     pub fn set_state(&mut self, state: ConnectionState, cx: &mut Context<Self>) {
         if state.is_connected() {
@@ -134,19 +128,16 @@ impl ConnectionModel {
         self.begin(profile, None, cx);
     }
 
-    /// Signs in from the form. Returns whether the form was valid, so the
-    /// caller can persist the profile.
-    pub fn sign_in(
-        &mut self,
-        request: SignIn,
-        profile: ServerProfile,
-        cx: &mut Context<Self>,
-    ) -> bool {
+    /// Signs in from the form.
+    ///
+    /// The caller persists the profile once the model reaches connected, so a
+    /// refused sign-in never replaces a working profile with a mismatched one.
+    pub fn sign_in(&mut self, request: SignIn, profile: ServerProfile, cx: &mut Context<Self>) {
         self.form_error = None;
         if !profile.is_configured() {
             self.form_error = Some("Enter the server URL and the email address.".to_string());
             cx.notify();
-            return false;
+            return;
         }
         if request.secret.expose().trim().is_empty() {
             self.form_error = Some(
@@ -157,12 +148,11 @@ impl ConnectionModel {
                 .to_string(),
             );
             cx.notify();
-            return false;
+            return;
         }
         self.profile = profile.clone();
         self.set_state(ConnectionState::Connecting, cx);
         self.begin(profile, Some(request), cx);
-        true
     }
 
     /// Runs the sign-in or the restore on the worker runtime and applies the
