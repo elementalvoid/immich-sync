@@ -9,14 +9,20 @@
 use std::rc::Rc;
 
 use crate::autostart::Autostart;
+use crate::connection::{ConnectionModel, apply_profile, profile_from_settings};
 use crate::dashboard::CardPalette;
 use crate::paths::AppPaths;
 use crate::settings::{Settings, SettingsStore};
 
 use gpui_kit::component::ActiveTheme as _;
-use gpui_kit::component::input::{InputEvent, InputState, NumberInput};
+use gpui_kit::component::Theme;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::{Input, InputEvent, InputState, NumberInput};
+use gpui_kit::component::radio::Radio;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::*;
+use sync_core::connection::{AuthMethod, ConnectionState, ServerProfile, SignIn};
+use sync_core::credential::Secret;
 
 /// The number of bytes in a displayed megabyte. The stored limit stays bytes
 /// per second (SPEC R7.1); the UI shows MB/s with up to six decimals, which is
@@ -211,6 +217,13 @@ pub struct SettingsView {
     store: SettingsStore,
     paths: AppPaths,
     autostart: Rc<dyn Autostart>,
+    /// The connection state shared with the dashboard (R8.1).
+    connection: Entity<ConnectionModel>,
+    server_url_input: Entity<InputState>,
+    email_input: Entity<InputState>,
+    secret_input: Entity<InputState>,
+    /// The credential kind the form signs in with (R1.1, R1.5).
+    auth_method: AuthMethod,
     fields: Vec<Field>,
     /// The last failed save or autostart change, shown with the load problem.
     action_error: Option<String>,
@@ -226,11 +239,13 @@ impl SettingsView {
         store: SettingsStore,
         paths: AppPaths,
         autostart: Rc<dyn Autostart>,
+        connection: Entity<ConnectionModel>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let initial = store.settings().clone();
         let mut fields = Vec::with_capacity(FieldKey::ALL.len());
-        let mut subscriptions = Vec::with_capacity(FieldKey::ALL.len());
+        let mut subscriptions = Vec::with_capacity(FieldKey::ALL.len() + 1);
         for key in FieldKey::ALL {
             let input = cx.new(|cx| {
                 InputState::new(window, cx)
@@ -256,22 +271,69 @@ impl SettingsView {
             fields.push(Field { key, input });
         }
 
+        let server_url_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("https://immich.example.com")
+                .default_value(initial.server_url.clone())
+        });
+        let email_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("you@example.com")
+                .default_value(initial.email.clone())
+        });
+        let secret_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(secret_placeholder_for(initial.auth_method))
+                .masked(true)
+        });
+        subscriptions.push(cx.subscribe_in(
+            &secret_input,
+            window,
+            |this, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.sign_in(window, cx);
+                }
+            },
+        ));
+        // The profile is persisted only once the model reaches connected, so
+        // a refused sign-in leaves the saved profile and credential in step.
+        subscriptions.push(cx.observe(&connection, |this, _, cx| {
+            this.save_connected_profile(cx);
+        }));
+
         let mut view = Self {
             store,
             paths,
             autostart,
+            connection,
+            server_url_input,
+            email_input,
+            secret_input,
+            auth_method: initial.auth_method,
             fields,
             action_error: None,
             environment_problem: None,
             _subscriptions: subscriptions,
         };
         view.reconcile_autostart(cx);
+        // A saved profile logs in at startup with no user input (R1.3).
+        // Reopening the window rebuilds this view, so the model's once guard
+        // keeps that restore from restarting the saved session. A first run
+        // has nothing to restore, but it must consume the guard too, or the
+        // first reopen would restore the profile the first sign-in just saved.
+        let profile = profile_from_settings(view.store.settings());
+        view.connection
+            .update(cx, |model, cx| model.restore_once(profile, cx));
         view
     }
 
     /// Builds the view from the real platform directories and OS autostart.
-    pub fn from_environment(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Self::from_resolved_paths(AppPaths::resolve(), window, cx)
+    pub fn from_environment(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        connection: Entity<ConnectionModel>,
+    ) -> Self {
+        Self::from_resolved_paths(AppPaths::resolve(), window, cx, connection)
     }
 
     /// Builds the view from an already-attempted path resolution.
@@ -282,6 +344,7 @@ impl SettingsView {
         resolved: anyhow::Result<AppPaths>,
         window: &mut Window,
         cx: &mut Context<Self>,
+        connection: Entity<ConnectionModel>,
     ) -> Self {
         let (store, paths, environment_problem) = match resolved {
             Ok(paths) => (SettingsStore::open(paths.config_file.clone()), paths, None),
@@ -304,9 +367,68 @@ impl SettingsView {
                 "{error:#}"
             )))
         });
-        let mut view = Self::new(store, paths, autostart, window, cx);
+        let mut view = Self::new(store, paths, autostart, connection, window, cx);
         view.environment_problem = environment_problem;
         view
+    }
+
+    /// Signs in with the form's values. The profile is saved only once the
+    /// session reaches connected (see [`Self::save_connected_profile`]), and
+    /// the secret itself never reaches the settings file (R1.2).
+    fn sign_in(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let profile = ServerProfile {
+            server_url: self.server_url_input.read(cx).value().trim().to_string(),
+            email: self.email_input.read(cx).value().trim().to_string(),
+            method: self.auth_method,
+        };
+        let request = SignIn {
+            email: profile.email.clone(),
+            secret: Secret::new(self.secret_input.read(cx).value().to_string()),
+            method: profile.method,
+        };
+        self.connection
+            .update(cx, |model, cx| model.sign_in(request, profile, cx));
+    }
+
+    /// Saves the profile the session actually connected with.
+    ///
+    /// Saving it when the form was merely valid would persist a new server or
+    /// email while the credential store still held the old credential, so the
+    /// next start would retry a mismatched pair and break a working setup
+    /// (R1.2). The session reaches connected only after the credential store
+    /// accepted the new secret (R1.3).
+    fn save_connected_profile(&mut self, cx: &mut Context<Self>) {
+        if self.connection.read(cx).state() != &ConnectionState::Connected {
+            return;
+        }
+        let profile = self.connection.read(cx).profile().clone();
+        if profile_from_settings(self.store.settings()) == profile {
+            return;
+        }
+        let result = self
+            .store
+            .update(|settings| apply_profile(settings, &profile));
+        self.record(SAVE_PROBLEM, result, cx);
+    }
+
+    /// Switches the credential kind the form signs in with.
+    fn set_auth_method(&mut self, method: AuthMethod, window: &mut Window, cx: &mut Context<Self>) {
+        self.auth_method = method;
+        self.secret_input.update(cx, |input, cx| {
+            input.set_placeholder(secret_placeholder_for(method), window, cx);
+        });
+        cx.notify();
+    }
+
+    /// The placeholder the secret field currently shows, for a test and for
+    /// assistive technology.
+    #[must_use]
+    pub fn secret_placeholder(&self, cx: &App) -> String {
+        self.secret_input
+            .read(cx)
+            .presentation()
+            .placeholder()
+            .to_string()
     }
 
     /// Brings the stored autostart flag in line with the real OS mechanism.
@@ -430,6 +552,214 @@ impl SettingsView {
             );
         }
         notices
+    }
+
+    /// The Connection section: server, account, credential, and sign-in
+    /// (R1.1 to R1.6).
+    fn connection(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let palette = CardPalette::new(cx.theme());
+        let (state, form_error) = {
+            let model = self.connection.read(cx);
+            (
+                model.state().clone(),
+                model.form_error().map(str::to_string),
+            )
+        };
+        let needs_api_key = matches!(
+            &state,
+            ConnectionState::NeedsAttention(attention) if attention.needs_api_key()
+        );
+        // The accents are read before the row builders borrow `cx` mutably.
+        let (state_accent, hint_accent, error_accent) = {
+            let theme = cx.theme();
+            (connection_accent(&state, theme), theme.info, theme.danger)
+        };
+
+        let mut rows = vec![
+            self.text_row(
+                "settings-server-url",
+                "Server URL",
+                "For example https://immich.example.com. Certificate verification stays on.",
+                &self.server_url_input,
+                cx,
+            ),
+            self.text_row(
+                "settings-email",
+                "Email address",
+                "The Immich account this client uploads as.",
+                &self.email_input,
+                cx,
+            ),
+            self.method_row(cx),
+            self.secret_row(cx),
+            div()
+                .id("settings-sign-in-row")
+                .test_support()
+                .flex()
+                .flex_row()
+                .justify_end()
+                .child(
+                    Button::new("settings-sign-in")
+                        .primary()
+                        .label("Sign in")
+                        .accessibility_label("Sign in")
+                        .on_click(cx.listener(|this, _, window, cx| this.sign_in(window, cx))),
+                )
+                .into_any_element(),
+        ];
+
+        rows.push(
+            notice(
+                "settings-connection-state",
+                state.message(),
+                state_accent,
+                &palette,
+            )
+            .into_any_element(),
+        );
+        if needs_api_key {
+            rows.push(
+                notice(
+                    "settings-connection-hint",
+                    "Switch the credential to API key and paste a key from Immich (Account \
+                     settings, then API keys)."
+                        .to_string(),
+                    hint_accent,
+                    &palette,
+                )
+                .into_any_element(),
+            );
+        }
+        if let Some(error) = form_error {
+            rows.push(
+                notice("settings-connection-error", error, error_accent, &palette)
+                    .into_any_element(),
+            );
+        }
+
+        section(
+            "settings-connection",
+            "Connection",
+            "The server and the account this client uploads to.",
+            rows,
+            cx,
+        )
+    }
+
+    /// One connection text input row.
+    fn text_row(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        help: &'static str,
+        input: &Entity<InputState>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let palette = CardPalette::new(cx.theme());
+        let focus = input.read(cx).focus_handle(cx);
+        div()
+            .id(id)
+            .test_support()
+            .track_focus(&focus)
+            .aria_label(label)
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap_6()
+            .min_h(rems(2.25))
+            .child(field_text(label, help, &palette))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(Input::new(input).aria_label(label)),
+            )
+            .into_any_element()
+    }
+
+    /// The credential kind: password or API key (R1.1, R1.5).
+    fn method_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let palette = CardPalette::new(cx.theme());
+        div()
+            .id("settings-auth-method")
+            .test_support()
+            .aria_label("Credential")
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap_6()
+            .min_h(rems(2.25))
+            .child(field_text(
+                "Credential",
+                "A password for the account, or an API key from Immich.",
+                &palette,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_4()
+                    .child(
+                        Radio::new("settings-auth-password")
+                            .label("Password")
+                            .accessibility_label("Sign in with a password")
+                            .checked(self.auth_method == AuthMethod::Password)
+                            .on_change(cx.listener(|this, checked, window, cx| {
+                                if *checked {
+                                    this.set_auth_method(AuthMethod::Password, window, cx);
+                                }
+                            })),
+                    )
+                    .child(
+                        Radio::new("settings-auth-apikey")
+                            .label("API key")
+                            .accessibility_label("Sign in with an API key")
+                            .checked(self.auth_method == AuthMethod::ApiKey)
+                            .on_change(cx.listener(|this, checked, window, cx| {
+                                if *checked {
+                                    this.set_auth_method(AuthMethod::ApiKey, window, cx);
+                                }
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The password or API key input. The value is masked and never saved to
+    /// the settings file (R1.2).
+    fn secret_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let palette = CardPalette::new(cx.theme());
+        let label = match self.auth_method {
+            AuthMethod::Password => "Password",
+            AuthMethod::ApiKey => "API key",
+        };
+        let focus = self.secret_input.read(cx).focus_handle(cx);
+        div()
+            .id("settings-secret")
+            .test_support()
+            .track_focus(&focus)
+            .aria_label(label)
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap_6()
+            .min_h(rems(2.25))
+            .child(field_text(
+                label,
+                "Stored in the OS credential store, never in the settings file.",
+                &palette,
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(Input::new(&self.secret_input).aria_label(label)),
+            )
+            .into_any_element()
     }
 
     /// The General section: autostart.
@@ -610,6 +940,7 @@ impl Render for SettingsView {
         let background = theme.background;
         let foreground = theme.foreground;
         let notices = self.notices(cx);
+        let connection = self.connection(cx);
         let general = self.general(cx);
         let limits = self.limits(cx);
         let sync = self.sync(cx);
@@ -627,6 +958,7 @@ impl Render for SettingsView {
             .gap_2()
             .child(Self::header(cx))
             .children(notices)
+            .child(connection)
             .child(general)
             .child(limits)
             .child(sync)
@@ -637,6 +969,27 @@ impl Render for SettingsView {
                     .text_color(palette.meta)
                     .child("Every control is reachable with the Tab key."),
             )
+    }
+}
+
+/// The placeholder the secret field shows for one credential kind.
+///
+/// The field follows the radio, so the empty password field does not advertise
+/// an API key while the password radio is selected (R1.1, R1.5).
+fn secret_placeholder_for(method: AuthMethod) -> &'static str {
+    match method {
+        AuthMethod::Password => "Password",
+        AuthMethod::ApiKey => "API key",
+    }
+}
+
+/// The accent that marks one connection state on the settings notice.
+fn connection_accent(state: &ConnectionState, theme: &Theme) -> Hsla {
+    match state {
+        ConnectionState::Connected => theme.success,
+        ConnectionState::NeedsAttention(_) => theme.danger,
+        ConnectionState::Connecting => theme.info,
+        ConnectionState::NotConfigured => theme.muted_foreground,
     }
 }
 

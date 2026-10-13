@@ -1,6 +1,8 @@
 //! Immich Sync shell: a GPUI-Kit window, a tray icon, and a single instance.
 
 pub mod autostart;
+pub mod connection;
+pub mod credentials;
 pub mod dashboard;
 pub mod instance;
 pub mod paths;
@@ -49,13 +51,15 @@ fn boot(cx: &mut App, incoming: Receiver<instance::Request>) {
     })
     .detach();
 
-    if let Err(error) = shell::open_main_window(cx) {
-        eprintln!("immich-sync: could not open the main window: {error:#}");
-    }
+    // The tray is installed before the window so the shell's first connection
+    // state lands on it (R1.4).
     if let Err(error) = shell::install_tray(cx) {
         // With no tray there is no Quit menu item, so the app must not keep the
         // tray's explicit quit mode: it would run with no way to quit.
         cx.set_quit_mode(QuitMode::default());
         eprintln!("immich-sync: could not create the tray icon: {error}");
+    }
+    if let Err(error) = shell::open_main_window(cx) {
+        eprintln!("immich-sync: could not open the main window: {error:#}");
     }
 }

@@ -46,6 +46,14 @@ impl Dashboard {
         cx.notify();
     }
 
+    /// Shows the connection state on the global card (SPEC R8.1).
+    pub fn set_connection(&mut self, state: Option<String>, cx: &mut Context<Self>) {
+        if self.model.global.connection != state {
+            self.model.global.connection = state;
+            cx.notify();
+        }
+    }
+
     fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
         let (pause_label, pause_name) = if self.paused {
@@ -120,6 +128,7 @@ impl Render for Dashboard {
             .child(status_card(
                 "status-global".into(),
                 "status-state-global".into(),
+                Some("status-connection-global".into()),
                 &self.model.global,
                 cx,
             ))
@@ -134,6 +143,7 @@ impl Render for Dashboard {
                             div().w(rems(17.5)).flex().child(status_card(
                                 ("status-folder", index).into(),
                                 ("status-state-folder", index).into(),
+                                None,
                                 folder,
                                 cx,
                             ))
@@ -202,6 +212,7 @@ pub fn state_border(state: ActivityState, theme: &Theme) -> Hsla {
 fn status_card(
     id: ElementId,
     state_id: ElementId,
+    connection_id: Option<ElementId>,
     card: &StatusCard,
     cx: &App,
 ) -> impl IntoElement {
@@ -286,6 +297,19 @@ fn status_card(
                 .child(content.counts),
         );
 
+    if let Some(connection) = content.connection.clone()
+        && let Some(id) = connection_id
+    {
+        root = root.child(
+            div()
+                .id(id)
+                .test_support()
+                .aria_label(connection.clone())
+                .text_sm()
+                .text_color(palette.meta)
+                .child(connection),
+        );
+    }
     if let Some(review) = content.review {
         root = root.child(notice(review, theme.warning, &palette));
     }

@@ -7,19 +7,32 @@ use std::cell::Cell;
 use std::fs;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use gpui_kit::test::TestAppContextExt as _;
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, Bounds, ElementId, Point, Role, TestAppContext, Window,
-    WindowBounds, WindowOptions, px, size,
+    AnyWindowHandle, App, AppContext as _, Bounds, ElementId, Entity, Point, Role, TestAppContext,
+    Window, WindowBounds, WindowOptions, px, size,
 };
 use immich_sync::autostart::Autostart;
+use immich_sync::connection::{ConnectionModel, profile_from_settings};
+use immich_sync::credentials::CredentialStoreProvider;
 use immich_sync::dashboard::Dashboard;
 use immich_sync::paths::AppPaths;
 use immich_sync::settings::{Settings, SettingsStore};
 use immich_sync::settings_view::{FieldKey, SettingsView};
 use immich_sync::shell::AppShell;
 use immich_sync::status;
+use mock_immich::MockImmich;
+use sync_core::connection::{
+    Attention, AuthMethod, ConnectionState, Secret, ServerProfile, SignIn,
+};
+use sync_core::credential::{
+    CredentialError, CredentialStore, MemoryCredentialStore, SharedCredentialStore,
+};
 
 /// A stand-in for the OS autostart mechanism, so the settings-to-OS wiring is
 /// testable on every platform. On Linux the real XDG backend is covered by
@@ -95,7 +108,9 @@ fn window_options() -> WindowOptions {
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds {
             origin: Point::default(),
-            size: size(px(1200.), px(900.)),
+            // Tall enough for every settings section to be laid out at once,
+            // so a visibility assertion measures the section, not the scroll.
+            size: size(px(1200.), px(1400.)),
         })),
         ..Default::default()
     }
@@ -107,14 +122,80 @@ fn open_settings(
     paths: AppPaths,
     autostart: Rc<dyn Autostart>,
 ) -> AnyWindowHandle {
+    open_settings_with_connection(cx, store, paths, autostart).0
+}
+
+/// Opens the settings and returns the connection model next to the window.
+fn open_settings_with_connection(
+    cx: &mut TestAppContext,
+    store: SettingsStore,
+    paths: AppPaths,
+    autostart: Rc<dyn Autostart>,
+) -> (AnyWindowHandle, Entity<ConnectionModel>) {
+    let (window, _view, connection) = open_settings_view(
+        cx,
+        store,
+        paths,
+        autostart,
+        Arc::new(MemoryCredentialStore::new()),
+    );
+    (window, connection)
+}
+
+/// Opens the settings and returns the view entity too, for a test that reads
+/// what the fields show.
+fn open_settings_view(
+    cx: &mut TestAppContext,
+    store: SettingsStore,
+    paths: AppPaths,
+    autostart: Rc<dyn Autostart>,
+    credentials: SharedCredentialStore,
+) -> (
+    AnyWindowHandle,
+    Entity<SettingsView>,
+    Entity<ConnectionModel>,
+) {
+    let profile = profile_from_settings(store.settings());
+    let connection = cx.update(|cx| cx.new(|_| ConnectionModel::new(profile, credentials)));
+    let (window, view) =
+        open_settings_over_connection(cx, store, paths, autostart, connection.clone());
+    (window, view, connection)
+}
+
+/// Opens the settings view over `connection`, so a test can decide how the
+/// model resolves its credential store.
+fn open_settings_over_connection(
+    cx: &mut TestAppContext,
+    store: SettingsStore,
+    paths: AppPaths,
+    autostart: Rc<dyn Autostart>,
+    connection: Entity<ConnectionModel>,
+) -> (AnyWindowHandle, Entity<SettingsView>) {
     cx.update(|cx| {
         gpui_kit::init(cx);
         gpui_kit::open_window(window_options(), cx, |window, cx| {
-            cx.new(|cx| SettingsView::new(store, paths, autostart, window, cx))
+            cx.new(|cx| SettingsView::new(store, paths, autostart, connection.clone(), window, cx))
         })
         .expect("open the settings window")
-        .0
     })
+}
+
+/// Starts the offline Immich double on its own runtime: a GPUI test runs on
+/// the GPUI executor, which is not a Tokio runtime.
+fn mock_server() -> (tokio::runtime::Runtime, MockImmich) {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("start the mock runtime");
+    let server = runtime.block_on(MockImmich::start());
+    (runtime, server)
+}
+
+/// Replaces the text in the focused field with `value`.
+fn retype(window: &mut Window, value: &str, cx: &mut App) {
+    window.press("ctrl-a", cx);
+    window.input(value, cx);
 }
 
 /// Opens the settings over an explicit path-resolution result.
@@ -124,8 +205,12 @@ fn open_settings_over_resolution(
 ) -> AnyWindowHandle {
     cx.update(|cx| {
         gpui_kit::init(cx);
+        let connection = cx.new(|_| {
+            let store: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+            ConnectionModel::new(ServerProfile::default(), store)
+        });
         gpui_kit::open_window(window_options(), cx, |window, cx| {
-            cx.new(|cx| SettingsView::from_resolved_paths(resolved, window, cx))
+            cx.new(|cx| SettingsView::from_resolved_paths(resolved, window, cx, connection.clone()))
         })
         .expect("open the settings window")
         .0
@@ -137,16 +222,24 @@ fn open_shell(
     store: SettingsStore,
     paths: AppPaths,
     autostart: Rc<dyn Autostart>,
-) -> AnyWindowHandle {
+) -> (AnyWindowHandle, Entity<ConnectionModel>) {
+    let profile = profile_from_settings(store.settings());
     cx.update(|cx| {
         gpui_kit::init(cx);
-        gpui_kit::open_window(window_options(), cx, |window, cx| {
+        let connection = cx.new(|_| {
+            let store: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+            ConnectionModel::new(profile, store)
+        });
+        let window = gpui_kit::open_window(window_options(), cx, |window, cx| {
             let dashboard = cx.new(|_| Dashboard::new(status::sample()));
-            let settings = cx.new(|cx| SettingsView::new(store, paths, autostart, window, cx));
-            cx.new(|_| AppShell::new(dashboard, settings))
+            let settings = cx.new(|cx| {
+                SettingsView::new(store, paths, autostart, connection.clone(), window, cx)
+            });
+            cx.new(|cx| AppShell::new(dashboard, settings, connection.clone(), cx))
         })
         .expect("open the shell window")
-        .0
+        .0;
+        (window, connection)
     })
 }
 
@@ -813,7 +906,7 @@ fn the_shell_switch_shows_the_dashboard_and_the_settings(cx: &mut TestAppContext
     let temp = tempfile::tempdir().expect("create a temp dir");
     let paths = temporary_paths(temp.path());
     let store = SettingsStore::open(paths.config_file.clone());
-    let window = open_shell(cx, store, paths, FakeAutostart::new());
+    let (window, _connection) = open_shell(cx, store, paths, FakeAutostart::new());
 
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
@@ -845,4 +938,661 @@ fn the_shell_switch_shows_the_dashboard_and_the_settings(cx: &mut TestAppContext
         );
     })
     .expect("update the shell window");
+}
+
+#[gpui_kit::test]
+fn the_connection_form_names_its_controls(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let store = SettingsStore::open(paths.config_file.clone());
+    let window = open_settings(cx, store, paths, FakeAutostart::new());
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+
+        assert!(
+            window.find("settings-connection").visible(),
+            "the connection section is on the settings surface"
+        );
+        for (id, label) in [
+            ("settings-server-url", "Server URL"),
+            ("settings-email", "Email address"),
+            ("settings-secret", "Password"),
+            ("settings-auth-method", "Credential"),
+            ("settings-sign-in", "Sign in"),
+        ] {
+            let row = window.find(id);
+            assert!(row.visible(), "{id} is visible");
+            assert_eq!(row.label(), Some(label), "{id} is named");
+        }
+        // The nested text fields carry the same names to assistive technology.
+        for (id, label) in [
+            ("settings-server-url", "Server URL"),
+            ("settings-email", "Email address"),
+            ("settings-secret", "Password"),
+        ] {
+            assert_eq!(
+                row_text_input(window, id).label(),
+                Some(label),
+                "{id} names its text field"
+            );
+        }
+        // The secret field is masked, so its value is never announced.
+        assert!(
+            row_text_input(window, "settings-secret").value().is_none(),
+            "the password field is masked"
+        );
+        assert_eq!(
+            window.find("settings-auth-password").label(),
+            Some("Sign in with a password"),
+            "the password method is named"
+        );
+        assert_eq!(
+            window.find("settings-auth-apikey").label(),
+            Some("Sign in with an API key"),
+            "the API-key method is named"
+        );
+
+        // Switching the credential relabels the secret field (R1.5).
+        window.click("settings-auth-apikey", cx);
+        assert_eq!(
+            row_text_input(window, "settings-secret").label(),
+            Some("API key"),
+            "the secret field follows the credential choice"
+        );
+    })
+    .expect("update the settings window");
+}
+
+#[gpui_kit::test]
+fn the_connection_state_shows_on_the_form_and_the_global_card(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let store = SettingsStore::open(paths.config_file.clone());
+    let (window, connection) = open_shell(cx, store, paths, FakeAutostart::new());
+    let attention = ConnectionState::NeedsAttention(Attention::PasswordLoginDisabled);
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("status-connection-global").label(),
+            Some(ConnectionState::NotConfigured.message().as_str()),
+            "the global card carries the live connection state, not the sample"
+        );
+    })
+    .expect("update the shell window");
+
+    // A state change travels through the shell's observation of the model.
+    cx.update(|cx| {
+        connection.update(cx, |model, cx| model.set_state(attention.clone(), cx));
+    });
+    cx.run_until_parked();
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("status-connection-global").label(),
+            Some(attention.message().as_str()),
+            "the global card follows a state change"
+        );
+
+        tab_to(window, "nav-settings", cx);
+        window.press("enter", cx);
+        assert_eq!(
+            window.find("settings-connection-state").label(),
+            Some(attention.message().as_str()),
+            "the form shows the same state"
+        );
+        assert!(
+            window.find("settings-connection-hint").visible(),
+            "a disabled password login points at the API key (R1.6)"
+        );
+    })
+    .expect("update the shell window");
+}
+
+#[gpui_kit::test]
+fn reopening_the_window_does_not_restart_the_startup_login(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+
+    // A saved profile, as a fresh launch finds in the settings file (R1.3).
+    let mut store = SettingsStore::open(paths.config_file.clone());
+    store
+        .update(|settings| {
+            settings.server_url = "https://immich.example.com".to_string();
+            settings.email = "sync@example.com".to_string();
+        })
+        .expect("seed a saved profile");
+    let connection = cx.update(|cx| {
+        cx.new(|_| {
+            let credentials: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+            ConnectionModel::new(profile_from_settings(store.settings()), credentials)
+        })
+    });
+
+    // The first open starts the startup login and puts the model in connecting.
+    let _first = open_settings_over_connection(
+        cx,
+        store.clone(),
+        paths.clone(),
+        FakeAutostart::new(),
+        connection.clone(),
+    );
+    assert_eq!(
+        cx.read(|cx| connection.read(cx).state().clone()),
+        ConnectionState::Connecting,
+        "the first open starts the saved login"
+    );
+
+    // The app-scoped model transitions while the window is hidden, e.g. after
+    // the server refused the restore.
+    let attention = ConnectionState::NeedsAttention(Attention::Rejected);
+    cx.update(|cx| {
+        connection.update(cx, |model, cx| model.set_state(attention.clone(), cx));
+    });
+
+    // The reopen must not restart the startup login, which would reset the
+    // state the tray is showing.
+    let window =
+        open_settings_over_connection(cx, store, paths, FakeAutostart::new(), connection.clone()).0;
+    assert_eq!(
+        cx.read(|cx| connection.read(cx).state().clone()),
+        attention,
+        "a reopened window keeps the state the app-level model holds"
+    );
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("settings-connection-state").label(),
+            Some(attention.message().as_str()),
+            "the reopened form shows the surviving state"
+        );
+    })
+    .expect("render the reopened window");
+}
+
+#[gpui_kit::test]
+async fn a_first_run_does_not_restart_the_login_on_reopen(cx: &mut TestAppContext) {
+    let (runtime, server) = mock_server();
+    // The sign-in result arrives from the HTTP worker thread.
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let server_url = server.base_url().to_string();
+
+    // A genuine first launch: the settings file holds no saved profile (R1.3).
+    let store = SettingsStore::open(paths.config_file.clone());
+    let credentials: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+    let connection = cx.update(|cx| {
+        cx.new(|_| ConnectionModel::new(profile_from_settings(store.settings()), credentials))
+    });
+    let (window, _first) = open_settings_over_connection(
+        cx,
+        store.clone(),
+        paths.clone(),
+        FakeAutostart::new(),
+        connection.clone(),
+    );
+    assert_eq!(
+        cx.read(|cx| connection.read(cx).state().clone()),
+        ConnectionState::NotConfigured,
+        "a first launch has no saved login to restore"
+    );
+
+    // The user signs in through the form, and the view persists the connected
+    // profile, so the settings file now holds the login a later launch reads.
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        tab_to(window, "settings-server-url", cx);
+        window.input(&server_url, cx);
+        tab_to(window, "settings-email", cx);
+        window.input("sync@example.com", cx);
+        tab_to(window, "settings-secret", cx);
+        window.input("correct horse", cx);
+        window.click("settings-sign-in", cx);
+    })
+    .expect("fill in the form and sign in");
+    cx.wait_for(window, Duration::from_secs(30), |window, _| {
+        window.find("settings-connection-state").label() == Some("Connected")
+    })
+    .await;
+    cx.run_until_parked();
+    let text = fs::read_to_string(&paths.config_file).expect("the connected profile was saved");
+    assert!(text.contains(&server_url), "{text}");
+
+    // Hide and reopen the window: the profile is now saved, but the app-scoped
+    // model already owns the live session. The first open consumed the restore
+    // guard, so the reopen must not start the saved login again. A later launch
+    // reads the persisted profile from the file, not the stale first-run store.
+    let store = SettingsStore::open(paths.config_file.clone());
+    let reopened =
+        open_settings_over_connection(cx, store, paths, FakeAutostart::new(), connection.clone()).0;
+    assert_eq!(
+        cx.read(|cx| connection.read(cx).state().clone()),
+        ConnectionState::Connected,
+        "reopening after a first-run sign-in keeps the live session"
+    );
+    cx.update_window(reopened, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("settings-connection-state").label(),
+            Some("Connected"),
+            "the reopened form shows the surviving session"
+        );
+    })
+    .expect("render the reopened window");
+    drop(runtime);
+}
+
+/// A credential store whose drop is observable. The connection model holds one
+/// while an attempt is in flight; a result a newer state superseded drops the
+/// connection instead of storing it, so the drop proves the branch ran.
+struct DropSignalingStore {
+    secret: Mutex<Option<Secret>>,
+    dropped: Arc<AtomicBool>,
+}
+
+impl CredentialStore for DropSignalingStore {
+    fn get(&self) -> Result<Option<Secret>, CredentialError> {
+        Ok(self
+            .secret
+            .lock()
+            .expect("the store is not poisoned")
+            .clone())
+    }
+
+    fn set(&self, secret: &Secret) -> Result<(), CredentialError> {
+        *self.secret.lock().expect("the store is not poisoned") = Some(secret.clone());
+        Ok(())
+    }
+
+    fn delete(&self) -> Result<(), CredentialError> {
+        *self.secret.lock().expect("the store is not poisoned") = None;
+        Ok(())
+    }
+}
+
+impl Drop for DropSignalingStore {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
+#[gpui_kit::test]
+async fn a_superseded_sign_in_result_is_dropped(cx: &mut TestAppContext) {
+    let (runtime, server) = mock_server();
+    // The sign-in result arrives from the HTTP worker thread.
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+
+    // Every resolve makes a fresh store whose drop this test observes.
+    let dropped = Arc::new(AtomicBool::new(false));
+    let provider = CredentialStoreProvider::new({
+        let dropped = dropped.clone();
+        move || {
+            Arc::new(DropSignalingStore {
+                secret: Mutex::new(None),
+                dropped: dropped.clone(),
+            })
+        }
+    });
+    let connection =
+        cx.update(|cx| cx.new(|_| ConnectionModel::new(ServerProfile::default(), provider)));
+    let window = open_settings_over_connection(
+        cx,
+        SettingsStore::open(paths.config_file.clone()),
+        paths,
+        FakeAutostart::new(),
+        connection.clone(),
+    )
+    .0;
+
+    // A sign-in starts, and a newer state supersedes it while it is in flight.
+    let profile = ServerProfile {
+        server_url: server.base_url().to_string(),
+        email: "sync@example.com".to_string(),
+        method: AuthMethod::Password,
+    };
+    cx.update(|cx| {
+        connection.update(cx, |model, cx| {
+            model.sign_in(
+                SignIn {
+                    email: profile.email.clone(),
+                    secret: Secret::new("correct horse"),
+                    method: AuthMethod::Password,
+                },
+                profile.clone(),
+                cx,
+            );
+        });
+    });
+    let attention = ConnectionState::NeedsAttention(Attention::Rejected);
+    cx.update(|cx| {
+        connection.update(cx, |model, cx| model.set_state(attention.clone(), cx));
+    });
+
+    // The result arrives after the newer state. The connection is dropped
+    // rather than stored; without the generation check the predicate would see
+    // the overwritten state and the assertion would fail.
+    cx.wait_for(window, Duration::from_secs(30), |_, cx| {
+        dropped.load(Ordering::SeqCst) || connection.read(cx).state().clone() != attention
+    })
+    .await;
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "the superseded result must be dropped instead of overwriting the newer state"
+    );
+    assert_eq!(
+        cx.read(|cx| connection.read(cx).state().clone()),
+        attention,
+        "the newer state survives the superseded result"
+    );
+    drop(runtime);
+}
+
+#[gpui_kit::test]
+fn a_wrong_password_shows_an_error_and_the_form_stays_usable(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let store = SettingsStore::open(paths.config_file.clone());
+    let (window, connection) =
+        open_settings_with_connection(cx, store, paths, FakeAutostart::new());
+
+    cx.update_window(window, |_, window, cx| {
+        connection.update(cx, |model, cx| {
+            model.set_state(
+                ConnectionState::NeedsAttention(Attention::WrongPassword),
+                cx,
+            );
+        });
+        window.render_frame(cx);
+
+        let notice = window.find("settings-connection-state");
+        let label = notice.label();
+        assert!(
+            label.is_some_and(|text| text.contains("rejected the password")),
+            "the wrong password is reported: {label:?}"
+        );
+        // The form itself stays enabled, so the user can try again.
+        assert_ne!(window.find("settings-sign-in").disabled(), Some(true));
+        assert_ne!(
+            row_text_input(window, "settings-secret").disabled(),
+            Some(true),
+            "the secret field stays enabled"
+        );
+        assert!(
+            window.try_find("settings-connection-hint").is_none(),
+            "a wrong password does not point at the API key"
+        );
+
+        connection.update(cx, |model, cx| {
+            model.set_state(ConnectionState::Connected, cx);
+        });
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("settings-connection-state").label(),
+            Some("Connected"),
+            "a successful sign-in clears the error"
+        );
+    })
+    .expect("update the settings window");
+}
+
+#[gpui_kit::test]
+fn the_connection_form_reports_empty_fields_without_signing_in(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let store = SettingsStore::open(paths.config_file.clone());
+    let window = open_settings(cx, store, paths, FakeAutostart::new());
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("settings-sign-in", cx);
+
+        let error = window.find("settings-connection-error");
+        let label = error.label();
+        assert!(
+            label.is_some_and(|text| text.contains("server URL")),
+            "the empty form is reported: {label:?}"
+        );
+    })
+    .expect("update the settings window");
+}
+
+#[gpui_kit::test]
+fn switching_the_credential_updates_the_secret_placeholder(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let store = SettingsStore::open(paths.config_file.clone());
+    let (window, view, _connection) = open_settings_view(
+        cx,
+        store,
+        paths,
+        FakeAutostart::new(),
+        Arc::new(MemoryCredentialStore::new()),
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            view.read(cx).secret_placeholder(cx),
+            "Password",
+            "the secret field follows the selected credential"
+        );
+
+        window.click("settings-auth-apikey", cx);
+        assert_eq!(
+            view.read(cx).secret_placeholder(cx),
+            "API key",
+            "the secret field follows the credential choice"
+        );
+
+        window.click("settings-auth-password", cx);
+        assert_eq!(
+            view.read(cx).secret_placeholder(cx),
+            "Password",
+            "switching back restores the password placeholder"
+        );
+    })
+    .expect("update the settings window");
+}
+
+#[gpui_kit::test]
+async fn signing_in_through_the_form_never_writes_the_secret(cx: &mut TestAppContext) {
+    let (runtime, server) = mock_server();
+    // The sign-in result arrives from the HTTP worker thread, so the test
+    // scheduler must allow that wake (its hook for I/O tests).
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let server_url = server.base_url().to_string();
+    let password = "correct horse";
+    let (window, _view, _connection) = open_settings_view(
+        cx,
+        SettingsStore::open(paths.config_file.clone()),
+        paths.clone(),
+        FakeAutostart::new(),
+        Arc::new(MemoryCredentialStore::new()),
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        tab_to(window, "settings-server-url", cx);
+        window.input(&server_url, cx);
+        tab_to(window, "settings-email", cx);
+        window.input("sync@example.com", cx);
+        tab_to(window, "settings-secret", cx);
+        window.input(password, cx);
+        window.click("settings-sign-in", cx);
+    })
+    .expect("fill in the connection form and click Sign in");
+
+    cx.wait_for(window, Duration::from_secs(30), |window, _| {
+        window.find("settings-connection-state").label() == Some("Connected")
+    })
+    .await;
+    cx.run_until_parked();
+
+    let text = fs::read_to_string(&paths.config_file).expect("the connected profile was saved");
+    assert!(text.contains(&server_url), "{text}");
+    assert!(text.contains("sync@example.com"), "{text}");
+    assert!(
+        !text.contains(password),
+        "the settings TOML holds the password: {text}"
+    );
+    drop(runtime);
+}
+
+#[gpui_kit::test]
+async fn signing_in_again_resolves_the_credential_store_again(cx: &mut TestAppContext) {
+    let (runtime, server) = mock_server();
+    // The sign-in result arrives from the HTTP worker thread.
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let server_url = server.base_url().to_string();
+
+    // The store is missing on the first sign-in and appears before the second,
+    // as when the user starts GNOME Keyring and signs in again.
+    let resolves = Arc::new(AtomicUsize::new(0));
+    let started_later: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+    let provider = CredentialStoreProvider::new({
+        let resolves = resolves.clone();
+        let started_later = started_later.clone();
+        move || {
+            if resolves.fetch_add(1, Ordering::SeqCst) == 0 {
+                Arc::new(MemoryCredentialStore::unavailable(
+                    "no Secret Service provider yet",
+                ))
+            } else {
+                started_later.clone()
+            }
+        }
+    });
+    let connection =
+        cx.update(|cx| cx.new(|_| ConnectionModel::new(ServerProfile::default(), provider)));
+    let (window, _view) = open_settings_over_connection(
+        cx,
+        SettingsStore::open(paths.config_file.clone()),
+        paths,
+        FakeAutostart::new(),
+        connection,
+    );
+
+    // The first sign-in resolves a missing provider and reports it.
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        tab_to(window, "settings-server-url", cx);
+        window.input(&server_url, cx);
+        tab_to(window, "settings-email", cx);
+        window.input("sync@example.com", cx);
+        tab_to(window, "settings-secret", cx);
+        window.input("correct horse", cx);
+        window.click("settings-sign-in", cx);
+    })
+    .expect("fill in the connection form and click Sign in");
+    cx.wait_for(window, Duration::from_secs(30), |window, _| {
+        window
+            .find("settings-connection-state")
+            .label()
+            .is_some_and(|label| label.contains("Secret Service"))
+    })
+    .await;
+    assert_eq!(
+        resolves.load(Ordering::SeqCst),
+        1,
+        "the first sign-in resolved the store"
+    );
+
+    // The user starts the provider and signs in again, without a restart.
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("settings-sign-in", cx);
+    })
+    .expect("sign in again");
+    cx.wait_for(window, Duration::from_secs(30), |window, _| {
+        window.find("settings-connection-state").label() == Some("Connected")
+    })
+    .await;
+    assert_eq!(
+        resolves.load(Ordering::SeqCst),
+        2,
+        "the second sign-in resolved the store again"
+    );
+    drop(runtime);
+}
+
+#[gpui_kit::test]
+async fn a_failed_sign_in_does_not_replace_the_saved_profile(cx: &mut TestAppContext) {
+    let (runtime, server) = mock_server();
+    // The restore and the failed sign-in both finish on the HTTP worker thread.
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let working_url = server.base_url().to_string();
+
+    // A working setup: the profile and the credential the server accepts.
+    let mut seed = SettingsStore::open(paths.config_file.clone());
+    seed.update(|settings| {
+        settings.server_url = working_url.clone();
+        settings.email = "sync@example.com".to_string();
+        settings.auth_method = AuthMethod::Password;
+    })
+    .expect("seed a saved profile");
+    let credentials = Arc::new(MemoryCredentialStore::new());
+    credentials
+        .set(&Secret::new("correct horse"))
+        .expect("store the working credential");
+
+    let (window, _view, _connection) = open_settings_view(
+        cx,
+        SettingsStore::open(paths.config_file.clone()),
+        paths.clone(),
+        FakeAutostart::new(),
+        credentials,
+    );
+
+    // The startup restore of the saved profile succeeds first.
+    cx.wait_for(window, Duration::from_secs(30), |window, _| {
+        window.find("settings-connection-state").label() == Some("Connected")
+    })
+    .await;
+
+    // Change the account and give the wrong credential, so the server rejects
+    // the sign-in.
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        tab_to(window, "settings-email", cx);
+        retype(window, "someone-else@example.com", cx);
+        tab_to(window, "settings-secret", cx);
+        retype(window, "wrong password", cx);
+        window.click("settings-sign-in", cx);
+    })
+    .expect("change the profile and sign in");
+
+    cx.wait_for(window, Duration::from_secs(30), |window, _| {
+        window
+            .find("settings-connection-state")
+            .label()
+            .is_some_and(|label| label.contains("Needs attention"))
+    })
+    .await;
+    cx.run_until_parked();
+
+    let text = fs::read_to_string(&paths.config_file).expect("the settings file still exists");
+    assert!(
+        text.contains(&working_url),
+        "the working server URL is still saved: {text}"
+    );
+    assert!(
+        text.contains("sync@example.com"),
+        "the working email is still saved: {text}"
+    );
+    assert!(
+        !text.contains("someone-else@example.com"),
+        "a failed sign-in must not replace the saved profile: {text}"
+    );
+    drop(runtime);
 }

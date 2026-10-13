@@ -1,6 +1,6 @@
 //! HTTP server implementation for the mock Immich double.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -63,6 +63,14 @@ struct Inner {
     assets: HashMap<String, Asset>,
     checksums: HashMap<Vec<u8>, String>,
     albums: HashMap<String, Album>,
+    /// Immich's `passwordLogin.enabled` system config.
+    password_login_disabled: bool,
+    /// The key `x-api-key` must carry, once one is configured.
+    api_key: Option<String>,
+    /// The session tokens this server issued and has not revoked.
+    tokens: HashSet<String>,
+    /// When set, only an issued, unrevoked token validates.
+    require_known_credentials: bool,
 }
 
 struct Asset {
@@ -191,6 +199,47 @@ impl MockImmich {
             .expect("mock state poisoned")
             .faults
             .clear();
+    }
+
+    /// Turn off password login, as an Immich admin can (R1.6).
+    pub fn disable_password_login(&self) {
+        self.state
+            .inner
+            .lock()
+            .expect("mock state poisoned")
+            .password_login_disabled = true;
+    }
+
+    /// Require an issued, unrevoked session token on `validateToken`.
+    ///
+    /// The default accepts any bearer token, which keeps the older mock tests
+    /// simple; session tests turn this on to model a revoked token.
+    pub fn require_known_credentials(&self) {
+        self.state
+            .inner
+            .lock()
+            .expect("mock state poisoned")
+            .require_known_credentials = true;
+    }
+
+    /// Delete every session, as an admin "log out all devices" does.
+    pub fn revoke_tokens(&self) {
+        self.state
+            .inner
+            .lock()
+            .expect("mock state poisoned")
+            .tokens
+            .clear();
+    }
+
+    /// Configure the one API key the server accepts. Without one the mock
+    /// accepts any non-empty `x-api-key`, as it always has.
+    pub fn set_api_key(&self, key: &str) {
+        self.state
+            .inner
+            .lock()
+            .expect("mock state poisoned")
+            .api_key = Some(key.to_string());
     }
 
     /// Whether the asset was uploaded with a sidecar.
@@ -325,6 +374,16 @@ async fn login(
     if let Some(response) = guard(&state, Operation::Login).await {
         return response;
     }
+    if state
+        .inner
+        .lock()
+        .expect("mock state poisoned")
+        .password_login_disabled
+    {
+        // The real server throws `UnauthorizedException('Password login has
+        // been disabled')`, so the message, not the status, is the signal.
+        return message(StatusCode::UNAUTHORIZED, "Password login has been disabled");
+    }
     let email = body.get("email").and_then(|value| value.as_str());
     let password = body.get("password").and_then(|value| value.as_str());
     if email != Some("sync@example.com") || password != Some("correct horse") {
@@ -336,6 +395,12 @@ async fn login(
         uuid::Uuid::new_v4().simple(),
         uuid::Uuid::new_v4().simple()
     );
+    state
+        .inner
+        .lock()
+        .expect("mock state poisoned")
+        .tokens
+        .insert(token.clone());
     (
         StatusCode::CREATED,
         Json(json!({
@@ -356,9 +421,31 @@ async fn validate_token(AxumState(state): AxumState<Arc<State>>, headers: Header
     if let Some(response) = guard(&state, Operation::ValidateToken).await {
         return response;
     }
-    let has_credential =
-        headers.contains_key(header::AUTHORIZATION) || headers.contains_key("x-api-key");
-    if !has_credential {
+    let valid = {
+        let inner = state.inner.lock().expect("mock state poisoned");
+        let api_key = headers
+            .get("x-api-key")
+            .and_then(|value| value.to_str().ok());
+        let bearer = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| {
+                value
+                    .strip_prefix("Bearer ")
+                    .or_else(|| value.strip_prefix("bearer "))
+            });
+        match (api_key, bearer) {
+            (Some(key), _) if !key.is_empty() => match &inner.api_key {
+                Some(configured) => key == configured,
+                None => true,
+            },
+            (None, Some(token)) if !token.is_empty() => {
+                !inner.require_known_credentials || inner.tokens.contains(token)
+            }
+            _ => false,
+        }
+    };
+    if !valid {
         return message(StatusCode::UNAUTHORIZED, "Invalid authentication");
     }
     Json(json!({ "authStatus": true })).into_response()

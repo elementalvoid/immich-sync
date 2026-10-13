@@ -13,6 +13,7 @@ use std::sync::{Mutex, MutexGuard};
 use immich_sync::autostart::{Autostart, XdgAutostart, platform_autostart};
 use immich_sync::paths::{APP_DIR, AppPaths, SETTINGS_FILE, STATE_FILE};
 use immich_sync::settings::{Settings, SettingsStore};
+use sync_core::connection::AuthMethod;
 
 /// Serializes the tests that mutate the process environment.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -203,6 +204,36 @@ fn default_settings_match_the_spec() {
         settings.attempt_cap, 8,
         "R6.1: the attempt cap defaults to 8"
     );
+    assert!(settings.server_url.is_empty(), "R1.1: no server yet");
+    assert!(settings.email.is_empty(), "R1.1: no account yet");
+    assert_eq!(settings.auth_method, AuthMethod::Password);
+}
+
+#[test]
+fn the_settings_file_has_no_field_a_secret_could_hide_in() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let path = temp.path().join("settings.toml");
+    let mut store = SettingsStore::open(path.clone());
+
+    store
+        .update(|settings| {
+            settings.server_url = "https://immich.example.com".to_string();
+            settings.email = "sync@example.com".to_string();
+        })
+        .expect("save the connection settings");
+
+    // The file is plain TOML, so a person can read and edit it. No key is a
+    // secret field: the value lives in the credential store (R1.2). The
+    // end-to-end proof with a real stored secret lives in `tests/login.rs`.
+    let text = fs::read_to_string(&path).expect("read the settings file");
+    let table: toml::Table = toml::from_str(&text).expect("the file is TOML");
+    for key in table.keys() {
+        assert!(
+            !key.contains("password") && !key.contains("secret") && !key.contains("api_key"),
+            "the settings file has a secret-shaped key: {key}"
+        );
+    }
+    assert!(text.contains("server_url"), "{text}");
 }
 
 #[test]
@@ -229,6 +260,9 @@ fn settings_round_trip_across_a_restart() {
             settings.concurrency = 6;
             settings.scan_interval_minutes = 45;
             settings.attempt_cap = 3;
+            settings.server_url = "https://immich.example.com".to_string();
+            settings.email = "sync@example.com".to_string();
+            settings.auth_method = AuthMethod::ApiKey;
         })
         .expect("save the changed settings");
 
@@ -240,6 +274,9 @@ fn settings_round_trip_across_a_restart() {
     assert_eq!(settings.concurrency, 6);
     assert_eq!(settings.scan_interval_minutes, 45);
     assert_eq!(settings.attempt_cap, 3);
+    assert_eq!(settings.server_url, "https://immich.example.com");
+    assert_eq!(settings.email, "sync@example.com");
+    assert_eq!(settings.auth_method, AuthMethod::ApiKey);
     assert!(restarted.problem().is_none());
 
     // The file is plain TOML, so a person can read and edit it.
@@ -250,7 +287,10 @@ fn settings_round_trip_across_a_restart() {
          bandwidth_bytes_per_second = 1500000\n\
          concurrency = 6\n\
          scan_interval_minutes = 45\n\
-         attempt_cap = 3\n"
+         attempt_cap = 3\n\
+         server_url = \"https://immich.example.com\"\n\
+         email = \"sync@example.com\"\n\
+         auth_method = \"api_key\"\n"
     );
 }
 

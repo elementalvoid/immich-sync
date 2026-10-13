@@ -1,9 +1,10 @@
 //! The TOML settings store (SPEC R9.1).
 //!
 //! The file lives in the OS config directory and holds every value the spec
-//! makes user-settable and persistent. Saves are atomic, and a file that cannot
-//! be parsed falls back to the defaults with a reported problem, so the client
-//! stays usable and the user learns what happened.
+//! makes user-settable and persistent. The password or API key is not one of
+//! them: it lives in the OS credential store (R1.2). Saves are atomic, and a
+//! file that cannot be parsed falls back to the defaults with a reported
+//! problem, so the client stays usable and the user learns what happened.
 
 use std::fmt;
 use std::fs;
@@ -12,9 +13,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
+use sync_core::connection::AuthMethod;
 
 /// The user-settable, persistent settings.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// Start the client at login (SPEC R8.5).
@@ -27,6 +29,12 @@ pub struct Settings {
     pub scan_interval_minutes: u32,
     /// The retry attempt cap (SPEC R6.1).
     pub attempt_cap: u32,
+    /// The Immich server URL (SPEC R1.1).
+    pub server_url: String,
+    /// The account's email address (SPEC R1.1).
+    pub email: String,
+    /// Whether the credential store holds a password or an API key (R1.5).
+    pub auth_method: AuthMethod,
 }
 
 impl Default for Settings {
@@ -37,6 +45,9 @@ impl Default for Settings {
             concurrency: 4,
             scan_interval_minutes: 30,
             attempt_cap: 8,
+            server_url: String::new(),
+            email: String::new(),
+            auth_method: AuthMethod::Password,
         }
     }
 }
@@ -127,7 +138,7 @@ impl SettingsStore {
     /// Returns an error when the settings directory cannot be created or the
     /// file cannot be written.
     pub fn update(&mut self, change: impl FnOnce(&mut Settings)) -> anyhow::Result<()> {
-        let mut next = self.settings;
+        let mut next = self.settings.clone();
         change(&mut next);
         if next == self.settings {
             return Ok(());
