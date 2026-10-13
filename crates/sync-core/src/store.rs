@@ -61,6 +61,28 @@ CREATE TABLE source_folder (
 );
 ";
 
+/// The fourth schema (issue #7): the attempt log and the dead letter
+/// (R6.5, R6.7, SPEC §5).
+///
+/// `attempt` is the §5 table: one row per upload attempt, with the item it
+/// belongs to, when it started, how it ended, and the failure class. The
+/// `attempts` counter on `sync_item` is what the retry policy reads, so a
+/// restart continues the count instead of starting a fresh budget; a manual
+/// retry resets it. `error_message` is the last user-facing reason, which the
+/// failed-items view shows beside the class.
+const SCHEMA_V4: &str = "
+ALTER TABLE sync_item ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE sync_item ADD COLUMN error_message TEXT;
+CREATE TABLE attempt (
+    id          INTEGER PRIMARY KEY,
+    item_id     INTEGER NOT NULL REFERENCES sync_item(id),
+    started_ns  INTEGER NOT NULL,
+    outcome     TEXT    NOT NULL,
+    error_class TEXT
+);
+CREATE INDEX attempt_item ON attempt(item_id);
+";
+
 /// How long the one writer waits for a competing lock before failing.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -79,6 +101,9 @@ pub enum ItemState {
     FailedPermanent,
     /// A transient failure that a later attempt may resolve (R6.1).
     RetryWait,
+    /// The retry policy gave up after the attempt cap; only a manual retry
+    /// tries again (R6.5).
+    DeadLetter,
 }
 
 impl ItemState {
@@ -92,6 +117,7 @@ impl ItemState {
             Self::Duplicate => "duplicate",
             Self::FailedPermanent => "failed_permanent",
             Self::RetryWait => "retry_wait",
+            Self::DeadLetter => "dead_letter",
         }
     }
 
@@ -106,6 +132,7 @@ impl ItemState {
             "duplicate" => Self::Duplicate,
             "failed_permanent" => Self::FailedPermanent,
             "retry_wait" => Self::RetryWait,
+            "dead_letter" => Self::DeadLetter,
             _ => return None,
         })
     }
@@ -155,6 +182,76 @@ pub struct ItemRecord {
     pub state: ItemState,
     /// The failure class of the last outcome, when it failed (R6.4).
     pub error_class: Option<FailureClass>,
+    /// The last user-facing reason, when the last outcome failed. The
+    /// failed-items view shows it beside the class (R6.5).
+    pub error_message: Option<String>,
+    /// How many automatic upload attempts the item has spent (R6.1). A manual
+    /// retry resets it (R6.5).
+    ///
+    /// [`StateStore::record`] does not write this column, so a pipeline row
+    /// cannot reset a count it did not earn; only
+    /// [`StateStore::record_attempt`] moves it.
+    pub attempts: u32,
+}
+
+/// What one upload attempt produced (SPEC §5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttemptOutcome {
+    /// The item reached a terminal success: created or duplicate (R3.2).
+    Succeeded,
+    /// The attempt failed; the class says why.
+    Failed,
+}
+
+impl AttemptOutcome {
+    /// The exact string the state database stores.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// Parses a stored outcome. Returns `None` for a value this build does not
+    /// know, so a newer build's row is reported instead of guessed at.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        Some(match text {
+            "succeeded" => Self::Succeeded,
+            "failed" => Self::Failed,
+            _ => return None,
+        })
+    }
+}
+
+/// One upload attempt (SPEC §5): the item, its start time, its outcome, and
+/// the failure class.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttemptRecord {
+    /// The item's path, which is how the attempt is addressed.
+    pub path: String,
+    /// When the attempt started, in nanoseconds since the Unix epoch.
+    pub started_ns: i64,
+    /// How the attempt ended.
+    pub outcome: AttemptOutcome,
+    /// The failure class, when the attempt failed (R6.4).
+    pub error_class: Option<FailureClass>,
+}
+
+/// One item the retry policy gave up on, for the failed-items view (R6.5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FailedItem {
+    /// The local path.
+    pub path: String,
+    /// `failed_permanent` or `dead_letter`.
+    pub state: ItemState,
+    /// The last failure class, when one fits (R6.4).
+    pub error_class: Option<FailureClass>,
+    /// The last user-facing reason.
+    pub error_message: Option<String>,
+    /// How many automatic attempts the item spent before it was parked.
+    pub attempts: u32,
 }
 
 /// The pragmas the writer connection runs with, for tests and diagnostics.
@@ -230,6 +327,12 @@ pub enum StoreError {
     /// A row holds a negative size.
     #[error("the state database holds a negative file size")]
     NegativeSize,
+    /// An attempt named an item the store does not hold.
+    #[error("the state database has no item {0} to record an attempt for")]
+    UnknownItem(String),
+    /// A row holds an attempt outcome this build does not know.
+    #[error("the state database holds an unknown attempt outcome {0:?}")]
+    UnknownAttemptOutcome(String),
     /// A thread panicked while holding the writer lock.
     #[error("the state database writer is unusable after a panic")]
     Poisoned,
@@ -376,8 +479,8 @@ impl StateStore {
             .map_err(|source| self.query_error(source))?;
         transaction
             .execute(
-                "INSERT INTO sync_item (path, path_key, size, mtime_ns, sha1, asset_id, state, error_class)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "INSERT INTO sync_item (path, path_key, size, mtime_ns, sha1, asset_id, state, error_class, error_message)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(path_key) DO UPDATE SET
                      path = excluded.path,
                      size = excluded.size,
@@ -385,7 +488,8 @@ impl StateStore {
                      sha1 = excluded.sha1,
                      asset_id = excluded.asset_id,
                      state = excluded.state,
-                     error_class = excluded.error_class",
+                     error_class = excluded.error_class,
+                     error_message = excluded.error_message",
                 params![
                     item.path,
                     key(Path::new(&item.path), case),
@@ -395,6 +499,7 @@ impl StateStore {
                     item.asset_id,
                     item.state.as_str(),
                     item.error_class.map(FailureClass::as_str),
+                    item.error_message,
                 ],
             )
             .map_err(|source| self.query_error(source))?;
@@ -413,7 +518,7 @@ impl StateStore {
         let writer = self.writer()?;
         writer
             .query_row(
-                "SELECT path, size, mtime_ns, sha1, asset_id, state, error_class
+                "SELECT path, size, mtime_ns, sha1, asset_id, state, error_class, error_message, attempts
                  FROM sync_item WHERE path_key = ?1",
                 [path_key(Path::new(path))],
                 read_item,
@@ -436,7 +541,7 @@ impl StateStore {
         let writer = self.writer()?;
         writer
             .query_row(
-                "SELECT path, size, mtime_ns, sha1, asset_id, state, error_class
+                "SELECT path, size, mtime_ns, sha1, asset_id, state, error_class, error_message, attempts
                  FROM sync_item WHERE path_key = ?1",
                 [key(Path::new(path), case)],
                 read_item,
@@ -514,9 +619,12 @@ impl StateStore {
     }
 
     /// Re-queues what a restart interrupted: an `uploading` row becomes
-    /// `pending` again, and every pending path is returned to enqueue (R6.7).
+    /// `pending` again, and a `retry_wait` row returns to the queue with its
+    /// attempt count intact (R6.7). Every pending path is returned to enqueue.
     ///
     /// A completed row is never returned, so a restart cannot re-upload it.
+    /// A `failed_permanent` or `dead_letter` row is not returned either: only
+    /// the manual retry of R6.5 tries those again.
     ///
     /// # Errors
     ///
@@ -529,7 +637,8 @@ impl StateStore {
             .map_err(|source| self.query_error(source))?;
         transaction
             .execute(
-                "UPDATE sync_item SET state = 'pending' WHERE state = 'uploading'",
+                "UPDATE sync_item SET state = 'pending'
+                 WHERE state IN ('uploading', 'retry_wait')",
                 [],
             )
             .map_err(|source| self.query_error(source))?;
@@ -547,6 +656,174 @@ impl StateStore {
             .commit()
             .map_err(|source| self.query_error(source))?;
         Ok(paths)
+    }
+
+    /// Records one upload attempt and returns the item's attempt count after
+    /// it (R6.1, R6.7, SPEC §5).
+    ///
+    /// The counter on the item and the attempt row are written in one
+    /// transaction, so a restart continues the count and the log agrees with
+    /// it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::UnknownItem`] when no item row holds the path,
+    /// and [`StoreError`] when the transaction fails or the lock is poisoned.
+    pub fn record_attempt(&self, attempt: &AttemptRecord) -> Result<u32, StoreError> {
+        let mut writer = self.writer()?;
+        let transaction = writer
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| self.query_error(source))?;
+        let key = path_key(Path::new(&attempt.path));
+        let changed = transaction
+            .execute(
+                "UPDATE sync_item SET attempts = attempts + 1 WHERE path_key = ?1",
+                [&key],
+            )
+            .map_err(|source| self.query_error(source))?;
+        if changed == 0 {
+            return Err(StoreError::UnknownItem(attempt.path.clone()));
+        }
+        let (item_id, attempts): (i64, i64) = transaction
+            .query_row(
+                "SELECT id, attempts FROM sync_item WHERE path_key = ?1",
+                [&key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|source| self.query_error(source))?;
+        transaction
+            .execute(
+                "INSERT INTO attempt (item_id, started_ns, outcome, error_class)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    item_id,
+                    attempt.started_ns,
+                    attempt.outcome.as_str(),
+                    attempt.error_class.map(FailureClass::as_str),
+                ],
+            )
+            .map_err(|source| self.query_error(source))?;
+        transaction
+            .commit()
+            .map_err(|source| self.query_error(source))?;
+        Ok(u32::try_from(attempts).unwrap_or(u32::MAX))
+    }
+
+    /// Every attempt recorded for one item, oldest first (SPEC §5).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the query fails or a row cannot be read.
+    pub fn attempts(&self, path: &str) -> Result<Vec<AttemptRecord>, StoreError> {
+        let writer = self.writer()?;
+        let mut statement = writer
+            .prepare(
+                "SELECT a.started_ns, a.outcome, a.error_class FROM attempt a
+                 JOIN sync_item i ON i.id = a.item_id
+                 WHERE i.path_key = ?1 ORDER BY a.id",
+            )
+            .map_err(|source| self.query_error(source))?;
+        let rows = statement
+            .query_map([path_key(Path::new(path))], |row| {
+                let started_ns: i64 = row.get(0)?;
+                let outcome_text: String = row.get(1)?;
+                let outcome = AttemptOutcome::parse(&outcome_text).ok_or_else(|| {
+                    conversion_error(
+                        1,
+                        rusqlite::types::Type::Text,
+                        StoreError::UnknownAttemptOutcome(outcome_text.clone()),
+                    )
+                })?;
+                let class_text: Option<String> = row.get(2)?;
+                Ok((started_ns, outcome, class_text))
+            })
+            .map_err(|source| self.query_error(source))?;
+        let mut attempts = Vec::new();
+        for row in rows {
+            let (started_ns, outcome, class_text) =
+                row.map_err(|source| self.query_error(source))?;
+            attempts.push(AttemptRecord {
+                path: path.to_string(),
+                started_ns,
+                outcome,
+                error_class: class_text.as_deref().and_then(FailureClass::parse),
+            });
+        }
+        Ok(attempts)
+    }
+
+    /// The items the retry policy gave up on, in path order (R6.5).
+    ///
+    /// A `failed_permanent` row is there because no automatic retry can fix
+    /// it; a `dead_letter` row is there because it spent the attempt cap.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the query fails or a row cannot be read.
+    pub fn failed_items(&self) -> Result<Vec<FailedItem>, StoreError> {
+        let writer = self.writer()?;
+        let mut statement = writer
+            .prepare(
+                "SELECT path, state, error_class, error_message, attempts FROM sync_item
+                 WHERE state IN ('failed_permanent', 'dead_letter') ORDER BY path",
+            )
+            .map_err(|source| self.query_error(source))?;
+        let rows = statement
+            .query_map([], |row| {
+                let state_text: String = row.get(1)?;
+                let state = ItemState::parse(&state_text).ok_or_else(|| {
+                    conversion_error(
+                        1,
+                        rusqlite::types::Type::Text,
+                        StoreError::UnknownState(state_text.clone()),
+                    )
+                })?;
+                let class_text: Option<String> = row.get(2)?;
+                let attempts: i64 = row.get(4)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    state,
+                    class_text,
+                    row.get::<_, Option<String>>(3)?,
+                    attempts,
+                ))
+            })
+            .map_err(|source| self.query_error(source))?;
+        let mut items = Vec::new();
+        for row in rows {
+            let (path, state, class_text, error_message, attempts) =
+                row.map_err(|source| self.query_error(source))?;
+            items.push(FailedItem {
+                path,
+                state,
+                error_class: class_text.as_deref().and_then(FailureClass::parse),
+                error_message,
+                attempts: u32::try_from(attempts).unwrap_or(u32::MAX),
+            });
+        }
+        Ok(items)
+    }
+
+    /// Puts one parked item back in the queue with a fresh attempt budget
+    /// (R6.5). Returns whether a parked row was found.
+    ///
+    /// Only a `failed_permanent` or `dead_letter` row is re-queued: a retry
+    /// must not disturb an item that is already queued or in flight.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the write fails or the lock is poisoned.
+    pub fn retry_item(&self, path: &str) -> Result<bool, StoreError> {
+        let writer = self.writer()?;
+        let changed = writer
+            .execute(
+                "UPDATE sync_item SET state = 'pending', attempts = 0,
+                     error_class = NULL, error_message = NULL
+                 WHERE path_key = ?1 AND state IN ('failed_permanent', 'dead_letter')",
+                [path_key(Path::new(path))],
+            )
+            .map_err(|source| self.query_error(source))?;
+        Ok(changed > 0)
     }
 
     /// The item counts under one source folder, for its dashboard card
@@ -578,7 +855,9 @@ impl StateStore {
             let count = u32::try_from(count).unwrap_or(u32::MAX);
             match ItemState::parse(&state) {
                 Some(ItemState::Uploaded | ItemState::Duplicate) => counts.uploaded += count,
-                Some(ItemState::FailedPermanent | ItemState::RetryWait) => counts.failed += count,
+                Some(ItemState::FailedPermanent | ItemState::RetryWait | ItemState::DeadLetter) => {
+                    counts.failed += count;
+                }
                 // A state a newer build wrote still counts as work in flight,
                 // and an unknown state is not silently dropped.
                 _ => counts.pending += count,
@@ -622,6 +901,7 @@ fn read_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<ItemRecord> {
     // A class a newer build wrote reads as `None`, which is the same as "no
     // known class"; the row is not rejected for it.
     let error_class = class_text.as_deref().and_then(FailureClass::parse);
+    let attempts: i64 = row.get(8)?;
     Ok(ItemRecord {
         path: row.get(0)?,
         size,
@@ -630,6 +910,8 @@ fn read_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<ItemRecord> {
         asset_id: row.get(4)?,
         state,
         error_class,
+        error_message: row.get(7)?,
+        attempts: u32::try_from(attempts).unwrap_or(u32::MAX),
     })
 }
 
@@ -658,6 +940,7 @@ fn migrations() -> Migrations<'static> {
         M::up(SCHEMA_V1),
         M::up_with_hook(SCHEMA_V2, backfill_path_keys),
         M::up(SCHEMA_V3),
+        M::up(SCHEMA_V4),
     ])
 }
 

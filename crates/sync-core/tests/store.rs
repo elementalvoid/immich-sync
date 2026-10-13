@@ -22,6 +22,8 @@ fn record(path: &str, state: ItemState) -> ItemRecord {
         asset_id: Some("asset-1".to_string()),
         state,
         error_class: None,
+        error_message: None,
+        attempts: 0,
     }
 }
 
@@ -230,13 +232,20 @@ fn requeue_unfinished_returns_pending_paths_and_never_completed_ones() {
     let mut parked = record("parked.jpg", ItemState::RetryWait);
     parked.asset_id = None;
     store.record(&parked).expect("write the parked row");
+    store
+        .record(&record("dead.jpg", ItemState::DeadLetter))
+        .expect("write the dead-letter row");
 
     let queued = store.requeue_unfinished().expect("re-queue the unfinished");
 
     assert_eq!(
         queued,
-        vec!["interrupted.jpg".to_string(), "pending.jpg".to_string()],
-        "R6.7: only unfinished paths come back, in path order"
+        vec![
+            "interrupted.jpg".to_string(),
+            "parked.jpg".to_string(),
+            "pending.jpg".to_string(),
+        ],
+        "R6.7: the unfinished paths come back, in path order, with the attempt count kept"
     );
     assert_eq!(
         store
@@ -249,12 +258,211 @@ fn requeue_unfinished_returns_pending_paths_and_never_completed_ones() {
     );
     assert_eq!(
         store
+            .item("dead.jpg")
+            .expect("read")
+            .expect("the row")
+            .state,
+        ItemState::DeadLetter,
+        "R6.5: only a manual retry restarts a dead-letter item"
+    );
+    assert_eq!(
+        store
             .item("uploaded.jpg")
             .expect("read")
             .expect("the row")
             .state,
         ItemState::Uploaded,
         "R6.7: a completed item is never re-queued"
+    );
+}
+
+#[test]
+fn an_attempt_row_and_its_count_survive_a_reopen() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let path = temp.path().join("state.db");
+    let store = StateStore::open(&path).expect("open a fresh store");
+    let mut row = record("hello.txt", ItemState::RetryWait);
+    row.asset_id = None;
+    row.error_class = Some(FailureClass::ServerTransient);
+    row.error_message = Some("the server answered 503".to_string());
+    store.record(&row).expect("write the failed row");
+
+    let first = store
+        .record_attempt(&sync_core::store::AttemptRecord {
+            path: "hello.txt".to_string(),
+            started_ns: 1_700_000_000_000_000_000,
+            outcome: sync_core::store::AttemptOutcome::Failed,
+            error_class: Some(FailureClass::ServerTransient),
+        })
+        .expect("record the first attempt");
+    let second = store
+        .record_attempt(&sync_core::store::AttemptRecord {
+            path: "hello.txt".to_string(),
+            started_ns: 1_700_000_000_000_000_500,
+            outcome: sync_core::store::AttemptOutcome::Succeeded,
+            error_class: None,
+        })
+        .expect("record the second attempt");
+    assert_eq!((first, second), (1, 2), "the counter follows the attempts");
+    drop(store);
+
+    // R6.7, §5: a restart continues the count instead of starting fresh.
+    let reopened = StateStore::open(&path).expect("reopen the store");
+    assert_eq!(
+        reopened
+            .item("hello.txt")
+            .expect("read")
+            .expect("the row")
+            .attempts,
+        2,
+        "the attempt count survived the reopen"
+    );
+    let attempts = reopened.attempts("hello.txt").expect("read the attempts");
+    assert_eq!(attempts.len(), 2, "the attempt log survived the reopen");
+    assert_eq!(
+        attempts[0].outcome,
+        sync_core::store::AttemptOutcome::Failed
+    );
+    assert_eq!(attempts[0].error_class, Some(FailureClass::ServerTransient));
+    assert_eq!(attempts[0].started_ns, 1_700_000_000_000_000_000);
+    assert_eq!(
+        attempts[1].outcome,
+        sync_core::store::AttemptOutcome::Succeeded
+    );
+    assert_eq!(attempts[1].error_class, None);
+}
+
+#[test]
+fn recording_an_attempt_for_an_unknown_item_is_an_error() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+
+    let error = store
+        .record_attempt(&sync_core::store::AttemptRecord {
+            path: "never-seen.txt".to_string(),
+            started_ns: 1,
+            outcome: sync_core::store::AttemptOutcome::Failed,
+            error_class: None,
+        })
+        .expect_err("an attempt needs an item");
+
+    assert!(
+        matches!(error, sync_core::store::StoreError::UnknownItem(_)),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn the_failed_items_view_lists_the_parked_rows_with_their_reason() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    let mut dead = record("dead.bin", ItemState::DeadLetter);
+    dead.asset_id = None;
+    dead.error_class = Some(FailureClass::ServerTransient);
+    dead.error_message = Some("the server answered 503".to_string());
+    store.record(&dead).expect("write the dead-letter row");
+    // The count comes from the attempt log, which is what the retry policy
+    // reads after a restart (R6.7).
+    for index in 0..8 {
+        store
+            .record_attempt(&sync_core::store::AttemptRecord {
+                path: "dead.bin".to_string(),
+                started_ns: 1_700_000_000_000_000_000 + index,
+                outcome: sync_core::store::AttemptOutcome::Failed,
+                error_class: Some(FailureClass::ServerTransient),
+            })
+            .expect("record the attempt");
+    }
+    let mut permanent = record("permanent.bin", ItemState::FailedPermanent);
+    permanent.asset_id = None;
+    permanent.error_class = Some(FailureClass::UnsupportedFormat);
+    permanent.error_message = Some("the server does not accept this file format".to_string());
+    store.record(&permanent).expect("write the permanent row");
+    store
+        .record(&record("done.jpg", ItemState::Uploaded))
+        .expect("write a completed row");
+    store
+        .record(&record("waiting.jpg", ItemState::RetryWait))
+        .expect("write a retrying row");
+
+    let failed = store.failed_items().expect("read the failed items");
+
+    assert_eq!(
+        failed
+            .iter()
+            .map(|item| item.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["dead.bin", "permanent.bin"],
+        "R6.5: the parked items, in path order, and nothing else"
+    );
+    assert_eq!(failed[0].state, ItemState::DeadLetter);
+    assert_eq!(failed[0].attempts, 8);
+    assert_eq!(failed[0].error_class, Some(FailureClass::ServerTransient));
+    assert_eq!(
+        failed[0].error_message.as_deref(),
+        Some("the server answered 503"),
+        "the view shows the last error beside the class"
+    );
+    assert_eq!(failed[1].error_class, Some(FailureClass::UnsupportedFormat));
+}
+
+#[test]
+fn a_manual_retry_requeues_a_parked_item_with_a_fresh_budget() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    let mut dead = record("dead.bin", ItemState::DeadLetter);
+    dead.asset_id = None;
+    dead.error_class = Some(FailureClass::ServerTransient);
+    dead.error_message = Some("the server answered 503".to_string());
+    store.record(&dead).expect("write the dead-letter row");
+    // The count comes from the attempt log, which is what the retry policy
+    // reads after a restart (R6.7).
+    for index in 0..8 {
+        store
+            .record_attempt(&sync_core::store::AttemptRecord {
+                path: "dead.bin".to_string(),
+                started_ns: 1_700_000_000_000_000_000 + index,
+                outcome: sync_core::store::AttemptOutcome::Failed,
+                error_class: Some(FailureClass::ServerTransient),
+            })
+            .expect("record the attempt");
+    }
+    store
+        .record(&record("done.jpg", ItemState::Uploaded))
+        .expect("write a completed row");
+
+    assert!(
+        store.retry_item("dead.bin").expect("retry the item"),
+        "R6.5: the parked item was found"
+    );
+    let row = store.item("dead.bin").expect("read").expect("the row");
+    assert_eq!(row.state, ItemState::Pending, "it is queued again");
+    assert_eq!(row.attempts, 0, "the manual retry grants a fresh budget");
+    assert_eq!(row.error_class, None);
+    assert_eq!(row.error_message, None);
+    assert_eq!(
+        store.attempts("dead.bin").expect("read the attempts").len(),
+        8,
+        "the attempt log is history and survives a manual retry"
+    );
+    assert!(
+        !store.retry_item("dead.bin").expect("retry again"),
+        "a queued item is not re-queued twice"
+    );
+    assert!(
+        !store
+            .retry_item("done.jpg")
+            .expect("retry a completed item"),
+        "a completed item is not a failed one"
+    );
+    assert_eq!(
+        store
+            .item("done.jpg")
+            .expect("read")
+            .expect("the row")
+            .state,
+        ItemState::Uploaded,
+        "a completed item is untouched"
     );
 }
 
@@ -276,6 +484,7 @@ fn folder_counts_bucket_the_states() {
         ("c.jpg", ItemState::Pending),
         ("d.jpg", ItemState::FailedPermanent),
         ("e.jpg", ItemState::RetryWait),
+        ("f.jpg", ItemState::DeadLetter),
     ] {
         store.record(&path(name, state)).expect("write the row");
     }
@@ -293,5 +502,5 @@ fn folder_counts_bucket_the_states() {
 
     assert_eq!(counts.uploaded, 2);
     assert_eq!(counts.pending, 1);
-    assert_eq!(counts.failed, 2);
+    assert_eq!(counts.failed, 3, "a dead-letter item counts as failed");
 }
