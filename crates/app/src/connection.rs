@@ -253,10 +253,22 @@ impl ConnectionModel {
     }
 }
 
-/// Records a sign-in outcome. The state holds no secret, and the reason is the
-/// user-facing message, so the line is safe to write (R10.3, N3).
+/// Records a sign-in outcome. The state holds no secret, and a locally
+/// classified reason is safe to write; a server-supplied message is not,
+/// because a broken or hostile server can echo a submitted credential in it
+/// (R10.3, N3).
 fn log_outcome(state: &ConnectionState) {
     match state {
+        ConnectionState::NeedsAttention(Attention::Server(_)) => tracing::warn!(
+            state = state.summary(),
+            reason = "the server answered an error",
+            "sign-in outcome"
+        ),
+        ConnectionState::NeedsAttention(Attention::Unreachable(_)) => tracing::warn!(
+            state = state.summary(),
+            reason = "the server could not be reached",
+            "sign-in outcome"
+        ),
         ConnectionState::NeedsAttention(attention) => tracing::warn!(
             state = state.summary(),
             reason = %attention.message(),

@@ -22,7 +22,7 @@ use tracing::Subscriber;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::Registry;
-use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::filter::{LevelFilter, Targets};
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::reload;
 
@@ -176,11 +176,23 @@ pub fn set_level(level: LogLevel) {
     }
 }
 
+/// The subscriber filter: the app's own crates log at `level`, and every
+/// dependency is held at `error`, because `zbus` logs the same harmless D-Bus
+/// portal failure at `warn` on every proxy and would still bury app
+/// diagnostics.
+fn targets(level: LogLevel) -> Targets {
+    Targets::new()
+        .with_default(LevelFilter::ERROR)
+        .with_target("immich_sync", level.filter())
+        .with_target("immich_client", level.filter())
+        .with_target("sync_core", level.filter())
+}
+
 /// A handle to the running subscriber: where it writes, and how to change its
 /// level.
 #[derive(Clone)]
 pub struct LogControl {
-    reload: reload::Handle<LevelFilter, Registry>,
+    reload: reload::Handle<Targets, Registry>,
     directory: PathBuf,
 }
 
@@ -197,10 +209,12 @@ impl LogControl {
     ///
     /// Returns an error when the subscriber was dropped.
     pub fn set_level(&self, level: LogLevel) -> anyhow::Result<()> {
-        self.reload
-            .reload(level.filter())
-            .context("apply the log level")?;
+        // Recorded under the level that is still active: the new level would
+        // filter this line out.
         tracing::info!(level = level.as_str(), "log level changed");
+        self.reload
+            .reload(targets(level))
+            .context("apply the log level")?;
         Ok(())
     }
 }
@@ -231,7 +245,7 @@ impl LogSink {
             .build(directory)
             .with_context(|| format!("create the log file in {}", directory.display()))?;
         let (writer, guard) = tracing_appender::non_blocking(appender);
-        let (filter, reload) = reload::Layer::new(level.filter());
+        let (filter, reload) = reload::Layer::new(targets(level));
         let subscriber = tracing_subscriber::registry().with(filter).with(
             tracing_subscriber::fmt::layer()
                 .with_writer(writer)

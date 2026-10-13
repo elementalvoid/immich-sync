@@ -394,8 +394,9 @@ impl SettingsView {
     ///
     /// # Errors
     ///
-    /// Returns an error when the settings file cannot be written. The level
-    /// still applies live, so the session honours the choice either way.
+    /// Returns an error when the settings file cannot be written. The running
+    /// level then keeps its last saved value, so the subscriber, the settings
+    /// file, and the level the view shows never disagree.
     pub fn set_log_level(&mut self, level: LogLevel, cx: &mut Context<Self>) -> anyhow::Result<()> {
         let result = self.store.update(|settings| settings.log_level = level);
         if result.is_ok() {

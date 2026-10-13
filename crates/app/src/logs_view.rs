@@ -129,12 +129,12 @@ impl LogsView {
                 .child(field_text(label, help, &palette))
                 .child(
                     div().flex_1().min_w_0().text_right().child(
+                        // Wrapped, not truncated: the whole path stays visible.
                         div()
                             .id(value_id)
                             .test_support()
                             .aria_label(value.clone())
                             .min_w_0()
-                            .truncate()
                             .font_family(theme.mono_font_family.clone())
                             .text_xs()
                             .text_color(palette.meta)
