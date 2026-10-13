@@ -7,3 +7,11 @@
 
 pub mod connection;
 pub mod credential;
+pub mod failure;
+pub mod hash;
+pub mod store;
+pub mod upload;
+
+// Re-exported so the shell can hand the engine the client it holds without
+// depending on the HTTP client crate directly.
+pub use immich_client::ImmichClient;

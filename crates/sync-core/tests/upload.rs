@@ -1,0 +1,369 @@
+//! The one-file pipeline against the offline Immich double (R3.1, R3.2, R4.5).
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::UNIX_EPOCH;
+
+use immich_client::ImmichClient;
+use mock_immich::{Fault, MockImmich, Operation};
+use sync_core::connection::{AuthMethod, Connection, RequestCredential, Secret, SignIn};
+use sync_core::credential::MemoryCredentialStore;
+use sync_core::failure::{FailureClass, FailureKind};
+use sync_core::hash::Sha1;
+use sync_core::store::{ItemState, StateStore};
+use sync_core::upload::{UploadOutcome, Uploader};
+
+/// `sha1("hello world")`, hex.
+const HELLO_WORLD_SHA1_HEX: &str = "2aae6c35c94fcfb415dbe95f408b9ce91ee846ed";
+
+/// A fixture file whose bytes have a known digest.
+fn hello_world_file(directory: &Path, name: &str) -> PathBuf {
+    let path = directory.join(name);
+    std::fs::write(&path, b"hello world").expect("write the fixture");
+    path
+}
+
+async fn uploader(
+    server: &MockImmich,
+) -> (
+    Uploader,
+    RequestCredential,
+    Arc<StateStore>,
+    tempfile::TempDir,
+) {
+    let client = ImmichClient::new(server.base_url()).expect("a valid mock URL");
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = Arc::new(
+        StateStore::open(temp.path().join("data").join("state.db")).expect("open the store"),
+    );
+    let mut connection = Connection::new(server.base_url(), Arc::new(MemoryCredentialStore::new()))
+        .expect("a valid URL");
+    connection
+        .sign_in(SignIn {
+            email: "sync@example.com".to_string(),
+            secret: Secret::new("correct horse"),
+            method: AuthMethod::Password,
+        })
+        .await;
+    let credential = connection
+        .credential()
+        .expect("a signed-in session")
+        .clone();
+    (
+        Uploader::new(client, store.clone()),
+        credential,
+        store,
+        temp,
+    )
+}
+
+/// The mtime the filesystem reports, converted independently of the pipeline.
+fn expected_mtime_ns(path: &Path) -> i64 {
+    let modified = std::fs::metadata(path)
+        .expect("read the fixture metadata")
+        .modified()
+        .expect("the platform reports a modification time");
+    i64::try_from(
+        modified
+            .duration_since(UNIX_EPOCH)
+            .expect("the fixture is newer than 1970")
+            .as_nanos(),
+    )
+    .expect("the mtime fits an i64")
+}
+
+fn success_asset_id(outcome: &UploadOutcome) -> &str {
+    match outcome {
+        UploadOutcome::Created { asset_id } | UploadOutcome::Duplicate { asset_id } => asset_id,
+        other => panic!("expected a success, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn uploading_a_new_file_returns_created_and_records_the_row() {
+    let server = MockImmich::start().await;
+    let (uploader, credential, store, temp) = uploader(&server).await;
+    let path = hello_world_file(temp.path(), "hello.txt");
+
+    let outcome = uploader.upload_one(&path, &credential).await;
+
+    let UploadOutcome::Created { asset_id } = &outcome else {
+        panic!("expected created, got {outcome:?}");
+    };
+    assert!(!asset_id.is_empty(), "R3.6: success carries the asset id");
+    let row = store
+        .item(&path.display().to_string())
+        .expect("read the row")
+        .expect("the upload was recorded");
+    assert_eq!(row.path, path.display().to_string());
+    assert_eq!(row.size, 11, "the row holds the file size");
+    assert_eq!(
+        row.mtime_ns,
+        expected_mtime_ns(&path),
+        "the row holds the file mtime"
+    );
+    assert_eq!(
+        row.sha1,
+        Sha1::from_hex(HELLO_WORLD_SHA1_HEX).expect("a hex SHA-1"),
+        "the row holds the file's SHA-1 literal"
+    );
+    assert_eq!(row.asset_id.as_deref(), Some(asset_id.as_str()));
+    assert_eq!(row.state, ItemState::Uploaded);
+    assert_eq!(row.error_class, None);
+    assert_eq!(server.upload_requests(), 1);
+}
+
+#[tokio::test]
+async fn the_same_file_again_is_a_duplicate_and_transfers_no_body() {
+    let server = MockImmich::start().await;
+    let (uploader, credential, store, temp) = uploader(&server).await;
+    let path = hello_world_file(temp.path(), "hello.txt");
+    let first = uploader.upload_one(&path, &credential).await;
+
+    let second = uploader.upload_one(&path, &credential).await;
+
+    let UploadOutcome::Duplicate { asset_id } = &second else {
+        panic!("expected a duplicate, got {second:?}");
+    };
+    assert_eq!(
+        asset_id,
+        success_asset_id(&first),
+        "the same asset is reported"
+    );
+    assert_eq!(
+        server.upload_requests(),
+        1,
+        "R4.5: an unchanged SHA-1 must not transfer a body again"
+    );
+    assert_eq!(
+        server.bulk_check_requests(),
+        1,
+        "the local row short-circuits even the check"
+    );
+    let row = store
+        .item(&path.display().to_string())
+        .expect("read the row")
+        .expect("the row exists");
+    assert_eq!(row.state, ItemState::Uploaded, "the successful row is kept");
+}
+
+#[tokio::test]
+async fn an_unchanged_file_that_was_touched_does_not_upload_again() {
+    let server = MockImmich::start().await;
+    let (uploader, credential, _store, temp) = uploader(&server).await;
+    let path = hello_world_file(temp.path(), "hello.txt");
+    uploader.upload_one(&path, &credential).await;
+
+    // Same bytes, new mtime: the decision must come from the SHA-1, not the
+    // metadata (R4.5).
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(&path, b"hello world").expect("rewrite the same bytes");
+    let outcome = uploader.upload_one(&path, &credential).await;
+
+    assert!(
+        matches!(outcome, UploadOutcome::Duplicate { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(server.upload_requests(), 1);
+}
+
+#[tokio::test]
+async fn content_the_server_already_has_is_a_duplicate_without_a_second_upload() {
+    let server = MockImmich::start().await;
+    let (uploader, credential, store, temp) = uploader(&server).await;
+    let first_path = hello_world_file(temp.path(), "first.txt");
+    let second_path = hello_world_file(temp.path(), "second.txt");
+    let first = uploader.upload_one(&first_path, &credential).await;
+
+    let second = uploader.upload_one(&second_path, &credential).await;
+
+    let UploadOutcome::Duplicate { asset_id } = &second else {
+        panic!("expected the server's duplicate answer, got {second:?}");
+    };
+    assert_eq!(asset_id, success_asset_id(&first));
+    assert_eq!(
+        server.upload_requests(),
+        1,
+        "a rejected checksum must not upload"
+    );
+    let row = store
+        .item(&second_path.display().to_string())
+        .expect("read the row")
+        .expect("the duplicate was recorded");
+    assert_eq!(row.state, ItemState::Duplicate);
+    assert_eq!(row.asset_id.as_deref(), Some(asset_id.as_str()));
+}
+
+#[tokio::test]
+async fn a_415_is_exactly_one_permanent_failure_and_no_retry() {
+    let server = MockImmich::start().await;
+    server.fail(Operation::Upload, Fault::UnsupportedFormat);
+    let (uploader, credential, store, temp) = uploader(&server).await;
+    let path = hello_world_file(temp.path(), "hello.bin");
+
+    let outcome = uploader.upload_one(&path, &credential).await;
+
+    let UploadOutcome::Failed(failure) = &outcome else {
+        panic!("expected a failure, got {outcome:?}");
+    };
+    assert_eq!(failure.class, Some(FailureClass::UnsupportedFormat));
+    assert_eq!(failure.kind, FailureKind::Permanent);
+    assert_eq!(
+        server.upload_requests(),
+        1,
+        "a permanent failure must not retry (R6.3)"
+    );
+    let row = store
+        .item(&path.display().to_string())
+        .expect("read the row")
+        .expect("the failure was recorded");
+    assert_eq!(row.state, ItemState::FailedPermanent);
+    assert_eq!(row.error_class, Some(FailureClass::UnsupportedFormat));
+    assert_eq!(row.asset_id, None);
+    assert_eq!(row.sha1.hex(), HELLO_WORLD_SHA1_HEX);
+}
+
+#[tokio::test]
+async fn a_rejected_unsupported_format_never_uploads() {
+    let server = MockImmich::start().await;
+    server.reject_format(
+        Sha1::from_hex(HELLO_WORLD_SHA1_HEX)
+            .expect("a hex SHA-1")
+            .base64()
+            .as_str(),
+    );
+    let (uploader, credential, store, temp) = uploader(&server).await;
+    let path = hello_world_file(temp.path(), "hello.bin");
+
+    let outcome = uploader.upload_one(&path, &credential).await;
+
+    let UploadOutcome::Failed(failure) = &outcome else {
+        panic!("expected a failure, got {outcome:?}");
+    };
+    assert_eq!(failure.class, Some(FailureClass::UnsupportedFormat));
+    assert_eq!(server.upload_requests(), 0, "the check refused it first");
+    let row = store
+        .item(&path.display().to_string())
+        .expect("read the row")
+        .expect("the failure was recorded");
+    assert_eq!(row.state, ItemState::FailedPermanent);
+    assert_eq!(row.error_class, Some(FailureClass::UnsupportedFormat));
+}
+
+#[tokio::test]
+async fn a_transient_server_failure_waits_for_a_later_attempt() {
+    let server = MockImmich::start().await;
+    server.fail(
+        Operation::Upload,
+        Fault::Status {
+            code: 503,
+            retry_after: None,
+        },
+    );
+    let (uploader, credential, store, temp) = uploader(&server).await;
+    let path = hello_world_file(temp.path(), "hello.txt");
+
+    let outcome = uploader.upload_one(&path, &credential).await;
+
+    let UploadOutcome::Failed(failure) = &outcome else {
+        panic!("expected a failure, got {outcome:?}");
+    };
+    assert_eq!(failure.class, Some(FailureClass::ServerTransient));
+    assert_eq!(failure.kind, FailureKind::Transient);
+    let row = store
+        .item(&path.display().to_string())
+        .expect("read the row")
+        .expect("the failure was recorded");
+    assert_eq!(row.state, ItemState::RetryWait);
+    assert_eq!(row.error_class, Some(FailureClass::ServerTransient));
+}
+
+#[tokio::test]
+async fn a_missing_file_is_a_local_read_error_and_writes_no_row() {
+    let server = MockImmich::start().await;
+    let (uploader, credential, store, temp) = uploader(&server).await;
+    let path = temp.path().join("missing.txt");
+
+    let outcome = uploader.upload_one(&path, &credential).await;
+
+    let UploadOutcome::Failed(failure) = &outcome else {
+        panic!("expected a failure, got {outcome:?}");
+    };
+    assert_eq!(failure.class, Some(FailureClass::LocalReadError));
+    assert_eq!(
+        store.item(&path.display().to_string()).expect("read"),
+        None,
+        "a file that was never hashed leaves no row"
+    );
+    assert_eq!(server.upload_requests(), 0);
+}
+
+#[tokio::test]
+async fn a_failed_row_is_attempted_again_instead_of_short_circuiting() {
+    let server = MockImmich::start().await;
+    server.fail(Operation::Upload, Fault::UnsupportedFormat);
+    let (uploader, credential, _store, temp) = uploader(&server).await;
+    let path = hello_world_file(temp.path(), "hello.bin");
+    let first = uploader.upload_one(&path, &credential).await;
+    assert!(matches!(first, UploadOutcome::Failed(_)), "{first:?}");
+
+    // The fault is consumed; a later run (a manual retry, in #7) must try
+    // again rather than report the failed row as a duplicate.
+    let second = uploader.upload_one(&path, &credential).await;
+
+    assert!(
+        matches!(second, UploadOutcome::Created { .. }),
+        "the retry uploads: {second:?}"
+    );
+    assert_eq!(server.upload_requests(), 2);
+}
+
+#[tokio::test]
+async fn a_revoked_token_is_a_permanent_auth_failure() {
+    let server = MockImmich::start().await;
+    server.fail(
+        Operation::BulkUploadCheck,
+        Fault::Status {
+            code: 401,
+            retry_after: None,
+        },
+    );
+    let (uploader, credential, store, temp) = uploader(&server).await;
+    let path = hello_world_file(temp.path(), "hello.txt");
+
+    let outcome = uploader.upload_one(&path, &credential).await;
+
+    let UploadOutcome::Failed(failure) = &outcome else {
+        panic!("expected a failure, got {outcome:?}");
+    };
+    assert_eq!(failure.class, Some(FailureClass::AuthFailed));
+    assert_eq!(failure.kind, FailureKind::Permanent);
+    let row = store
+        .item(&path.display().to_string())
+        .expect("read the row")
+        .expect("the failure was recorded");
+    assert_eq!(row.state, ItemState::FailedPermanent);
+}
+
+#[tokio::test]
+async fn a_checksum_the_server_never_answers_for_is_permanent() {
+    let server = MockImmich::start().await;
+    server.fail(
+        Operation::BulkUploadCheck,
+        Fault::Status {
+            code: 200,
+            retry_after: None,
+        },
+    );
+    let (uploader, credential, _store, temp) = uploader(&server).await;
+    let path = hello_world_file(temp.path(), "hello.txt");
+
+    let outcome = uploader.upload_one(&path, &credential).await;
+
+    // A 200 with no usable body is a protocol failure, not a transport one.
+    let UploadOutcome::Failed(failure) = &outcome else {
+        panic!("expected a failure, got {outcome:?}");
+    };
+    assert_eq!(failure.kind, FailureKind::Permanent);
+    assert_eq!(server.upload_requests(), 0);
+}
