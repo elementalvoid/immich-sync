@@ -2,9 +2,11 @@
 //!
 //! `cx.quit()` and the tray icon are platform effects that a headless test
 //! cannot observe, so those are checked by the probe and the GUI smoke job.
+//! The state-to-tooltip mapping is pure, so it is tested here.
 
 use gpui_kit::{Action, MenuItem, TestAppContext};
 use immich_sync::shell::{self, Hide, Show};
+use sync_core::connection::{Attention, ConnectionState};
 
 fn boot(cx: &mut TestAppContext) {
     cx.update(|cx| {
@@ -86,5 +88,33 @@ fn tray_menu_labels_match_their_actions() {
     assert!(
         matches!(items[2], MenuItem::Separator),
         "a separator divides the window actions from Quit"
+    );
+}
+
+#[test]
+fn the_tray_tooltip_shows_every_connection_state() {
+    let not_configured = shell::tray_tooltip(&ConnectionState::NotConfigured);
+    assert!(not_configured.contains("Immich Sync"), "{not_configured}");
+    assert!(not_configured.contains("Not signed in"), "{not_configured}");
+
+    assert!(
+        shell::tray_tooltip(&ConnectionState::Connecting).contains("Signing in"),
+        "the connecting state is shown"
+    );
+    assert!(
+        shell::tray_tooltip(&ConnectionState::Connected).contains("Connected"),
+        "the connected state is shown"
+    );
+}
+
+#[test]
+fn the_needs_attention_tooltip_carries_the_reason() {
+    let state = ConnectionState::NeedsAttention(Attention::Rejected);
+
+    let tooltip = shell::tray_tooltip(&state);
+    assert!(tooltip.contains("Needs attention"), "{tooltip}");
+    assert!(
+        tooltip.contains("refused the session again"),
+        "a second 401 must be visible without the window open: {tooltip}"
     );
 }

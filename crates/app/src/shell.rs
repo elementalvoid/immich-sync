@@ -9,7 +9,7 @@ use gpui_tray::{Icon, Tray};
 use crate::connection::ConnectionModel;
 use crate::dashboard::Dashboard;
 use crate::settings_view::SettingsView;
-use sync_core::connection::ServerProfile;
+use sync_core::connection::{ConnectionState, ServerProfile};
 
 actions!(immich_sync, [Show, Hide, Quit]);
 
@@ -119,14 +119,18 @@ impl AppShell {
     ) -> Self {
         let subscription = cx.observe(&connection, |this, connection, cx| {
             let summary = connection.read(cx).summary();
+            let state = connection.read(cx).state().clone();
             this.dashboard.update(cx, |dashboard, cx| {
                 dashboard.set_connection(Some(summary), cx)
             });
+            show_connection_on_tray(&state, cx);
         });
         let summary = connection.read(cx).summary();
+        let state = connection.read(cx).state().clone();
         dashboard.update(cx, |dashboard, cx| {
             dashboard.set_connection(Some(summary), cx);
         });
+        show_connection_on_tray(&state, cx);
         Self {
             mode: ViewMode::Dashboard,
             dashboard,
@@ -237,6 +241,26 @@ pub fn tray_menu() -> Vec<MenuItem> {
         MenuItem::separator(),
         MenuItem::action("Quit", Quit),
     ]
+}
+
+/// The tray tooltip for one connection state (R1.4).
+///
+/// The full message, not just the summary, so a needs-attention state shows its
+/// reason from the tray when the window is behind another one.
+#[must_use]
+pub fn tray_tooltip(state: &ConnectionState) -> String {
+    format!("Immich Sync — {}", state.message())
+}
+
+/// Shows a connection state on the tray tooltip, when a tray is installed.
+///
+/// The tray can be absent (a desktop without one, or a failed install), so a
+/// missing tray is not an error.
+pub fn show_connection_on_tray(state: &ConnectionState, cx: &mut App) {
+    let Some(tray) = cx.try_global::<TrayHandle>().map(|handle| handle.0.clone()) else {
+        return;
+    };
+    let _ = tray.set_tooltip(Some(tray_tooltip(state)), cx);
 }
 
 /// A solid circular tray icon, drawn in code so the shell needs no asset.
