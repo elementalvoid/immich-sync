@@ -1,0 +1,372 @@
+//! Headless tests for the manual upload view (issue #5, R3.1, R3.2, R3.6, R4.5).
+//!
+//! The view is driven through its real controls: the path field, the button,
+//! and the result notice the window renders.
+
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+
+use gpui_kit::test::TestAppContextExt as _;
+use gpui_kit::test::TestWindowExt as _;
+use gpui_kit::{
+    AnyWindowHandle, App, AppContext as _, Bounds, ElementId, Entity, Point, Role, TestAppContext,
+    Window, WindowBounds, WindowOptions, px, size,
+};
+use immich_sync::connection::ConnectionModel;
+use immich_sync::paths::AppPaths;
+use immich_sync::upload::UploadReport;
+use immich_sync::upload_view::UploadView;
+use mock_immich::MockImmich;
+use sync_core::connection::{AuthMethod, Secret, ServerProfile, SignIn};
+use sync_core::credential::{MemoryCredentialStore, SharedCredentialStore};
+use sync_core::failure::FailureClass;
+use sync_core::store::StateStore;
+
+/// The path layout the settings view uses, so the upload uses a temp database.
+fn temporary_paths(dir: &Path) -> AppPaths {
+    AppPaths {
+        config_file: dir.join("config").join("settings.toml"),
+        state_db: dir.join("data").join("state.db"),
+        autostart_dir: dir.join("config").join("autostart"),
+    }
+}
+
+fn window_options() -> WindowOptions {
+    WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds {
+            origin: Point::default(),
+            size: size(px(1200.), px(800.)),
+        })),
+        ..Default::default()
+    }
+}
+
+/// Starts the offline Immich double on its own runtime.
+fn mock_server() -> (tokio::runtime::Runtime, MockImmich) {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("start the mock runtime");
+    let server = runtime.block_on(MockImmich::start());
+    (runtime, server)
+}
+
+/// A connection model signed in to `server`, with an in-memory credential
+/// store. The test waits for the sign-in to finish.
+fn connected_model(cx: &mut TestAppContext, server: &MockImmich) -> Entity<ConnectionModel> {
+    let credentials: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+    let profile = ServerProfile {
+        server_url: server.base_url().to_string(),
+        email: "sync@example.com".to_string(),
+        method: AuthMethod::Password,
+    };
+    cx.update(|cx| {
+        let request = SignIn {
+            email: profile.email.clone(),
+            secret: Secret::new("correct horse"),
+            method: AuthMethod::Password,
+        };
+        let connection = cx.new(|_| ConnectionModel::new(profile.clone(), credentials));
+        connection.update(cx, |model, cx| model.sign_in(request, profile, cx));
+        connection
+    })
+}
+
+/// Opens the upload view over a model for `paths`.
+fn open_upload(
+    cx: &mut TestAppContext,
+    paths: &AppPaths,
+    connection: Entity<ConnectionModel>,
+) -> AnyWindowHandle {
+    let paths = paths.clone();
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        gpui_kit::open_window(window_options(), cx, |window, cx| {
+            let model =
+                cx.new(|_| immich_sync::upload::UploadModel::new(connection.clone(), &paths));
+            cx.new(|cx| UploadView::new(model, window, cx))
+        })
+        .expect("open the upload window")
+        .0
+    })
+}
+
+/// Moves focus to the next tab stop, as the Root's Tab binding does.
+fn tab(window: &mut Window, cx: &mut App) {
+    window.focus_next(cx);
+    window.render_frame(cx);
+}
+
+/// Tabs until `id` holds the keyboard focus.
+fn tab_to(window: &mut Window, id: &'static str, cx: &mut App) {
+    for _ in 0..16 {
+        if window.find(id).focused() == Some(true) {
+            return;
+        }
+        tab(window, cx);
+    }
+    assert_eq!(
+        window.find(id).focused(),
+        Some(true),
+        "{id} is not keyboard reachable"
+    );
+}
+
+/// The text input the kit nests inside the row `id`.
+fn row_text_input(
+    window: &Window,
+    id: &'static str,
+) -> gpui_kit::base::test_support::ElementSnapshot {
+    gpui_kit::base::test_support::snapshots(window)
+        .into_iter()
+        .find(|snapshot| {
+            snapshot.role() == Some(Role::TextInput)
+                && snapshot.path().contains(&ElementId::Name(id.into()))
+        })
+        .expect("a text input inside the row")
+}
+
+#[test]
+fn the_report_text_names_the_asset_id_the_duplicate_and_the_class() {
+    let created = UploadReport::Created {
+        asset_id: "abc-123".to_string(),
+    };
+    assert_eq!(created.headline(), "Uploaded");
+    assert!(
+        created.message().contains("abc-123"),
+        "{}",
+        created.message()
+    );
+
+    let duplicate = UploadReport::Duplicate {
+        asset_id: "abc-123".to_string(),
+    };
+    assert_eq!(duplicate.headline(), "Duplicate");
+    assert!(duplicate.message().contains("duplicate"));
+    assert!(
+        duplicate.message().contains("Nothing was transferred"),
+        "the duplicate is explicit: {}",
+        duplicate.message()
+    );
+
+    let permanent = UploadReport::Failed {
+        class: Some(FailureClass::UnsupportedFormat),
+        permanent: true,
+        message: "the server does not accept this file format".to_string(),
+    };
+    assert_eq!(permanent.headline(), "Permanent error");
+    assert!(
+        permanent.message().contains("unsupported_format"),
+        "the permanent class is shown: {}",
+        permanent.message()
+    );
+
+    let transient = UploadReport::Failed {
+        class: Some(FailureClass::ServerTransient),
+        permanent: false,
+        message: "the server answered 503".to_string(),
+    };
+    assert_eq!(transient.headline(), "Temporary error");
+    assert!(transient.message().contains("server_transient"));
+
+    assert!(!UploadReport::Idle.is_busy());
+    assert!(UploadReport::Running.is_busy());
+}
+
+#[gpui_kit::test]
+fn the_upload_view_names_its_controls(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let connection = cx.update(|cx| {
+        let store: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+        cx.new(|_| ConnectionModel::new(ServerProfile::default(), store))
+    });
+    let window = open_upload(cx, &paths, connection);
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("upload-path").label(),
+            Some("File path"),
+            "the row carries the field name"
+        );
+        assert_eq!(
+            row_text_input(window, "upload-path").label(),
+            Some("File path"),
+            "the text field is named for assistive technology"
+        );
+        assert_eq!(window.find("upload-button").label(), Some("Upload"));
+        let result = window.find("upload-result");
+        assert_eq!(result.role(), Some(Role::Alert), "the result is announced");
+        assert_eq!(
+            result.label(),
+            Some(UploadReport::Idle.message().as_str()),
+            "the notice states the current outcome"
+        );
+    })
+    .expect("update the upload window");
+}
+
+#[gpui_kit::test]
+async fn uploading_a_file_shows_the_asset_id_and_a_repeat_shows_the_duplicate(
+    cx: &mut TestAppContext,
+) {
+    let (_runtime, server) = mock_server();
+    // The sign-in and the upload results arrive from the HTTP worker thread.
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let connection = connected_model(cx, &server);
+    let window = open_upload(cx, &paths, connection.clone());
+    cx.wait_for(window, Duration::from_secs(60), |_, cx| {
+        connection.read(cx).state().is_connected()
+    })
+    .await;
+
+    let file = temp.path().join("hello.txt");
+    std::fs::write(&file, b"hello world").expect("write the fixture");
+    let path_text = file.display().to_string();
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        tab_to(window, "upload-path", cx);
+        window.input(&path_text, cx);
+        assert_eq!(
+            row_text_input(window, "upload-path").value(),
+            Some(path_text.as_str()),
+            "the path field holds the typed path"
+        );
+        window.click("upload-button", cx);
+    })
+    .expect("fill in the path and click Upload");
+    cx.wait_for(window, Duration::from_secs(60), |window, _| {
+        window.find("upload-result").label().is_some_and(|label| {
+            !label.starts_with("Uploading") && label != "No file has been uploaded yet."
+        })
+    })
+    .await;
+    let first_label = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window
+                .find("upload-result")
+                .label()
+                .expect("the result")
+                .to_string()
+        })
+        .expect("read the result");
+    assert!(
+        first_label.starts_with("Uploaded"),
+        "the upload finished: {first_label}"
+    );
+
+    // The row the pipeline wrote holds the asset id the notice shows.
+    let store = StateStore::open(paths.state_db.clone()).expect("open the state database");
+    let row = store
+        .item(&path_text)
+        .expect("read the row")
+        .expect("the upload was recorded");
+    let asset_id = row.asset_id.clone().expect("the row holds the asset id");
+    assert!(
+        first_label.contains(&asset_id),
+        "the window shows the asset id {asset_id}: {first_label}"
+    );
+    assert_eq!(server.upload_requests(), 1);
+
+    // The same file again: an explicit duplicate, and no second transfer.
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("upload-button", cx);
+    })
+    .expect("click Upload again");
+    cx.wait_for(window, Duration::from_secs(60), |window, _| {
+        window
+            .find("upload-result")
+            .label()
+            .is_some_and(|label| label.starts_with("Already on the server (duplicate)"))
+    })
+    .await;
+    assert_eq!(
+        server.upload_requests(),
+        1,
+        "R4.5: the unchanged SHA-1 transferred no body"
+    );
+}
+
+#[gpui_kit::test]
+async fn a_second_enter_during_an_upload_starts_nothing(cx: &mut TestAppContext) {
+    let (_runtime, server) = mock_server();
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let connection = connected_model(cx, &server);
+    let window = open_upload(cx, &paths, connection.clone());
+    cx.wait_for(window, Duration::from_secs(60), |_, cx| {
+        connection.read(cx).state().is_connected()
+    })
+    .await;
+
+    let file = temp.path().join("hello.txt");
+    std::fs::write(&file, b"hello world").expect("write the fixture");
+    let path_text = file.display().to_string();
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        tab_to(window, "upload-path", cx);
+        window.input(&path_text, cx);
+        window.press("enter", cx);
+        // A second Enter while the first pipeline runs must be a no-op, not a
+        // second upload of the same file.
+        window.press("enter", cx);
+    })
+    .expect("submit twice");
+    cx.wait_for(window, Duration::from_secs(60), |window, _| {
+        window.find("upload-result").label().is_some_and(|label| {
+            !label.starts_with("Uploading") && label != "No file has been uploaded yet."
+        })
+    })
+    .await;
+
+    assert_eq!(
+        server.upload_requests(),
+        1,
+        "a second Enter during an in-flight upload must not start a second pipeline"
+    );
+}
+
+#[gpui_kit::test]
+async fn an_upload_without_a_session_is_unavailable_not_a_crash(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let connection = cx.update(|cx| {
+        let store: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+        cx.new(|_| ConnectionModel::new(ServerProfile::default(), store))
+    });
+    let window = open_upload(cx, &paths, connection);
+    let file = temp.path().join("hello.txt");
+    std::fs::write(&file, b"hello world").expect("write the fixture");
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        tab_to(window, "upload-path", cx);
+        window.input(file.to_str().expect("a UTF-8 temp path"), cx);
+        window.click("upload-button", cx);
+    })
+    .expect("click Upload with no session");
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("upload-result").label(),
+            Some(
+                UploadReport::CannotRun {
+                    message: "Sign in to a server before uploading a file.".to_string()
+                }
+                .message()
+                .as_str()
+            ),
+            "the window says what to do instead of failing silently"
+        );
+    })
+    .expect("read the result");
+}

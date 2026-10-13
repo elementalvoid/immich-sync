@@ -11,6 +11,8 @@ pub mod settings_view;
 pub mod shell;
 pub mod status;
 pub mod theme;
+pub mod upload;
+pub mod upload_view;
 
 use anyhow::Context as _;
 use async_channel::Receiver;
