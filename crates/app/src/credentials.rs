@@ -135,7 +135,7 @@ fn install_platform_store() -> Result<(), String> {
 fn install_platform_store() -> Result<(), String> {
     let store = windows_native_keyring_store::Store::new()
         .map_err(|error| credential_manager_message(&error.to_string()))?;
-    keyring_core::set_default_store(Arc::new(store));
+    keyring_core::set_default_store(store);
     Ok(())
 }
 

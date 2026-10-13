@@ -58,13 +58,20 @@ jobs:
             libfontconfig-dev libfreetype-dev libwayland-dev libxkbcommon-dev \
             libxkbcommon-x11-dev libx11-xcb-dev libxcb1-dev \
             libvulkan1 mesa-vulkan-drivers libdbus-1-dev \
-            xvfb xvfb-run xauth imagemagick x11-utils
+            xvfb xauth dbus-daemon imagemagick x11-utils
       - run: cargo build --bin immich-sync
       - name: Capture a real frame
         run: |
           set -euo pipefail
-          export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json
-          export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json
+          # The ICD file name depends on the mesa version (lvp_icd.json vs lvp_icd.x86_64.json).
+          ICD=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json 2>/dev/null | head -1) || ICD=""
+          if [ -z "$ICD" ]; then
+            echo "no lavapipe ICD file under /usr/share/vulkan/icd.d" >&2
+            exit 1
+          fi
+          echo "lavapipe ICD=$ICD"
+          export VK_ICD_FILENAMES="$ICD"
+          export VK_DRIVER_FILES="$ICD"
           export LIBGL_ALWAYS_SOFTWARE=1
           unset WAYLAND_DISPLAY
           dbus-run-session -- xvfb-run -a -s "-screen 0 1280x800x24" bash -c '
@@ -80,6 +87,17 @@ jobs:
             kill $APP 2>/dev/null || true
             wait $APP 2>/dev/null || true
             cat shot.png.log
+            # The app logs to $XDG_DATA_HOME/immich-sync, not stdout.
+            LOG_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/immich-sync"
+            echo "--- app log directory: $LOG_DIR"
+            ls -la "$LOG_DIR" 2>/dev/null || true
+            newest=$(ls -t "$LOG_DIR"/immich-sync.log* 2>/dev/null | head -1 || true)
+            if [ -n "$newest" ]; then
+              echo "--- app log: $newest"
+              cat "$newest"
+            else
+              echo "--- no app log file found"
+            fi
           '
       - name: Assert the frame is not blank
         run: |
