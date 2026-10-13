@@ -68,10 +68,18 @@ struct Inner {
     /// Checksums `bulk-upload-check` rejects as an unsupported format.
     unsupported: HashSet<Vec<u8>>,
     albums: HashMap<String, Album>,
+    /// The album ids in creation order, so `album_names` is deterministic.
+    album_order: Vec<String>,
     /// How many `POST /assets/bulk-upload-check` requests arrived.
     bulk_check_requests: u64,
     /// How many `POST /assets` requests arrived, whether or not one uploaded.
     upload_requests: u64,
+    /// How many `POST /albums` requests the double answered, whether or not
+    /// one created an album (R3.4). A request an injected fault short-circuits
+    /// is the fault's answer and is not counted here.
+    create_album_requests: u64,
+    /// How many `PUT /albums/{id}/assets` requests the double answered.
+    add_album_requests: u64,
     /// Immich's `passwordLogin.enabled` system config.
     password_login_disabled: bool,
     /// The key `x-api-key` must carry, once one is configured.
@@ -132,6 +140,7 @@ impl Inner {
 
     fn create_album(&mut self, name: String, asset_ids: Vec<String>) -> String {
         let id = uuid::Uuid::new_v4().to_string();
+        self.album_order.push(id.clone());
         self.albums.insert(
             id.clone(),
             Album {
@@ -162,6 +171,16 @@ impl Inner {
             .values()
             .find(|album| album.asset_ids.iter().any(|id| id == asset_id))
             .map(|album| album.name.clone())
+    }
+
+    /// Every album name, in creation order. Two albums can share one name,
+    /// which is what two leaf folders with the same folder name look like.
+    fn album_names(&self) -> Vec<String> {
+        self.album_order
+            .iter()
+            .filter_map(|id| self.albums.get(id))
+            .map(|album| album.name.clone())
+            .collect()
     }
 }
 
@@ -348,6 +367,38 @@ impl MockImmich {
             .lock()
             .expect("mock state poisoned")
             .album_for_asset(asset_id)
+    }
+
+    /// Every album name, in the order the albums were created (R3.4).
+    #[must_use]
+    pub fn album_names(&self) -> Vec<String> {
+        self.state
+            .inner
+            .lock()
+            .expect("mock state poisoned")
+            .album_names()
+    }
+
+    /// How many `POST /albums` requests the double answered, whether or not
+    /// one created an album. A client that must create no album asserts this is
+    /// 0 (R3.4), which no album row alone can prove.
+    #[must_use]
+    pub fn create_album_requests(&self) -> u64 {
+        self.state
+            .inner
+            .lock()
+            .expect("mock state poisoned")
+            .create_album_requests
+    }
+
+    /// How many `PUT /albums/{id}/assets` requests arrived.
+    #[must_use]
+    pub fn add_album_requests(&self) -> u64 {
+        self.state
+            .inner
+            .lock()
+            .expect("mock state poisoned")
+            .add_album_requests
     }
 
     async fn spawn() -> MockImmich {
@@ -847,6 +898,7 @@ async fn create_album(
     };
     let asset_ids = id_list(body.get("assetIds"));
     let mut inner = state.inner.lock().expect("mock state poisoned");
+    inner.create_album_requests += 1;
     let id = inner.create_album(name.to_string(), asset_ids);
     let album = inner.albums.get(&id).expect("album just created");
     (StatusCode::CREATED, Json(album_response(album))).into_response()
@@ -862,6 +914,7 @@ async fn add_assets_to_album(
     }
     let ids = id_list(body.get("ids"));
     let mut inner = state.inner.lock().expect("mock state poisoned");
+    inner.add_album_requests += 1;
     let Some(added) = inner.add_assets_to_album(&album_id, &ids) else {
         return message(StatusCode::NOT_FOUND, "Album not found");
     };
