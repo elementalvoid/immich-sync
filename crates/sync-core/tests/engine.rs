@@ -14,7 +14,7 @@ use sync_core::connection::{AuthMethod, Connection, RequestCredential, Secret, S
 use sync_core::credential::MemoryCredentialStore;
 use sync_core::engine::{Activity, Engine, EngineConfig};
 use sync_core::hash::{Sha1, sha1_file};
-use sync_core::store::{ItemRecord, ItemState, SourceFolder, StateStore};
+use sync_core::store::{FolderCounts, ItemRecord, ItemState, SourceFolder, StateStore};
 
 /// Starts the mock and signs in, returning the client and credential the
 /// engine attaches to every request.
@@ -749,6 +749,56 @@ async fn a_restart_with_a_pending_row_does_not_double_count_the_pending_item() {
         1.0,
         "the drained queue must read as complete"
     );
+    engine.stop();
+}
+
+#[tokio::test]
+async fn a_re_added_folder_seeds_its_counts_from_the_store() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let files = [
+        write_file(&photos, "a.jpg", b"first"),
+        write_file(&photos, "b.jpg", b"second"),
+    ];
+    // Rows an earlier run left behind while the folder was not a source.
+    for file in &files {
+        let meta = std::fs::metadata(file).expect("read the fixture metadata");
+        store
+            .record(&ItemRecord {
+                path: file.display().to_string(),
+                size: meta.len(),
+                mtime_ns: mtime_ns_of(file),
+                sha1: sha1_file(file).expect("hash the fixture"),
+                asset_id: Some("asset-1".to_string()),
+                state: ItemState::Uploaded,
+                error_class: None,
+            })
+            .expect("write the terminal row");
+    }
+    let config = EngineConfig {
+        watch: false,
+        ..EngineConfig::default()
+    };
+    let engine = start_engine(&server, &store, config).await;
+
+    engine
+        .add_folder(&photos.display().to_string(), true)
+        .expect("re-add the folder");
+
+    // R8.1: the card shows what the store already holds, not a zeroed card
+    // the settled rows never fill.
+    assert_eq!(
+        engine.status().folders.first().map(|folder| folder.counts),
+        Some(FolderCounts {
+            pending: 0,
+            uploaded: 2,
+            failed: 0,
+        }),
+        "a re-added folder starts from the rows the store holds"
+    );
+    assert_eq!(server.upload_requests(), 0, "settled rows stay settled");
     engine.stop();
 }
 

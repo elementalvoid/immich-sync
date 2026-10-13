@@ -349,6 +349,13 @@ impl Engine {
             recursive,
         };
         self.inner.store.add_folder(&folder)?;
+        // R8.1: a folder new to this engine starts from what the store already
+        // holds for it; a zeroed card would never fill, because the rows are
+        // settled and `prepare` does not count them again.
+        let counts = self.inner.store.folder_counts(path).unwrap_or_else(|error| {
+            tracing::warn!(folder = path, error = %error, "the folder counts could not be read");
+            FolderCounts::default()
+        });
         {
             let mut folders = self.inner.folders.lock().expect("the folder lock");
             let key = path_key(Path::new(path));
@@ -362,7 +369,7 @@ impl Engine {
                 folders.push(FolderEntry {
                     available: Path::new(path).is_dir(),
                     folder,
-                    counts: FolderCounts::default(),
+                    counts,
                     last_error: None,
                 });
             }
