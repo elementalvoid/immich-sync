@@ -11,6 +11,8 @@
 use std::fs::Metadata;
 use std::path::{Component, Path};
 
+use crate::paths::{PathCase, key};
+
 /// Why a path is skipped (R2.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SkipReason {
@@ -118,6 +120,24 @@ pub fn skip_reason_below(
     None
 }
 
+/// The path below `root` as a forward-slash string, or `None` when `path` is
+/// not below `root` under `case`.
+///
+/// `Path::strip_prefix` compares case-sensitively, so both sides go through
+/// [`key`] the way [`crate::paths::is_within`] does: a stored folder spelling
+/// that differs only in case still covers the same files on Windows (R2.4).
+fn relative_below(root: &Path, path: &Path, case: PathCase) -> Option<String> {
+    let root_key = key(root, case);
+    let path_key = key(path, case);
+    if path_key == root_key {
+        return Some(String::new());
+    }
+    path_key
+        .strip_prefix(&root_key)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .map(str::to_string)
+}
+
 /// Whether any directory between `root` (exclusive) and `path` itself is a
 /// symlink or reparse point (R2.2).
 ///
@@ -128,14 +148,17 @@ pub fn skip_reason_below(
 /// choice and is never checked.
 #[must_use]
 pub fn has_symlink_ancestor(root: &Path, path: &Path) -> bool {
-    let Ok(relative) = path.strip_prefix(root) else {
+    let Some(relative) = relative_below(root, path, PathCase::for_platform()) else {
         return false;
     };
-    let components: Vec<Component<'_>> = relative.components().collect();
+    let components: Vec<&str> = relative
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .collect();
     let mut current = root.to_path_buf();
     // The last component is the file itself; only its ancestors matter.
     for component in components.iter().take(components.len().saturating_sub(1)) {
-        current.push(component.as_os_str());
+        current.push(component);
         match std::fs::symlink_metadata(&current) {
             Ok(metadata) if is_symlink_metadata(&metadata) => return true,
             Ok(_) => {}
@@ -263,6 +286,22 @@ mod tests {
                 None
             ),
             None
+        );
+    }
+
+    #[test]
+    fn a_root_spelled_with_a_different_case_still_covers_its_children() {
+        // R2.2: the stored folder spelling may differ in case from the path
+        // the walker reports; the symlink check must not fail open.
+        assert_eq!(
+            relative_below(
+                Path::new("/photos"),
+                Path::new("/Photos/album/photo.jpg"),
+                PathCase::Insensitive,
+            )
+            .as_deref(),
+            Some("album/photo.jpg"),
+            "the folded root must still find the file's ancestors"
         );
     }
 
