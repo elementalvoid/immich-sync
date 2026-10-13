@@ -78,17 +78,51 @@ jobs:
             set -euo pipefail
             target/debug/immich-sync >shot.png.log 2>&1 &
             APP=$!
-            sleep 10
+            # The app logs here, not to stdout.
+            LOG_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/immich-sync"
+            started() { grep -qs "immich-sync started" "$LOG_DIR"/immich-sync.log* 2>/dev/null; }
+            alive() { kill -0 $APP 2>/dev/null; }
+            # Wait for the client instead of sleeping a fixed 10 s: opening the
+            # store made startup slower, and a fixed budget captured a black
+            # root while the app was still booting.
+            START_TIMEOUT=60
+            waited=$SECONDS
+            until started; do
+              alive || { echo "the app exited during startup:" >&2; cat shot.png.log >&2; exit 1; }
+              if [ $((SECONDS - waited)) -ge $START_TIMEOUT ]; then
+                echo "timeout: no immich-sync started line in $LOG_DIR after ${START_TIMEOUT}s" >&2
+                cat shot.png.log >&2
+                kill $APP 2>/dev/null || true
+                exit 1
+              fi
+              sleep 1
+            done
+            echo "app started after $((SECONDS - waited))s"
             kill -0 $APP                  # the app survived startup
-            import -window root shot.png
+            # That line is logged before the window opens, so wait for a drawn
+            # frame too: a bare root captures as one flat colour.
+            PAINT_TIMEOUT=60
+            waited=$SECONDS
+            while :; do
+              alive || { echo "the app exited before it painted:" >&2; cat shot.png.log >&2; exit 1; }
+              import -window root shot.png
+              colors=$(identify -format %k shot.png)
+              if [ "$colors" -gt 1 ]; then break; fi
+              if [ $((SECONDS - waited)) -ge $PAINT_TIMEOUT ]; then
+                echo "timeout: the frame is still one flat colour after ${PAINT_TIMEOUT}s (colors=$colors)" >&2
+                cat shot.png.log >&2
+                kill $APP 2>/dev/null || true
+                exit 1
+              fi
+              sleep 1
+            done
+            echo "frame painted after $((SECONDS - waited))s"
             target/debug/immich-sync      # second launch: non-primary, exits 0 under set -e
             sleep 2
             kill -0 $APP                  # the handoff did not stop the primary
             kill $APP 2>/dev/null || true
             wait $APP 2>/dev/null || true
             cat shot.png.log
-            # The app logs to $XDG_DATA_HOME/immich-sync, not stdout.
-            LOG_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/immich-sync"
             echo "--- app log directory: $LOG_DIR"
             ls -la "$LOG_DIR" 2>/dev/null || true
             newest=$(ls -t "$LOG_DIR"/immich-sync.log* 2>/dev/null | head -1 || true)
