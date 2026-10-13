@@ -9,6 +9,7 @@
 //! Reader connections for the UI arrive with the views that need them; until
 //! then the writer serves the engine's own reads.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
@@ -665,6 +666,19 @@ fn migrations() -> Migrations<'static> {
 /// The key depends on the platform, which SQL cannot see, so the hook walks
 /// the rows and writes what [`crate::paths::path_key`] produces.
 fn backfill_path_keys(transaction: &Transaction<'_>) -> rusqlite_migration::HookResult {
+    backfill_path_keys_with_case(transaction, PathCase::for_platform())
+}
+
+/// The backfill under an explicit case rule, so the Windows collision is
+/// testable on any platform (R2.4).
+///
+/// Two v1 rows can share one key: case-only variants on Windows, or a trailing
+/// separator anywhere. V3 puts a unique index on the key, so the older row is
+/// dropped and the newest id per key survives.
+fn backfill_path_keys_with_case(
+    transaction: &Transaction<'_>,
+    case: PathCase,
+) -> rusqlite_migration::HookResult {
     let rows = {
         let mut statement = transaction.prepare("SELECT id, path FROM sync_item")?;
         let rows = statement.query_map([], |row| {
@@ -674,11 +688,20 @@ fn backfill_path_keys(transaction: &Transaction<'_>) -> rusqlite_migration::Hook
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
-    for (id, path) in rows {
-        transaction.execute(
-            "UPDATE sync_item SET path_key = ?1 WHERE id = ?2",
-            params![path_key(Path::new(&path)), id],
-        )?;
+    let mut newest: HashMap<String, i64> = HashMap::new();
+    for (id, path) in &rows {
+        newest.insert(key(Path::new(path), case), *id);
+    }
+    for (id, path) in &rows {
+        let row_key = key(Path::new(path), case);
+        if newest.get(&row_key) == Some(id) {
+            transaction.execute(
+                "UPDATE sync_item SET path_key = ?1 WHERE id = ?2",
+                params![row_key, *id],
+            )?;
+        } else {
+            transaction.execute("DELETE FROM sync_item WHERE id = ?1", params![*id])?;
+        }
     }
     Ok(())
 }
@@ -686,6 +709,129 @@ fn backfill_path_keys(transaction: &Transaction<'_>) -> rusqlite_migration::Hook
 #[cfg(test)]
 mod migration_tests {
     use super::*;
+
+    /// Two v1 path spellings that share one `path_key` on this platform:
+    /// case-only variants on Windows, a trailing separator on Linux. v1's
+    /// `path UNIQUE` allowed both.
+    fn colliding_v1_paths() -> (String, String) {
+        if cfg!(windows) {
+            // Built from parts so the repository's hardcoded-path scan stays
+            // clean.
+            let root = format!("{}:{}photos", 'C', '\\');
+            (format!("{root}\\photo.jpg"), format!("{root}\\Photo.JPG"))
+        } else {
+            (
+                "/photos/photo.jpg".to_string(),
+                "/photos/photo.jpg/".to_string(),
+            )
+        }
+    }
+
+    #[test]
+    fn the_path_key_backfill_survives_two_rows_that_share_one_key() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let path = temp.path().join("state.db");
+        let (first, second) = colliding_v1_paths();
+        {
+            let mut connection = Connection::open(&path).expect("open the raw database");
+            Migrations::new(vec![M::up(SCHEMA_V1)])
+                .to_latest(&mut connection)
+                .expect("create the first schema");
+            let sha1 =
+                Sha1::from_hex("2aae6c35c94fcfb415dbe95f408b9ce91ee846ed").expect("a hex SHA-1");
+            for text in [&first, &second] {
+                connection
+                    .execute(
+                        "INSERT INTO sync_item (path, size, mtime_ns, sha1, asset_id, state, error_class)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        params![
+                            text,
+                            11_i64,
+                            1_i64,
+                            sha1.as_bytes().as_slice(),
+                            "asset-1",
+                            "uploaded",
+                            Option::<String>::None,
+                        ],
+                    )
+                    .expect("insert the old row");
+            }
+            drop(connection);
+        }
+
+        // The V3 unique index cannot hold both keys; the backfill must keep
+        // one row per key or the whole database fails to open.
+        let store = StateStore::open(&path).expect("a shared-key v1 database must migrate");
+        let row = store.item(&first).expect("read").expect("a row survives");
+        assert_eq!(
+            row.path, second,
+            "the newest id is the row the unique key keeps"
+        );
+    }
+
+    /// The V2 hook under the Windows case rule, so the case-only collision is
+    /// reproducible on any platform (R2.4).
+    fn backfill_path_keys_insensitive(
+        transaction: &Transaction<'_>,
+    ) -> rusqlite_migration::HookResult {
+        backfill_path_keys_with_case(transaction, PathCase::Insensitive)
+    }
+
+    #[test]
+    fn the_backfill_collapses_case_only_variants_to_the_newest_row() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let path = temp.path().join("state.db");
+        let mut connection = Connection::open(&path).expect("open the raw database");
+        Migrations::new(vec![M::up(SCHEMA_V1)])
+            .to_latest(&mut connection)
+            .expect("create the first schema");
+        let sha1 = Sha1::from_hex("2aae6c35c94fcfb415dbe95f408b9ce91ee846ed").expect("a hex SHA-1");
+        // Case-only variants, legal under v1's `path UNIQUE` but one file under
+        // the Windows rule.
+        for text in ["Photo.JPG", "photo.jpg"] {
+            connection
+                .execute(
+                    "INSERT INTO sync_item (path, size, mtime_ns, sha1, asset_id, state, error_class)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        text,
+                        11_i64,
+                        1_i64,
+                        sha1.as_bytes().as_slice(),
+                        "asset-1",
+                        "uploaded",
+                        Option::<String>::None,
+                    ],
+                )
+                .expect("insert the old row");
+        }
+
+        // The V1 entry keeps the version numbering aligned; it is already
+        // applied, so only V2 and V3 run.
+        Migrations::new(vec![
+            M::up(SCHEMA_V1),
+            M::up_with_hook(SCHEMA_V2, backfill_path_keys_insensitive),
+            M::up(SCHEMA_V3),
+        ])
+        .to_latest(&mut connection)
+        .expect("case-only variants must migrate");
+
+        let rows: Vec<(i64, String)> = {
+            let mut statement = connection
+                .prepare("SELECT id, path_key FROM sync_item")
+                .expect("prepare the read");
+            let rows = statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .expect("query the rows");
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .expect("collect the rows")
+        };
+        assert_eq!(
+            rows,
+            vec![(2, "photo.jpg".to_string())],
+            "the newest id survives and carries the folded key"
+        );
+    }
 
     #[test]
     fn the_path_key_migration_backfills_an_existing_row() {
