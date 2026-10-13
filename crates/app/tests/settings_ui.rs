@@ -1048,6 +1048,67 @@ fn the_connection_state_shows_on_the_form_and_the_global_card(cx: &mut TestAppCo
 }
 
 #[gpui_kit::test]
+fn reopening_the_window_does_not_restart_the_startup_login(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+
+    // A saved profile, as a fresh launch finds in the settings file (R1.3).
+    let mut store = SettingsStore::open(paths.config_file.clone());
+    store
+        .update(|settings| {
+            settings.server_url = "https://immich.example.com".to_string();
+            settings.email = "sync@example.com".to_string();
+        })
+        .expect("seed a saved profile");
+    let connection = cx.update(|cx| {
+        cx.new(|_| {
+            let credentials: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+            ConnectionModel::new(profile_from_settings(store.settings()), credentials)
+        })
+    });
+
+    // The first open starts the startup login and puts the model in connecting.
+    let _first = open_settings_over_connection(
+        cx,
+        store.clone(),
+        paths.clone(),
+        FakeAutostart::new(),
+        connection.clone(),
+    );
+    assert_eq!(
+        cx.read(|cx| connection.read(cx).state().clone()),
+        ConnectionState::Connecting,
+        "the first open starts the saved login"
+    );
+
+    // The app-scoped model transitions while the window is hidden, e.g. after
+    // the server refused the restore.
+    let attention = ConnectionState::NeedsAttention(Attention::Rejected);
+    cx.update(|cx| {
+        connection.update(cx, |model, cx| model.set_state(attention.clone(), cx));
+    });
+
+    // The reopen must not restart the startup login, which would reset the
+    // state the tray is showing.
+    let window =
+        open_settings_over_connection(cx, store, paths, FakeAutostart::new(), connection.clone()).0;
+    assert_eq!(
+        cx.read(|cx| connection.read(cx).state().clone()),
+        attention,
+        "a reopened window keeps the state the app-level model holds"
+    );
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("settings-connection-state").label(),
+            Some(attention.message().as_str()),
+            "the reopened form shows the surviving state"
+        );
+    })
+    .expect("render the reopened window");
+}
+
+#[gpui_kit::test]
 fn a_wrong_password_shows_an_error_and_the_form_stays_usable(cx: &mut TestAppContext) {
     let temp = tempfile::tempdir().expect("create a temp dir");
     let paths = temporary_paths(temp.path());

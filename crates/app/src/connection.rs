@@ -54,11 +54,17 @@ pub struct ConnectionModel {
     form_error: Option<String>,
     connection: Option<Connection>,
     provider: CredentialStoreProvider,
+    /// Whether the startup restore already ran. The model outlives every
+    /// window, so a reopen must not reset the session (R1.3).
+    startup_restore_started: bool,
+    /// Changes with every state change, so a result from an attempt that a
+    /// newer state superseded is dropped instead of overwriting it.
+    generation: u64,
 }
 
 impl ConnectionModel {
     /// A model with no session yet. A configured profile starts in the
-    /// connecting state, because [`Self::restore`] is about to run.
+    /// connecting state, because [`Self::restore_once`] is about to run.
     ///
     /// The credential store arrives as a provider, because the platform store
     /// can appear after the client started (SPEC R1.2, R1.5).
@@ -75,6 +81,8 @@ impl ConnectionModel {
             form_error: None,
             connection: None,
             provider: store.into(),
+            startup_restore_started: false,
+            generation: 0,
         }
     }
 
@@ -103,11 +111,15 @@ impl ConnectionModel {
     }
 
     /// Replaces the state and notifies the views.
+    ///
+    /// The generation moves with it, so an attempt still in flight cannot
+    /// overwrite this state when its result arrives.
     pub fn set_state(&mut self, state: ConnectionState, cx: &mut Context<Self>) {
         if state.is_connected() {
             self.form_error = None;
         }
         self.state = state;
+        self.generation = self.generation.wrapping_add(1);
         cx.notify();
     }
 
@@ -118,8 +130,17 @@ impl ConnectionModel {
     }
 
     /// Logs in at startup with the saved profile and the stored credential, with
-    /// no user input (R1.3).
-    pub fn restore(&mut self, profile: ServerProfile, cx: &mut Context<Self>) {
+    /// no user input (R1.3), at most once per model.
+    ///
+    /// The window's root view is rebuilt on every show, so this is called from
+    /// the settings view's constructor. The once guard lives on the app-scoped
+    /// model: a reopen must not restart the saved login, which would reset a
+    /// state the tray is already showing.
+    pub fn restore_once(&mut self, profile: ServerProfile, cx: &mut Context<Self>) {
+        if self.startup_restore_started {
+            return;
+        }
+        self.startup_restore_started = true;
         self.profile = profile.clone();
         if !profile.is_configured() {
             self.connection = None;
@@ -172,6 +193,9 @@ impl ConnectionModel {
             }
         };
         let server_url = profile.server_url.clone();
+        // The attempt belongs to the state the caller just set. A later state
+        // change supersedes it, so its result must not overwrite that state.
+        let generation = self.generation;
         // Resolving per request makes the recovery step real: starting the OS
         // credential store and signing in again works without a restart.
         let store = self.provider.resolve();
@@ -199,6 +223,9 @@ impl ConnectionModel {
             // The model can be gone while the request runs; the result is then
             // simply dropped.
             let _ = this.update(cx, |model, cx| {
+                if model.generation != generation {
+                    return;
+                }
                 model.connection = connection;
                 model.set_state(state, cx);
             });

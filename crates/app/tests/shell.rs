@@ -10,6 +10,10 @@ use immich_sync::shell::{self, Hide, Show};
 use sync_core::connection::{Attention, ConnectionState};
 
 fn boot(cx: &mut TestAppContext) {
+    // The saved-profile restore runs on the app's Tokio worker, whose result
+    // wakes the foreground executor from that thread. Parking mode is how the
+    // harness permits a task to be woken off the test thread.
+    cx.executor().allow_parking();
     cx.update(|cx| {
         gpui_kit::init(cx);
         shell::init(cx);
@@ -80,7 +84,10 @@ fn the_connection_model_outlives_the_window(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     // The reopened window renders from that same model, not a fresh one that
-    // would have forgotten the transition.
+    // would have forgotten the transition. With a configured profile (a real
+    // settings file, or XDG_CONFIG_HOME in CI), the reopen used to restart the
+    // startup restore here and reset the state; the model's once guard keeps
+    // it (R1.3).
     cx.update(|cx| cx.dispatch_action(&Show));
     cx.run_until_parked();
     let window = cx
