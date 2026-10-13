@@ -7359,6 +7359,15 @@ dependencies = [
 [[package]]
 name = "sync-core"
 version = "0.1.0"
+dependencies = [
+ "immich-client",
+ "mock-immich",
+ "serde",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "sync_wrapper"
