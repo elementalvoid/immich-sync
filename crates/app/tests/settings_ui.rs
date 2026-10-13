@@ -8,6 +8,7 @@ use std::fs;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use gpui_kit::test::TestAppContextExt as _;
@@ -18,6 +19,7 @@ use gpui_kit::{
 };
 use immich_sync::autostart::Autostart;
 use immich_sync::connection::{ConnectionModel, profile_from_settings};
+use immich_sync::credentials::CredentialStoreProvider;
 use immich_sync::dashboard::Dashboard;
 use immich_sync::paths::AppPaths;
 use immich_sync::settings::{Settings, SettingsStore};
@@ -150,14 +152,27 @@ fn open_settings_view(
     Entity<ConnectionModel>,
 ) {
     let profile = profile_from_settings(store.settings());
+    let connection = cx.update(|cx| cx.new(|_| ConnectionModel::new(profile, credentials)));
+    let (window, view) =
+        open_settings_over_connection(cx, store, paths, autostart, connection.clone());
+    (window, view, connection)
+}
+
+/// Opens the settings view over `connection`, so a test can decide how the
+/// model resolves its credential store.
+fn open_settings_over_connection(
+    cx: &mut TestAppContext,
+    store: SettingsStore,
+    paths: AppPaths,
+    autostart: Rc<dyn Autostart>,
+    connection: Entity<ConnectionModel>,
+) -> (AnyWindowHandle, Entity<SettingsView>) {
     cx.update(|cx| {
         gpui_kit::init(cx);
-        let connection = cx.new(|_| ConnectionModel::new(profile, credentials));
-        let (window, view) = gpui_kit::open_window(window_options(), cx, |window, cx| {
+        gpui_kit::open_window(window_options(), cx, |window, cx| {
             cx.new(|cx| SettingsView::new(store, paths, autostart, connection.clone(), window, cx))
         })
-        .expect("open the settings window");
-        (window, view, connection)
+        .expect("open the settings window")
     })
 }
 
@@ -1181,6 +1196,85 @@ async fn signing_in_through_the_form_never_writes_the_secret(cx: &mut TestAppCon
     assert!(
         !text.contains(password),
         "the settings TOML holds the password: {text}"
+    );
+    drop(runtime);
+}
+
+#[gpui_kit::test]
+async fn signing_in_again_resolves_the_credential_store_again(cx: &mut TestAppContext) {
+    let (runtime, server) = mock_server();
+    // The sign-in result arrives from the HTTP worker thread.
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let server_url = server.base_url().to_string();
+
+    // The store is missing on the first sign-in and appears before the second,
+    // as when the user starts GNOME Keyring and signs in again.
+    let resolves = Arc::new(AtomicUsize::new(0));
+    let started_later: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+    let provider = CredentialStoreProvider::new({
+        let resolves = resolves.clone();
+        let started_later = started_later.clone();
+        move || {
+            if resolves.fetch_add(1, Ordering::SeqCst) == 0 {
+                Arc::new(MemoryCredentialStore::unavailable(
+                    "no Secret Service provider yet",
+                ))
+            } else {
+                started_later.clone()
+            }
+        }
+    });
+    let connection =
+        cx.update(|cx| cx.new(|_| ConnectionModel::new(ServerProfile::default(), provider)));
+    let (window, _view) = open_settings_over_connection(
+        cx,
+        SettingsStore::open(paths.config_file.clone()),
+        paths,
+        FakeAutostart::new(),
+        connection,
+    );
+
+    // The first sign-in resolves a missing provider and reports it.
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        tab_to(window, "settings-server-url", cx);
+        window.input(&server_url, cx);
+        tab_to(window, "settings-email", cx);
+        window.input("sync@example.com", cx);
+        tab_to(window, "settings-secret", cx);
+        window.input("correct horse", cx);
+        window.click("settings-sign-in", cx);
+    })
+    .expect("fill in the connection form and click Sign in");
+    cx.wait_for(window, Duration::from_secs(30), |window, _| {
+        window
+            .find("settings-connection-state")
+            .label()
+            .is_some_and(|label| label.contains("Secret Service"))
+    })
+    .await;
+    assert_eq!(
+        resolves.load(Ordering::SeqCst),
+        1,
+        "the first sign-in resolved the store"
+    );
+
+    // The user starts the provider and signs in again, without a restart.
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("settings-sign-in", cx);
+    })
+    .expect("sign in again");
+    cx.wait_for(window, Duration::from_secs(30), |window, _| {
+        window.find("settings-connection-state").label() == Some("Connected")
+    })
+    .await;
+    assert_eq!(
+        resolves.load(Ordering::SeqCst),
+        2,
+        "the second sign-in resolved the store again"
     );
     drop(runtime);
 }

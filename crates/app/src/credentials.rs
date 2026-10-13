@@ -35,6 +35,35 @@ pub fn platform_credential_store() -> SharedCredentialStore {
     })
 }
 
+/// Resolves the credential store for one sign-in (SPEC R1.2, R1.5).
+///
+/// The platform store can appear after the client started (the user starts
+/// GNOME Keyring), so the connection model asks through this provider on every
+/// sign-in instead of holding the store that existed when the window opened.
+#[derive(Clone)]
+pub struct CredentialStoreProvider(Arc<dyn Fn() -> SharedCredentialStore + Send + Sync>);
+
+impl CredentialStoreProvider {
+    /// A provider that calls `resolve` again for every sign-in.
+    #[must_use]
+    pub fn new(resolve: impl Fn() -> SharedCredentialStore + Send + Sync + 'static) -> Self {
+        Self(Arc::new(resolve))
+    }
+
+    /// The store for the sign-in or restore that is starting.
+    #[must_use]
+    pub fn resolve(&self) -> SharedCredentialStore {
+        (self.0)()
+    }
+}
+
+impl From<SharedCredentialStore> for CredentialStoreProvider {
+    /// A provider that always hands back `store`.
+    fn from(store: SharedCredentialStore) -> Self {
+        Self::new(move || store.clone())
+    }
+}
+
 /// The store `install` produces, cached in `cache` only after a success.
 ///
 /// A failed install is returned fresh every time, so a later sign-in retries.

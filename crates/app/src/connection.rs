@@ -7,13 +7,12 @@
 
 use std::sync::OnceLock;
 
+use crate::credentials::CredentialStoreProvider;
+use crate::settings::Settings;
 use gpui_kit::*;
 use sync_core::connection::{
     Attention, AuthMethod, Connection, ConnectionState, ServerProfile, SignIn,
 };
-use sync_core::credential::SharedCredentialStore;
-
-use crate::settings::Settings;
 
 /// The saved connection profile, from the settings file. It holds no secret.
 #[must_use]
@@ -54,14 +53,17 @@ pub struct ConnectionModel {
     state: ConnectionState,
     form_error: Option<String>,
     connection: Option<Connection>,
-    store: SharedCredentialStore,
+    provider: CredentialStoreProvider,
 }
 
 impl ConnectionModel {
     /// A model with no session yet. A configured profile starts in the
     /// connecting state, because [`Self::restore`] is about to run.
+    ///
+    /// The credential store arrives as a provider, because the platform store
+    /// can appear after the client started (SPEC R1.2, R1.5).
     #[must_use]
-    pub fn new(profile: ServerProfile, store: SharedCredentialStore) -> Self {
+    pub fn new(profile: ServerProfile, store: impl Into<CredentialStoreProvider>) -> Self {
         let state = if profile.is_configured() {
             ConnectionState::Connecting
         } else {
@@ -72,7 +74,7 @@ impl ConnectionModel {
             state,
             form_error: None,
             connection: None,
-            store,
+            provider: store.into(),
         }
     }
 
@@ -170,7 +172,9 @@ impl ConnectionModel {
             }
         };
         let server_url = profile.server_url.clone();
-        let store = self.store.clone();
+        // Resolving per request makes the recovery step real: starting the OS
+        // credential store and signing in again works without a restart.
+        let store = self.provider.resolve();
         let (results, incoming) = async_channel::bounded(1);
         runtime.spawn(async move {
             let (state, connection) = match Connection::new(&server_url, store) {
