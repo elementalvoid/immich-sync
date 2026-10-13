@@ -4,7 +4,7 @@
 //! `%APPDATA%` for config and `%LOCALAPPDATA%` for state, and Linux resolves
 //! the XDG directories. No path is hardcoded.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use directories::BaseDirs;
@@ -49,6 +49,18 @@ impl AppPaths {
         let base = BaseDirs::new()
             .context("the platform did not provide a home directory for the client")?;
         Ok(Self::from_base_dirs(&base))
+    }
+
+    /// The directory the rotating log file lives in (SPEC R10.3).
+    ///
+    /// It is the state database's directory, so the log stays on this machine
+    /// (R9.2) and sits beside the state it describes.
+    #[must_use]
+    pub fn log_directory(&self) -> PathBuf {
+        self.state_db
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
     }
 
     /// The paths used when [`Self::resolve`] fails: the current directory.

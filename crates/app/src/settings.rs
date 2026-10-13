@@ -15,6 +15,8 @@ use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use sync_core::connection::AuthMethod;
 
+use crate::logging::LogLevel;
+
 /// The user-settable, persistent settings.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -35,6 +37,8 @@ pub struct Settings {
     pub email: String,
     /// Whether the credential store holds a password or an API key (R1.5).
     pub auth_method: AuthMethod,
+    /// The rotating file log's level (R10.3).
+    pub log_level: LogLevel,
 }
 
 impl Default for Settings {
@@ -48,6 +52,7 @@ impl Default for Settings {
             server_url: String::new(),
             email: String::new(),
             auth_method: AuthMethod::Password,
+            log_level: LogLevel::Info,
         }
     }
 }
@@ -106,6 +111,13 @@ impl SettingsStore {
     }
 
     fn broken(path: PathBuf, reason: String) -> Self {
+        // The reason reaches the log as well as the view, so a client that
+        // starts with a corrupt file can be troubleshot from the file alone.
+        tracing::warn!(
+            path = %path.display(),
+            reason = %reason,
+            "the settings file could not be used, so the defaults are in use"
+        );
         Self {
             problem: Some(LoadProblem {
                 path: path.clone(),
@@ -146,7 +158,12 @@ impl SettingsStore {
         self.write(&next)?;
         self.settings = next;
         // The file is valid again, so a load problem no longer describes it.
-        self.problem = None;
+        if self.problem.take().is_some() {
+            tracing::info!(
+                path = %self.path.display(),
+                "the settings file was repaired by this save"
+            );
+        }
         Ok(())
     }
 
