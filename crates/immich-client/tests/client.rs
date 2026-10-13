@@ -1,7 +1,12 @@
 //! The typed client against the offline Immich test double.
 
-use immich_client::{ClientError, ImmichClient};
+use std::time::Duration;
+
+use immich_client::{Auth, BulkCheckItem, ClientError, ImmichClient};
 use mock_immich::{Fault, MockImmich, Operation};
+
+/// `sha1("hello world")`, base64 (a known source of truth, not a recomputation).
+const HELLO_WORLD_SHA1_BASE64: &str = "Kq5sNclPz7QV2+lfQIuc6R7oRu0=";
 
 fn client(server: &MockImmich) -> ImmichClient {
     ImmichClient::new(server.base_url()).expect("the mock URL is valid")
@@ -149,6 +154,59 @@ async fn a_500_stays_a_protocol_error_with_its_status() {
         matches!(error, ClientError::Protocol { status: 500, .. }),
         "{error:?}"
     );
+}
+
+#[tokio::test]
+async fn a_retry_after_header_surfaces_with_its_wait() {
+    let server = MockImmich::start().await;
+    let client = client(&server);
+
+    // R6.2: the engine's delay reads this wait, so a 429 that carries the
+    // header must not lose it in the client.
+    server.fail(
+        Operation::BulkUploadCheck,
+        Fault::Status {
+            code: 429,
+            retry_after: Some(7),
+        },
+    );
+    let error = client
+        .bulk_upload_check(
+            Auth::ApiKey("api-key-1234"),
+            &[BulkCheckItem {
+                id: "hello.txt".to_string(),
+                checksum: HELLO_WORLD_SHA1_BASE64.to_string(),
+            }],
+        )
+        .await
+        .expect_err("the server asked the client to wait");
+
+    assert_eq!(
+        error.retry_after(),
+        Some(Duration::from_secs(7)),
+        "{error:?}"
+    );
+    assert!(
+        matches!(error, ClientError::Protocol { status: 429, .. }),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_refusal_without_the_header_asks_for_no_wait() {
+    let server = MockImmich::start().await;
+    let client = client(&server);
+
+    server.fail(
+        Operation::About,
+        Fault::Status {
+            code: 503,
+            retry_after: None,
+        },
+    );
+    let error = client.about().await.expect_err("the server failed");
+
+    assert_eq!(error.retry_after(), None, "{error:?}");
 }
 
 #[tokio::test]
