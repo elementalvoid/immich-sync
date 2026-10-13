@@ -8,7 +8,13 @@ publish = false
 
 [dependencies]
 base64 = "0.22"
+# The reconciliation scan: one parallel walk plus the hidden-entry filter
+# (docs/research/rust-sync-engine-crates.md §5).
+ignore = "0.4"
 immich-client = { path = "../immich-client" }
+# The watcher, pinned with its debouncer (docs/research/rust-sync-engine-crates.md §5).
+notify = "8.2"
+notify-debouncer-full = "0.7"
 # Bundled SQLite: no system library, no version drift across platforms (ADR 0005).
 rusqlite = { version = "0.40", features = ["bundled"] }
 rusqlite_migration = "2.6"
@@ -16,8 +22,9 @@ serde = { version = "1", features = ["derive"] }
 # Shared with mock-immich, so the workspace compiles one SHA-1 implementation.
 sha1 = "0.10"
 thiserror = "2"
-# spawn_blocking for the hashing pass; the HTTP client brings the runtime itself.
-tokio = { version = "1", features = ["rt"] }
+# spawn_blocking for the hashing pass, the queue channels, the pause notify,
+# the concurrency semaphore, and the scan interval.
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 tracing = "0.1"
 
 [dev-dependencies]

@@ -7,10 +7,15 @@
 
 pub mod connection;
 pub mod credential;
+pub mod engine;
 pub mod failure;
 pub mod hash;
+pub mod paths;
+pub mod scan;
+pub mod skip;
 pub mod store;
 pub mod upload;
+pub mod watch;
 
 // Re-exported so the shell can hand the engine the client it holds without
 // depending on the HTTP client crate directly.

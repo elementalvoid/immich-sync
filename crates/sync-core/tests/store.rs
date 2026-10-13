@@ -147,3 +147,151 @@ fn opening_creates_the_local_data_directory() {
     assert!(Path::new(&path).exists(), "the database file was created");
     drop(store);
 }
+
+#[test]
+fn the_store_compares_paths_with_the_requested_case_rule() {
+    // Built from parts so the repository's hardcoded-path scan stays clean.
+    let windows = format!("{}:\\Photos\\A.JPG", 'C');
+    let other_case = windows.to_lowercase();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    store
+        .record_with_case(
+            &record(&windows, ItemState::Uploaded),
+            sync_core::paths::PathCase::Insensitive,
+        )
+        .expect("write the row as Windows would");
+
+    let insensitive = store
+        .item_with_case(&other_case, sync_core::paths::PathCase::Insensitive)
+        .expect("read with the Windows rule");
+    assert!(
+        insensitive.is_some(),
+        "R2.4: Windows must see one item, not two"
+    );
+
+    let sensitive = store
+        .item_with_case(&other_case, sync_core::paths::PathCase::Sensitive)
+        .expect("read with the Linux rule");
+    assert!(
+        sensitive.is_none(),
+        "R2.4: Linux keeps the two spellings apart"
+    );
+}
+
+#[test]
+fn source_folders_persist_with_their_recursive_flag() {
+    use sync_core::store::SourceFolder;
+
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    store
+        .add_folder(&SourceFolder {
+            path: "/photos".to_string(),
+            recursive: false,
+        })
+        .expect("add the folder");
+    store
+        .add_folder(&SourceFolder {
+            path: "/photos".to_string(),
+            recursive: true,
+        })
+        .expect("re-adding updates the flag");
+
+    assert_eq!(
+        store.folders().expect("read the folders"),
+        vec![SourceFolder {
+            path: "/photos".to_string(),
+            recursive: true,
+        }]
+    );
+
+    assert!(
+        store.remove_folder("/photos").expect("remove the folder"),
+        "the folder was there"
+    );
+    assert!(!store.remove_folder("/photos").expect("remove again"));
+    assert!(store.folders().expect("read the folders").is_empty());
+}
+
+#[test]
+fn requeue_unfinished_returns_pending_paths_and_never_completed_ones() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    store
+        .record(&record("uploaded.jpg", ItemState::Uploaded))
+        .expect("write the completed row");
+    store
+        .record(&record("pending.jpg", ItemState::Pending))
+        .expect("write the pending row");
+    store
+        .record(&record("interrupted.jpg", ItemState::Uploading))
+        .expect("write the interrupted row");
+    let mut parked = record("parked.jpg", ItemState::RetryWait);
+    parked.asset_id = None;
+    store.record(&parked).expect("write the parked row");
+
+    let queued = store.requeue_unfinished().expect("re-queue the unfinished");
+
+    assert_eq!(
+        queued,
+        vec!["interrupted.jpg".to_string(), "pending.jpg".to_string()],
+        "R6.7: only unfinished paths come back, in path order"
+    );
+    assert_eq!(
+        store
+            .item("interrupted.jpg")
+            .expect("read")
+            .expect("the row")
+            .state,
+        ItemState::Pending,
+        "an upload that a crash interrupted is queued again"
+    );
+    assert_eq!(
+        store
+            .item("uploaded.jpg")
+            .expect("read")
+            .expect("the row")
+            .state,
+        ItemState::Uploaded,
+        "R6.7: a completed item is never re-queued"
+    );
+}
+
+#[test]
+fn folder_counts_bucket_the_states() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    let folder = temp.path().join("photos");
+    let path = |name: &str, state| {
+        let mut row = record(&folder.join(name).display().to_string(), state);
+        if !state.is_terminal_success() {
+            row.asset_id = None;
+        }
+        row
+    };
+    for (name, state) in [
+        ("a.jpg", ItemState::Uploaded),
+        ("b.jpg", ItemState::Duplicate),
+        ("c.jpg", ItemState::Pending),
+        ("d.jpg", ItemState::FailedPermanent),
+        ("e.jpg", ItemState::RetryWait),
+    ] {
+        store.record(&path(name, state)).expect("write the row");
+    }
+    // A path outside the folder must not count towards it.
+    store
+        .record(&record(
+            &temp.path().join("other.jpg").display().to_string(),
+            ItemState::Uploaded,
+        ))
+        .expect("write the outside row");
+
+    let counts = store
+        .folder_counts(&folder.display().to_string())
+        .expect("read the counts");
+
+    assert_eq!(counts.uploaded, 2);
+    assert_eq!(counts.pending, 1);
+    assert_eq!(counts.failed, 2);
+}

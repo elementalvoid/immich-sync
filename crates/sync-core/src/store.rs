@@ -9,15 +9,16 @@
 //! Reader connections for the UI arrive with the views that need them; until
 //! then the writer serves the engine's own reads.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension as _, Transaction, TransactionBehavior, params};
 use rusqlite_migration::{M, Migrations};
 
 use crate::failure::FailureClass;
 use crate::hash::Sha1;
+use crate::paths::{PathCase, key, path_key};
 
 /// The first schema (SPEC §5 and issue #5): one row per sync item.
 ///
@@ -39,12 +40,36 @@ CREATE TABLE sync_item (
 );
 ";
 
+/// The second schema (issue #6): the path comparison key that makes
+/// case-only variants one item on Windows (R2.4), and the `source_folder`
+/// table (R2.1).
+///
+/// The SQL adds the column; the hook fills it with the platform's own key,
+/// which SQL alone cannot compute. The unique index and the folder table
+/// arrive in the next migration, after every row has a key.
+const SCHEMA_V2: &str = "ALTER TABLE sync_item ADD COLUMN path_key TEXT;";
+
+/// The third schema (issue #6): the unique key index and the source folders.
+const SCHEMA_V3: &str = "
+CREATE UNIQUE INDEX sync_item_path_key ON sync_item(path_key);
+CREATE TABLE source_folder (
+    id        INTEGER PRIMARY KEY,
+    path      TEXT    NOT NULL,
+    path_key  TEXT    NOT NULL UNIQUE,
+    recursive INTEGER NOT NULL
+);
+";
+
 /// How long the one writer waits for a competing lock before failing.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The state one item is in (SPEC §5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ItemState {
+    /// Discovered and queued, not yet uploaded (R6.7).
+    Pending,
+    /// A worker holds it right now. A restart re-queues this state (R6.7).
+    Uploading,
     /// The server created the asset (R3.2).
     Uploaded,
     /// The server already had the content (R3.2, R4.5).
@@ -60,6 +85,8 @@ impl ItemState {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Pending => "pending",
+            Self::Uploading => "uploading",
             Self::Uploaded => "uploaded",
             Self::Duplicate => "duplicate",
             Self::FailedPermanent => "failed_permanent",
@@ -72,6 +99,8 @@ impl ItemState {
     #[must_use]
     pub fn parse(text: &str) -> Option<Self> {
         Some(match text {
+            "pending" => Self::Pending,
+            "uploading" => Self::Uploading,
             "uploaded" => Self::Uploaded,
             "duplicate" => Self::Duplicate,
             "failed_permanent" => Self::FailedPermanent,
@@ -79,6 +108,33 @@ impl ItemState {
             _ => return None,
         })
     }
+
+    /// Whether the item finished for good: no later run uploads it again
+    /// (R3.2, R6.7).
+    #[must_use]
+    pub fn is_terminal_success(self) -> bool {
+        matches!(self, Self::Uploaded | Self::Duplicate)
+    }
+}
+
+/// One source folder the user selected (R2.1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceFolder {
+    /// The folder path, exactly as the user chose it.
+    pub path: String,
+    /// Whether the scan and the watcher descend into subfolders.
+    pub recursive: bool,
+}
+
+/// The per-folder item counts a dashboard card shows (R8.1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FolderCounts {
+    /// Items queued or in flight.
+    pub pending: u32,
+    /// Items in a terminal success state (R3.2).
+    pub uploaded: u32,
+    /// Items in a failed state.
+    pub failed: u32,
 }
 
 /// One `sync_item` row, in Rust form.
@@ -293,13 +349,25 @@ impl StateStore {
     /// Writes one item's outcome, replacing the row for the same path.
     ///
     /// The write runs inside `BEGIN IMMEDIATE` on the one writer connection
-    /// (ADR 0005), so a concurrent worker waits rather than interleaving.
+    /// (ADR 0005), so a concurrent worker waits rather than interleaving. The
+    /// comparison key is what makes a case-only path variant the same row on
+    /// Windows (R2.4).
     ///
     /// # Errors
     ///
     /// Returns [`StoreError`] when the transaction cannot start, the statement
     /// fails, or the lock is poisoned.
     pub fn record(&self, item: &ItemRecord) -> Result<(), StoreError> {
+        self.record_with_case(item, PathCase::for_platform())
+    }
+
+    /// Writes one item with an explicit case rule, for the platform seam
+    /// (R2.4) and for tests that exercise the Windows rule anywhere.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::record`].
+    pub fn record_with_case(&self, item: &ItemRecord, case: PathCase) -> Result<(), StoreError> {
         let size = i64::try_from(item.size).map_err(|_| StoreError::SizeOutOfRange(item.size))?;
         let mut writer = self.writer()?;
         let transaction = writer
@@ -307,9 +375,10 @@ impl StateStore {
             .map_err(|source| self.query_error(source))?;
         transaction
             .execute(
-                "INSERT INTO sync_item (path, size, mtime_ns, sha1, asset_id, state, error_class)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                 ON CONFLICT(path) DO UPDATE SET
+                "INSERT INTO sync_item (path, path_key, size, mtime_ns, sha1, asset_id, state, error_class)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(path_key) DO UPDATE SET
+                     path = excluded.path,
                      size = excluded.size,
                      mtime_ns = excluded.mtime_ns,
                      sha1 = excluded.sha1,
@@ -318,6 +387,7 @@ impl StateStore {
                      error_class = excluded.error_class",
                 params![
                     item.path,
+                    key(Path::new(&item.path), case),
                     size,
                     item.mtime_ns,
                     item.sha1.as_bytes().as_slice(),
@@ -332,7 +402,8 @@ impl StateStore {
             .map_err(|source| self.query_error(source))
     }
 
-    /// Reads one item by its exact path, or `None` when it is not tracked.
+    /// Reads one item by its path, compared with the platform's own case rule
+    /// (R2.4), or `None` when it is not tracked.
     ///
     /// # Errors
     ///
@@ -342,12 +413,177 @@ impl StateStore {
         writer
             .query_row(
                 "SELECT path, size, mtime_ns, sha1, asset_id, state, error_class
-                 FROM sync_item WHERE path = ?1",
-                [path],
+                 FROM sync_item WHERE path_key = ?1",
+                [path_key(Path::new(path))],
                 read_item,
             )
             .optional()
             .map_err(|source| self.query_error(source))
+    }
+
+    /// Reads an item with an explicit case rule, for tests and for a caller
+    /// that knows the platform behaviour it wants (R2.4).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the query fails or the row cannot be read.
+    pub fn item_with_case(
+        &self,
+        path: &str,
+        case: PathCase,
+    ) -> Result<Option<ItemRecord>, StoreError> {
+        let writer = self.writer()?;
+        writer
+            .query_row(
+                "SELECT path, size, mtime_ns, sha1, asset_id, state, error_class
+                 FROM sync_item WHERE path_key = ?1",
+                [key(Path::new(path), case)],
+                read_item,
+            )
+            .optional()
+            .map_err(|source| self.query_error(source))
+    }
+
+    /// Adds a source folder, or updates its recursive flag when the same
+    /// folder is added again (R2.1).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the write fails or the lock is poisoned.
+    pub fn add_folder(&self, folder: &SourceFolder) -> Result<(), StoreError> {
+        let mut writer = self.writer()?;
+        let transaction = writer
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| self.query_error(source))?;
+        transaction
+            .execute(
+                "INSERT INTO source_folder (path, path_key, recursive)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(path_key) DO UPDATE SET
+                     path = excluded.path,
+                     recursive = excluded.recursive",
+                params![
+                    folder.path,
+                    path_key(Path::new(&folder.path)),
+                    folder.recursive,
+                ],
+            )
+            .map_err(|source| self.query_error(source))?;
+        transaction
+            .commit()
+            .map_err(|source| self.query_error(source))
+    }
+
+    /// Removes a source folder. Returns whether one was removed (R2.1).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the write fails or the lock is poisoned.
+    pub fn remove_folder(&self, path: &str) -> Result<bool, StoreError> {
+        let writer = self.writer()?;
+        let removed = writer
+            .execute(
+                "DELETE FROM source_folder WHERE path_key = ?1",
+                [path_key(Path::new(path))],
+            )
+            .map_err(|source| self.query_error(source))?;
+        Ok(removed > 0)
+    }
+
+    /// Every source folder, ordered by path (R2.1).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the query fails or a row cannot be read.
+    pub fn folders(&self) -> Result<Vec<SourceFolder>, StoreError> {
+        let writer = self.writer()?;
+        let mut statement = writer
+            .prepare("SELECT path, recursive FROM source_folder ORDER BY path")
+            .map_err(|source| self.query_error(source))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(SourceFolder {
+                    path: row.get(0)?,
+                    recursive: row.get(1)?,
+                })
+            })
+            .map_err(|source| self.query_error(source))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|source| self.query_error(source))
+    }
+
+    /// Re-queues what a restart interrupted: an `uploading` row becomes
+    /// `pending` again, and every pending path is returned to enqueue (R6.7).
+    ///
+    /// A completed row is never returned, so a restart cannot re-upload it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the transaction fails or the lock is
+    /// poisoned.
+    pub fn requeue_unfinished(&self) -> Result<Vec<String>, StoreError> {
+        let mut writer = self.writer()?;
+        let transaction = writer
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| self.query_error(source))?;
+        transaction
+            .execute(
+                "UPDATE sync_item SET state = 'pending' WHERE state = 'uploading'",
+                [],
+            )
+            .map_err(|source| self.query_error(source))?;
+        let paths = {
+            let mut statement = transaction
+                .prepare("SELECT path FROM sync_item WHERE state = 'pending' ORDER BY path")
+                .map_err(|source| self.query_error(source))?;
+            let rows = statement
+                .query_map([], |row| row.get(0))
+                .map_err(|source| self.query_error(source))?;
+            rows.collect::<rusqlite::Result<Vec<String>>>()
+                .map_err(|source| self.query_error(source))?
+        };
+        transaction
+            .commit()
+            .map_err(|source| self.query_error(source))?;
+        Ok(paths)
+    }
+
+    /// The item counts under one source folder, for its dashboard card
+    /// (R8.1).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the query fails.
+    pub fn folder_counts(&self, folder: &str) -> Result<FolderCounts, StoreError> {
+        let prefix = format!("{}/", path_key(Path::new(folder)));
+        let writer = self.writer()?;
+        let mut statement = writer
+            .prepare(
+                "SELECT state, COUNT(*) FROM sync_item
+                 WHERE substr(path_key, 1, length(?1)) = ?1
+                 GROUP BY state",
+            )
+            .map_err(|source| self.query_error(source))?;
+        let rows = statement
+            .query_map([&prefix], |row| {
+                let state: String = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                Ok((state, count))
+            })
+            .map_err(|source| self.query_error(source))?;
+        let mut counts = FolderCounts::default();
+        for row in rows {
+            let (state, count) = row.map_err(|source| self.query_error(source))?;
+            let count = u32::try_from(count).unwrap_or(u32::MAX);
+            match ItemState::parse(&state) {
+                Some(ItemState::Uploaded | ItemState::Duplicate) => counts.uploaded += count,
+                Some(ItemState::FailedPermanent | ItemState::RetryWait) => counts.failed += count,
+                // A state a newer build wrote still counts as work in flight,
+                // and an unknown state is not silently dropped.
+                _ => counts.pending += count,
+            }
+        }
+        Ok(counts)
     }
 
     /// The writer connection, or the poison error after a panic.
@@ -417,5 +653,75 @@ fn set_writer_pragmas(writer: &Connection) -> rusqlite::Result<()> {
 
 /// The schema migrations, in order (ADR 0005: `rusqlite_migration`).
 fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![M::up(SCHEMA_V1)])
+    Migrations::new(vec![
+        M::up(SCHEMA_V1),
+        M::up_with_hook(SCHEMA_V2, backfill_path_keys),
+        M::up(SCHEMA_V3),
+    ])
+}
+
+/// Fills `path_key` for the rows the first schema wrote (R2.4).
+///
+/// The key depends on the platform, which SQL cannot see, so the hook walks
+/// the rows and writes what [`crate::paths::path_key`] produces.
+fn backfill_path_keys(transaction: &Transaction<'_>) -> rusqlite_migration::HookResult {
+    let rows = {
+        let mut statement = transaction.prepare("SELECT id, path FROM sync_item")?;
+        let rows = statement.query_map([], |row| {
+            let id: i64 = row.get(0)?;
+            let path: String = row.get(1)?;
+            Ok((id, path))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (id, path) in rows {
+        transaction.execute(
+            "UPDATE sync_item SET path_key = ?1 WHERE id = ?2",
+            params![path_key(Path::new(&path)), id],
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+
+    #[test]
+    fn the_path_key_migration_backfills_an_existing_row() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let path = temp.path().join("state.db");
+        // Build a v1 database the way the v1 build did, then let the full
+        // migration list bring it up. The tracking pragma must show V1 as
+        // applied, or the migration would try to create the table again.
+        {
+            let mut connection = Connection::open(&path).expect("open the raw database");
+            Migrations::new(vec![M::up(SCHEMA_V1)])
+                .to_latest(&mut connection)
+                .expect("create the first schema");
+            let sha1 =
+                Sha1::from_hex("2aae6c35c94fcfb415dbe95f408b9ce91ee846ed").expect("a hex SHA-1");
+            connection
+                .execute(
+                    "INSERT INTO sync_item (path, size, mtime_ns, sha1, asset_id, state, error_class)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        "hello.txt",
+                        11_i64,
+                        1_i64,
+                        sha1.as_bytes().as_slice(),
+                        "asset-1",
+                        "uploaded",
+                        Option::<String>::None,
+                    ],
+                )
+                .expect("insert the old row");
+            drop(connection);
+        }
+
+        let store = StateStore::open(&path).expect("migrate the old database");
+        let row = store.item("hello.txt").expect("read").expect("the row");
+        assert_eq!(row.asset_id.as_deref(), Some("asset-1"));
+        assert!(store.folders().expect("read folders").is_empty());
+    }
 }
