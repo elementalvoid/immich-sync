@@ -673,37 +673,85 @@ fn backfill_path_keys(transaction: &Transaction<'_>) -> rusqlite_migration::Hook
 /// testable on any platform (R2.4).
 ///
 /// Two v1 rows can share one key: case-only variants on Windows, or a trailing
-/// separator anywhere. V3 puts a unique index on the key, so the older row is
-/// dropped and the newest id per key survives.
+/// separator anywhere. V3 puts a unique index on the key, so one row per key
+/// survives: the row with an asset mapping first, then a terminal success, then
+/// the newest id. Dropping a row is irreversible, so every drop is logged.
 fn backfill_path_keys_with_case(
     transaction: &Transaction<'_>,
     case: PathCase,
 ) -> rusqlite_migration::HookResult {
     let rows = {
-        let mut statement = transaction.prepare("SELECT id, path FROM sync_item")?;
+        let mut statement =
+            transaction.prepare("SELECT id, path, asset_id, state FROM sync_item ORDER BY id")?;
         let rows = statement.query_map([], |row| {
-            let id: i64 = row.get(0)?;
-            let path: String = row.get(1)?;
-            Ok((id, path))
+            Ok(MigrationRow {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                asset_id: row.get(2)?,
+                state: row.get(3)?,
+            })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
-    let mut newest: HashMap<String, i64> = HashMap::new();
-    for (id, path) in &rows {
-        newest.insert(key(Path::new(path), case), *id);
+    let mut survivors: HashMap<String, &MigrationRow> = HashMap::new();
+    for row in &rows {
+        survivors
+            .entry(key(Path::new(&row.path), case))
+            .and_modify(|kept| {
+                if outranks(row, kept) {
+                    *kept = row;
+                }
+            })
+            .or_insert(row);
     }
-    for (id, path) in &rows {
-        let row_key = key(Path::new(path), case);
-        if newest.get(&row_key) == Some(id) {
+    for row in &rows {
+        let row_key = key(Path::new(&row.path), case);
+        let kept = survivors
+            .get(&row_key)
+            .expect("every row's key has a survivor");
+        if kept.id == row.id {
             transaction.execute(
                 "UPDATE sync_item SET path_key = ?1 WHERE id = ?2",
-                params![row_key, *id],
+                params![row_key, row.id],
             )?;
         } else {
-            transaction.execute("DELETE FROM sync_item WHERE id = ?1", params![*id])?;
+            tracing::warn!(
+                dropped_path = %row.path,
+                dropped_id = row.id,
+                dropped_asset_id = ?row.asset_id,
+                dropped_state = %row.state,
+                kept_id = kept.id,
+                "the path-key migration dropped a duplicate sync item"
+            );
+            transaction.execute("DELETE FROM sync_item WHERE id = ?1", params![row.id])?;
         }
     }
     Ok(())
+}
+
+/// One `sync_item` row the V2 backfill reads.
+struct MigrationRow {
+    id: i64,
+    path: String,
+    asset_id: Option<String>,
+    state: String,
+}
+
+/// Whether `candidate` outranks `kept` as the survivor of a path-key
+/// collision.
+///
+/// The asset mapping comes first, because a rename-or-deletion review keys on
+/// it (#12) and losing it is permanent; then a terminal success; then the
+/// newest id.
+fn outranks(candidate: &MigrationRow, kept: &MigrationRow) -> bool {
+    fn rank(row: &MigrationRow) -> (bool, bool, i64) {
+        (
+            row.asset_id.is_some(),
+            ItemState::parse(&row.state).is_some_and(ItemState::is_terminal_success),
+            row.id,
+        )
+    }
+    rank(candidate) > rank(kept)
 }
 
 #[cfg(test)]
@@ -777,18 +825,19 @@ mod migration_tests {
         backfill_path_keys_with_case(transaction, PathCase::Insensitive)
     }
 
-    #[test]
-    fn the_backfill_collapses_case_only_variants_to_the_newest_row() {
-        let temp = tempfile::tempdir().expect("create a temp dir");
-        let path = temp.path().join("state.db");
-        let mut connection = Connection::open(&path).expect("open the raw database");
+    /// Seeds a v1 database with `(path, asset_id, state)` rows in insertion
+    /// order, runs the V2 backfill under the Windows case rule, and returns
+    /// the surviving `(id, path)` rows.
+    fn migrate_colliding_rows(
+        db: &Path,
+        rows: &[(&str, Option<&str>, &str)],
+    ) -> Vec<(i64, String)> {
+        let mut connection = Connection::open(db).expect("open the raw database");
         Migrations::new(vec![M::up(SCHEMA_V1)])
             .to_latest(&mut connection)
             .expect("create the first schema");
         let sha1 = Sha1::from_hex("2aae6c35c94fcfb415dbe95f408b9ce91ee846ed").expect("a hex SHA-1");
-        // Case-only variants, legal under v1's `path UNIQUE` but one file under
-        // the Windows rule.
-        for text in ["Photo.JPG", "photo.jpg"] {
+        for (text, asset_id, state) in rows {
             connection
                 .execute(
                     "INSERT INTO sync_item (path, size, mtime_ns, sha1, asset_id, state, error_class)
@@ -798,14 +847,13 @@ mod migration_tests {
                         11_i64,
                         1_i64,
                         sha1.as_bytes().as_slice(),
-                        "asset-1",
-                        "uploaded",
+                        asset_id,
+                        state,
                         Option::<String>::None,
                     ],
                 )
                 .expect("insert the old row");
         }
-
         // The V1 entry keeps the version numbering aligned; it is already
         // applied, so only V2 and V3 run.
         Migrations::new(vec![
@@ -814,22 +862,69 @@ mod migration_tests {
             M::up(SCHEMA_V3),
         ])
         .to_latest(&mut connection)
-        .expect("case-only variants must migrate");
+        .expect("colliding v1 rows must migrate");
 
-        let rows: Vec<(i64, String)> = {
-            let mut statement = connection
-                .prepare("SELECT id, path_key FROM sync_item")
-                .expect("prepare the read");
-            let rows = statement
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-                .expect("query the rows");
-            rows.collect::<rusqlite::Result<Vec<_>>>()
-                .expect("collect the rows")
-        };
+        let mut statement = connection
+            .prepare("SELECT id, path FROM sync_item ORDER BY id")
+            .expect("prepare the read");
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("query the rows");
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect the rows")
+    }
+
+    #[test]
+    fn the_backfill_keeps_the_highest_id_not_the_last_row_in_path_order() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        // "photo.jpg" sorts after "Photo.JPG", so a path-ordered last-wins
+        // pass keeps the older id; the newest id is the one that must survive.
+        let rows = migrate_colliding_rows(
+            &temp.path().join("state.db"),
+            &[
+                ("photo.jpg", Some("asset-1"), "uploaded"),
+                ("Photo.JPG", Some("asset-1"), "uploaded"),
+            ],
+        );
         assert_eq!(
             rows,
-            vec![(2, "photo.jpg".to_string())],
-            "the newest id survives and carries the folded key"
+            vec![(2, "Photo.JPG".to_string())],
+            "the newest id survives, whatever the path order"
+        );
+    }
+
+    #[test]
+    fn the_backfill_keeps_a_row_with_an_asset_id_over_a_newer_row_without_one() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let rows = migrate_colliding_rows(
+            &temp.path().join("state.db"),
+            &[
+                // The mapped row is older and sorts first; both must lose.
+                ("Photo.JPG", Some("asset-1"), "failed_permanent"),
+                ("photo.jpg", None, "uploaded"),
+            ],
+        );
+        assert_eq!(
+            rows,
+            vec![(1, "Photo.JPG".to_string())],
+            "the asset mapping is what a rename-or-deletion review keys on (#12)"
+        );
+    }
+
+    #[test]
+    fn the_backfill_keeps_a_terminal_success_over_a_newer_failure() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let rows = migrate_colliding_rows(
+            &temp.path().join("state.db"),
+            &[
+                ("Photo.JPG", None, "uploaded"),
+                ("photo.jpg", None, "failed_permanent"),
+            ],
+        );
+        assert_eq!(
+            rows,
+            vec![(1, "Photo.JPG".to_string())],
+            "a finished row outranks a parked failure"
         );
     }
 
