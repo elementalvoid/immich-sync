@@ -268,3 +268,97 @@ pub fn report_from_outcome(outcome: UploadOutcome) -> UploadReport {
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{ConnectionModel, UploadModel, UploadReport};
+    use crate::paths::AppPaths;
+    use gpui_kit::AppContext as _;
+    use gpui_kit::TestAppContext;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use sync_core::connection::{AuthMethod, Secret, ServerProfile, SignIn, Unauthorized};
+    use sync_core::credential::{MemoryCredentialStore, SharedCredentialStore};
+
+    /// Starts the offline Immich double on its own runtime.
+    fn mock_server() -> (tokio::runtime::Runtime, mock_immich::MockImmich) {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("start the mock runtime");
+        let server = runtime.block_on(mock_immich::MockImmich::start());
+        (runtime, server)
+    }
+
+    /// Pumps GPUI's test executor until the condition holds.
+    async fn wait_until(cx: &mut TestAppContext, mut done: impl FnMut(&mut gpui_kit::App) -> bool) {
+        for _ in 0..600 {
+            if cx.update(&mut done) {
+                return;
+            }
+            cx.executor().timer(Duration::from_millis(10)).await;
+            cx.run_until_parked();
+        }
+        panic!("the test condition never became true");
+    }
+
+    #[gpui_kit::test]
+    async fn a_successful_upload_restores_the_re_login_budget(cx: &mut TestAppContext) {
+        let (_runtime, server) = mock_server();
+        cx.executor().allow_parking();
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let paths = AppPaths {
+            config_file: temp.path().join("config").join("settings.toml"),
+            state_db: temp.path().join("data").join("state.db"),
+            autostart_dir: temp.path().join("config").join("autostart"),
+        };
+        let profile = ServerProfile {
+            server_url: server.base_url().to_string(),
+            email: "sync@example.com".to_string(),
+            method: AuthMethod::Password,
+        };
+        let credentials: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+        let connection = cx.update(|cx| {
+            let connection = cx.new(|_| ConnectionModel::new(profile.clone(), credentials));
+            let request = SignIn {
+                email: profile.email.clone(),
+                secret: Secret::new("correct horse"),
+                method: AuthMethod::Password,
+            };
+            connection.update(cx, |model, cx| model.sign_in(request, profile.clone(), cx));
+            connection
+        });
+        wait_until(cx, |cx| connection.read(cx).state().is_connected()).await;
+
+        // A first 401 spends the one re-login of this session.
+        server.revoke_tokens();
+        let first = cx
+            .update(|cx| connection.update(cx, |model, cx| model.handle_unauthorized_for_test(cx)));
+        assert_eq!(first, Unauthorized::Retry, "the first 401 re-logs in");
+
+        let model = cx.update(|cx| cx.new(|_| UploadModel::new(connection.clone(), &paths)));
+        let file = temp.path().join("hello.txt");
+        std::fs::write(&file, b"hello world").expect("write the fixture");
+        let path_text = file.display().to_string();
+        cx.update(|cx| {
+            model.update(cx, |model, cx| model.upload(path_text.clone(), cx));
+        });
+        wait_until(cx, |cx| {
+            matches!(model.read(cx).report(), UploadReport::Created { .. })
+        })
+        .await;
+
+        // The successful upload restored the budget, so a later 401 re-logs in
+        // again instead of parking the connection in needs-attention.
+        server.revoke_tokens();
+        let second = cx
+            .update(|cx| connection.update(cx, |model, cx| model.handle_unauthorized_for_test(cx)));
+        assert_eq!(
+            second,
+            Unauthorized::Retry,
+            "an upload that succeeded must refresh the re-login budget"
+        );
+        assert!(cx.read(|cx| connection.read(cx).state().is_connected()));
+    }
+}
