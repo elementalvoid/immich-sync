@@ -146,7 +146,7 @@ pub fn forward(listener: LocalSocketListener, requests: Sender<Request>) {
                 }
             }
             Err(error) => {
-                eprintln!("immich-sync: single-instance listener stopped: {error}");
+                tracing::warn!(error = %error, "the single-instance listener stopped");
                 break;
             }
         }

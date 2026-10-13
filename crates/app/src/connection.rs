@@ -148,6 +148,12 @@ impl ConnectionModel {
             return;
         }
         self.set_state(ConnectionState::Connecting, cx);
+        tracing::info!(
+            server = %crate::logging::without_userinfo(&profile.server_url),
+            email = %profile.email,
+            method = ?profile.method,
+            "restoring the saved sign-in"
+        );
         self.begin(profile, None, cx);
     }
 
@@ -159,6 +165,7 @@ impl ConnectionModel {
         self.form_error = None;
         if !profile.is_configured() {
             self.form_error = Some("Enter the server URL and the email address.".to_string());
+            tracing::debug!("sign-in not attempted: the server URL or the email is missing");
             cx.notify();
             return;
         }
@@ -170,10 +177,21 @@ impl ConnectionModel {
                 }
                 .to_string(),
             );
+            tracing::debug!(
+                method = ?profile.method,
+                "sign-in not attempted: the secret field is empty"
+            );
             cx.notify();
             return;
         }
         self.profile = profile.clone();
+        // The attempt names the account, never the secret (R10.3, N3).
+        tracing::info!(
+            server = %crate::logging::without_userinfo(&profile.server_url),
+            email = %profile.email,
+            method = ?profile.method,
+            "sign-in attempt"
+        );
         self.set_state(ConnectionState::Connecting, cx);
         self.begin(profile, Some(request), cx);
     }
@@ -227,9 +245,23 @@ impl ConnectionModel {
                     return;
                 }
                 model.connection = connection;
+                log_outcome(&state);
                 model.set_state(state, cx);
             });
         })
         .detach();
+    }
+}
+
+/// Records a sign-in outcome. The state holds no secret, and the reason is the
+/// user-facing message, so the line is safe to write (R10.3, N3).
+fn log_outcome(state: &ConnectionState) {
+    match state {
+        ConnectionState::NeedsAttention(attention) => tracing::warn!(
+            state = state.summary(),
+            reason = %attention.message(),
+            "sign-in outcome"
+        ),
+        other => tracing::info!(state = other.summary(), "sign-in outcome"),
     }
 }
