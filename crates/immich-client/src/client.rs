@@ -321,16 +321,24 @@ impl ImmichClient {
     }
 
     /// The id of the asset the server already holds for `checksum`, if any.
+    ///
+    /// Only an answer carrying the `id` sent here is about this file; an entry
+    /// for another id is some other asset, and a row that carries one is never
+    /// uploaded again (#19).
     async fn asset_for_checksum(&self, auth: Auth<'_>, id: &str, checksum: &str) -> Option<String> {
         let item = BulkCheckItem {
             id: id.to_string(),
             checksum: checksum.to_string(),
         };
-        let mut results = self
+        let results = self
             .bulk_upload_check(auth, std::slice::from_ref(&item))
             .await
             .ok()?;
-        match results.pop()?.action {
+        match results
+            .into_iter()
+            .find(|result| result.id == id)
+            .map(|result| result.action)?
+        {
             BulkAction::Reject {
                 reason: RejectReason::Duplicate,
                 asset_id: Some(asset_id),

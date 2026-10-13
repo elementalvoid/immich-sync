@@ -288,6 +288,10 @@ async fn server_that_never_reads_a_body(answers: &'static [Option<&'static str>]
 const SERVER_HOLDS_IT: &str = r#"{"results":[{"id":"hello.txt","action":"reject",
     "reason":"duplicate","assetId":"kept","isTrashed":false}]}"#;
 
+/// The same answer, about a file this upload knows nothing of.
+const SERVER_HOLDS_ANOTHER_FILE: &str = r#"{"results":[{"id":"other.txt","action":"reject",
+    "reason":"duplicate","assetId":"someone-elses","isTrashed":false}]}"#;
+
 #[tokio::test]
 async fn a_cut_off_upload_is_resolved_by_asking_whether_the_server_kept_it() {
     let base_url = server_that_never_reads_a_body(&[None, Some(SERVER_HOLDS_IT)]).await;
@@ -307,6 +311,29 @@ async fn a_cut_off_upload_is_resolved_by_asking_whether_the_server_kept_it() {
         "an upload the server hung up on is the duplicate it reported (#19)"
     );
     assert_eq!(response.asset_id, "kept");
+}
+
+#[tokio::test]
+async fn an_answer_about_another_file_does_not_resolve_the_upload() {
+    let base_url = server_that_never_reads_a_body(&[None, Some(SERVER_HOLDS_ANOTHER_FILE)]).await;
+    let client = ImmichClient::new(&base_url).expect("a loopback URL is valid");
+    let (_directory, path) = hello_world_file();
+
+    let error = client
+        .upload_asset(
+            Auth::ApiKey("api-key-1234"),
+            &upload_request(&path, HELLO_WORLD_SHA1_BASE64),
+        )
+        .await
+        .expect_err("another file's answer says nothing about this upload");
+
+    // A row that already carries an asset id is never uploaded again, so
+    // another file's id would be trusted and persisted (#19). What is left is
+    // the transport failure the upload started with.
+    assert!(
+        matches!(error, ClientError::Unreachable(_)),
+        "an answer for another id leaves the upload unanswered (#19): {error:?}"
+    );
 }
 
 #[tokio::test]
