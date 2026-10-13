@@ -11,8 +11,8 @@ use tokio_util::io::ReaderStream;
 
 use crate::error::ClientError;
 use crate::model::{
-    AssetUpload, Auth, AuthStatus, BulkCheckBody, BulkCheckItem, BulkCheckResult, LoginResponse,
-    ServerAbout, SessionToken, UploadBody, UploadResponse,
+    AssetUpload, Auth, AuthStatus, BulkAction, BulkCheckBody, BulkCheckItem, BulkCheckResult,
+    LoginResponse, RejectReason, ServerAbout, SessionToken, UploadBody, UploadResponse,
 };
 
 /// The longest error message body kept from the server. A reverse proxy can
@@ -252,14 +252,22 @@ impl ImmichClient {
 
     /// Uploads one asset with its checksum header (R3.1).
     ///
-    /// The file streams from disk; it is never buffered in memory. The checksum
-    /// must already be known, because `x-immich-checksum` is a request header
-    /// and the server refuses a duplicate before it reads the body.
+    /// The file streams from disk; it is never buffered in memory. The
+    /// checksum must already be known, because `x-immich-checksum` is a request
+    /// header and it is what makes the server answer `duplicate` for an asset
+    /// it already has.
+    ///
+    /// Immich answers such a duplicate from the header, before multer parses
+    /// the body, and hangs up while the client is still sending (#19). That
+    /// answer can be lost in flight, so a transport failure here is resolved by
+    /// asking whether the server kept the asset.
     ///
     /// # Errors
     ///
     /// Returns [`ClientError::LocalRead`] when the file cannot be opened, the
     /// typed refusal classes (R6.3), and the transport and protocol variants.
+    /// A transport failure is returned only when the server neither holds the
+    /// asset nor answers the follow-up question.
     pub async fn upload_asset(
         &self,
         auth: Auth<'_>,
@@ -281,21 +289,55 @@ impl ImmichClient {
         // them from the local file (R3.1).
         let form = Form::new()
             .part("assetData", part)
-            .text("filename", filename)
+            .text("filename", filename.clone())
             .text("deviceAssetId", upload.path.display().to_string())
             .text("deviceId", "immich-sync")
             .text("fileCreatedAt", iso8601(upload.created_at))
             .text("fileModifiedAt", iso8601(upload.modified_at));
-        let response = self
+        let sent = self
             .authorize(self.http.post(self.endpoint("assets")), auth)
             .header("x-immich-checksum", upload.checksum)
             .multipart(form)
             .send()
-            .await
-            .map_err(ClientError::Unreachable)?;
-        let result = self.read_upload(response).await;
+            .await;
+        let result = match sent {
+            Ok(response) => self.read_upload(response).await,
+            Err(error) => {
+                let lost = ClientError::Unreachable(error);
+                match self
+                    .asset_for_checksum(auth, &filename, upload.checksum)
+                    .await
+                {
+                    Some(asset_id) => Ok(UploadResponse {
+                        asset_id,
+                        duplicate: true,
+                    }),
+                    None => Err(lost),
+                }
+            }
+        };
         log_outcome("upload-asset", &result);
         result
+    }
+
+    /// The id of the asset the server already holds for `checksum`, if any.
+    async fn asset_for_checksum(&self, auth: Auth<'_>, id: &str, checksum: &str) -> Option<String> {
+        let item = BulkCheckItem {
+            id: id.to_string(),
+            checksum: checksum.to_string(),
+        };
+        let mut results = self
+            .bulk_upload_check(auth, std::slice::from_ref(&item))
+            .await
+            .ok()?;
+        match results.pop()?.action {
+            BulkAction::Reject {
+                reason: RejectReason::Duplicate,
+                asset_id: Some(asset_id),
+                ..
+            } => Some(asset_id),
+            _ => None,
+        }
     }
 
     /// Attaches the credential to one request.
