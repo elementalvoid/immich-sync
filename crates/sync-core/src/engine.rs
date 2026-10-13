@@ -26,6 +26,7 @@ use immich_client::{BulkAction, BulkCheckItem, ClientError, ImmichClient, Reject
 use tokio::sync::{Notify, Semaphore, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
 
+use crate::albums::AlbumMapper;
 use crate::connection::RequestCredential;
 use crate::failure::{FailureClass, classify};
 use crate::hash::Sha1;
@@ -76,6 +77,9 @@ pub enum EngineError {
     /// The folder path was blank.
     #[error("the source folder path is empty")]
     EmptyFolder,
+    /// The path is not one of this engine's source folders.
+    #[error("{0} is not a source folder of this client")]
+    UnknownFolder(String),
 }
 
 /// The activity state the tray and the dashboard show (R8.2).
@@ -111,6 +115,10 @@ pub struct FolderStatus {
     pub path: String,
     /// Whether the watcher and the scan descend into subfolders (R2.1).
     pub recursive: bool,
+    /// Whether this folder's files join an album (R3.4).
+    pub album_mapping: bool,
+    /// What the folder maps to once album mapping is on (R3.4).
+    pub album_scope: AlbumScope,
     /// Whether the folder is readable right now (R2.5).
     pub available: bool,
     /// The folder's live counts.
@@ -158,6 +166,7 @@ struct EngineInner {
     client: ImmichClient,
     credential: RequestCredential,
     uploader: Uploader,
+    albums: AlbumMapper,
     config: EngineConfig,
     gate: UploadGate,
     queue: mpsc::UnboundedSender<PathBuf>,
@@ -219,11 +228,13 @@ impl Engine {
             let _ = queue.send(PathBuf::from(path));
         }
         let uploader = Uploader::new(client.clone(), store.clone());
+        let albums = AlbumMapper::new(client.clone(), store.clone());
         let inner = Arc::new(EngineInner {
             store,
             client,
             credential,
             uploader,
+            albums,
             upload_slots: Arc::new(Semaphore::new(config.concurrency.max(1))),
             config,
             gate: UploadGate::new(),
@@ -411,6 +422,58 @@ impl Engine {
         Ok(())
     }
 
+    /// Turns album mapping on or off for one source folder (R3.4).
+    ///
+    /// The mapping is opt-in per folder, so an unmapped folder sends no album
+    /// request at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError`] when the path is not one of this engine's
+    /// source folders, or when the store refuses the change.
+    pub fn set_album_mapping(&self, path: &str, enabled: bool) -> Result<(), EngineError> {
+        self.update_folder(path, |folder| folder.album_mapping = enabled)
+    }
+
+    /// Sets the album scope for one source folder (R3.4).
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::set_album_mapping`].
+    pub fn set_album_scope(&self, path: &str, scope: AlbumScope) -> Result<(), EngineError> {
+        self.update_folder(path, |folder| folder.album_scope = scope)
+    }
+
+    /// Writes one changed field of a source folder back to the store.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::UnknownFolder`] for a path this engine does not
+    /// hold, and [`EngineError::Store`] when the write fails.
+    fn update_folder(
+        &self,
+        path: &str,
+        change: impl FnOnce(&mut SourceFolder),
+    ) -> Result<(), EngineError> {
+        let key = path_key(Path::new(path));
+        let mut folders = self.inner.folders.lock().expect("the folder lock");
+        let entry = folders
+            .iter_mut()
+            .find(|entry| path_key(Path::new(&entry.folder.path)) == key)
+            .ok_or_else(|| EngineError::UnknownFolder(path.to_string()))?;
+        change(&mut entry.folder);
+        let folder = entry.folder.clone();
+        drop(folders);
+        self.inner.store.add_folder(&folder)?;
+        tracing::info!(
+            folder = %folder.path,
+            album_mapping = folder.album_mapping,
+            album_scope = folder.album_scope.as_str(),
+            "the album mapping changed"
+        );
+        Ok(())
+    }
+
     /// Removes a source folder; its items stay in the store (R2.1).
     ///
     /// # Errors
@@ -444,6 +507,8 @@ impl Engine {
             .map(|entry| FolderStatus {
                 path: entry.folder.path.clone(),
                 recursive: entry.folder.recursive,
+                album_mapping: entry.folder.album_mapping,
+                album_scope: entry.folder.album_scope,
                 available: entry.available,
                 counts: entry.counts,
                 last_error: entry.last_error.clone(),
@@ -664,6 +729,52 @@ async fn dispatch_loop(inner: Arc<EngineInner>, mut queue_rx: mpsc::UnboundedRec
     }
 }
 
+/// Adds a finished asset to the albums its folder maps to (R3.4).
+///
+/// The upload is already recorded when this runs, so a failure here never
+/// costs the upload: the row keeps its terminal state and its asset mapping,
+/// and the folder's last error says what could not be done. A retry of the
+/// album call belongs with the retry work, not here.
+async fn attach_albums(inner: &Arc<EngineInner>, file: &Path, asset_id: &str) {
+    let Some(folder) = folder_entry_for(inner, file) else {
+        return;
+    };
+    match inner
+        .albums
+        .attach(&folder, file, asset_id, &inner.credential)
+        .await
+    {
+        // R3.4: an unmapped folder maps no album, and sends no request.
+        Ok(None) => {}
+        Ok(Some(_album)) => {}
+        Err(error) => {
+            tracing::warn!(
+                path = %file.display(),
+                folder = %folder.path,
+                reason = %error.redacted_reason(),
+                "the asset is on the server, but album mapping failed"
+            );
+            set_folder_error(
+                inner,
+                &folder.path,
+                format!("album mapping failed: {error}"),
+            );
+        }
+    }
+}
+
+/// The source folder that contains `path`, as stored.
+fn folder_entry_for(inner: &EngineInner, path: &Path) -> Option<SourceFolder> {
+    let case = PathCase::for_platform();
+    inner
+        .folders
+        .lock()
+        .expect("the folder lock")
+        .iter()
+        .find(|entry| is_within(Path::new(&entry.folder.path), path, case))
+        .map(|entry| entry.folder.clone())
+}
+
 /// Prepares one batch and checks it with one `bulk-upload-check` (R3.1).
 async fn process_batch(inner: &Arc<EngineInner>, batch: Vec<PathBuf>) {
     let mut prepared = Vec::with_capacity(batch.len());
@@ -702,7 +813,15 @@ async fn process_batch(inner: &Arc<EngineInner>, batch: Vec<PathBuf>) {
                         ..
                     }) => {
                         record_terminal(inner, &item, &asset_id, ItemState::Duplicate);
-                        inner.finish_item(&item, &UploadOutcome::Duplicate { asset_id });
+                        inner.finish_item(
+                            &item,
+                            &UploadOutcome::Duplicate {
+                                asset_id: asset_id.clone(),
+                            },
+                        );
+                        // R3.4: a duplicate is a success (R3.2), and it still
+                        // maps to its folder's album.
+                        attach_albums(inner, &item.path, &asset_id).await;
                     }
                     Some(BulkAction::Reject {
                         reason: RejectReason::UnsupportedFormat,
@@ -923,6 +1042,10 @@ async fn spawn_upload(inner: &Arc<EngineInner>, item: PreparedItem) {
         worker.finish_item(&item, &outcome);
         match &outcome {
             UploadOutcome::Created { asset_id } | UploadOutcome::Duplicate { asset_id } => {
+                // R3.4: the asset joins the album its folder maps to. This runs
+                // after `finish_item`, so a later success cannot clear the error
+                // an album failure records against the folder.
+                attach_albums(&worker, &item.path, asset_id).await;
                 tracing::info!(path = %item.path.display(), asset_id = %asset_id, "the item finished");
             }
             UploadOutcome::Failed(failure) => {
