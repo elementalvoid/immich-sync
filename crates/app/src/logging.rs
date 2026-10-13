@@ -148,6 +148,13 @@ pub fn control() -> Option<&'static LogControl> {
     CONTROL.get()
 }
 
+/// The target the level-change record uses.
+///
+/// [`targets`] pins it open, so the record lands whatever the previous and the
+/// new level are: a change from `Error` down to `Debug` would otherwise be
+/// emitted under a filter that drops it.
+const LEVEL_CHANGE_TARGET: &str = "immich_sync::logging::level_change";
+
 /// Flushes the queued log lines and stops the writer thread.
 ///
 /// The client calls this once, on the way out; the guard cannot live in a
@@ -176,16 +183,24 @@ pub fn set_level(level: LogLevel) {
     }
 }
 
-/// The subscriber filter: the app's own crates log at `level`, and every
-/// dependency is held at `error`, because `zbus` logs the same harmless D-Bus
-/// portal failure at `warn` on every proxy and would still bury app
-/// diagnostics.
+/// The subscriber filter: the app's own crates log at `level`, dependencies at
+/// `warn`, and only the one target measured to repeat harmless failures is
+/// pinned down.
+///
+/// Dependencies are not held at `error`: rustls and zbus report real TLS and
+/// D-Bus problems at `warn`, and this file is the one a user is told to read
+/// (R10.3).
 fn targets(level: LogLevel) -> Targets {
     Targets::new()
-        .with_default(LevelFilter::ERROR)
+        .with_default(LevelFilter::WARN)
         .with_target("immich_sync", level.filter())
         .with_target("immich_client", level.filter())
         .with_target("sync_core", level.filter())
+        .with_target(LEVEL_CHANGE_TARGET, LevelFilter::TRACE)
+        // Measured: zbus logs the same harmless D-Bus failures at warn on
+        // every proxy — a missing org.freedesktop.portal.Desktop (twice) and
+        // a missing org.a11y.Bus — and they would bury app diagnostics.
+        .with_target("zbus::proxy", LevelFilter::ERROR)
 }
 
 /// A handle to the running subscriber: where it writes, and how to change its
@@ -209,9 +224,11 @@ impl LogControl {
     ///
     /// Returns an error when the subscriber was dropped.
     pub fn set_level(&self, level: LogLevel) -> anyhow::Result<()> {
-        // Recorded under the level that is still active: the new level would
-        // filter this line out.
-        tracing::info!(level = level.as_str(), "log level changed");
+        tracing::info!(
+            target: LEVEL_CHANGE_TARGET,
+            level = level.as_str(),
+            "log level changed"
+        );
         self.reload
             .reload(targets(level))
             .context("apply the log level")?;

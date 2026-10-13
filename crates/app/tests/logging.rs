@@ -81,6 +81,10 @@ fn changing_the_level_changes_what_is_written_without_a_restart() {
         text.contains("revealed diagnostic"),
         "the raised level applies without a restart: {text}"
     );
+    assert!(
+        text.contains("log level changed"),
+        "the Error-to-Debug change is recorded even though the old level hid info: {text}"
+    );
 }
 
 #[test]
@@ -153,14 +157,15 @@ fn lowering_the_level_still_records_the_change() {
 }
 
 #[test]
-fn the_app_level_applies_while_dependency_noise_is_held_back() {
+fn the_app_level_applies_and_only_known_dependency_noise_is_silenced() {
     let temp = tempfile::tempdir().expect("create a temp dir");
     let mut sink =
         LogSink::start(temp.path(), LogPolicy::default(), LogLevel::Info).expect("start the log");
     let guard = sink.thread_default();
 
-    tracing::info!(target: "zbus::proxy", "dependency chatter");
-    tracing::warn!(target: "gpui_component::theme", "dependency warning");
+    tracing::info!(target: "hyper_util::client", "dependency chatter");
+    tracing::warn!(target: "rustls::client::hs", "a real TLS warning");
+    tracing::warn!(target: "zbus::proxy", "the known portal failure");
     tracing::info!(target: "immich_sync::connection", "app diagnostic");
 
     drop(guard);
@@ -172,8 +177,12 @@ fn the_app_level_applies_while_dependency_noise_is_held_back() {
         "a dependency's info line is held back: {text}"
     );
     assert!(
-        !text.contains("dependency warning"),
-        "a dependency's warning cannot bury the app: {text}"
+        text.contains("a real TLS warning"),
+        "a dependency's warning reaches the file a user reads: {text}"
+    );
+    assert!(
+        !text.contains("the known portal failure"),
+        "the measured benign zbus failure is silenced explicitly: {text}"
     );
     assert!(
         text.contains("app diagnostic"),
