@@ -18,12 +18,14 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use immich_client::{BulkAction, BulkCheckItem, ClientError, ImmichClient, RejectReason};
-use tokio::sync::{Notify, Semaphore, mpsc};
+use immich_client::{
+    BandwidthLimit, BulkAction, BulkCheckItem, ClientError, ImmichClient, RejectReason,
+};
+use tokio::sync::{Mutex as AsyncMutex, Notify, Semaphore, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::connection::RequestCredential;
@@ -41,9 +43,12 @@ use crate::watch::FolderWatcher;
 pub struct EngineConfig {
     /// How many checksums one `bulk-upload-check` carries (R3.1). Default 100.
     pub batch_size: usize,
-    /// How many uploads may run at once (R7.2). Read once at pool start; #8
-    /// makes it live.
+    /// How many uploads may run at once (R7.2). Default 4. [`Engine::set_limits`]
+    /// is the live path; this is the value the engine starts with.
     pub concurrency: usize,
+    /// The upload bandwidth limit in bytes per second; 0 means unlimited
+    /// (R7.1). [`Engine::set_limits`] is the live path.
+    pub bandwidth_bytes_per_second: u64,
     /// How often the reconciliation scan runs (R2.3). Default 30 minutes.
     pub scan_interval: Duration,
     /// How long the watcher settles before it reports a batch (R2.3).
@@ -58,9 +63,32 @@ impl Default for EngineConfig {
         Self {
             batch_size: 100,
             concurrency: 4,
+            bandwidth_bytes_per_second: 0,
             scan_interval: Duration::from_secs(30 * 60),
             watch_debounce: Duration::from_secs(2),
             watch: true,
+        }
+    }
+}
+
+/// The user-set limits the running engine can be moved to (SPEC R7).
+///
+/// [`Engine::set_limits`] applies both without a restart: the bandwidth limit
+/// is read by an upload already on the wire, and the concurrency limit admits
+/// or retires workers as the pool drains.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    /// Upload bytes per second; 0 means unlimited (R7.1).
+    pub bandwidth_bytes_per_second: u64,
+    /// How many uploads may run at once (R7.2).
+    pub concurrency: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            bandwidth_bytes_per_second: 0,
+            concurrency: 4,
         }
     }
 }
@@ -167,6 +195,14 @@ struct EngineInner {
     resume: Notify,
     sync_now: Notify,
     upload_slots: Arc<Semaphore>,
+    /// The upload bandwidth limit, shared with every upload so a change
+    /// reaches one already on the wire (R7.1).
+    bandwidth: BandwidthLimit,
+    /// The concurrency the pool is sized to right now (R7.2).
+    concurrency: AtomicUsize,
+    /// Serializes a pool resize, so two quick settings changes cannot leave
+    /// the permits and this count disagreeing.
+    limits_lock: AsyncMutex<()>,
     watcher: Mutex<Option<FolderWatcher>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     /// Set by `stop` before it aborts, so no worker is spawned afterwards.
@@ -223,6 +259,9 @@ impl Engine {
             credential,
             uploader,
             upload_slots: Arc::new(Semaphore::new(config.concurrency.max(1))),
+            bandwidth: BandwidthLimit::new(config.bandwidth_bytes_per_second),
+            concurrency: AtomicUsize::new(config.concurrency.max(1)),
+            limits_lock: AsyncMutex::new(()),
             config,
             gate: UploadGate::new(),
             queue,
@@ -349,6 +388,52 @@ impl Engine {
     /// Asks for a reconciliation scan now (R8.3).
     pub fn sync_now(&self) {
         self.inner.sync_now.notify_one();
+    }
+
+    /// The limits the engine is running with right now (R7.1, R7.2).
+    #[must_use]
+    pub fn limits(&self) -> Limits {
+        Limits {
+            bandwidth_bytes_per_second: self.inner.bandwidth.bytes_per_second(),
+            concurrency: self.inner.concurrency.load(Ordering::Acquire),
+        }
+    }
+
+    /// Moves both limits while the engine runs (R7.1, R7.2).
+    ///
+    /// The bandwidth limit is read by every upload on its next poll, so a
+    /// change reaches an upload already on the wire without a restart and
+    /// without re-sending a request. A raised concurrency admits new workers
+    /// at once. A lowered concurrency lets the in-flight uploads finish: the
+    /// pool takes no new work until it has drained to the new number, and no
+    /// upload is cancelled or failed.
+    pub async fn set_limits(&self, limits: Limits) {
+        self.inner.bandwidth.set(limits.bandwidth_bytes_per_second);
+        // One resize at a time, so a second change cannot race the permits.
+        let _resize = self.inner.limits_lock.lock().await;
+        let target = limits.concurrency.max(1);
+        let current = self.inner.concurrency.swap(target, Ordering::AcqRel);
+        if target > current {
+            self.inner.upload_slots.add_permits(target - current);
+        } else if target < current {
+            // Take the whole pool first, so nothing new starts while it
+            // drains; then forget the difference, so the pool stays smaller
+            // from then on.
+            let slots = Arc::clone(&self.inner.upload_slots);
+            let remove = current - target;
+            let permits = u32::try_from(current).unwrap_or(u32::MAX);
+            if let Ok(mut held) = slots.acquire_many_owned(permits).await {
+                match held.split(remove) {
+                    Some(removed) => removed.forget(),
+                    None => held.forget(),
+                }
+            }
+        }
+        tracing::info!(
+            bandwidth = limits.bandwidth_bytes_per_second,
+            concurrency = target,
+            "the limits changed"
+        );
     }
 
     /// Adds a source folder and scans it (R2.1).
@@ -912,7 +997,12 @@ async fn spawn_upload(inner: &Arc<EngineInner>, item: PreparedItem) {
     uploads.spawn(async move {
         let outcome = worker
             .uploader
-            .upload_prepared(&item, &worker.credential, &worker.gate)
+            .upload_prepared(
+                &item,
+                &worker.credential,
+                &worker.gate,
+                Some(&worker.bandwidth),
+            )
             .await;
         worker.finish_item(&item, &outcome);
         match &outcome {
@@ -1041,6 +1131,10 @@ mod tests {
         let config = EngineConfig::default();
         assert_eq!(config.batch_size, 100, "R3.1: batched checks");
         assert_eq!(config.concurrency, 4, "R7.2: default concurrency");
+        assert_eq!(
+            config.bandwidth_bytes_per_second, 0,
+            "R7.1: default bandwidth is unlimited"
+        );
         assert_eq!(
             config.scan_interval,
             Duration::from_secs(30 * 60),

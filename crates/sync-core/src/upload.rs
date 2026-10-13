@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use immich_client::{
-    AssetUpload, BulkAction, BulkCheckItem, ClientError, ImmichClient, RejectReason,
+    AssetUpload, BandwidthLimit, BulkAction, BulkCheckItem, ClientError, ImmichClient, RejectReason,
 };
 
 use crate::connection::RequestCredential;
@@ -248,7 +248,8 @@ impl Uploader {
             }
         }
 
-        self.send_upload(&mut item, &checksum, credential).await
+        self.send_upload(&mut item, &checksum, credential, None)
+            .await
     }
 
     /// Uploads a file the caller already hashed and the server already
@@ -256,12 +257,15 @@ impl Uploader {
     /// leaves it re-queueable (R6.7).
     ///
     /// The gate is checked immediately before the request, so a pause stops
-    /// the next upload even inside an already-dispatched worker (R8.7).
+    /// the next upload even inside an already-dispatched worker (R8.7). The
+    /// bandwidth limit is live, so the request streams under whatever limit is
+    /// set when its bytes are read (R7.1).
     pub async fn upload_prepared(
         &self,
         prepared: &PreparedItem,
         credential: &RequestCredential,
         gate: &UploadGate,
+        bandwidth: Option<&BandwidthLimit>,
     ) -> UploadOutcome {
         let mut item = ItemRecord {
             path: prepared.path.to_string_lossy().into_owned(),
@@ -279,7 +283,7 @@ impl Uploader {
             return UploadOutcome::Deferred;
         }
         self.record(&item);
-        self.send_upload(&mut item, &prepared.sha1.base64(), credential)
+        self.send_upload(&mut item, &prepared.sha1.base64(), credential, bandwidth)
             .await
     }
 
@@ -289,6 +293,7 @@ impl Uploader {
         item: &mut ItemRecord,
         checksum: &str,
         credential: &RequestCredential,
+        bandwidth: Option<&BandwidthLimit>,
     ) -> UploadOutcome {
         // Immich requires the file's own dates on the asset (R3.1). The
         // creation time is missing on some platforms and filesystems; the
@@ -311,6 +316,7 @@ impl Uploader {
                     checksum,
                     created_at,
                     modified_at,
+                    bandwidth: bandwidth.cloned(),
                 },
             )
             .await
