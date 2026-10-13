@@ -11,6 +11,7 @@ use std::rc::Rc;
 use crate::autostart::Autostart;
 use crate::connection::{ConnectionModel, apply_profile, profile_from_settings};
 use crate::dashboard::CardPalette;
+use crate::logging::LogLevel;
 use crate::paths::AppPaths;
 use crate::settings::{Settings, SettingsStore};
 
@@ -362,7 +363,10 @@ impl SettingsView {
             }
         };
         let autostart = crate::autostart::platform_autostart(&paths).unwrap_or_else(|error| {
-            eprintln!("immich-sync: could not prepare autostart: {error:#}");
+            tracing::error!(
+                error = %format!("{error:#}"),
+                "could not prepare the autostart mechanism; the setting is unavailable"
+            );
             Rc::new(crate::autostart::UnavailableAutostart::new(format!(
                 "{error:#}"
             )))
@@ -370,6 +374,45 @@ impl SettingsView {
         let mut view = Self::new(store, paths, autostart, connection, window, cx);
         view.environment_problem = environment_problem;
         view
+    }
+
+    /// The resolved paths, so the Logs view can show where the log lives (R9.3).
+    #[must_use]
+    pub fn paths(&self) -> &AppPaths {
+        &self.paths
+    }
+
+    /// The persisted log level (R10.3).
+    #[must_use]
+    pub fn log_level(&self) -> LogLevel {
+        self.store.settings().log_level
+    }
+
+    /// Persists a log level and applies it to the running subscriber.
+    ///
+    /// The Logs view calls this, so the settings file keeps its one writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the settings file cannot be written. The running
+    /// level then keeps its last saved value, so the subscriber, the settings
+    /// file, and the level the view shows never disagree.
+    pub fn set_log_level(&mut self, level: LogLevel, cx: &mut Context<Self>) -> anyhow::Result<()> {
+        let result = self.store.update(|settings| settings.log_level = level);
+        if result.is_ok() {
+            crate::logging::set_level(level);
+        }
+        match result {
+            Ok(()) => {
+                self.record(SAVE_PROBLEM, Ok(()), cx);
+                Ok(())
+            }
+            Err(error) => {
+                let message = format!("{SAVE_PROBLEM}: {error:#}");
+                self.record(SAVE_PROBLEM, Err(error), cx);
+                Err(anyhow::anyhow!(message))
+            }
+        }
     }
 
     /// Signs in with the form's values. The profile is saved only once the
@@ -995,7 +1038,7 @@ fn connection_accent(state: &ConnectionState, theme: &Theme) -> Hsla {
 
 /// One labelled field row: the name and help on the left, the control on the
 /// right.
-fn field_text(label: &str, help: &str, palette: &CardPalette) -> impl IntoElement {
+pub(crate) fn field_text(label: &str, help: &str, palette: &CardPalette) -> impl IntoElement {
     div()
         .flex()
         .flex_col()
@@ -1016,7 +1059,7 @@ fn field_text(label: &str, help: &str, palette: &CardPalette) -> impl IntoElemen
 }
 
 /// One card of related settings.
-fn section(
+pub(crate) fn section(
     id: &'static str,
     title: &'static str,
     description: &'static str,
@@ -1057,7 +1100,12 @@ fn section(
 
 /// A notice with a colored edge. The accessible name carries the message, so
 /// the visible copy is not announced a second time.
-fn notice(id: &'static str, text: String, accent: Hsla, palette: &CardPalette) -> impl IntoElement {
+pub(crate) fn notice(
+    id: &'static str,
+    text: String,
+    accent: Hsla,
+    palette: &CardPalette,
+) -> impl IntoElement {
     div()
         .id(id)
         .test_support()

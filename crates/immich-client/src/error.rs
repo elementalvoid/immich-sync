@@ -5,6 +5,8 @@
 //! server, and a response the client cannot use. Nothing here carries the
 //! password, the API key, or the session token.
 
+use std::borrow::Cow;
+
 use thiserror::Error;
 
 /// Why a request to the Immich server failed.
@@ -59,4 +61,73 @@ pub enum ClientError {
         /// The server's message, or a short description of the unusable body.
         message: String,
     },
+}
+
+impl ClientError {
+    /// The label a log line records: the variant and, for a protocol failure,
+    /// its status.
+    ///
+    /// The server's own message is never included. Several variants quote it,
+    /// and a broken or hostile server can fill it with a submitted credential,
+    /// so only this label may reach a log (SPEC N3, R10.3).
+    #[must_use]
+    pub fn redacted_reason(&self) -> Cow<'static, str> {
+        match self {
+            Self::InvalidUrl(_) => Cow::Borrowed("the server URL is not valid"),
+            Self::HttpClient(_) => Cow::Borrowed("the HTTP client could not be built"),
+            Self::Unreachable(_) => Cow::Borrowed("the server could not be reached"),
+            Self::WrongCredentials => Cow::Borrowed("the server rejected the password"),
+            Self::PasswordLoginDisabled => Cow::Borrowed("password login is disabled"),
+            Self::InvalidApiKey => Cow::Borrowed("the server rejected the API key"),
+            Self::InvalidToken => Cow::Borrowed("the server rejected the session token"),
+            Self::UnsupportedFormat(_) => {
+                Cow::Borrowed("the server does not accept this file format")
+            }
+            Self::QuotaExceeded(_) => Cow::Borrowed("the account is over its storage quota"),
+            Self::PermissionDenied(_) => {
+                Cow::Borrowed("the credential lacks the required permission")
+            }
+            Self::TooLarge(_) => Cow::Borrowed("the file is too large for the server"),
+            Self::LocalRead(_) => Cow::Borrowed("the local file could not be read"),
+            Self::Protocol { status, .. } => Cow::Owned(format!(
+                "the server answered {status} in a form this client does not understand"
+            )),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ClientError;
+
+    #[test]
+    fn a_server_message_never_reaches_the_redacted_reason() {
+        let secret = "hunter2-echo";
+        let errors = [
+            ClientError::UnsupportedFormat(secret.to_string()),
+            ClientError::QuotaExceeded(secret.to_string()),
+            ClientError::PermissionDenied(secret.to_string()),
+            ClientError::TooLarge(secret.to_string()),
+            ClientError::Protocol {
+                status: 500,
+                message: secret.to_string(),
+            },
+        ];
+        for error in errors {
+            let reason = error.redacted_reason();
+            assert!(
+                !reason.contains(secret),
+                "the reason for an error quotes the server: {reason}"
+            );
+        }
+        assert!(
+            ClientError::Protocol {
+                status: 503,
+                message: String::new(),
+            }
+            .redacted_reason()
+            .contains("503"),
+            "the status stays in the reason"
+        );
+    }
 }

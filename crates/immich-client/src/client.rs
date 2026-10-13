@@ -107,6 +107,16 @@ impl ImmichClient {
                 "the server URL must start with http:// or https://".to_string(),
             ));
         }
+        // A URL can carry `user:password@`. That password would reach the
+        // settings file, a log line, and a request error, so it is refused at
+        // the one place a server URL enters the client (R10.3, N3).
+        if !base.username().is_empty() || base.password().is_some() {
+            return Err(ClientError::InvalidUrl(
+                "the server URL must not contain a user name or password; sign in with the \
+                 credential fields instead"
+                    .to_string(),
+            ));
+        }
         // A base with a path prefix (`https://host/immich`) must keep the
         // prefix when an endpoint is joined to it.
         if !base.path().ends_with('/') {
@@ -428,17 +438,20 @@ fn password_login_disabled(message: &str) -> bool {
 }
 
 /// Records the outcome of one request as structured, secret-free fields.
+///
+/// Every failure variant can carry a server-supplied message — the protocol
+/// error, and the typed refusals that quote the body (403, 415, 413, and the
+/// quota 400) — and a broken or hostile server can fill it with a submitted
+/// credential. Only [`ClientError::redacted_reason`] is recorded (SPEC N3).
 fn log_outcome<T>(operation: &'static str, result: &Result<T, ClientError>) {
     match result {
         Ok(_) => tracing::debug!(operation, outcome = "ok", "Immich request finished"),
-        Err(error) => {
-            tracing::debug!(
-                operation,
-                outcome = "error",
-                error = %error,
-                "Immich request finished"
-            );
-        }
+        Err(error) => tracing::debug!(
+            operation,
+            outcome = "error",
+            reason = %error.redacted_reason(),
+            "Immich request finished"
+        ),
     }
 }
 

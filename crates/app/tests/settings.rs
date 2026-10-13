@@ -11,6 +11,7 @@ use std::sync::{Mutex, MutexGuard};
 
 #[cfg(target_os = "linux")]
 use immich_sync::autostart::{Autostart, XdgAutostart, platform_autostart};
+use immich_sync::logging::LogLevel;
 use immich_sync::paths::{APP_DIR, AppPaths, SETTINGS_FILE, STATE_FILE};
 use immich_sync::settings::{Settings, SettingsStore};
 use sync_core::connection::AuthMethod;
@@ -277,6 +278,7 @@ fn settings_round_trip_across_a_restart() {
     assert_eq!(settings.server_url, "https://immich.example.com");
     assert_eq!(settings.email, "sync@example.com");
     assert_eq!(settings.auth_method, AuthMethod::ApiKey);
+    assert_eq!(settings.log_level, LogLevel::Info);
     assert!(restarted.problem().is_none());
 
     // The file is plain TOML, so a person can read and edit it.
@@ -290,7 +292,8 @@ fn settings_round_trip_across_a_restart() {
          attempt_cap = 3\n\
          server_url = \"https://immich.example.com\"\n\
          email = \"sync@example.com\"\n\
-         auth_method = \"api_key\"\n"
+         auth_method = \"api_key\"\n\
+         log_level = \"info\"\n"
     );
 }
 

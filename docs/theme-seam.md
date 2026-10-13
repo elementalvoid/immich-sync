@@ -20,3 +20,10 @@ the capture is reproducible:
 ```sh
 IMMICH_SYNC_THEME=dark target/debug/immich-sync
 ```
+
+## Picking the captured view
+
+The shell starts on the dashboard. To capture another surface, set
+`IMMICH_SYNC_VIEW` to `dashboard`, `settings`, or `logs`; any other value is
+ignored and the dashboard opens. `shell::view_for_name` is the pure mapping and
+is covered by a headless test.
