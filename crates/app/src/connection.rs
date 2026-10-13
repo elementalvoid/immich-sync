@@ -10,11 +10,11 @@ use std::sync::OnceLock;
 use crate::credentials::CredentialStoreProvider;
 use crate::settings::Settings;
 use gpui_kit::*;
+#[cfg(test)]
+use sync_core::connection::Unauthorized;
 use sync_core::connection::{
     Attention, AuthMethod, Connection, ConnectionState, RequestCredential, ServerProfile, SignIn,
 };
-#[cfg(test)]
-use sync_core::connection::Unauthorized;
 
 /// The saved connection profile, from the settings file. It holds no secret.
 #[must_use]
