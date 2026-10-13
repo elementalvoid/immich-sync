@@ -58,7 +58,7 @@ jobs:
             libfontconfig-dev libfreetype-dev libwayland-dev libxkbcommon-dev \
             libxkbcommon-x11-dev libx11-xcb-dev libxcb1-dev \
             libvulkan1 mesa-vulkan-drivers libdbus-1-dev \
-            xvfb xvfb-run xauth imagemagick x11-utils
+            xvfb xauth dbus-daemon imagemagick x11-utils
       - run: cargo build --bin immich-sync
       - name: Capture a real frame
         run: |
