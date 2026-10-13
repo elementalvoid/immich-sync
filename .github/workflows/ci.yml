@@ -137,6 +137,11 @@ jobs:
         run: |
           set -euo pipefail
           identify -format "geom=%wx%h colors=%k\n" shot.png
+          colors=$(identify -format %k shot.png)
           mean=$(convert shot.png -colorspace gray -format '%[fx:mean]' info:)
           echo "screenshot gray mean=$mean"
+          # One colour means nothing was drawn; a mean of 0 only means black,
+          # so both reject a bare root (a lit pixel in a black frame passes the
+          # mean alone).
+          test "$colors" -gt 1
           test "$mean" != "0"
