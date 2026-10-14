@@ -20,7 +20,7 @@
 //! The engine has no UI imports (N6, PLAN). The shell reads [`Engine::status`]
 //! for the dashboard and the tray.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -35,14 +35,14 @@ use crate::backoff::RetryPolicy;
 use crate::breaker::CircuitBreaker;
 use crate::connection::SharedSession;
 use crate::failure::{FailureClass, FailureKind, classify};
-use crate::hash::Sha1;
+use crate::hash::{Sha1, sha1_file};
 use crate::pairing::FolderIndex;
 use crate::paths::{PathCase, is_within, path_key};
 use crate::scan::{ScanError, scan_folder};
 use crate::skip::{has_symlink_ancestor, skip_reason_below};
 use crate::store::{
     AlbumScope, AttemptOutcome, AttemptRecord, FailedItem, FolderCounts, ItemRecord, ItemState,
-    SourceFolder, StateStore, StoreError,
+    ReviewDecision, ReviewItem, SourceFolder, StateStore, StoreError,
 };
 use crate::upload::{
     PreparedItem, UploadFailure, UploadGate, UploadOutcome, Uploader, hash_in_background,
@@ -132,6 +132,20 @@ pub enum EngineError {
     /// The path is not one of this engine's source folders.
     #[error("{0} is not a source folder of this client")]
     UnknownFolder(String),
+}
+
+/// Why a deletion-review decision could not be recorded (R5.3, R5.5).
+#[derive(Debug, thiserror::Error)]
+pub enum ReviewError {
+    /// The state database refused the decision.
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    /// The server refused the trash call, or could not be reached (R5.5).
+    #[error(transparent)]
+    Client(#[from] ClientError),
+    /// The path is not waiting for a decision.
+    #[error("{0} is not waiting for a review decision")]
+    NotInReview(String),
 }
 
 /// The activity state the tray and the dashboard show (R8.2).
@@ -250,6 +264,12 @@ struct EngineInner {
     /// The upload workers the dispatcher spawned, so `stop` can abort the ones
     /// still on the wire instead of leaving them running after the engine.
     uploads: Mutex<JoinSet<()>>,
+    /// Paths the watcher reported gone (R5.1). The watcher callback must not
+    /// block, so it only records the path and wakes the scan loop, which asks
+    /// the store whether anything tracked really disappeared.
+    absences: Mutex<Vec<PathBuf>>,
+    /// Wakes the scan loop when an absence needs reconciling.
+    reconcile: Notify,
 }
 
 /// The folder sync engine (R2, R3, R6.7, R8.7).
@@ -322,6 +342,8 @@ impl Engine {
             tasks: Mutex::new(Vec::new()),
             stopped: AtomicBool::new(false),
             uploads: Mutex::new(JoinSet::new()),
+            absences: Mutex::new(Vec::new()),
+            reconcile: Notify::new(),
         });
         Ok(Self {
             inner,
@@ -649,6 +671,7 @@ impl Engine {
             counts.pending += folder.counts.pending;
             counts.uploaded += folder.counts.uploaded;
             counts.failed += folder.counts.failed;
+            counts.review += folder.counts.review;
         }
         let activity = if self.inner.gate.is_paused() {
             Activity::Paused
@@ -660,6 +683,10 @@ impl Engine {
             Activity::NeedsAttention
         } else if counts.pending > 0 {
             Activity::Syncing
+        } else if counts.review > 0 {
+            // R5.4: a file waiting for a keep-or-trash decision is the user's
+            // to answer, like a failure.
+            Activity::NeedsAttention
         } else {
             Activity::Idle
         };
@@ -695,6 +722,81 @@ impl Engine {
     /// Returns a [`StoreError`] when the query fails.
     pub fn failed_items(&self) -> Result<Vec<FailedItem>, StoreError> {
         self.inner.store.failed_items()
+    }
+
+    /// The missing files that wait for a decision, in path order (R5.3).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StoreError`] when the query fails.
+    pub fn review_items(&self) -> Result<Vec<ReviewItem>, StoreError> {
+        self.inner.store.review_items()
+    }
+
+    /// Keeps the server asset for one missing file and clears the item from
+    /// the review (R5.3). Nothing is sent: the server already holds the asset.
+    /// Returns whether an item was waiting for the decision.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StoreError`] when the write fails.
+    pub fn keep_review_item(&self, path: &str) -> Result<bool, StoreError> {
+        let kept = self.inner.store.decide_review(path, ReviewDecision::Keep)?;
+        if kept {
+            self.inner.note_review_decided(path);
+            tracing::info!(path, "R5.3: the server asset was kept");
+        }
+        Ok(kept)
+    }
+
+    /// Moves one missing file's asset to the trash and clears the item from
+    /// the review (R5.3).
+    ///
+    /// The request carries no force, so the asset is trashed and never
+    /// permanently deleted (ADR 0002). A refusal changes nothing: the asset
+    /// stays where it is and the item stays in the review for the user to act
+    /// on (R5.5).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReviewError::NotInReview`] when the path is not waiting for a
+    /// decision, [`ReviewError::Client`] when the server refuses or cannot be
+    /// reached, and [`ReviewError::Store`] when the decision cannot be
+    /// recorded.
+    pub async fn trash_review_item(&self, path: &str) -> Result<(), ReviewError> {
+        let row = self
+            .inner
+            .store
+            .item(path)?
+            .filter(|row| row.state == ItemState::Missing)
+            .ok_or_else(|| ReviewError::NotInReview(path.to_string()))?;
+        let Some(asset_id) = row.asset_id else {
+            // No server copy, so there is nothing to trash. The item leaves the
+            // review the way Keep leaves it, and no request is sent.
+            if self.inner.store.decide_review(path, ReviewDecision::Keep)? {
+                self.inner.note_review_decided(path);
+            }
+            return Ok(());
+        };
+        let client = self.inner.session.client();
+        let asset_ids = vec![asset_id.clone()];
+        self.inner
+            .session
+            .request(move |credential| {
+                let client = client.clone();
+                let asset_ids = asset_ids.clone();
+                async move { client.trash_assets(credential.auth(), &asset_ids).await }
+            })
+            .await?;
+        if self
+            .inner
+            .store
+            .decide_review(path, ReviewDecision::Trash)?
+        {
+            self.inner.note_review_decided(path);
+            tracing::info!(path, asset_id, "R5.3: the asset moved to the trash");
+        }
+        Ok(())
     }
 
     /// Puts one parked item back in the queue for a manual retry (R6.5).
@@ -735,11 +837,18 @@ impl Drop for Engine {
 
 impl EngineInner {
     /// Queues the settled paths the watcher reported, after the shared skip
-    /// rules (R2.2). A path that disappeared is left to the deletion review
-    /// (#12).
+    /// rules (R2.2). A path that disappeared is recorded and reconciled by the
+    /// scan loop (R5.1).
     fn enqueue_watch_batch(&self, paths: Vec<PathBuf>) {
         for path in paths {
             let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                // The path is gone. Whether that is a missing file, a rename,
+                // or a second copy with the same content is decided in one
+                // place, by the reconciliation scan; the watcher only asks for
+                // one. The store is not read here: this callback runs on the
+                // debouncer's thread and must not block (R5.1, R5.2).
+                self.absences.lock().expect("the absence list").push(path);
+                self.reconcile.notify_one();
                 continue;
             };
             if !metadata.is_file() {
@@ -797,15 +906,43 @@ impl EngineInner {
     /// `previous` is the row's state before this run queued it: a row the
     /// pipeline re-prepares out of `retry_wait` was counted as failed when it
     /// was parked, so it moves back to pending rather than being counted twice.
+    /// A missing row whose file came back leaves the review the same way
+    /// (R5.1), so the tray's count follows it down.
     fn note_pending(&self, path: &Path, previous: Option<ItemState>) {
         if let Some(index) = self.folder_index_for(path) {
             let mut folders = self.folders.lock().expect("the folder lock");
             let counts = &mut folders[index].counts;
-            if previous == Some(ItemState::RetryWait) {
-                counts.failed = counts.failed.saturating_sub(1);
+            match previous {
+                Some(ItemState::RetryWait) => counts.failed = counts.failed.saturating_sub(1),
+                Some(ItemState::Missing) => counts.review = counts.review.saturating_sub(1),
+                _ => {}
             }
             counts.pending += 1;
         }
+    }
+
+    /// Records that one item left the review by a decision (R5.3, R5.4).
+    fn note_review_decided(&self, path: &str) {
+        if let Some(index) = self.folder_index_for(Path::new(path)) {
+            let mut folders = self.folders.lock().expect("the folder lock");
+            let counts = &mut folders[index].counts;
+            counts.review = counts.review.saturating_sub(1);
+        }
+    }
+
+    /// Records that one item entered the review, raising the tray count
+    /// (R5.4).
+    fn note_review_missing(&self, path: &str) {
+        if let Some(index) = self.folder_index_for(Path::new(path)) {
+            let mut folders = self.folders.lock().expect("the folder lock");
+            folders[index].counts.review += 1;
+        }
+    }
+
+    /// Drains the paths the watcher reported gone, so the scan loop can ask
+    /// the store whether any of them is tracked (R5.1).
+    fn drain_absences(&self) -> Vec<PathBuf> {
+        std::mem::take(&mut *self.absences.lock().expect("the absence list"))
     }
 
     /// Records one finished item against its folder and releases its claim.
@@ -1460,9 +1597,10 @@ async fn prepare(
     Some(item)
 }
 
-/// Whether a recorded row is finished on its own: a terminal success, or a
-/// failure no automatic retry can fix. A pending, uploading, or `retry_wait`
-/// row is still work the pipeline owns, so a scan may pick it up again.
+/// Whether a recorded row is finished on its own: a terminal success, a
+/// failure no automatic retry can fix, or a decision the user already made.
+/// A pending, uploading, `retry_wait`, or `missing` row is still work the
+/// pipeline owns, so a scan may pick it up again.
 fn is_settled(state: ItemState) -> bool {
     matches!(
         state,
@@ -1470,6 +1608,8 @@ fn is_settled(state: ItemState) -> bool {
             | ItemState::Duplicate
             | ItemState::FailedPermanent
             | ItemState::DeadLetter
+            | ItemState::ReviewKeep
+            | ItemState::ReviewTrash
     )
 }
 
@@ -1647,12 +1787,33 @@ async fn scan_loop(inner: Arc<EngineInner>) {
         tokio::select! {
             _ = ticker.tick() => {}
             () = inner.sync_now.notified() => {}
+            () = inner.reconcile.notified() => {}
+        }
+        // A scan is expensive, so the watcher's absences buy one only when
+        // they name something the client tracks; a temporary file that came
+        // and went does not walk every source folder.
+        let absences = inner.drain_absences();
+        let tracked = absences.iter().any(|path| {
+            inner
+                .store
+                .item(&path.to_string_lossy())
+                .ok()
+                .flatten()
+                .is_some()
+        });
+        if !absences.is_empty() && !tracked {
+            continue;
         }
         scan_once(&inner).await;
     }
 }
 
-/// Walks every source folder and queues what it finds (R2.3).
+/// Walks every source folder and queues what it finds (R2.3), then reconciles
+/// what disappeared (R5.1-R5.3).
+///
+/// The walk of every folder happens before the reconciliation, so a rename
+/// across folders is seen: the reconciliation has the whole picture, not one
+/// folder at a time.
 async fn scan_once(inner: &Arc<EngineInner>) {
     let folders: Vec<SourceFolder> = inner
         .folders
@@ -1661,7 +1822,7 @@ async fn scan_once(inner: &Arc<EngineInner>) {
         .iter()
         .map(|entry| entry.folder.clone())
         .collect();
-    let mut queued = 0_usize;
+    let mut reports: Vec<(SourceFolder, crate::scan::ScanReport)> = Vec::new();
     for folder in folders {
         let report = tokio::task::spawn_blocking({
             let folder = folder.clone();
@@ -1671,10 +1832,7 @@ async fn scan_once(inner: &Arc<EngineInner>) {
         match report {
             Ok(Ok(report)) => {
                 set_folder_available(inner, &folder.path, true);
-                queued += report.files.len();
-                for file in report.files {
-                    let _ = inner.queue.send(file);
-                }
+                reports.push((folder, report));
             }
             Ok(Err(ScanError::Missing(path))) => {
                 set_folder_available(inner, &path, false);
@@ -1688,7 +1846,189 @@ async fn scan_once(inner: &Arc<EngineInner>) {
             }
         }
     }
+    // R5.1: a scan that could not read a folder says nothing about what is
+    // missing under it, so only the folders that answered are reconciled
+    // (R2.5).
+    let present: Vec<PathBuf> = reports
+        .iter()
+        .flat_map(|(_, report)| report.files.iter().cloned())
+        .collect();
+    let scanned: Vec<SourceFolder> = reports.iter().map(|(folder, _)| folder.clone()).collect();
+    if !scanned.is_empty() {
+        reconcile_files(inner, &present, &scanned).await;
+    }
+    let mut queued = 0_usize;
+    for (_, report) in reports {
+        queued += report.files.len();
+        for file in report.files {
+            let _ = inner.queue.send(file);
+        }
+    }
     tracing::info!(queued, "the reconciliation scan finished");
+}
+
+/// Decides what each tracked disappearance under the scanned folders is
+/// (R5.1-R5.3): a rename, a second copy, or a missing file that waits for a
+/// decision.
+async fn reconcile_files(inner: &Arc<EngineInner>, present: &[PathBuf], folders: &[SourceFolder]) {
+    let mut gone: Vec<ItemRecord> = Vec::new();
+    for folder in folders {
+        let candidates = match inner.store.review_candidates(&folder.path) {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                tracing::warn!(folder = %folder.path, error = %error, "the review candidates could not be read");
+                continue;
+            }
+        };
+        for row in candidates {
+            // The filesystem, not the scan report, is the test: a file the
+            // skip rules refused this pass, or one a non-recursive folder no
+            // longer walks, is still there and is not missing.
+            if file_is_gone(&row.path) {
+                gone.push(row);
+            }
+        }
+    }
+    if gone.is_empty() {
+        return;
+    }
+    // The files a rename could have moved to, indexed by size so no unrelated
+    // file is ever read (R5.2).
+    let mut by_size: HashMap<u64, Vec<PathBuf>> = HashMap::new();
+    for path in present {
+        let Ok(metadata) = std::fs::symlink_metadata(path) else {
+            continue;
+        };
+        if metadata.is_file() {
+            by_size
+                .entry(metadata.len())
+                .or_default()
+                .push(path.clone());
+        }
+    }
+    let mut undecided = Vec::new();
+    for row in gone {
+        let target = match by_size.get(&row.size) {
+            Some(paths) => rename_target(inner, &row, paths).await,
+            None => None,
+        };
+        let Some(target) = target else {
+            undecided.push(row);
+            continue;
+        };
+        let Ok(metadata) = std::fs::symlink_metadata(&target) else {
+            undecided.push(row);
+            continue;
+        };
+        let moved = inner.store.move_item(
+            &row.path,
+            &target.to_string_lossy(),
+            row.size,
+            mtime_ns(&metadata),
+        );
+        match moved {
+            Ok(true) => tracing::info!(
+                from = %row.path,
+                to = %target.display(),
+                "R5.2: the item was renamed and keeps its asset mapping"
+            ),
+            // A target another item claimed in this same pass: the row is
+            // still gone, and the twin check below decides it.
+            Ok(false) => undecided.push(row),
+            Err(error) => {
+                tracing::warn!(path = %row.path, error = %error, "the renamed item could not be moved");
+                undecided.push(row);
+            }
+        }
+    }
+    for row in undecided {
+        // A second copy of the same content, still on disk: the asset is held
+        // by another item, so no decision is needed (the SPEC acceptance line
+        // for a second instance).
+        if has_present_content_twin(inner, &row) {
+            match inner.store.retire_item(&row.path) {
+                Ok(true) => tracing::info!(
+                    path = %row.path,
+                    "R5.2: another item still holds this content, so no review is needed"
+                ),
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(path = %row.path, error = %error, "the twin copy could not be retired")
+                }
+            }
+            continue;
+        }
+        match inner.store.mark_missing(&row.path) {
+            Ok(true) => {
+                inner.note_review_missing(&row.path);
+                tracing::info!(path = %row.path, "R5.1: the file is missing and waits for a review");
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(path = %row.path, error = %error, "the missing file could not be recorded")
+            }
+        }
+    }
+}
+
+/// Whether the tracked path is no longer a file (R5.1).
+///
+/// A path that cannot be read, and one that is now a directory or a symlink, is
+/// no longer the file the item tracked. Both wait for a decision rather than
+/// silently changing the server (ADR 0002).
+fn file_is_gone(path: &str) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => !metadata.is_file(),
+        Err(_) => true,
+    }
+}
+
+/// The first present, untracked file whose size and content match `row`
+/// (R5.2).
+async fn rename_target(
+    inner: &Arc<EngineInner>,
+    row: &ItemRecord,
+    candidates: &[PathBuf],
+) -> Option<PathBuf> {
+    for path in candidates {
+        // A tracked path is another item's home, never a rename target: the
+        // item it holds is its own.
+        if inner
+            .store
+            .item(&path.to_string_lossy())
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            continue;
+        }
+        let probe = path.clone();
+        let hashed = tokio::task::spawn_blocking(move || sha1_file(&probe)).await;
+        match hashed {
+            Ok(Ok(sha1)) if sha1 == row.sha1 => return Some(path.clone()),
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                tracing::debug!(path = %path.display(), error = %error, "a rename candidate could not be read");
+            }
+            Err(join) => {
+                tracing::debug!(path = %path.display(), error = %join, "a rename candidate could not be hashed");
+            }
+        }
+    }
+    None
+}
+
+/// Whether another tracked item holds the same content and still has its file
+/// on disk (R5.2, the second-copy acceptance line).
+fn has_present_content_twin(inner: &Arc<EngineInner>, row: &ItemRecord) -> bool {
+    let Ok(twins) = inner.store.content_twins(row.sha1, row.size, &row.path) else {
+        return false;
+    };
+    twins.iter().any(|twin| {
+        std::fs::symlink_metadata(&twin.path)
+            .map(|metadata| metadata.is_file())
+            .unwrap_or(false)
+    })
 }
 
 /// Marks one folder available or missing (R2.5).
