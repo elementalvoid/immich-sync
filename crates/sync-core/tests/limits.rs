@@ -12,7 +12,7 @@ use mock_immich::MockImmich;
 use sync_core::connection::{AuthMethod, Connection, RequestCredential, Secret, SignIn};
 use sync_core::credential::MemoryCredentialStore;
 use sync_core::engine::{Engine, EngineConfig, Limits};
-use sync_core::store::{SourceFolder, StateStore};
+use sync_core::store::{AlbumScope, SourceFolder, StateStore};
 
 /// The acceptance criterion's rate (R7.1).
 const ONE_MEGABYTE_PER_SECOND: u64 = 1_000_000;
@@ -49,6 +49,8 @@ fn add_folder(store: &StateStore, path: &Path) {
         .add_folder(&SourceFolder {
             path: path.display().to_string(),
             recursive: true,
+            album_mapping: false,
+            album_scope: AlbumScope::Leaf,
         })
         .expect("add the source folder");
 }

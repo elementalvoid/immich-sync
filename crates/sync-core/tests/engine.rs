@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use immich_client::ImmichClient;
+use immich_client::{BandwidthLimit, ImmichClient};
 use mock_immich::{Fault, MockImmich, Operation};
 use sync_core::connection::{AuthMethod, Connection, RequestCredential, Secret, SignIn};
 use sync_core::credential::MemoryCredentialStore;
@@ -1281,6 +1281,7 @@ async fn a_duplicate_the_server_already_has_joins_the_album_too() {
                 checksum: &sha1_file(&file).expect("hash the fixture").base64(),
                 created_at: std::time::UNIX_EPOCH,
                 modified_at: std::time::UNIX_EPOCH,
+                bandwidth: BandwidthLimit::default(),
             },
         )
         .await
