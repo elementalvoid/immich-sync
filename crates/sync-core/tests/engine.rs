@@ -3712,3 +3712,52 @@ async fn a_review_item_whose_content_reappears_elsewhere_leaves_the_review() {
     assert_eq!(engine.status().counts.review, 0);
     engine.stop();
 }
+
+#[tokio::test]
+async fn a_missing_row_retired_behind_a_restored_twin_leaves_the_review_count() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let first = write_file(&photos, "twin-one.jpg", b"twin bytes");
+    let second = write_file(&photos, "twin-two.jpg", b"twin bytes");
+    add_folder(&store, &photos, true);
+    let engine = start_engine(
+        &server,
+        &store,
+        review_config(Duration::from_secs(1), false),
+    )
+    .await;
+    assert!(
+        wait_until(
+            || all_terminal(&store, &[first.clone(), second.clone()]),
+            Duration::from_secs(30)
+        )
+        .await,
+        "the twins never reached a terminal state"
+    );
+
+    // Both copies disappear: both wait for a decision.
+    std::fs::remove_file(&first).expect("delete the first twin");
+    std::fs::remove_file(&second).expect("delete the second twin");
+    wait_for_review(&engine, 2).await;
+    assert_eq!(engine.status().counts.review, 2, "both twins are counted");
+
+    // One copy comes back at the same path: the other is retired behind its
+    // present twin, which must also take it off the tray count (R5.4).
+    write_file(&photos, "twin-two.jpg", b"twin bytes");
+    assert!(
+        wait_until(
+            || engine.review_items().is_ok_and(|items| items.is_empty()),
+            Duration::from_secs(20)
+        )
+        .await,
+        "the review never drained"
+    );
+    assert_eq!(
+        engine.status().counts.review,
+        0,
+        "a retired missing item must leave the tray count"
+    );
+    engine.stop();
+}

@@ -1954,10 +1954,17 @@ async fn reconcile_files(inner: &Arc<EngineInner>, present: &[PathBuf], folders:
         // for a second instance).
         if has_present_content_twin(inner, &row) {
             match inner.store.retire_item(&row.path) {
-                Ok(true) => tracing::info!(
-                    path = %row.path,
-                    "R5.2: another item still holds this content, so no review is needed"
-                ),
+                Ok(true) => {
+                    if row.state == ItemState::Missing {
+                        // The retired item no longer waits for a decision, so
+                        // the tray count follows it down (R5.4).
+                        inner.note_review_decided(&row.path);
+                    }
+                    tracing::info!(
+                        path = %row.path,
+                        "R5.2: another item still holds this content, so no review is needed"
+                    );
+                }
                 Ok(false) => {}
                 Err(error) => {
                     tracing::warn!(path = %row.path, error = %error, "the twin copy could not be retired")
