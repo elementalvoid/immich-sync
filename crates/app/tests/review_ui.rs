@@ -77,8 +77,12 @@ fn seed(paths: &AppPaths, root: &Path, names: &[&str]) {
     }
 }
 
-/// Opens the review view over the seeded state database.
-fn open_review_view(cx: &mut TestAppContext, paths: &AppPaths) -> AnyWindowHandle {
+/// Opens the review view over the seeded state database, with the engine model
+/// the view observes.
+fn open_review_view(
+    cx: &mut TestAppContext,
+    paths: &AppPaths,
+) -> (AnyWindowHandle, gpui_kit::Entity<EngineModel>) {
     let paths = paths.clone();
     cx.update(|cx| {
         gpui_kit::init(cx);
@@ -87,12 +91,13 @@ fn open_review_view(cx: &mut TestAppContext, paths: &AppPaths) -> AnyWindowHandl
             ConnectionModel::new(ServerProfile::default(), store)
         });
         let store_model = cx.new(|cx| StoreModel::open(&paths, cx));
-        gpui_kit::open_window(window_options(), cx, |window, cx| {
-            let engine = cx.new(|cx| EngineModel::new(connection, store_model.clone(), &paths, cx));
-            cx.new(|cx| ReviewView::new(engine, window, cx))
+        let engine = cx.new(|cx| EngineModel::new(connection, store_model.clone(), &paths, cx));
+        let window = gpui_kit::open_window(window_options(), cx, |window, cx| {
+            cx.new(|cx| ReviewView::new(engine.clone(), window, cx))
         })
         .expect("open the review window")
-        .0
+        .0;
+        (window, engine)
     })
 }
 
@@ -148,7 +153,7 @@ async fn the_review_names_every_row_and_both_actions(cx: &mut TestAppContext) {
     let paths = temporary_paths(temp.path());
     let photos = temp.path().join("photos");
     seed(&paths, &photos, &["IMG_0001.jpg", "CLIP_0002.mp4"]);
-    let window = open_review_view(cx, &paths);
+    let (window, _engine) = open_review_view(cx, &paths);
     wait_for_rows(cx, window, 2).await;
 
     cx.update_window(window, |_, window, cx| {
@@ -189,7 +194,7 @@ async fn every_review_control_is_a_keyboard_reachable_tab_stop(cx: &mut TestAppC
     let paths = temporary_paths(temp.path());
     let photos = temp.path().join("photos");
     seed(&paths, &photos, &["IMG_0001.jpg", "CLIP_0002.mp4"]);
-    let window = open_review_view(cx, &paths);
+    let (window, _engine) = open_review_view(cx, &paths);
     wait_for_rows(cx, window, 2).await;
 
     cx.update_window(window, |_, window, cx| {
@@ -210,8 +215,13 @@ async fn keeping_a_file_leaves_the_asset_and_clears_its_row(cx: &mut TestAppCont
     let paths = temporary_paths(temp.path());
     let photos = temp.path().join("photos");
     seed(&paths, &photos, &["keep.jpg", "other.jpg"]);
-    let window = open_review_view(cx, &paths);
+    let (window, engine) = open_review_view(cx, &paths);
     wait_for_rows(cx, window, 2).await;
+    assert_eq!(
+        cx.read(|cx| engine.read(cx).status().counts.review),
+        2,
+        "the tray starts with both items in the review"
+    );
 
     let keep_path = photos.join("keep.jpg").display().to_string();
     cx.update_window(window, |_, window, cx| {
@@ -232,6 +242,11 @@ async fn keeping_a_file_leaves_the_asset_and_clears_its_row(cx: &mut TestAppCont
         "R5.3: Keep clears the item and leaves the server asset"
     );
     assert_eq!(store.review_count().expect("count the review"), 1);
+    assert_eq!(
+        cx.read(|cx| engine.read(cx).status().counts.review),
+        1,
+        "R5.4: the tray count follows a decision made with no engine running"
+    );
 }
 
 #[gpui_kit::test]
@@ -241,7 +256,7 @@ async fn a_trash_while_signed_out_says_so_and_keeps_the_row(cx: &mut TestAppCont
     let paths = temporary_paths(temp.path());
     let photos = temp.path().join("photos");
     seed(&paths, &photos, &["denied.jpg"]);
-    let window = open_review_view(cx, &paths);
+    let (window, _engine) = open_review_view(cx, &paths);
     wait_for_rows(cx, window, 1).await;
 
     cx.update_window(window, |_, window, cx| {

@@ -193,16 +193,17 @@ impl EngineModel {
             return;
         };
         let (results, incoming) = async_channel::bounded(1);
+        let action_path = path.clone();
         runtime.spawn(async move {
             // N2: the store write belongs on the worker, not the UI thread.
             let result = match engine {
                 Some(engine) => engine
-                    .keep_review_item(&path)
+                    .keep_review_item(&action_path)
                     .map(|_| ())
                     .map_err(|error| error.to_string()),
                 None => match store {
                     Some(store) => store
-                        .decide_review(&path, ReviewDecision::Keep)
+                        .decide_review(&action_path, ReviewDecision::Keep)
                         .map(|_| ())
                         .map_err(|error| error.to_string()),
                     None => Err("The state database is still opening.".to_string()),
@@ -210,7 +211,7 @@ impl EngineModel {
             };
             let _ = results.send(result).await;
         });
-        self.finish_review_action(incoming, cx);
+        self.finish_review_action(incoming, path, cx);
     }
 
     /// Moves one missing file's asset to the trash and clears its row (R5.3).
@@ -229,14 +230,15 @@ impl EngineModel {
             return;
         };
         let (results, incoming) = async_channel::bounded(1);
+        let action_path = path.clone();
         runtime.spawn(async move {
             let result = engine
-                .trash_review_item(&path)
+                .trash_review_item(&action_path)
                 .await
                 .map_err(|error| crate::review::trash_problem(&error));
             let _ = results.send(result).await;
         });
-        self.finish_review_action(incoming, cx);
+        self.finish_review_action(incoming, path, cx);
     }
 
     /// Publishes the outcome of a keep or a trash and refreshes the rows
@@ -244,6 +246,7 @@ impl EngineModel {
     fn finish_review_action(
         &mut self,
         incoming: async_channel::Receiver<Result<(), String>>,
+        path: String,
         cx: &mut Context<Self>,
     ) {
         cx.spawn(async move |this, cx| {
@@ -251,6 +254,7 @@ impl EngineModel {
                 return;
             };
             let _ = this.update(cx, |model, cx| {
+                let decided = result.is_ok();
                 match result {
                     Ok(()) => model.review_problem = None,
                     Err(problem) => model.review_problem = Some(problem),
@@ -258,9 +262,30 @@ impl EngineModel {
                 model.refresh_review(cx);
                 // R5.4: the tray count follows the decision at once.
                 model.refresh_status(cx);
+                // Without a running engine the status is the store's cached
+                // counts, which do not know about the write that just landed,
+                // so the one item this decision cleared comes off here.
+                if decided && model.engine.is_none() {
+                    model.note_review_decided(&path);
+                }
             });
         })
         .detach();
+    }
+
+    /// Takes one decided item off the published review count (R5.4).
+    fn note_review_decided(&mut self, path: &str) {
+        self.status.counts.review = self.status.counts.review.saturating_sub(1);
+        let case = sync_core::paths::PathCase::for_platform();
+        for folder in &mut self.status.folders {
+            if sync_core::paths::is_within(
+                std::path::Path::new(&folder.path),
+                std::path::Path::new(path),
+                case,
+            ) {
+                folder.counts.review = folder.counts.review.saturating_sub(1);
+            }
+        }
     }
 
     /// Re-reads the missing files from the store on the background executor
