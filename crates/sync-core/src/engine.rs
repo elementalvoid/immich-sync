@@ -726,8 +726,7 @@ impl EngineInner {
         UploadOutcome::DeadLetter(failure)
     }
 
-    /// Records a failure for every item of a batch whose checksum check could
-    /// not be made, and finishes their bookkeeping with it.
+    /// Records one batch-level failure against every item of the batch.
     ///
     /// A connection that is no longer usable failed as a whole, not once per
     /// item (R1.4): nothing is written, so the rows stay `pending` and the next
@@ -735,6 +734,11 @@ impl EngineInner {
     /// leave every file looking permanently broken to a sign-in that fixes it.
     fn fail_batch(&self, prepared: &[PreparedItem], error: &ClientError) {
         if !self.session.state().is_connected() {
+            tracing::warn!(
+                batch = prepared.len(),
+                reason = %error.redacted_reason(),
+                "the connection needs the user, so the batch stays pending for the next scan"
+            );
             for item in prepared {
                 self.release_item(item);
             }
