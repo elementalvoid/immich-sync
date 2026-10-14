@@ -3015,6 +3015,121 @@ async fn an_edit_to_bytes_the_server_already_holds_becomes_a_version() {
     engine.stop();
 }
 
+/// R4.2, R4.4: the first edit of a file that existed before this upgrade
+/// still copies from the asset the row already points at.
+///
+/// The row was written by the schema before the version table, so the chain
+/// only holds what the migration seeds: `prepare` clears the item's asset id
+/// before the promote runs, and the version table is the only record the
+/// promote reads. Without the seed the edit uploads a second asset, records a
+/// chain of one, and sends no copy — the loss ADR 0004 exists to prevent.
+#[tokio::test]
+async fn the_first_edit_of_a_migrated_item_copies_from_its_recorded_asset() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let photos = temp.path().join("photos");
+    let file = write_file(&photos, "migrated.jpg", b"first bytes");
+    // The asset an earlier build uploaded: the server holds it, the pre-upgrade
+    // row points at it.
+    let old = upload_bytes(&server, b"first bytes").await;
+    let metadata = std::fs::metadata(&file).expect("read the metadata");
+    let mtime_ns = i64::try_from(
+        metadata
+            .modified()
+            .expect("a modification time")
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a time after the epoch")
+            .as_nanos(),
+    )
+    .expect("the nanoseconds fit");
+    // A database at the schema before this branch, holding the row that schema
+    // wrote for the file.
+    let db = temp.path().join("data").join("state.db");
+    std::fs::create_dir_all(db.parent().expect("the db has a parent"))
+        .expect("create the data directory");
+    {
+        let mut connection = rusqlite::Connection::open(&db).expect("open the raw database");
+        sync_core::store::migrations_before_version_schema()
+            .to_latest(&mut connection)
+            .expect("create the fifth schema");
+        connection
+            .execute(
+                "INSERT INTO sync_item (path, path_key, size, mtime_ns, sha1, asset_id, state, error_class)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'uploaded', NULL)",
+                rusqlite::params![
+                    file.display().to_string(),
+                    file.display().to_string(),
+                    i64::try_from(metadata.len()).expect("the size fits"),
+                    mtime_ns,
+                    sha1_file(&file).expect("hash the fixture").as_bytes().as_slice(),
+                    old,
+                ],
+            )
+            .expect("insert the pre-upgrade row");
+    }
+    // Opening runs this branch's migration, which seeds the chain from the row.
+    let store = store_in(&temp);
+    add_folder(&store, &photos, true);
+    let engine = start_engine(&server, &store, retry_config(4)).await;
+
+    std::fs::write(&file, b"second bytes").expect("edit the file in place");
+    engine.sync_now();
+
+    assert!(
+        wait_until(|| chain_len(&store, &file) == 2, Duration::from_secs(30)).await,
+        "R4.2: the first edit after the upgrade did not extend the seeded chain: {:?}",
+        chain(&store, &file)
+    );
+    assert!(
+        wait_until(
+            || all_terminal(&store, std::slice::from_ref(&file)),
+            Duration::from_secs(20)
+        )
+        .await,
+        "the edit did not finish: {:?}",
+        store.item(&file.display().to_string())
+    );
+    let new = asset_of(&store, &file);
+    let copies = server.copy_calls();
+    assert_eq!(
+        copies.len(),
+        1,
+        "R4.2: one copy for the first edit after the upgrade"
+    );
+    assert_eq!(
+        copies[0].source_id, old,
+        "R4.2: the asset the migrated row pointed at is the source"
+    );
+    assert_eq!(
+        copies[0].target_id, new,
+        "R4.2: the new asset is the target"
+    );
+    let versions = chain(&store, &file);
+    assert_eq!(
+        versions[0].asset_id, old,
+        "R4.4: the chain starts at the asset the migration seeded"
+    );
+    assert_eq!(versions[1].asset_id, new, "R4.4: the edit is the newest");
+    assert!(
+        !versions[0].is_current && versions[1].is_current,
+        "R4.4: the current flag moved to the edit"
+    );
+    assert_eq!(
+        versions[0].item_id, versions[1].item_id,
+        "R4.1: the migrated row and its successor are one item"
+    );
+    let recorded = store
+        .stack_id(&file.display().to_string())
+        .expect("read the stack id")
+        .expect("the versions are stacked");
+    assert_eq!(
+        server.stack_of(&new).map(|stack| stack.stack_id),
+        Some(recorded),
+        "R4.4: the recorded stack id names a live stack"
+    );
+    engine.stop();
+}
+
 /// The asset id the server assigns to `bytes` uploaded straight through the
 /// API, for a file whose bytes reach the server by another route.
 async fn upload_bytes(server: &MockImmich, bytes: &[u8]) -> String {

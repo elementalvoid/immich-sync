@@ -54,6 +54,10 @@ fn the_writer_uses_wal_and_full_synchronous() {
         "the one writer waits for a lock instead of failing: {}",
         pragmas.busy_timeout_ms
     );
+    assert_eq!(
+        pragmas.foreign_keys, 1,
+        "foreign keys are enforced, or the state tables' ON DELETE actions are dead SQL"
+    );
 }
 
 #[test]

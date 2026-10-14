@@ -121,17 +121,25 @@ CREATE INDEX attempt_item ON attempt(item_id);
 /// same asset twice idempotent, which is what the version flow needs: a lost
 /// answer or a later attempt records the same version again. It also serves the
 /// one read a caller makes, which is every version of one item.
+///
+/// The final `INSERT` seeds the chain from the rows the earlier schemas wrote.
+/// An asset id a migrated row holds lives only on `sync_item`, and `prepare`
+/// clears that column before the first edit uploads, so without the seed the
+/// first edit after the upgrade would record a chain of one and send no copy —
+/// the loss ADR 0004 exists to prevent (R4.2).
 const SCHEMA_V6: &str = "
 ALTER TABLE sync_item ADD COLUMN stack_id TEXT;
 CREATE TABLE version (
     id            INTEGER PRIMARY KEY,
-    item_id       INTEGER NOT NULL REFERENCES sync_item(id),
+    item_id       INTEGER NOT NULL REFERENCES sync_item(id) ON DELETE CASCADE,
     asset_id      TEXT    NOT NULL,
     sha1          BLOB    NOT NULL,
     created_at_ns INTEGER NOT NULL,
     is_current    INTEGER NOT NULL
 );
 CREATE UNIQUE INDEX version_item_asset ON version(item_id, asset_id);
+INSERT INTO version (item_id, asset_id, sha1, created_at_ns, is_current)
+SELECT id, asset_id, sha1, mtime_ns, 1 FROM sync_item WHERE asset_id IS NOT NULL;
 ";
 
 /// How long the one writer waits for a competing lock before failing.
@@ -393,6 +401,9 @@ pub struct StorePragmas {
     pub synchronous: i64,
     /// `busy_timeout` in milliseconds.
     pub busy_timeout_ms: i64,
+    /// `foreign_keys`; the store turns it on, so the `ON DELETE` actions of
+    /// the state tables are enforced (`1`).
+    pub foreign_keys: i64,
 }
 
 /// Why the state store could not be used.
@@ -580,6 +591,7 @@ impl StateStore {
             // SQLite reports `synchronous` as an integer; 2 is FULL.
             synchronous: read("PRAGMA synchronous")?,
             busy_timeout_ms: read("PRAGMA busy_timeout")?,
+            foreign_keys: read("PRAGMA foreign_keys")?,
         })
     }
 
@@ -1265,7 +1277,25 @@ fn set_writer_pragmas(writer: &Connection) -> rusqlite::Result<()> {
     debug_assert_eq!(mode, "wal", "WAL is what ADR 0005 requires");
     writer.pragma_update(None, "synchronous", "FULL")?;
     writer.busy_timeout(BUSY_TIMEOUT)?;
+    // ADR 0005 builds on bundled SQLite, which defaults foreign keys on; the
+    // pragma pins that, so the state tables' ON DELETE actions never depend on
+    // a compile-time default.
+    writer.pragma_update(None, "foreign_keys", "ON")?;
     Ok(())
+}
+
+/// The migration list as it stood before the version schema (issue #11), so
+/// an upgrade-path test can build a database at the schema the upgrade really
+/// starts from.
+#[doc(hidden)]
+pub fn migrations_before_version_schema() -> Migrations<'static> {
+    Migrations::new(vec![
+        M::up(SCHEMA_V1),
+        M::up_with_hook(SCHEMA_V2, backfill_path_keys),
+        M::up(SCHEMA_V3),
+        M::up(SCHEMA_V4),
+        M::up(SCHEMA_V5),
+    ])
 }
 
 /// The schema migrations, in order (ADR 0005: `rusqlite_migration`).
@@ -1483,15 +1513,9 @@ mod migration_tests {
         {
             let mut connection = Connection::open(&path).expect("open the raw database");
             // A v5 database: the attempt log exists, the version table does not.
-            Migrations::new(vec![
-                M::up(SCHEMA_V1),
-                M::up_with_hook(SCHEMA_V2, backfill_path_keys),
-                M::up(SCHEMA_V3),
-                M::up(SCHEMA_V4),
-                M::up(SCHEMA_V5),
-            ])
-            .to_latest(&mut connection)
-            .expect("create the fifth schema");
+            migrations_before_version_schema()
+                .to_latest(&mut connection)
+                .expect("create the fifth schema");
             connection
                 .execute(
                     "INSERT INTO sync_item (path, path_key, size, mtime_ns, sha1, asset_id, state, error_class)
@@ -1517,6 +1541,19 @@ mod migration_tests {
             None,
             "a migrated item has no stack until its first edit"
         );
+        let seeded = store.versions("hello.txt").expect("read the chain");
+        assert_eq!(
+            seeded.len(),
+            1,
+            "R4.2: the migration seeds the chain from the row's asset id, or the \
+             first edit after the upgrade would have nothing to copy from"
+        );
+        assert_eq!(seeded[0].asset_id, "asset-1");
+        assert!(seeded[0].is_current, "the migrated asset starts current");
+        assert_eq!(
+            seeded[0].created_at_ns, 1,
+            "the row's mtime is when the version was recorded"
+        );
         store
             .record_version(&NewVersion {
                 path: "hello.txt".to_string(),
@@ -1527,7 +1564,16 @@ mod migration_tests {
                 stack_id: Some("stack-1".to_string()),
             })
             .expect("the version table works after the migration");
-        assert_eq!(store.versions("hello.txt").expect("read").len(), 1);
+        let chain = store.versions("hello.txt").expect("read the chain");
+        assert_eq!(
+            chain.len(),
+            2,
+            "the seeded version and its successor are both recorded"
+        );
+        assert!(
+            !chain[0].is_current && chain[1].is_current,
+            "the successor takes the current flag from the seeded row"
+        );
     }
 
     /// The V2 hook under the Windows case rule, so the case-only collision is
