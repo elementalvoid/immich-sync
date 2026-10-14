@@ -605,13 +605,24 @@ impl SharedSession {
     /// Returns the transport and protocol variants, and
     /// [`ClientError::InvalidToken`] when no credential is available.
     pub async fn validate(&self) -> Result<(), ClientError> {
-        match self.credential() {
+        let probe = match self.credential() {
             Some(RequestCredential::Session(token)) => self.client.validate_token(&token).await,
             Some(RequestCredential::ApiKey(key)) => {
                 self.client.validate_api_key(key.expose()).await
             }
             None => Err(ClientError::InvalidToken),
+        };
+        // The probe is the one path that learns a refusal without going through
+        // `request`, so it records it here: the snapshot the tray reads must
+        // not keep saying Connected while nothing can authenticate (R1.4).
+        if let Err(error) = &probe
+            && matches!(error, ClientError::InvalidToken | ClientError::InvalidApiKey)
+        {
+            let mut connection = self.connection.lock().await;
+            connection.reject();
+            self.mirror(&connection);
         }
+        probe
     }
 
     /// The snapshot of the last change.

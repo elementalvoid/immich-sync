@@ -1551,6 +1551,68 @@ async fn a_revoked_api_key_parks_the_item_instead_of_probing_forever() {
 }
 
 #[tokio::test]
+async fn a_refused_probe_mirrors_the_refusal_and_leaves_the_batch_pending() {
+    let server = MockImmich::start().await;
+    let key = "api-key-abc123";
+    server.set_api_key(key);
+    let session = signed_in_with(&server, AuthMethod::ApiKey, key).await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let files = [
+        write_file(&photos, "one.jpg", b"one bytes"),
+        write_file(&photos, "two.jpg", b"two bytes"),
+    ];
+    add_folder(&store, &photos, true);
+    // The server drops the checksum checks, so the breaker opens and the queue
+    // waits for the probe. The key is then rotated, so the probe is a refusal
+    // no wait can turn into an answer (R1.4).
+    for _ in 0..3 {
+        server.fail(Operation::BulkUploadCheck, Fault::Disconnect);
+    }
+    server.set_api_key("a-rotated-key");
+    let engine = start_engine_over(&session, &store, retry_config(8));
+
+    assert!(
+        wait_until(
+            || matches!(session.state(), ConnectionState::NeedsAttention(_)),
+            Duration::from_secs(20)
+        )
+        .await,
+        "R1.4: the refused probe left the session reading {:?}",
+        session.state()
+    );
+    // R1.4: the refusal the probe learned is the connection's answer, so the
+    // snapshot the tray reads must not keep saying Connected.
+    assert_eq!(
+        engine.status().activity,
+        Activity::NeedsAttention,
+        "R1.4: the tray reads a refused credential as needing attention"
+    );
+
+    // R1.4: nothing about the two files is wrong, so the batch is not
+    // condemned. The rows stay pending for the re-login that fixes it.
+    for file in &files {
+        let row = store
+            .item(&file.display().to_string())
+            .expect("read")
+            .expect("the row exists");
+        assert_eq!(
+            row.state,
+            ItemState::Pending,
+            "R1.4: a refused key must not park {:?} permanently",
+            file.display()
+        );
+    }
+    assert_eq!(
+        engine.failed_items().expect("read the failed items").len(),
+        0,
+        "R1.4: a refused key is the account's problem, not a dead letter"
+    );
+    engine.stop();
+}
+
+#[tokio::test]
 async fn a_batch_during_a_dead_session_stays_pending_until_the_user_signs_in_again() {
     let server = MockImmich::start().await;
     let temp = tempfile::tempdir().expect("create a temp dir");
