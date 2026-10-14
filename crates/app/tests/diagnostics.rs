@@ -7,7 +7,7 @@
 //! under both and reading the same accessibility properties.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -574,7 +574,7 @@ async fn a_rebuild_recovers_a_deleted_state_database_and_rescans_the_folder(
 
     // R10.4's acceptance: the database is deleted by hand.
     for suffix in ["", "-wal", "-shm"] {
-        let path = PathBuf::from(format!("{}{suffix}", paths.state_db.display()));
+        let path = std::path::PathBuf::from(format!("{}{suffix}", paths.state_db.display()));
         match fs::remove_file(&path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
