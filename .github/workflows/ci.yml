@@ -6,17 +6,37 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Incremental artifacts are not reusable on ephemeral runners and bloat the
+  # dependency cache; rust-cache sets this too, but keep it explicit.
+  CARGO_INCREMENTAL: 0
+  # Keep file/line panic locations while cutting codegen, link time (Windows
+  # especially) and cache size. Dependency debug info is already off in
+  # Cargo.toml; this trims the workspace crates and test binaries too.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+
+# A newer push to the same ref replaces an in-flight run: before this,
+# superseded merges kept burning 10-25 minutes each.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   linux:
     name: Linux
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      # Pinned by commit SHA, version tag in the comment. Update deliberately:
+      # only releases at least a week old.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust 1.99.0
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal --component rustfmt --component clippy
+          rustup default 1.99.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          toolchain: "1.99.0"
-          components: rustfmt, clippy
+          shared-key: linux
+          cache-on-failure: "true"
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -26,30 +46,43 @@ jobs:
             libxkbcommon-x11-dev libx11-xcb-dev libxcb1-dev libvulkan1 \
             libssl-dev libzstd-dev libdbus-1-dev
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
 
   windows:
     name: Windows
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust 1.99.0
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal --component rustfmt --component clippy
+          rustup default 1.99.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          toolchain: "1.99.0"
-          components: rustfmt, clippy
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+          shared-key: windows
+          cache-on-failure: "true"
+      # fmt is platform-independent and already checked on Linux; running it
+      # here only paid for a toolchain component and a fresh checkout.
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
 
   linux-gui-smoke:
     name: Linux GUI smoke (Xvfb + lavapipe)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust 1.99.0
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal --component rustfmt --component clippy
+          rustup default 1.99.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          toolchain: "1.99.0"
+          # Shared with the Linux job: rust-cache persists dependencies only, so
+          # this job restores the same dependency artifacts instead of
+          # compiling them a third time.
+          shared-key: linux
+          cache-on-failure: "true"
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -59,7 +92,7 @@ jobs:
             libxkbcommon-x11-dev libx11-xcb-dev libxcb1-dev \
             libvulkan1 mesa-vulkan-drivers libdbus-1-dev \
             xvfb xauth dbus-daemon imagemagick x11-utils
-      - run: cargo build --bin immich-sync
+      - run: cargo build --locked --bin immich-sync
       - name: Capture a real frame
         run: |
           set -euo pipefail
