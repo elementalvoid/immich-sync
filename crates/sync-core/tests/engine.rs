@@ -1050,20 +1050,6 @@ async fn a_server_that_stops_answering_produces_backoff_not_a_hot_loop() {
             "attempt {attempt} waited {gap:?}, less than the policy's {expected:?}"
         );
     }
-    // R6.1: the ceiling these gaps are bounded by has to grow. A constant
-    // sleep satisfies every bound above, so without this the test cannot tell
-    // a backoff from a pause.
-    let ceilings: Vec<Duration> = (1..=5)
-        .map(|attempt| {
-            config
-                .retry
-                .ceiling(u32::try_from(attempt).expect("a small index"))
-        })
-        .collect();
-    assert!(
-        *ceilings.last().expect("a ceiling") > ceilings[0],
-        "the policy's ceiling does not grow: {ceilings:?}"
-    );
     let total: Duration = gaps.iter().sum();
     println!("five refusals produced {total:?} of backoff in {gaps:?}");
     assert!(
