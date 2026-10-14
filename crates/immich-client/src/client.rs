@@ -54,6 +54,7 @@ struct BulkCheckRequest<'a> {
 /// still knows it is permanent, not transport noise.
 async fn failure(response: Response) -> ClientError {
     let status = response.status();
+    let retry_after = retry_after(&response);
     let message = server_message(response).await;
     match status {
         StatusCode::UNAUTHORIZED => ClientError::InvalidToken,
@@ -64,8 +65,20 @@ async fn failure(response: Response) -> ClientError {
         _ => ClientError::Protocol {
             status: status.as_u16(),
             message,
+            retry_after,
         },
     }
+}
+
+/// The `Retry-After` wait a refusal asked for, in seconds (R6.2).
+///
+/// The header also allows an HTTP date. A date is not a wait this client can
+/// act on without trusting the server's clock, so it reads as no hint and the
+/// client's own backoff applies.
+fn retry_after(response: &Response) -> Option<Duration> {
+    let value = response.headers().get(reqwest::header::RETRY_AFTER)?;
+    let seconds = value.to_str().ok()?.trim().parse::<u64>().ok()?;
+    Some(Duration::from_secs(seconds))
 }
 
 /// Maps a 2xx body the client could not read as JSON (R6.3).
@@ -81,6 +94,7 @@ fn body_failure(status: StatusCode, error: reqwest::Error) -> ClientError {
         ClientError::Protocol {
             status: status.as_u16(),
             message: error.to_string(),
+            retry_after: None,
         }
     }
 }
@@ -208,6 +222,7 @@ impl ImmichClient {
             .await
             .map_err(ClientError::Unreachable)?;
         let status = response.status();
+        let retry_after = retry_after(&response);
         let result = if status.is_success() {
             response
                 .json::<ServerAbout>()
@@ -217,6 +232,7 @@ impl ImmichClient {
             Err(ClientError::Protocol {
                 status: status.as_u16(),
                 message: server_message(response).await,
+                retry_after,
             })
         };
         log_outcome("about", &result);
@@ -439,6 +455,7 @@ impl ImmichClient {
                 entry.into_result().ok_or(ClientError::Protocol {
                     status: status.as_u16(),
                     message: "bulk-upload-check answered with an unknown action".to_string(),
+                    retry_after: None,
                 })
             })
             .collect()
@@ -458,6 +475,7 @@ impl ImmichClient {
             return Err(ClientError::Protocol {
                 status: status.as_u16(),
                 message: "the server returned no asset id".to_string(),
+                retry_after: None,
             });
         }
         Ok(UploadResponse {
@@ -481,6 +499,7 @@ impl ImmichClient {
             return Err(ClientError::Protocol {
                 status: status.as_u16(),
                 message: "the server returned an album without an id or a name".to_string(),
+                retry_after: None,
             });
         }
         Ok(Album {
@@ -514,6 +533,7 @@ impl ImmichClient {
                 .await
                 .map_err(|error| body_failure(status, error));
         }
+        let retry_after = retry_after(&response);
         let message = server_message(response).await;
         match status {
             // The server answers 401 for both a wrong password and a disabled
@@ -525,6 +545,7 @@ impl ImmichClient {
             _ => Err(ClientError::Protocol {
                 status: status.as_u16(),
                 message,
+                retry_after,
             }),
         }
     }
@@ -536,6 +557,7 @@ impl ImmichClient {
         refusal: ClientError,
     ) -> Result<(), ClientError> {
         let status = response.status();
+        let retry_after = retry_after(&response);
         if status == StatusCode::UNAUTHORIZED {
             return Err(refusal);
         }
@@ -543,6 +565,7 @@ impl ImmichClient {
             return Err(ClientError::Protocol {
                 status: status.as_u16(),
                 message: server_message(response).await,
+                retry_after,
             });
         }
         let body = response

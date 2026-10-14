@@ -22,10 +22,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use immich_client::{ClientError, ImmichClient};
+use immich_client::ClientError;
 use tokio::sync::Mutex;
 
-use crate::connection::RequestCredential;
+use crate::connection::SharedSession;
 use crate::paths::path_key;
 use crate::store::{AlbumScope, SourceFolder, StateStore};
 
@@ -72,7 +72,10 @@ pub fn folder_name(path: &Path) -> String {
 /// through the upload path.
 #[derive(Debug)]
 pub struct AlbumMapper {
-    client: ImmichClient,
+    /// The connection session, so an album call carries the current credential
+    /// and a 401 is answered by the one re-login rule (R1.4) like every other
+    /// request the engine makes.
+    session: SharedSession,
     store: Arc<StateStore>,
     /// The album ids this client knows, by the mapped folder's path key.
     ///
@@ -82,11 +85,12 @@ pub struct AlbumMapper {
 }
 
 impl AlbumMapper {
-    /// Builds a mapper over the client and the app-scoped state store.
+    /// Builds a mapper over the connection session and the app-scoped state
+    /// store.
     #[must_use]
-    pub fn new(client: ImmichClient, store: Arc<StateStore>) -> Self {
+    pub fn new(session: SharedSession, store: Arc<StateStore>) -> Self {
         Self {
-            client,
+            session,
             store,
             known: Mutex::new(HashMap::new()),
         }
@@ -108,14 +112,25 @@ impl AlbumMapper {
         folder: &SourceFolder,
         file: &Path,
         asset_id: &str,
-        credential: &RequestCredential,
     ) -> Result<Option<String>, ClientError> {
         let Some((name, folder_key)) = album_of(folder, file) else {
             return Ok(None);
         };
-        let album = self.album_id(&folder_key, &name, credential).await?;
-        self.client
-            .add_assets_to_album(credential.auth(), &album, &[asset_id.to_string()])
+        let album = self.album_id(&folder_key, &name).await?;
+        let client = self.session.client();
+        let requested_album = album.clone();
+        let asset = asset_id.to_string();
+        self.session
+            .request(move |credential| {
+                let client = client.clone();
+                let requested_album = requested_album.clone();
+                let asset = asset.clone();
+                async move {
+                    client
+                        .add_assets_to_album(credential.auth(), &requested_album, &[asset])
+                        .await
+                }
+            })
             .await?;
         tracing::debug!(album = %name, folder = %folder_key, asset_id, "the asset joined its album");
         Ok(Some(name))
@@ -129,12 +144,7 @@ impl AlbumMapper {
     /// Returns the [`ClientError`] of the create call. A state database that
     /// cannot record the new id is logged and the album is still used, because
     /// the next file can find it in this run's cache.
-    async fn album_id(
-        &self,
-        folder_key: &str,
-        name: &str,
-        credential: &RequestCredential,
-    ) -> Result<String, ClientError> {
+    async fn album_id(&self, folder_key: &str, name: &str) -> Result<String, ClientError> {
         let mut known = self.known.lock().await;
         if let Some(id) = known.get(folder_key) {
             return Ok(id.clone());
@@ -149,9 +159,19 @@ impl AlbumMapper {
         let id = match stored {
             Some(id) => id,
             None => {
+                let client = self.session.client();
+                let album_name = name.to_string();
                 let album = self
-                    .client
-                    .create_album(credential.auth(), name, &[])
+                    .session
+                    .request(move |credential| {
+                        let client = client.clone();
+                        let album_name = album_name.clone();
+                        async move {
+                            client
+                                .create_album(credential.auth(), &album_name, &[])
+                                .await
+                        }
+                    })
                     .await?;
                 tracing::info!(album = %name, album_id = %album.id, "an album was created");
                 if let Err(error) = self.store.remember_album(folder_key, name, &album.id) {

@@ -13,7 +13,8 @@ use gpui_kit::*;
 #[cfg(test)]
 use sync_core::connection::Unauthorized;
 use sync_core::connection::{
-    Attention, AuthMethod, Connection, ConnectionState, RequestCredential, ServerProfile, SignIn,
+    Attention, AuthMethod, Connection, ConnectionState, RequestCredential, ServerProfile,
+    SharedSession, SignIn,
 };
 
 /// The saved connection profile, from the settings file. It holds no secret.
@@ -54,7 +55,11 @@ pub struct ConnectionModel {
     profile: ServerProfile,
     state: ConnectionState,
     form_error: Option<String>,
-    connection: Option<Connection>,
+    /// The live session, shared with the sync engine so a 401 on an upload is
+    /// answered by the same one re-login rule the form uses (R1.4). The form
+    /// signs in on this handle rather than building another one, so the engine
+    /// never keeps a session the user has already replaced.
+    session: Option<SharedSession>,
     provider: CredentialStoreProvider,
     /// Whether the startup restore already ran. The model outlives every
     /// window, so a reopen must not reset the session (R1.3).
@@ -81,7 +86,7 @@ impl ConnectionModel {
             profile,
             state,
             form_error: None,
-            connection: None,
+            session: None,
             provider: store.into(),
             startup_restore_started: false,
             generation: 0,
@@ -128,24 +133,35 @@ impl ConnectionModel {
     /// The HTTP client of the live session, for an upload request.
     #[must_use]
     pub fn client(&self) -> Option<sync_core::ImmichClient> {
-        self.connection
-            .as_ref()
-            .map(|connection| connection.client().clone())
+        self.session.as_ref().map(SharedSession::client)
     }
 
     /// The credential the live session attaches to a request.
     #[must_use]
     pub fn credential(&self) -> Option<RequestCredential> {
-        self.connection
-            .as_ref()
-            .and_then(|connection| connection.credential().cloned())
+        self.session.as_ref().and_then(SharedSession::credential)
     }
 
-    /// Records that an authenticated request succeeded with the current
-    /// credential, which restores the one re-login budget (R1.4).
-    pub fn note_authenticated(&mut self) {
-        if let Some(connection) = &mut self.connection {
-            connection.note_authenticated();
+    /// The live session, for a request path that answers its own 401s (R1.4).
+    #[must_use]
+    pub fn session(&self) -> Option<SharedSession> {
+        self.session.clone()
+    }
+
+    /// Adopts the session's state after a request path changed it (R1.4).
+    ///
+    /// The engine's 401 handling runs off this model's thread, so the model
+    /// pulls the state it produced on its own poll instead of being notified.
+    pub fn refresh_state(&mut self, cx: &mut Context<Self>) {
+        if let Some(session) = &self.session {
+            let state = session.state();
+            if state != self.state {
+                // The session's own state, not a new attempt, so the generation
+                // must not move: an attempt still in flight would be dropped as
+                // superseded by the very sign-in it is waiting for (R1.4).
+                self.state = state;
+                cx.notify();
+            }
         }
     }
 
@@ -154,21 +170,11 @@ impl ConnectionModel {
     /// path calls it yet; the retried request belongs to #7.
     #[cfg(test)]
     pub(crate) fn handle_unauthorized_for_test(&mut self, cx: &mut Context<Self>) -> Unauthorized {
+        let session = self.session.clone().expect("a live session before the 401");
         let outcome = worker()
             .expect("the worker runtime starts in tests")
-            .block_on(
-                self.connection
-                    .as_mut()
-                    .expect("a live session before the 401")
-                    .handle_unauthorized(),
-            );
-        let state = self
-            .connection
-            .as_ref()
-            .expect("the session outlives the re-login")
-            .state()
-            .clone();
-        self.set_state(state, cx);
+            .block_on(session.handle_unauthorized());
+        self.set_state(session.state(), cx);
         outcome
     }
 
@@ -186,7 +192,7 @@ impl ConnectionModel {
         self.startup_restore_started = true;
         self.profile = profile.clone();
         if !profile.is_configured() {
-            self.connection = None;
+            self.session = None;
             self.set_state(ConnectionState::NotConfigured, cx);
             return;
         }
@@ -260,25 +266,40 @@ impl ConnectionModel {
         // Resolving per request makes the recovery step real: starting the OS
         // credential store and signing in again works without a restart.
         let store = self.provider.resolve();
+        // A live session is repointed in place, so the sign-in that lands here
+        // is the one the sync engine and the uploader hold (R1.4).
+        let live = self.session.clone();
         let (results, incoming) = async_channel::bounded(1);
         runtime.spawn(async move {
-            let (state, connection) = match Connection::new(&server_url, store) {
-                Ok(mut connection) => {
-                    let state = match request {
-                        Some(request) => connection.sign_in(request).await,
-                        None => connection.restore(&profile).await,
-                    };
-                    (state, Some(connection))
-                }
-                Err(error) => (
-                    ConnectionState::NeedsAttention(Attention::from(&error)),
-                    None,
-                ),
+            let (state, session) = match live {
+                Some(session) => match session.repoint(&server_url, store).await {
+                    Ok(()) => {
+                        let state = authenticate(session.clone(), profile, request).await;
+                        (state, Some(session))
+                    }
+                    // The session keeps the handle the engine holds, so it says
+                    // why the attempt failed instead of the model alone.
+                    Err(error) => (
+                        ConnectionState::NeedsAttention(Attention::from(&error)),
+                        Some(session),
+                    ),
+                },
+                None => match Connection::new(&server_url, store) {
+                    Ok(connection) => {
+                        let session = connection.shared();
+                        let state = authenticate(session.clone(), profile, request).await;
+                        (state, Some(session))
+                    }
+                    Err(error) => (
+                        ConnectionState::NeedsAttention(Attention::from(&error)),
+                        None,
+                    ),
+                },
             };
-            let _ = results.send((state, connection)).await;
+            let _ = results.send((state, session)).await;
         });
         cx.spawn(async move |this, cx| {
-            let Ok((state, connection)) = incoming.recv().await else {
+            let Ok((state, session)) = incoming.recv().await else {
                 return;
             };
             // The model can be gone while the request runs; the result is then
@@ -287,12 +308,25 @@ impl ConnectionModel {
                 if model.generation != generation {
                     return;
                 }
-                model.connection = connection;
+                model.session = session;
                 log_outcome(&state);
                 model.set_state(state, cx);
             });
         })
         .detach();
+    }
+}
+
+/// Signs in, or restores the saved profile with no user input, on the one
+/// session the app, the engine, and the uploader share (R1.3, R1.4).
+async fn authenticate(
+    session: SharedSession,
+    profile: ServerProfile,
+    request: Option<SignIn>,
+) -> ConnectionState {
+    match request {
+        Some(request) => session.sign_in(request).await,
+        None => session.restore(&profile).await,
     }
 }
 
@@ -318,5 +352,90 @@ fn log_outcome(state: &ConnectionState) {
             "sign-in outcome"
         ),
         other => tracing::info!(state = other.summary(), "sign-in outcome"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConnectionModel, ServerProfile, worker};
+    use gpui_kit::AppContext as _;
+    use gpui_kit::TestAppContext;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use sync_core::connection::{Attention, AuthMethod, ConnectionState, Secret, SignIn};
+    use sync_core::credential::{MemoryCredentialStore, SharedCredentialStore};
+
+    /// Starts the offline Immich double on its own runtime.
+    fn mock_server() -> (tokio::runtime::Runtime, mock_immich::MockImmich) {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("start the mock runtime");
+        let server = runtime.block_on(mock_immich::MockImmich::start());
+        (runtime, server)
+    }
+
+    /// Pumps GPUI's test executor until the condition holds.
+    async fn wait_until(cx: &mut TestAppContext, mut done: impl FnMut(&mut gpui_kit::App) -> bool) {
+        for _ in 0..600 {
+            if cx.update(&mut done) {
+                return;
+            }
+            cx.executor().timer(Duration::from_millis(10)).await;
+            cx.run_until_parked();
+        }
+        panic!("the test condition never became true");
+    }
+
+    /// The one bridge from a refusal the engine answered on its own thread back
+    /// to the model the tray and the dashboard read (R1.4).
+    #[gpui_kit::test]
+    async fn a_refusal_the_engine_answered_reaches_the_model_on_refresh(cx: &mut TestAppContext) {
+        let (_runtime, server) = mock_server();
+        cx.executor().allow_parking();
+        let profile = ServerProfile {
+            server_url: server.base_url().to_string(),
+            email: "sync@example.com".to_string(),
+            method: AuthMethod::Password,
+        };
+        let credentials: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+        let connection = cx.update(|cx| {
+            let connection = cx.new(|_| ConnectionModel::new(profile.clone(), credentials));
+            let request = SignIn {
+                email: profile.email.clone(),
+                secret: Secret::new("correct horse"),
+                method: AuthMethod::Password,
+            };
+            connection.update(cx, |model, cx| model.sign_in(request, profile.clone(), cx));
+            connection
+        });
+        wait_until(cx, |cx| connection.read(cx).state().is_connected()).await;
+
+        // What the engine's 401 handling does, off this model's thread: the one
+        // re-login, then the refusal that needs the user.
+        let session = cx
+            .read(|cx| connection.read(cx).session())
+            .expect("a live session");
+        for _ in 0..2 {
+            let _ = cx.update(|_| {
+                worker()
+                    .expect("the worker runtime starts in tests")
+                    .block_on(session.handle_unauthorized())
+            });
+        }
+        let before = cx.read(|cx| connection.read(cx).state().clone());
+        assert!(
+            before.is_connected(),
+            "the model has not heard about the refusal yet: {before:?}"
+        );
+
+        cx.update(|cx| connection.update(cx, |model, cx| model.refresh_state(cx)));
+
+        assert_eq!(
+            cx.read(|cx| connection.read(cx).state().clone()),
+            ConnectionState::NeedsAttention(Attention::Rejected),
+            "R1.4: the tray reads the refusal the engine answered as needing attention"
+        );
     }
 }
