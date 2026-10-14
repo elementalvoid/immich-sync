@@ -25,8 +25,10 @@ use tokio::time::{Instant, Sleep};
 /// waiting on a long, low-rate delay.
 const MAX_WAIT: Duration = Duration::from_millis(50);
 
-/// How much of a second's budget a bucket may hold at once. A tenth keeps the
-/// burst small enough that a short file still averages near the limit.
+/// How much of a second's budget a bucket may hold at once. A tenth is short
+/// enough that a file smaller than the bucket still finishes near its limit,
+/// but only while the rate is above `BUCKET_FLOOR * BURST_DIVISOR` (about
+/// 640 kB/s). Below that the floor is the capacity, not a tenth of a second.
 const BURST_DIVISOR: u64 = 10;
 
 /// The least a bucket holds, whatever the rate is.
@@ -35,7 +37,9 @@ const BURST_DIVISOR: u64 = 10;
 /// kilobytes at most. A bucket that holds less than one read can never pay for
 /// it, so any rate below `read / BURST_DIVISOR` would leave the body waiting
 /// for ever - and the stall guard would rightly call that a dead server. This
-/// floor keeps a very slow limit paying out one read at a time.
+/// floor keeps a very slow limit paying out one read at a time, and it is what
+/// the bucket holds below `BUCKET_FLOOR * BURST_DIVISOR`, where a tenth of a
+/// second is too little to pay for even one read.
 const BUCKET_FLOOR: u64 = 64 * 1024;
 
 /// A shareable limit on upload bytes per second; 0 means unlimited.
