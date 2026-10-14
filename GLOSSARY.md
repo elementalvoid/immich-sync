@@ -19,7 +19,7 @@ A full read of a source folder. The client uses it to find changes that watch ev
 _Avoid_: rescan, poll
 
 **Album mapping**:
-A per-folder rule that copies the source folder name to the name of one Immich album.
+A per-folder rule that copies a mapped folder's name to the name of one Immich album. One album belongs to one folder: two folders that share a name are two albums.
 _Avoid_: folder sync, album mode
 
 **Album scope**:

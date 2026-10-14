@@ -61,6 +61,27 @@ CREATE TABLE source_folder (
 );
 ";
 
+/// The fourth schema (issue #9): the per-folder album mapping and its album
+/// scope (R3.4), plus the album ids the server assigned.
+///
+/// The album id is stored so a restart reuses the album instead of creating a
+/// second one for the same folder. The album is keyed by the mapped folder's
+/// path key (R2.4), not by its name: the name is a copy the mapping makes, so
+/// two folders that share a name are two albums, and one folder spelled with
+/// another case is one.
+///
+/// The `name` column is a breadcrumb for a person reading the file with the
+/// sqlite CLI; nothing reads it, and the album is found by folder key alone.
+const SCHEMA_V4: &str = "
+ALTER TABLE source_folder ADD COLUMN album_mapping INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE source_folder ADD COLUMN album_scope TEXT NOT NULL DEFAULT 'leaf';
+CREATE TABLE album (
+    folder_key TEXT PRIMARY KEY,
+    name       TEXT NOT NULL,
+    album_id   TEXT NOT NULL
+);
+";
+
 /// How long the one writer waits for a competing lock before failing.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -118,6 +139,47 @@ impl ItemState {
     }
 }
 
+/// What one mapped source folder maps its files to (GLOSSARY, R3.4).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AlbumScope {
+    /// One album per folder that directly contains files (GLOSSARY).
+    #[default]
+    Leaf,
+    /// One album for the whole source folder (GLOSSARY).
+    WholeFolder,
+}
+
+impl AlbumScope {
+    /// The exact string the state database stores.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Leaf => "leaf",
+            Self::WholeFolder => "whole_folder",
+        }
+    }
+
+    /// Parses a stored scope. Returns `None` for a value this build does not
+    /// know, so a row a newer build wrote is not guessed at.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        Some(match text {
+            "leaf" => Self::Leaf,
+            "whole_folder" => Self::WholeFolder,
+            _ => return None,
+        })
+    }
+
+    /// The user's choice in the config window's words (GLOSSARY).
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Leaf => "One album per folder",
+            Self::WholeFolder => "One album for this folder",
+        }
+    }
+}
+
 /// One source folder the user selected (R2.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceFolder {
@@ -125,6 +187,11 @@ pub struct SourceFolder {
     pub path: String,
     /// Whether the scan and the watcher descend into subfolders.
     pub recursive: bool,
+    /// Whether this folder's files join an album (R3.4). Off until the user
+    /// opts in.
+    pub album_mapping: bool,
+    /// What the folder maps to once album mapping is on (R3.4).
+    pub album_scope: AlbumScope,
 }
 
 /// The per-folder item counts a dashboard card shows (R8.1).
@@ -224,6 +291,9 @@ pub enum StoreError {
     /// A row holds a SHA-1 that is not 20 bytes.
     #[error("the state database holds a SHA-1 that is not 20 bytes")]
     BadChecksum,
+    /// A row holds an album scope this build does not know.
+    #[error("the state database holds an unknown album scope {0:?}")]
+    UnknownAlbumScope(String),
     /// A file size does not fit SQLite's signed 64-bit integer.
     #[error("the file size {0} does not fit the state database")]
     SizeOutOfRange(u64),
@@ -445,8 +515,8 @@ impl StateStore {
             .map_err(|source| self.query_error(source))
     }
 
-    /// Adds a source folder, or updates its recursive flag when the same
-    /// folder is added again (R2.1).
+    /// Adds a source folder, or updates its recursive flag, album mapping, and
+    /// album scope when the same folder is added again (R2.1, R3.4).
     ///
     /// # Errors
     ///
@@ -458,15 +528,19 @@ impl StateStore {
             .map_err(|source| self.query_error(source))?;
         transaction
             .execute(
-                "INSERT INTO source_folder (path, path_key, recursive)
-                 VALUES (?1, ?2, ?3)
+                "INSERT INTO source_folder (path, path_key, recursive, album_mapping, album_scope)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(path_key) DO UPDATE SET
                      path = excluded.path,
-                     recursive = excluded.recursive",
+                     recursive = excluded.recursive,
+                     album_mapping = excluded.album_mapping,
+                     album_scope = excluded.album_scope",
                 params![
                     folder.path,
                     path_key(Path::new(&folder.path)),
                     folder.recursive,
+                    folder.album_mapping,
+                    folder.album_scope.as_str(),
                 ],
             )
             .map_err(|source| self.query_error(source))?;
@@ -499,18 +573,68 @@ impl StateStore {
     pub fn folders(&self) -> Result<Vec<SourceFolder>, StoreError> {
         let writer = self.writer()?;
         let mut statement = writer
-            .prepare("SELECT path, recursive FROM source_folder ORDER BY path")
+            .prepare(
+                "SELECT path, recursive, album_mapping, album_scope
+                 FROM source_folder ORDER BY path",
+            )
             .map_err(|source| self.query_error(source))?;
         let rows = statement
-            .query_map([], |row| {
-                Ok(SourceFolder {
-                    path: row.get(0)?,
-                    recursive: row.get(1)?,
-                })
-            })
+            .query_map([], read_folder)
             .map_err(|source| self.query_error(source))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|source| self.query_error(source))
+    }
+
+    /// The album the server assigned for the mapped folder `folder_key`, when
+    /// this client already made one (R3.4).
+    ///
+    /// The folder key is the identity, because the album scope is one album per
+    /// folder (GLOSSARY): the album name is a copy the mapping makes, so two
+    /// folders that share a name are two albums (R3.4).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the query fails.
+    pub fn album(&self, folder_key: &str) -> Result<Option<String>, StoreError> {
+        let writer = self.writer()?;
+        writer
+            .query_row(
+                "SELECT album_id FROM album WHERE folder_key = ?1",
+                [folder_key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|source| self.query_error(source))
+    }
+
+    /// Records the album the server assigned for the mapped folder
+    /// `folder_key`, so the next file in the same folder joins the same album
+    /// (R3.4).
+    ///
+    /// `name` is recorded for whoever reads the file directly; no query reads
+    /// it back.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the write fails or the lock is poisoned.
+    pub fn remember_album(
+        &self,
+        folder_key: &str,
+        name: &str,
+        album_id: &str,
+    ) -> Result<(), StoreError> {
+        let writer = self.writer()?;
+        // One statement, so the single write is atomic on its own and needs no
+        // transaction around it.
+        writer
+            .execute(
+                "INSERT INTO album (folder_key, name, album_id) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(folder_key) DO UPDATE SET
+                     name = excluded.name, album_id = excluded.album_id",
+                params![folder_key, name, album_id],
+            )
+            .map_err(|source| self.query_error(source))?;
+        Ok(())
     }
 
     /// Re-queues what a restart interrupted: an `uploading` row becomes
@@ -601,6 +725,24 @@ impl StateStore {
     }
 }
 
+/// Reads one `source_folder` row.
+fn read_folder(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceFolder> {
+    let scope_text: String = row.get(3)?;
+    let album_scope = AlbumScope::parse(&scope_text).ok_or_else(|| {
+        conversion_error(
+            3,
+            rusqlite::types::Type::Text,
+            StoreError::UnknownAlbumScope(scope_text.clone()),
+        )
+    })?;
+    Ok(SourceFolder {
+        path: row.get(0)?,
+        recursive: row.get(1)?,
+        album_mapping: row.get(2)?,
+        album_scope,
+    })
+}
+
 /// Reads one `sync_item` row.
 fn read_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<ItemRecord> {
     let size: i64 = row.get(1)?;
@@ -658,6 +800,7 @@ fn migrations() -> Migrations<'static> {
         M::up(SCHEMA_V1),
         M::up_with_hook(SCHEMA_V2, backfill_path_keys),
         M::up(SCHEMA_V3),
+        M::up(SCHEMA_V4),
     ])
 }
 
@@ -814,6 +957,44 @@ mod migration_tests {
         assert_eq!(
             row.path, second,
             "the newest id is the row the unique key keeps"
+        );
+    }
+
+    #[test]
+    fn the_album_columns_survive_a_v3_database() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let path = temp.path().join("state.db");
+        {
+            let mut connection = Connection::open(&path).expect("open the raw database");
+            // A v3 database: source folders exist, the album columns do not.
+            Migrations::new(vec![
+                M::up(SCHEMA_V1),
+                M::up_with_hook(SCHEMA_V2, backfill_path_keys),
+                M::up(SCHEMA_V3),
+            ])
+            .to_latest(&mut connection)
+            .expect("create the third schema");
+            connection
+                .execute(
+                    "INSERT INTO source_folder (path, path_key, recursive)
+                     VALUES (?1, ?2, 1)",
+                    params!["/photos", "/photos"],
+                )
+                .expect("insert the source folder");
+            drop(connection);
+        }
+
+        let store = StateStore::open(&path).expect("a v3 database must migrate");
+        assert_eq!(
+            store.folders().expect("read the folders"),
+            vec![SourceFolder {
+                path: "/photos".to_string(),
+                recursive: true,
+                album_mapping: false,
+                album_scope: AlbumScope::Leaf,
+            }],
+            "R3.4: a folder mapped before album mapping existed reads back off, at the default \
+             scope, through the whole composed migration chain"
         );
     }
 
