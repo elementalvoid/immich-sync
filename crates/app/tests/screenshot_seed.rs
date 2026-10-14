@@ -49,6 +49,9 @@ fn row(folder: &Path, name: &str, state: ItemState, index: usize) -> ItemRecord 
         error_class,
         error_message,
         attempts: 0,
+        // R3.3: no sidecar has been sent in the capture, so the asset carries
+        // none.
+        sidecar: None,
     }
 }
 

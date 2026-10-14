@@ -478,6 +478,7 @@ async fn a_restart_resumes_without_reuploading_completed_items() {
             error_class: None,
             error_message: None,
             attempts: 0,
+            sidecar: None,
         })
         .expect("write the interrupted row");
     drop(store);
@@ -645,6 +646,7 @@ async fn a_restart_requeues_a_pending_row_whose_file_is_unchanged() {
             error_class: None,
             error_message: None,
             attempts: 0,
+            sidecar: None,
         })
         .expect("write the pending row");
 
@@ -689,6 +691,7 @@ async fn an_unchanged_size_and_mtime_skips_the_hash_of_a_finished_row() {
             error_class: None,
             error_message: None,
             attempts: 0,
+            sidecar: None,
         })
         .expect("write the settled row");
     let config = EngineConfig {
@@ -796,6 +799,7 @@ async fn a_restart_with_a_pending_row_does_not_double_count_the_pending_item() {
             error_class: None,
             error_message: None,
             attempts: 0,
+            sidecar: None,
         })
         .expect("write the pending row");
     let config = EngineConfig {
@@ -856,6 +860,7 @@ async fn a_re_added_folder_seeds_its_counts_from_the_store() {
                 error_class: None,
                 error_message: None,
                 attempts: 0,
+                sidecar: None,
             })
             .expect("write the terminal row");
     }
@@ -1800,6 +1805,8 @@ async fn a_duplicate_the_server_already_has_joins_the_album_too() {
                 checksum: &sha1_file(&file).expect("hash the fixture").base64(),
                 created_at: std::time::UNIX_EPOCH,
                 modified_at: std::time::UNIX_EPOCH,
+                sidecar: None,
+                live_photo_video_id: None,
             },
         )
         .await
@@ -2279,6 +2286,8 @@ async fn a_restart_requeues_a_retry_wait_row_with_its_attempt_count() {
             error_class: Some(FailureClass::ServerTransient),
             error_message: Some("the server answered 503".to_string()),
             attempts: 0,
+            // R3.3: nothing has been sent, so the sidecar is still owed.
+            sidecar: None,
         })
         .expect("write the parked row");
     store

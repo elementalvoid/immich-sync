@@ -10,7 +10,7 @@ use sync_core::credential::MemoryCredentialStore;
 use sync_core::failure::{FailureClass, FailureKind};
 use sync_core::hash::Sha1;
 use sync_core::store::{ItemState, StateStore};
-use sync_core::upload::{UploadOutcome, Uploader};
+use sync_core::upload::{PreparedItem, UploadGate, UploadOutcome, Uploader};
 
 /// `sha1("hello world")`, hex.
 const HELLO_WORLD_SHA1_HEX: &str = "2aae6c35c94fcfb415dbe95f408b9ce91ee846ed";
@@ -68,6 +68,19 @@ fn success_asset_id(outcome: &UploadOutcome) -> &str {
         other => panic!("expected a success, got {other:?}"),
     }
 }
+
+/// The bytes [`sidecar_of`] writes, whose digest is [`SIDECAR_SHA1_HEX`].
+const SIDECAR: &[u8] = b"<x:xmpmeta>sidecar</x:xmpmeta>";
+
+/// The XMP sidecar of `media`, written next to it.
+fn sidecar_of(media: &Path) -> PathBuf {
+    let sidecar = media.with_extension("txt.xmp");
+    std::fs::write(&sidecar, SIDECAR).expect("write the sidecar");
+    sidecar
+}
+
+/// The digest of [`sidecar_of`]'s fixture, as an independent literal.
+const SIDECAR_SHA1_HEX: &str = "f8d2e9cfb0466aeebda758acb4dbbdfa7ce77140";
 
 #[tokio::test]
 async fn uploading_a_new_file_returns_created_and_records_the_row() {
@@ -155,6 +168,51 @@ async fn an_unchanged_file_that_was_touched_does_not_upload_again() {
         "{outcome:?}"
     );
     assert_eq!(server.upload_requests(), 1);
+}
+
+#[tokio::test]
+async fn a_touched_sidecar_does_not_offer_the_asset_again() {
+    // R3.3, R4.5: the asset already carries these bytes. A `touch` or a backup
+    // restore moves the sidecar's mtime without changing its content, and
+    // offering it again is answered `duplicate` from the checksum header before
+    // the server reads the body — which parks the item claiming the sidecar
+    // could not be attached, although it is attached.
+    let server = MockImmich::start().await;
+    let (uploader, _session, store, temp) = uploader(&server).await;
+    let path = hello_world_file(temp.path(), "hello.txt");
+    let sidecar = sidecar_of(&path);
+
+    let first = uploader.upload_one(&path).await;
+    let asset_id = success_asset_id(&first).to_string();
+    assert!(
+        server.has_sidecar(&asset_id),
+        "R3.3: the sidecar rode along with the first attempt"
+    );
+
+    // Same bytes, new mtime.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(&sidecar, SIDECAR).expect("rewrite the same bytes");
+    let second = uploader.upload_one(&path).await;
+
+    assert!(
+        matches!(second, UploadOutcome::Duplicate { .. }),
+        "the sidecar is already attached, so there is nothing to offer: {second:?}"
+    );
+    assert_eq!(success_asset_id(&second), asset_id);
+    assert_eq!(
+        server.upload_requests(),
+        1,
+        "a touched sidecar must not go on the wire again"
+    );
+    let row = store
+        .item(&path.display().to_string())
+        .expect("read the row")
+        .expect("the row exists");
+    assert_eq!(
+        row.state,
+        ItemState::Uploaded,
+        "the item stays uploaded rather than parked: {row:?}"
+    );
 }
 
 #[tokio::test]
@@ -298,6 +356,96 @@ async fn a_upload_the_server_hangs_up_on_is_a_transient_network_failure() {
         "a cut-off body must not become a permanent verdict"
     );
     assert_eq!(row.error_class, Some(FailureClass::NetworkTransient));
+}
+
+#[tokio::test]
+async fn a_failed_upload_leaves_the_sidecar_owed_and_a_later_pass_sends_it() {
+    // R4.5: the digest is what says the asset carries the sidecar, so it may
+    // only be written once the request carrying it was accepted. A transient
+    // failure sends nothing, and a row that claims otherwise drops the
+    // sidecar for good.
+    let server = MockImmich::start().await;
+    server.fail(
+        Operation::Upload,
+        Fault::Status {
+            code: 503,
+            retry_after: None,
+        },
+    );
+    let (uploader, _session, store, temp) = uploader(&server).await;
+    let path = hello_world_file(temp.path(), "hello.txt");
+    sidecar_of(&path);
+
+    let failed = uploader.upload_one(&path).await;
+    assert!(
+        matches!(failed, UploadOutcome::Failed(_)),
+        "expected the faulted upload to fail, got {failed:?}"
+    );
+    let row = store
+        .item(&path.display().to_string())
+        .expect("read the row")
+        .expect("the failure was recorded");
+    assert_eq!(
+        row.sidecar, None,
+        "the request failed, so the asset carries no sidecar yet"
+    );
+
+    server.reset_faults();
+    let retried = uploader.upload_one(&path).await;
+    let asset_id = success_asset_id(&retried).to_string();
+    assert!(
+        server.has_sidecar(&asset_id),
+        "R3.3: the sidecar rides along with the later attempt"
+    );
+    assert_eq!(
+        store
+            .item(&path.display().to_string())
+            .expect("read the row")
+            .expect("the row exists")
+            .sidecar
+            .map(|sidecar| sidecar.sha1),
+        Some(Sha1::from_hex(SIDECAR_SHA1_HEX).expect("a hex SHA-1")),
+        "R4.5: the digest is recorded once the asset carries the sidecar"
+    );
+}
+
+#[tokio::test]
+async fn a_paused_upload_leaves_the_sidecar_owed() {
+    // R8.7: a paused upload sends nothing at all, so it can claim no sidecar.
+    let server = MockImmich::start().await;
+    let (uploader, _session, store, temp) = uploader(&server).await;
+    let path = hello_world_file(temp.path(), "hello.txt");
+    let sidecar = sidecar_of(&path);
+    let gate = UploadGate::new();
+    gate.pause();
+
+    let prepared = PreparedItem {
+        path: path.clone(),
+        size: 11,
+        mtime_ns: expected_mtime_ns(&path),
+        sha1: Sha1::from_hex(HELLO_WORLD_SHA1_HEX).expect("a hex SHA-1"),
+        sidecar: Some(sync_core::upload::SidecarFile {
+            digest: sync_core::store::SidecarDigest {
+                sha1: Sha1::from_hex(SIDECAR_SHA1_HEX).expect("a hex SHA-1"),
+                size: std::fs::metadata(&sidecar).expect("read the sidecar").len(),
+                mtime_ns: expected_mtime_ns(&sidecar),
+            },
+            path: sidecar,
+        }),
+        live_photo_video: None,
+    };
+    let outcome = uploader.upload_prepared(&prepared, &gate).await;
+
+    assert_eq!(outcome, UploadOutcome::Deferred);
+    assert_eq!(server.upload_requests(), 0, "nothing was sent");
+    let row = store
+        .item(&path.display().to_string())
+        .expect("read the row")
+        .expect("the deferred item was recorded");
+    assert_eq!(
+        row.sidecar, None,
+        "the request never went out, so the asset carries no sidecar yet"
+    );
 }
 
 #[tokio::test]

@@ -60,6 +60,8 @@ fn parked(
         error_class: class,
         error_message: message.map(str::to_string),
         attempts,
+        // R3.3: no sidecar has been sent in the fixture.
+        sidecar: None,
     }
 }
 

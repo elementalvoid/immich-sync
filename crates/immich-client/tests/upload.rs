@@ -163,7 +163,83 @@ fn upload_request<'a>(path: &'a std::path::Path, checksum: &'a str) -> AssetUplo
         checksum,
         created_at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
         modified_at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_040),
+        sidecar: None,
+        live_photo_video_id: None,
     }
+}
+
+#[tokio::test]
+async fn a_sidecar_and_a_live_photo_video_id_ride_along_with_the_upload() {
+    // R3.3: the sidecar is the `sidecarData` part and the motion video is the
+    // `livePhotoVideoId` field of the one upload the photo sends.
+    let server = MockImmich::start().await;
+    let client = client(&server);
+    let token = token(&client).await;
+    let (_directory, path) = hello_world_file();
+    let sidecar = path.with_extension("txt.xmp");
+    std::fs::write(&sidecar, b"<xmp/>").expect("write the sidecar fixture");
+    let video = _directory.path().join("hello.mov");
+    std::fs::write(&video, b"motion bytes").expect("write the video fixture");
+    let video_id = upload(&client, &token, &video, &checksum_of(b"motion bytes"))
+        .await
+        .expect("the video uploads first")
+        .asset_id;
+
+    let mut request = upload_request(&path, HELLO_WORLD_SHA1_BASE64);
+    request.sidecar = Some(&sidecar);
+    request.live_photo_video_id = Some(&video_id);
+    let response = client
+        .upload_asset(Auth::Token(&token), &request)
+        .await
+        .expect("the mock accepts the upload");
+
+    assert!(server.has_sidecar(&response.asset_id), "R3.3: sidecarData");
+    assert_eq!(
+        server.live_photo_video_id(&response.asset_id),
+        Some(video_id),
+        "R3.3: livePhotoVideoId"
+    );
+}
+
+#[tokio::test]
+async fn the_sidecar_part_precedes_every_text_field() {
+    // Immich's multer filter runs while the stream is parsed, and it resolves
+    // the `sidecarData` part's name from `body.filename || file.originalName`.
+    // A `filename` text field sent before the sidecar is already in `body`, and
+    // `IMG_0001.jpg` is not a sidecar name, so the filter answers
+    // `Unsupported file type IMG_0001.jpg` and every sidecar upload is a
+    // permanent 400. The part's own `filename` is already `IMG_0001.jpg.xmp`,
+    // so the sidecar has to come first.
+    let server = MockImmich::start().await;
+    let client = client(&server);
+    let token = token(&client).await;
+    let (_directory, path) = hello_world_file();
+    let sidecar = path.with_extension("txt.xmp");
+    std::fs::write(&sidecar, b"<xmp/>").expect("write the sidecar fixture");
+
+    let mut request = upload_request(&path, HELLO_WORLD_SHA1_BASE64);
+    request.sidecar = Some(&sidecar);
+    client
+        .upload_asset(Auth::Token(&token), &request)
+        .await
+        .expect("the mock accepts the upload");
+
+    let parts = &server.uploads()[0].parts;
+    let at = |name: &str| {
+        parts
+            .iter()
+            .position(|part| part == name)
+            .unwrap_or_else(|| panic!("the request carried a {name} part: {parts:?}"))
+    };
+    assert!(
+        at("sidecarData") < at("filename"),
+        "the sidecar part must come before any text field: {parts:?}"
+    );
+}
+
+/// The hex SHA-1 of a fixture body, for the `x-immich-checksum` header.
+fn checksum_of(body: &[u8]) -> String {
+    hex::encode(<sha1::Sha1 as sha1::Digest>::digest(body))
 }
 
 async fn upload(

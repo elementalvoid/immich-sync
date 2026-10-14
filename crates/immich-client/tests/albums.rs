@@ -35,6 +35,8 @@ async fn upload_asset(client: &ImmichClient, token: &SessionToken) -> String {
                 checksum: HELLO_WORLD_SHA1_BASE64,
                 created_at: std::time::UNIX_EPOCH,
                 modified_at: std::time::UNIX_EPOCH,
+                sidecar: None,
+                live_photo_video_id: None,
             },
         )
         .await

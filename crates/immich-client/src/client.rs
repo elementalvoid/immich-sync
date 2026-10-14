@@ -1,5 +1,6 @@
 //! The hand-written Immich HTTP client (ADR 0006).
 
+use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -274,43 +275,64 @@ impl ImmichClient {
     /// header and it is what makes the server answer `duplicate` for an asset
     /// it already has.
     ///
+    /// The XMP sidecar and the live photo video id the caller resolved ride
+    /// along in the same request (R3.3).
+    ///
     /// Immich answers such a duplicate from the header, before multer parses
     /// the body, and hangs up while the client is still sending (#19). That
     /// answer can be lost in flight, so a transport failure here is resolved by
     /// asking whether the server kept the asset.
     ///
+    /// A `duplicate` answer therefore proves nothing about the `sidecarData`
+    /// part that rode along: the server never read the body. It also deletes
+    /// the file it just buffered when it finds the body checksum known. There
+    /// is no Stable operation that attaches a sidecar to an asset afterwards,
+    /// so the caller must not treat a duplicate as "the sidecar arrived" (see
+    /// `sync-core`'s upload pipeline).
+    ///
     /// # Errors
     ///
-    /// Returns [`ClientError::LocalRead`] when the file cannot be opened, the
-    /// typed refusal classes (R6.3), and the transport and protocol variants.
-    /// A transport failure is returned only when the server neither holds the
-    /// asset nor answers the follow-up question.
+    /// Returns [`ClientError::LocalRead`] when the file or its sidecar cannot be
+    /// opened, the typed refusal classes (R6.3), and the transport and
+    /// protocol variants. A transport failure is returned only when the server
+    /// neither holds the asset nor answers the follow-up question.
     pub async fn upload_asset(
         &self,
         auth: Auth<'_>,
         upload: &AssetUpload<'_>,
     ) -> Result<UploadResponse, ClientError> {
-        let file = tokio::fs::File::open(upload.path)
-            .await
-            .map_err(ClientError::LocalRead)?;
-        let length = file.metadata().await.map_err(ClientError::LocalRead)?.len();
         let filename = upload
             .path
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("asset")
             .to_string();
-        let part = Part::stream_with_length(Body::wrap_stream(ReaderStream::new(file)), length)
-            .file_name(filename.clone());
+        let part = file_part(upload.path).await?;
+        // R3.3: the sidecar part goes before every text field. Immich's multer
+        // filter resolves the `sidecarData` part's name from
+        // `body.filename || file.originalName` while it parses the stream, and
+        // `body.filename` is already the media name once the `filename` field
+        // is read — `mimeTypes.isSidecar("IMG_0001.jpg")` is false, so the
+        // filter answers `Unsupported file type` and every sidecar upload is a
+        // permanent 400. Sent first, the part's own `file_name()` is already
+        // `IMG_0001.jpg.xmp`, which is what `originalName` then supplies.
+        let mut form = Form::new().part("assetData", part);
+        if let Some(sidecar) = upload.sidecar {
+            // The sidecar streams from disk as its own part, so an asset with
+            // a sidecar does not hold the sidecar in memory.
+            form = form.part("sidecarData", file_part(sidecar).await?);
+        }
         // Immich requires the file's own dates on the asset. The caller reads
         // them from the local file (R3.1).
-        let form = Form::new()
-            .part("assetData", part)
+        form = form
             .text("filename", filename.clone())
             .text("deviceAssetId", upload.path.display().to_string())
             .text("deviceId", "immich-sync")
             .text("fileCreatedAt", iso8601(upload.created_at))
             .text("fileModifiedAt", iso8601(upload.modified_at));
+        if let Some(video_id) = upload.live_photo_video_id {
+            form = form.text("livePhotoVideoId", video_id.to_string());
+        }
         let sent = self
             .authorize(self.http.post(self.endpoint("assets")), auth)
             .header("x-immich-checksum", upload.checksum)
@@ -578,6 +600,31 @@ impl ImmichClient {
             Err(refusal)
         }
     }
+}
+
+/// One streamed multipart file part: the file from disk, never buffered.
+///
+/// The filename is a hint for the server's own file name; a path without one
+/// is not a file the pipeline can upload anyway.
+///
+/// # Errors
+///
+/// Returns [`ClientError::LocalRead`] when the file cannot be opened or its
+/// length cannot be read.
+async fn file_part(path: &Path) -> Result<Part, ClientError> {
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(ClientError::LocalRead)?;
+    let length = file.metadata().await.map_err(ClientError::LocalRead)?.len();
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("asset")
+        .to_string();
+    Ok(
+        Part::stream_with_length(Body::wrap_stream(ReaderStream::new(file)), length)
+            .file_name(filename),
+    )
 }
 
 /// One local timestamp in the ISO 8601 form Immich stores, in UTC.

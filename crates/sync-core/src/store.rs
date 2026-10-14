@@ -108,6 +108,33 @@ CREATE TABLE attempt (
 CREATE INDEX attempt_item ON attempt(item_id);
 ";
 
+/// The sixth schema (issue #10): the digest of the XMP sidecar the asset
+/// carries (R3.3).
+///
+/// A sidecar is content, not a file of its own, so its digest belongs to the
+/// asset's row rather than to a row of its own. It is what tells a later pass
+/// that a sidecar appeared after the asset was uploaded.
+///
+/// #10 wrote this pair against a base where V4 was free and called them V4 and
+/// V5. The attempt migration (#7) had already reached integration as V5, so the
+/// pair lands as V6 and V7: numbering follows merge order, and a deployed
+/// database keys its applied migrations on the number.
+const SCHEMA_V6: &str = "ALTER TABLE sync_item ADD COLUMN sidecar_sha1 BLOB;";
+
+/// The seventh schema (issue #10): the sidecar's size and modification time
+/// beside its digest.
+///
+/// A settled library is not re-read on every reconciliation scan (R4.5), and
+/// that has to hold for the sidecars too, or a large library re-reads every
+/// sidecar every scan interval. The recorded size and mtime tell the client
+/// the sidecar has not changed without opening it, exactly as the media file's
+/// own columns do. A row written before this migration has none of the three,
+/// so its sidecar is hashed once more and then recorded with them.
+const SCHEMA_V7: &str = "
+ALTER TABLE sync_item ADD COLUMN sidecar_size INTEGER;
+ALTER TABLE sync_item ADD COLUMN sidecar_mtime_ns INTEGER;
+";
+
 /// How long the one writer waits for a competing lock before failing.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -263,6 +290,9 @@ pub struct ItemRecord {
     /// cannot reset a count it did not earn; only
     /// [`StateStore::record_attempt`] moves it.
     pub attempts: u32,
+    /// The XMP sidecar the asset carries, when one has been sent (R3.3). A
+    /// sidecar whose identity differs on disk has to ride along again.
+    pub sidecar: Option<SidecarDigest>,
 }
 
 /// What one upload attempt produced (SPEC §5).
@@ -323,6 +353,22 @@ pub struct FailedItem {
     pub error_message: Option<String>,
     /// How many automatic attempts the item spent before it was parked.
     pub attempts: u32,
+}
+
+/// The XMP sidecar an asset carries, and what it looked like when it did
+/// (R3.3, R4.5).
+///
+/// The size and modification time are stored with the digest so a later pass
+/// can tell an unchanged sidecar without reading it, the same way the media
+/// file's own columns do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SidecarDigest {
+    /// The SHA-1 of the sidecar's content.
+    pub sha1: Sha1,
+    /// Its size in bytes when it was sent.
+    pub size: u64,
+    /// Its modification time in nanoseconds since the Unix epoch.
+    pub mtime_ns: i64,
 }
 
 /// The pragmas the writer connection runs with, for tests and diagnostics.
@@ -547,14 +593,22 @@ impl StateStore {
     /// The same as [`Self::record`].
     pub fn record_with_case(&self, item: &ItemRecord, case: PathCase) -> Result<(), StoreError> {
         let size = i64::try_from(item.size).map_err(|_| StoreError::SizeOutOfRange(item.size))?;
+        let sidecar_size = match item.sidecar {
+            Some(sidecar) => Some(
+                i64::try_from(sidecar.size)
+                    .map_err(|_| StoreError::SizeOutOfRange(sidecar.size))?,
+            ),
+            None => None,
+        };
         let mut writer = self.writer()?;
         let transaction = writer
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| self.query_error(source))?;
         transaction
             .execute(
-                "INSERT INTO sync_item (path, path_key, size, mtime_ns, sha1, asset_id, state, error_class, error_message)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                "INSERT INTO sync_item (path, path_key, size, mtime_ns, sha1, asset_id, state, error_class,
+                        error_message, sidecar_sha1, sidecar_size, sidecar_mtime_ns)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                  ON CONFLICT(path_key) DO UPDATE SET
                      path = excluded.path,
                      size = excluded.size,
@@ -563,7 +617,10 @@ impl StateStore {
                      asset_id = excluded.asset_id,
                      state = excluded.state,
                      error_class = excluded.error_class,
-                     error_message = excluded.error_message",
+                     error_message = excluded.error_message,
+                     sidecar_sha1 = excluded.sidecar_sha1,
+                     sidecar_size = excluded.sidecar_size,
+                     sidecar_mtime_ns = excluded.sidecar_mtime_ns",
                 params![
                     item.path,
                     key(Path::new(&item.path), case),
@@ -574,6 +631,9 @@ impl StateStore {
                     item.state.as_str(),
                     item.error_class.map(FailureClass::as_str),
                     item.error_message,
+                    item.sidecar.map(|sidecar| sidecar.sha1.as_bytes().to_vec()),
+                    sidecar_size,
+                    item.sidecar.map(|sidecar| sidecar.mtime_ns),
                 ],
             )
             .map_err(|source| self.query_error(source))?;
@@ -592,7 +652,8 @@ impl StateStore {
         let writer = self.writer()?;
         writer
             .query_row(
-                "SELECT path, size, mtime_ns, sha1, asset_id, state, error_class, error_message, attempts
+                "SELECT path, size, mtime_ns, sha1, asset_id, state, error_class,
+                        error_message, attempts, sidecar_sha1, sidecar_size, sidecar_mtime_ns
                  FROM sync_item WHERE path_key = ?1",
                 [path_key(Path::new(path))],
                 read_item,
@@ -615,7 +676,8 @@ impl StateStore {
         let writer = self.writer()?;
         writer
             .query_row(
-                "SELECT path, size, mtime_ns, sha1, asset_id, state, error_class, error_message, attempts
+                "SELECT path, size, mtime_ns, sha1, asset_id, state, error_class,
+                        error_message, attempts, sidecar_sha1, sidecar_size, sidecar_mtime_ns
                  FROM sync_item WHERE path_key = ?1",
                 [key(Path::new(path), case)],
                 read_item,
@@ -1048,6 +1110,27 @@ fn read_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<ItemRecord> {
     // known class"; the row is not rejected for it.
     let error_class = class_text.as_deref().and_then(FailureClass::parse);
     let attempts: i64 = row.get(8)?;
+    // An asset with no sidecar, or one written before the columns existed, has
+    // no digest; all three read as `None`, which means "no sidecar has been
+    // sent". A digest of the wrong length reads as `None` too: the worst it
+    // costs is that the sidecar is hashed again.
+    let sidecar_sha1: Option<Vec<u8>> = row.get(9)?;
+    let sidecar_size: Option<i64> = row.get(10)?;
+    let sidecar_mtime_ns: Option<i64> = row.get(11)?;
+    let sidecar = match (
+        sidecar_sha1.as_deref().and_then(Sha1::from_slice),
+        sidecar_size,
+        sidecar_mtime_ns,
+    ) {
+        (Some(sha1), Some(size), Some(mtime_ns)) => Some(SidecarDigest {
+            sha1,
+            size: u64::try_from(size).map_err(|_| {
+                conversion_error(10, rusqlite::types::Type::Integer, StoreError::NegativeSize)
+            })?,
+            mtime_ns,
+        }),
+        _ => None,
+    };
     Ok(ItemRecord {
         path: row.get(0)?,
         size,
@@ -1058,6 +1141,7 @@ fn read_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<ItemRecord> {
         error_class,
         error_message: row.get(7)?,
         attempts: u32::try_from(attempts).unwrap_or(u32::MAX),
+        sidecar,
     })
 }
 
@@ -1088,6 +1172,8 @@ fn migrations() -> Migrations<'static> {
         M::up(SCHEMA_V3),
         M::up(SCHEMA_V4),
         M::up(SCHEMA_V5),
+        M::up(SCHEMA_V6),
+        M::up(SCHEMA_V7),
     ])
 }
 
