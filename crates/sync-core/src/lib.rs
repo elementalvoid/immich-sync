@@ -23,5 +23,6 @@ pub mod versions;
 pub mod watch;
 
 // Re-exported so the shell can hand the engine the client it holds without
-// depending on the HTTP client crate directly.
-pub use immich_client::ImmichClient;
+// depending on the HTTP client crate directly. The error type comes with it,
+// so the review view can tell a missing permission from a transport failure.
+pub use immich_client::{ClientError, ImmichClient};

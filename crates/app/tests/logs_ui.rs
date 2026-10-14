@@ -91,9 +91,22 @@ fn open_shell(cx: &mut TestAppContext, store: SettingsStore, paths: AppPaths) ->
                     cx,
                 )
             });
-            let failed =
-                cx.new(|cx| immich_sync::failed_view::FailedView::new(engine_model, window, cx));
-            cx.new(|cx| AppShell::new(dashboard, settings, upload, failed, connection.clone(), cx))
+            let failed = cx.new(|cx| {
+                immich_sync::failed_view::FailedView::new(engine_model.clone(), window, cx)
+            });
+            let review =
+                cx.new(|cx| immich_sync::review_view::ReviewView::new(engine_model, window, cx));
+            cx.new(|cx| {
+                AppShell::new(
+                    dashboard,
+                    settings,
+                    upload,
+                    failed,
+                    review,
+                    connection.clone(),
+                    cx,
+                )
+            })
         })
         .expect("open the shell window")
         .0
