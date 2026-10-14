@@ -13,10 +13,10 @@ use tokio_util::io::ReaderStream;
 use crate::bandwidth::{MeteredReader, Progress};
 use crate::error::ClientError;
 use crate::model::{
-    Album, AlbumAssetsRequest, AlbumBody, AssetBulkDeleteRequest, AssetCopyRequest, AssetInfo,
-    AssetInfoBody, AssetUpload, Auth, AuthStatus, BulkAction, BulkCheckBody, BulkCheckItem,
-    BulkCheckResult, BulkTagRequest, CreateAlbumRequest, CreateStackRequest, LoginResponse,
-    RejectReason, ServerAbout, SessionToken, StackBody, UploadBody, UploadResponse,
+    Album, AlbumAssetsRequest, AlbumBody, ApiKeyInfo, AssetBulkDeleteRequest, AssetCopyRequest,
+    AssetInfo, AssetInfoBody, AssetUpload, Auth, AuthStatus, BulkAction, BulkCheckBody,
+    BulkCheckItem, BulkCheckResult, BulkTagRequest, CreateAlbumRequest, CreateStackRequest,
+    LoginResponse, RejectReason, ServerAbout, SessionToken, StackBody, UploadBody, UploadResponse,
 };
 
 /// The longest error message body kept from the server. A reverse proxy can
@@ -273,26 +273,57 @@ impl ImmichClient {
 
     /// Reads the server version.
     ///
+    /// `GET /server/about` is `x-immich-state: Stable` and asks for the
+    /// `server.about` permission, so the request carries the credential and a
+    /// key without the permission is a [`ClientError::PermissionDenied`] whose
+    /// message names it.
+    ///
     /// # Errors
     ///
-    /// Returns the transport and protocol variants.
-    pub async fn about(&self) -> Result<ServerAbout, ClientError> {
-        let response = send(self.http.get(self.endpoint("server/about"))).await?;
+    /// Returns the typed refusal classes (R6.3) and the transport and protocol
+    /// variants.
+    pub async fn about(&self, auth: Auth<'_>) -> Result<ServerAbout, ClientError> {
+        let response =
+            send(self.authorize(self.http.get(self.endpoint("server/about")), auth)).await?;
         let status = response.status();
-        let retry_after = retry_after(&response);
         let result = if status.is_success() {
             response
                 .json::<ServerAbout>()
                 .await
                 .map_err(|error| body_failure(status, error))
         } else {
-            Err(ClientError::Protocol {
-                status: status.as_u16(),
-                message: server_message(response).await,
-                retry_after,
-            })
+            Err(failure(response).await)
         };
         log_outcome("about", &result);
+        result
+    }
+
+    /// Reads the API key a request authenticates with (R10.2).
+    ///
+    /// `GET /api-keys/me` is `x-immich-state: Stable` and asks for no
+    /// permission beyond a credential in the v3.3.1 spec. The real server
+    /// still answers a bearer session with 403 `Not authenticated with an API
+    /// Key`, so the caller asks only when the credential is an API key and
+    /// shows the refusal as a message when it is not.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::PermissionDenied`] for that session-token refusal, the
+    /// other typed refusal classes (R6.3), and the transport and protocol
+    /// variants.
+    pub async fn api_key_permissions(&self, auth: Auth<'_>) -> Result<ApiKeyInfo, ClientError> {
+        let response =
+            send(self.authorize(self.http.get(self.endpoint("api-keys/me")), auth)).await?;
+        let status = response.status();
+        let result = if status.is_success() {
+            response
+                .json::<ApiKeyInfo>()
+                .await
+                .map_err(|error| body_failure(status, error))
+        } else {
+            Err(failure(response).await)
+        };
+        log_outcome("api-key-permissions", &result);
         result
     }
 

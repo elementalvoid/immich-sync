@@ -26,6 +26,7 @@ pub enum Operation {
     Login,
     ValidateToken,
     About,
+    ApiKeyMe,
     BulkUploadCheck,
     Upload,
     GetAsset,
@@ -99,6 +100,16 @@ struct Inner {
     password_login_disabled: bool,
     /// The key `x-api-key` must carry, once one is configured.
     api_key: Option<String>,
+    /// The permissions the configured key was granted. `None` grants every
+    /// permission, mirroring `api_key: None` accepting any key.
+    api_key_permissions: Option<Vec<String>>,
+    /// How many `GET /server/about` requests arrived.
+    about_requests: u64,
+    /// The credential the last `GET /server/about` carried: `api_key`,
+    /// `bearer`, or `None`.
+    about_auth: Option<String>,
+    /// How many `GET /api-keys/me` requests arrived.
+    api_key_me_requests: u64,
     /// The session tokens this server issued and has not revoked.
     tokens: HashSet<String>,
     /// When set, only an issued, unrevoked token validates.
@@ -535,6 +546,51 @@ impl MockImmich {
             .api_key = Some(key.to_string());
     }
 
+    /// Grant the configured API key exactly `permissions`, so a test can prove
+    /// a refusal for a permission the key lacks. Without this the key holds
+    /// every permission.
+    pub fn set_api_key_permissions(&self, permissions: &[&str]) {
+        self.state
+            .inner
+            .lock()
+            .expect("mock state poisoned")
+            .api_key_permissions =
+            Some(permissions.iter().map(|value| value.to_string()).collect());
+    }
+
+    /// The number of `GET /server/about` requests that arrived, whether or not
+    /// one was answered.
+    #[must_use]
+    pub fn about_requests(&self) -> u64 {
+        self.state
+            .inner
+            .lock()
+            .expect("mock state poisoned")
+            .about_requests
+    }
+
+    /// The credential the last answered `GET /server/about` carried:
+    /// `api_key`, `bearer`, or nothing when no request was answered.
+    #[must_use]
+    pub fn about_auth(&self) -> Option<String> {
+        self.state
+            .inner
+            .lock()
+            .expect("mock state poisoned")
+            .about_auth
+            .clone()
+    }
+
+    /// The number of `GET /api-keys/me` requests that arrived.
+    #[must_use]
+    pub fn api_key_me_requests(&self) -> u64 {
+        self.state
+            .inner
+            .lock()
+            .expect("mock state poisoned")
+            .api_key_me_requests
+    }
+
     /// The `POST /assets` requests whose body the server read, in arrival
     /// order.
     ///
@@ -705,6 +761,7 @@ impl MockImmich {
         });
         let router = Router::new()
             .route("/server/about", get(about))
+            .route("/api-keys/me", get(api_key_me))
             .route("/auth/login", post(login))
             .route("/auth/validateToken", post(validate_token))
             .route("/assets/bulk-upload-check", post(bulk_upload_check))
@@ -793,11 +850,119 @@ async fn guard(state: &State, operation: Operation) -> Option<Response> {
     }
 }
 
-async fn about(AxumState(state): AxumState<Arc<State>>) -> Response {
+async fn about(AxumState(state): AxumState<Arc<State>>, headers: HeaderMap) -> Response {
+    state
+        .inner
+        .lock()
+        .expect("mock state poisoned")
+        .about_requests += 1;
     if let Some(response) = guard(&state, Operation::About).await {
         return response;
     }
+    // The real `GET /server/about` is `@Authenticated({ permission:
+    // Permission.ServerAbout })` (server.controller.ts, v3.3.1), so the double
+    // refuses a request with no credential the same way.
+    let auth = auth_kind(&headers);
+    if auth.is_none() {
+        return message(StatusCode::UNAUTHORIZED, "Authentication required");
+    }
+    if let Some(response) = api_key_permission_refusal(&state, &headers, "server.about") {
+        return response;
+    }
+    state.inner.lock().expect("mock state poisoned").about_auth = auth.map(str::to_string);
     Json(json!({ "version": SERVER_VERSION })).into_response()
+}
+
+/// The credential a request carried, as the double saw it.
+fn auth_kind(headers: &HeaderMap) -> Option<&'static str> {
+    let api_key = headers
+        .get("x-api-key")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|key| !key.is_empty());
+    if api_key {
+        return Some("api_key");
+    }
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| !value.is_empty())
+        .then_some("bearer")
+}
+
+/// The configured key's refusal when the request carries an API key that lacks
+/// `permission`, or was not the configured one.
+///
+/// A bearer token has no per-key permission list in the double, so it passes.
+fn api_key_permission_refusal(
+    state: &State,
+    headers: &HeaderMap,
+    permission: &str,
+) -> Option<Response> {
+    let key = headers
+        .get("x-api-key")
+        .and_then(|value| value.to_str().ok())
+        .filter(|key| !key.is_empty())?;
+    let inner = state.inner.lock().expect("mock state poisoned");
+    if let Some(configured) = &inner.api_key
+        && configured != key
+    {
+        return Some(message(StatusCode::UNAUTHORIZED, "Invalid authentication"));
+    }
+    let granted = inner
+        .api_key_permissions
+        .as_ref()
+        .is_none_or(|permissions| permissions.iter().any(|granted| granted == permission));
+    (!granted).then(|| {
+        message(
+            StatusCode::FORBIDDEN,
+            &format!("Missing required permission: {permission}"),
+        )
+    })
+}
+
+/// `GET /api-keys/me` (Stable, no permission beyond a credential).
+///
+/// The real authentication guard refuses a request with no credential with
+/// 401, and the real server answers a bearer session with 403 `Not
+/// authenticated with an API Key` (api-key.service.ts `getMine`, v3.3.1),
+/// which is the refusal the diagnostics probe must show as a message.
+async fn api_key_me(AxumState(state): AxumState<Arc<State>>, headers: HeaderMap) -> Response {
+    state
+        .inner
+        .lock()
+        .expect("mock state poisoned")
+        .api_key_me_requests += 1;
+    if let Some(response) = guard(&state, Operation::ApiKeyMe).await {
+        return response;
+    }
+    if auth_kind(&headers).is_none() {
+        return message(StatusCode::UNAUTHORIZED, "Authentication required");
+    }
+    let Some(key) = headers
+        .get("x-api-key")
+        .and_then(|value| value.to_str().ok())
+        .filter(|key| !key.is_empty())
+    else {
+        return message(StatusCode::FORBIDDEN, "Not authenticated with an API Key");
+    };
+    let inner = state.inner.lock().expect("mock state poisoned");
+    if let Some(configured) = &inner.api_key
+        && configured != key
+    {
+        return message(StatusCode::UNAUTHORIZED, "Invalid authentication");
+    }
+    let permissions = inner
+        .api_key_permissions
+        .clone()
+        .unwrap_or_else(|| vec!["all".to_string()]);
+    Json(json!({
+        "id": "00000000-0000-4000-8000-0000000000a1",
+        "name": "Mock API Key",
+        "permissions": permissions,
+        "createdAt": TIMESTAMP,
+        "updatedAt": TIMESTAMP,
+    }))
+    .into_response()
 }
 
 async fn login(

@@ -8,6 +8,8 @@ use gpui_tray::{Icon, Tray};
 
 use crate::connection::ConnectionModel;
 use crate::dashboard::Dashboard;
+use crate::diagnostics::DiagnosticsModel;
+use crate::diagnostics_view::DiagnosticsView;
 use crate::engine::EngineModel;
 use crate::failed_view::FailedView;
 use crate::logs_view::LogsView;
@@ -251,6 +253,10 @@ pub fn open_main_window(cx: &mut App) -> anyhow::Result<()> {
         .try_global::<EngineHandle>()
         .map(|handle| handle.0.clone())
         .ok_or_else(|| anyhow::anyhow!("the engine is not installed"))?;
+    let store = cx
+        .try_global::<StoreHandle>()
+        .map(|handle| handle.0.clone())
+        .ok_or_else(|| anyhow::anyhow!("the state store is not installed"))?;
     let (window, _view) = gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
         // The connection state is one entity both surfaces read, so the
         // dashboard's global card follows a sign-in from the settings form,
@@ -262,6 +268,9 @@ pub fn open_main_window(cx: &mut App) -> anyhow::Result<()> {
         settings.update(cx, |view, _| view.set_engine(engine.clone()));
         let upload_view = cx.new(|cx| UploadView::new(upload.clone(), window, cx));
         let failed_view = cx.new(|cx| FailedView::new(engine.clone(), window, cx));
+        let diagnostics_model = cx
+            .new(|cx| DiagnosticsModel::new(store.clone(), engine.clone(), connection.clone(), cx));
+        let diagnostics_view = cx.new(|cx| DiagnosticsView::new(diagnostics_model, cx));
         let review_view = cx.new(|cx| ReviewView::new(engine.clone(), window, cx));
         cx.new(|cx| {
             AppShell::new(
@@ -269,6 +278,7 @@ pub fn open_main_window(cx: &mut App) -> anyhow::Result<()> {
                 settings,
                 upload_view,
                 failed_view,
+                diagnostics_view,
                 review_view,
                 connection,
                 cx,
@@ -296,13 +306,16 @@ pub enum ViewMode {
     Review,
     /// The log file and its level control (R10.3).
     Logs,
+    /// The server, the state database, and the throughput (R10.2, R10.4).
+    Diagnostics,
 }
 
 /// The environment variable that pins the visible surface.
 ///
-/// Set it to `dashboard`, `settings`, `upload`, `failed`, `review`, or `logs`
-/// to open the window on that surface and skip the observer that would
-/// otherwise decide. A screenshot run uses it so the capture is reproducible.
+/// Set it to `dashboard`, `settings`, `upload`, `failed`, `review`, `logs`, or
+/// `diagnostics` to open the window on that surface and skip the observer that
+/// would otherwise decide. A screenshot run uses it so the capture is
+/// reproducible.
 pub const FORCE_VIEW_ENV: &str = "IMMICH_SYNC_VIEW";
 
 /// The surface a pinned value names, when one is set.
@@ -321,12 +334,13 @@ pub fn view_for_name(value: &str) -> Option<ViewMode> {
         "failed" => Some(ViewMode::Failed),
         "review" => Some(ViewMode::Review),
         "logs" => Some(ViewMode::Logs),
+        "diagnostics" => Some(ViewMode::Diagnostics),
         _ => None,
     }
 }
 
 /// The main window's view: a view switch above the dashboard, the settings, the
-/// upload, or the logs.
+/// upload, the logs, or the diagnostics.
 pub struct AppShell {
     mode: ViewMode,
     dashboard: Entity<Dashboard>,
@@ -334,6 +348,7 @@ pub struct AppShell {
     logs: Entity<LogsView>,
     upload: Entity<UploadView>,
     failed: Entity<FailedView>,
+    diagnostics: Entity<DiagnosticsView>,
     review: Entity<ReviewView>,
     _connection: Entity<ConnectionModel>,
     _connection_subscription: Subscription,
@@ -349,6 +364,7 @@ impl AppShell {
         settings: Entity<SettingsView>,
         upload: Entity<UploadView>,
         failed: Entity<FailedView>,
+        diagnostics: Entity<DiagnosticsView>,
         review: Entity<ReviewView>,
         connection: Entity<ConnectionModel>,
         cx: &mut Context<Self>,
@@ -373,6 +389,7 @@ impl AppShell {
             logs,
             upload,
             failed,
+            diagnostics,
             review,
             _connection: connection,
             _connection_subscription: subscription,
@@ -442,6 +459,13 @@ impl AppShell {
                 self.mode,
                 cx,
             ))
+            .child(view_button(
+                "nav-diagnostics",
+                "Diagnostics",
+                ViewMode::Diagnostics,
+                self.mode,
+                cx,
+            ))
     }
 }
 
@@ -473,6 +497,7 @@ impl Render for AppShell {
             ViewMode::Failed => self.failed.clone().into_any_element(),
             ViewMode::Review => self.review.clone().into_any_element(),
             ViewMode::Logs => self.logs.clone().into_any_element(),
+            ViewMode::Diagnostics => self.diagnostics.clone().into_any_element(),
         };
 
         div()

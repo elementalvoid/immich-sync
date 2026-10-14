@@ -4,6 +4,8 @@ pub mod autostart;
 pub mod connection;
 pub mod credentials;
 pub mod dashboard;
+pub mod diagnostics;
+pub mod diagnostics_view;
 pub mod engine;
 pub mod failed;
 pub mod failed_view;

@@ -63,6 +63,12 @@ pub struct EngineModel {
     /// Bumped by every engine start attempt, kept apart from `generation` so a
     /// folder edit cannot discard an engine that is already being built.
     start_generation: u64,
+    /// The store generation the model has seen, so a rebuild's fresh store is
+    /// noticed and the engine starts over it (R10.4).
+    store_generation: u64,
+    /// Whether a rebuild is running: no engine starts until the fresh store is
+    /// in place.
+    rebuilding: bool,
     _subscriptions: Vec<Subscription>,
     _poll: Task<()>,
 }
@@ -98,8 +104,12 @@ impl EngineModel {
             // The status and the review list are refreshed when the store opens,
             // so a review that already waits in the database raises its
             // notification and fills the view at start (R5.3, R5.4).
-            cx.observe(&store_model, |this, _, cx| {
-                this.try_start_engine(cx);
+            cx.observe(&store_model, |this, store, cx| {
+                let generation = store.read(cx).generation();
+                this.store_changed(generation, cx);
+                // A decision with no engine updates the store's cached counts,
+                // which do not move the generation, so the status follows every
+                // store notification (R5.4).
                 this.refresh_status(cx);
                 this.refresh_review(cx);
             }),
@@ -146,6 +156,8 @@ impl EngineModel {
             problem: None,
             generation: 0,
             start_generation: 0,
+            store_generation: 0,
+            rebuilding: false,
             _subscriptions: subscriptions,
             _poll: poll,
         }
@@ -427,6 +439,65 @@ impl EngineModel {
         self.engine.is_some()
     }
 
+    /// The bytes the running engine has put on the wire (R10.2).
+    #[must_use]
+    pub fn uploaded_bytes(&self) -> u64 {
+        self.engine
+            .as_ref()
+            .map_or(0, |engine| engine.uploaded_bytes())
+    }
+
+    /// Whether a state rebuild is running (R10.4).
+    #[must_use]
+    pub fn is_rebuilding(&self) -> bool {
+        self.rebuilding
+    }
+
+    /// Rebuilds the state database and rescans the folders (R10.4).
+    ///
+    /// The engine is stopped first, so the rebuild replaces the store while
+    /// nothing writes through the old one. It starts again over the fresh
+    /// store, and a start runs one reconciliation scan immediately, which is
+    /// the rescan this promises. While the first open or another rebuild is
+    /// still running this is a no-op.
+    pub fn rebuild(&mut self, cx: &mut Context<Self>) {
+        // A second click while a rebuild runs cannot start another (R10.4).
+        if self.rebuilding {
+            return;
+        }
+        // The first open owns the store until it lands; the store model
+        // refuses the rebuild and publishes the reason. Waiting here would
+        // leave this model rebuilding against a generation that may never
+        // arrive if the open fails (R10.4).
+        if !self.store_model.read(cx).settled() {
+            self.store_model.update(cx, |store, cx| store.rebuild(cx));
+            cx.notify();
+            return;
+        }
+        if let Some(engine) = self.engine.take() {
+            engine.stop();
+        }
+        // A start already in flight must not install its engine over the
+        // store this rebuild replaces (R10.4).
+        self.start_generation = self.start_generation.wrapping_add(1);
+        self.limits = None;
+        self.rebuilding = true;
+        self.status = empty_status();
+        self.store_model.update(cx, |store, cx| store.rebuild(cx));
+        cx.notify();
+    }
+
+    /// Handles a store notification: a new generation is the fresh store a
+    /// rebuild was waiting for, and it is what lets the next engine start.
+    fn store_changed(&mut self, generation: u64, cx: &mut Context<Self>) {
+        if generation != self.store_generation {
+            self.store_generation = generation;
+            self.rebuilding = false;
+            self.refresh_status(cx);
+        }
+        self.try_start_engine(cx);
+    }
+
     /// The session the running engine sends its requests through (R1.4).
     ///
     /// It is the one the connection form signs in on, so the two never observe
@@ -668,6 +739,11 @@ impl EngineModel {
 
     /// Starts the engine when it is not running yet and both inputs exist.
     fn try_start_engine(&mut self, cx: &mut Context<Self>) {
+        // A rebuild owns the store until its fresh one lands (R10.4); starting
+        // over the old store would leave the engine watching a replaced file.
+        if self.rebuilding {
+            return;
+        }
         let connected = self.connection.read(cx).state().is_connected();
         if self.engine.is_some() {
             if connected {

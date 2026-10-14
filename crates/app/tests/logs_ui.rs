@@ -94,6 +94,17 @@ fn open_shell(cx: &mut TestAppContext, store: SettingsStore, paths: AppPaths) ->
             let failed = cx.new(|cx| {
                 immich_sync::failed_view::FailedView::new(engine_model.clone(), window, cx)
             });
+            let diagnostics_model = cx.new(|cx| {
+                immich_sync::diagnostics::DiagnosticsModel::new(
+                    store_model.clone(),
+                    engine_model.clone(),
+                    connection.clone(),
+                    cx,
+                )
+            });
+            let diagnostics = cx.new(|cx| {
+                immich_sync::diagnostics_view::DiagnosticsView::new(diagnostics_model, cx)
+            });
             let review =
                 cx.new(|cx| immich_sync::review_view::ReviewView::new(engine_model, window, cx));
             cx.new(|cx| {
@@ -102,6 +113,7 @@ fn open_shell(cx: &mut TestAppContext, store: SettingsStore, paths: AppPaths) ->
                     settings,
                     upload,
                     failed,
+                    diagnostics,
                     review,
                     connection.clone(),
                     cx,

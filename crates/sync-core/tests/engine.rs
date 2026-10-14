@@ -3242,6 +3242,36 @@ async fn upload_bytes(server: &MockImmich, bytes: &[u8]) -> String {
         .asset_id
 }
 
+/// R10.2: the diagnostics throughput reads the engine's upload meter, so a
+/// real upload must move it.
+#[tokio::test]
+async fn the_engine_reports_the_bytes_it_put_on_the_wire() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let file = write_file(&photos, "clip.bin", &[7_u8; 8 * 1024]);
+    add_folder(&store, &photos, true);
+
+    let engine = start_engine(&server, &store, EngineConfig::default()).await;
+    assert_eq!(engine.uploaded_bytes(), 0, "nothing has been sent yet");
+
+    assert!(
+        wait_until(
+            || all_terminal(&store, std::slice::from_ref(&file)),
+            Duration::from_secs(30)
+        )
+        .await,
+        "the file never reached a terminal success state"
+    );
+    assert_eq!(
+        engine.uploaded_bytes(),
+        8 * 1024,
+        "the meter counts every byte of the one uploaded file"
+    );
+    engine.stop();
+}
+
 /// An engine for the deletion review tests: the scan interval the test waits
 /// out, and no watcher unless the test is about the watcher (R2.3, R5.1).
 fn review_config(scan_interval: Duration, watch: bool) -> EngineConfig {

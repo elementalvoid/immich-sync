@@ -6,15 +6,19 @@
 //! read-modify-write. The database lives in the local data directory; the
 //! caller passes the path from the platform-directory abstraction (R9.2).
 //!
-//! Reader connections for the UI arrive with the views that need them; until
-//! then the writer serves the engine's own reads.
+//! Reader connections for the UI: `sqlite_info` and `last_error_per_class`
+//! open their own read-only connection, so a diagnostics read never queues
+//! behind the engine's writer (ADR 0005, R10.2).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension as _, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, ErrorCode, OpenFlags, OptionalExtension as _, Transaction, TransactionBehavior,
+    params,
+};
 use rusqlite_migration::{M, Migrations};
 
 use crate::failure::FailureClass;
@@ -511,6 +515,38 @@ pub struct StorePragmas {
     pub foreign_keys: i64,
 }
 
+/// One table's row count, for the diagnostics view (R10.2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TableCount {
+    /// The table name the catalog holds.
+    pub table: String,
+    /// How many rows the table holds.
+    pub rows: i64,
+}
+
+/// What the state database reports about itself, for the diagnostics view
+/// (R10.2). [`StateStore::sqlite_info`] reads it without writing anything.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SqliteInfo {
+    /// `PRAGMA user_version`: the migration the schema stands at.
+    pub migration_version: i64,
+    /// The database's page footprint, `page_count * page_size`, in bytes.
+    pub size_bytes: u64,
+    /// Every table the catalog holds, with its row count.
+    pub tables: Vec<TableCount>,
+    /// The `PRAGMA quick_check` result: `ok`, or SQLite's reason.
+    pub integrity: String,
+}
+
+/// The newest failure of one class in the attempt log (R10.2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClassError {
+    /// The persisted failure class.
+    pub class: FailureClass,
+    /// The user-facing reason, when the item still holds this class.
+    pub message: Option<String>,
+}
+
 /// Why the state store could not be used.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -594,6 +630,22 @@ pub struct StateStore {
     writer: Mutex<Connection>,
 }
 
+/// Classifies a failed startup `quick_check` query: only a corruption verdict
+/// justifies the rebuild removing the file. A busy or locked database means
+/// the check could not run, so it is an open failure the rebuild reports
+/// instead of removing a healthy file (N4, R10.4).
+fn startup_check_error(path: PathBuf, source: rusqlite::Error) -> StoreError {
+    match source.sqlite_error_code() {
+        Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked) => {
+            StoreError::Open { path, source }
+        }
+        _ => StoreError::QuickCheck {
+            path,
+            reason: source.to_string(),
+        },
+    }
+}
+
 impl StateStore {
     /// Opens the database, runs the startup check, applies the pragmas, and
     /// migrates the schema to the latest version (N4).
@@ -619,14 +671,20 @@ impl StateStore {
             path: path.clone(),
             source,
         })?;
-        // Before the pragmas: a file that is not a database fails every pragma
-        // too, and `quick_check` is the honest reason to report.
+        // The busy timeout is set before the startup check, so a transient
+        // lock makes the check wait rather than read as corruption (the
+        // rebuild only replaces a database the check calls bad).
+        writer
+            .busy_timeout(BUSY_TIMEOUT)
+            .map_err(|source| StoreError::Open {
+                path: path.clone(),
+                source,
+            })?;
+        // `quick_check` is the honest reason to report for a file that is not
+        // a database, so it runs before the rest of the pragmas.
         let check: String = writer
             .query_row("PRAGMA quick_check", [], |row| row.get(0))
-            .map_err(|source| StoreError::QuickCheck {
-                path: path.clone(),
-                reason: source.to_string(),
-            })?;
+            .map_err(|source| startup_check_error(path.clone(), source))?;
         if check != "ok" {
             return Err(StoreError::QuickCheck {
                 path,
@@ -698,6 +756,134 @@ impl StateStore {
             busy_timeout_ms: read("PRAGMA busy_timeout")?,
             foreign_keys: read("PRAGMA foreign_keys")?,
         })
+    }
+
+    /// Reads what the state database says about itself: the migration it
+    /// stands at, its size, one row count per table, and the integrity check
+    /// (R10.2).
+    ///
+    /// Read-only: the diagnostics view calls it while the engine writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Query`] when a pragma, the catalog, or a row
+    /// count cannot be read.
+    pub fn sqlite_info(&self) -> Result<SqliteInfo, StoreError> {
+        let reader = self.reader()?;
+        let read = |name: &str| -> Result<i64, StoreError> {
+            reader
+                .query_row(name, [], |row| row.get(0))
+                .map_err(|source| self.query_error(source))
+        };
+        let migration_version = read("PRAGMA user_version")?;
+        let page_size = read("PRAGMA page_size")?.max(0);
+        let page_count = read("PRAGMA page_count")?.max(0);
+        let integrity: String = reader
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .map_err(|source| self.query_error(source))?;
+        let names: Vec<String> = reader
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
+                 ORDER BY name",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()
+            })
+            .map_err(|source| self.query_error(source))?;
+        let mut tables = Vec::with_capacity(names.len());
+        for table in names {
+            // The name comes from the catalog, so it cannot be a bind
+            // parameter; the quotes are doubled so a name with one still works.
+            let query = format!("SELECT COUNT(*) FROM \"{}\"", table.replace('"', "\"\""));
+            let rows = reader
+                .query_row(&query, [], |row| row.get(0))
+                .map_err(|source| self.query_error(source))?;
+            tables.push(TableCount { table, rows });
+        }
+        Ok(SqliteInfo {
+            migration_version,
+            size_bytes: u64::try_from(page_size)
+                .unwrap_or(0)
+                .saturating_mul(u64::try_from(page_count).unwrap_or(0)),
+            tables,
+            integrity,
+        })
+    }
+
+    /// The newest failure of each class the attempt log holds, newest first
+    /// (R10.2).
+    ///
+    /// The message is the item's own reason and only when the item still
+    /// carries the class, so a later outcome cannot label an older class with
+    /// the wrong reason.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the query fails.
+    pub fn last_error_per_class(&self) -> Result<Vec<ClassError>, StoreError> {
+        let reader = self.reader()?;
+        let newest: Vec<String> = {
+            let mut statement = reader
+                .prepare(
+                    "SELECT error_class FROM attempt WHERE error_class IS NOT NULL \
+                     GROUP BY error_class ORDER BY MAX(started_ns) DESC",
+                )
+                .map_err(|source| self.query_error(source))?;
+            statement
+                .query_map([], |row| row.get(0))
+                .and_then(|rows| rows.collect::<rusqlite::Result<Vec<String>>>())
+                .map_err(|source| self.query_error(source))?
+        };
+        let mut errors = Vec::with_capacity(newest.len());
+        for text in newest {
+            let Some(class) = FailureClass::parse(&text) else {
+                continue;
+            };
+            let message: Option<String> = reader
+                .query_row(
+                    "SELECT i.error_message FROM attempt a JOIN sync_item i ON i.id = a.item_id \
+                     WHERE a.error_class = ?1 AND i.error_class = ?1 \
+                     ORDER BY a.started_ns DESC, a.id DESC LIMIT 1",
+                    [&text],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|source| self.query_error(source))?
+                .flatten();
+            errors.push(ClassError { class, message });
+        }
+        Ok(errors)
+    }
+
+    /// Starts the state tables over (R10.4), in one transaction: the item,
+    /// attempt, album, and folder rows go, and the schema stays at the latest
+    /// migration.
+    ///
+    /// The caller re-adds the folders the user chose, because those choices
+    /// live only in the database and only the caller knows them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the transaction cannot run.
+    pub fn reset(&self) -> Result<(), StoreError> {
+        let mut writer = self.writer()?;
+        let transaction = writer
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| self.query_error(source))?;
+        transaction
+            .execute_batch(
+                "DELETE FROM version;
+                 DELETE FROM attempt;
+                 DELETE FROM sync_item;
+                 DELETE FROM album;
+                 DELETE FROM source_folder;",
+            )
+            .map_err(|source| self.query_error(source))?;
+        transaction
+            .commit()
+            .map_err(|source| self.query_error(source))
     }
 
     /// Writes one item's outcome, replacing the row for the same path.
@@ -1555,6 +1741,22 @@ impl StateStore {
         self.writer.lock().map_err(|_| StoreError::Poisoned)
     }
 
+    /// A fresh read-only connection to the same file, so a UI read never
+    /// queues behind the one writer (ADR 0005).
+    fn reader(&self) -> Result<Connection, StoreError> {
+        let open_error = |source| StoreError::Open {
+            path: self.path.clone(),
+            source,
+        };
+        let reader = Connection::open_with_flags(
+            &self.path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(open_error)?;
+        reader.busy_timeout(BUSY_TIMEOUT).map_err(open_error)?;
+        Ok(reader)
+    }
+
     /// One query failure, tagged with the database path.
     fn query_error(&self, source: rusqlite::Error) -> StoreError {
         StoreError::Query {
@@ -2139,5 +2341,79 @@ mod migration_tests {
         let row = store.item("hello.txt").expect("read").expect("the row");
         assert_eq!(row.asset_id.as_deref(), Some("asset-1"));
         assert!(store.folders().expect("read folders").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod startup_check_tests {
+    use super::*;
+
+    /// N4, R10.4: a check that could not run because the database is busy or
+    /// locked is not a corruption verdict; the rebuild must report it instead
+    /// of removing the file.
+    #[test]
+    fn a_busy_or_locked_startup_check_is_not_corruption() {
+        let path = PathBuf::from("state.db");
+        for code in [
+            rusqlite::ErrorCode::DatabaseBusy,
+            rusqlite::ErrorCode::DatabaseLocked,
+        ] {
+            let source = rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code,
+                    extended_code: 0,
+                },
+                None,
+            );
+            let error = startup_check_error(path.clone(), source);
+            assert!(
+                matches!(error, StoreError::Open { .. }),
+                "{code:?} means the check could not run, so the rebuild must not delete the file: \
+                 {error}"
+            );
+        }
+        // Everything else keeps the corruption verdict the rebuild acts on.
+        let source = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::DatabaseCorrupt,
+                extended_code: 0,
+            },
+            None,
+        );
+        let error = startup_check_error(path, source);
+        assert!(
+            matches!(error, StoreError::QuickCheck { .. }),
+            "a corrupt database keeps the verdict: {error}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod diagnostics_read_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::mpsc;
+
+    /// R10.2, ADR 0005: the diagnostics reads take their own reader
+    /// connections, so a read never queues behind the engine's writer. Holding
+    /// the writer lock here stands in for a slow engine write.
+    #[test]
+    fn the_diagnostics_reads_do_not_wait_for_the_writer() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let store =
+            Arc::new(StateStore::open(temp.path().join("state.db")).expect("open a fresh store"));
+        let writer = store.writer.lock().expect("lock the writer");
+        let (sender, receiver) = mpsc::channel();
+        {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                let _ = sender.send((store.sqlite_info(), store.last_error_per_class()));
+            });
+        }
+        let read = receiver.recv_timeout(Duration::from_secs(5));
+        drop(writer);
+        let (info, errors) = read.expect("the diagnostics read must not wait for the writer lock");
+        info.expect("read the sqlite info while the writer is held");
+        errors.expect("read the last errors while the writer is held");
     }
 }

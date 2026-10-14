@@ -25,6 +25,9 @@ tracing-subscriber = "0.3"
 [dev-dependencies]
 gpui-kit = { workspace = true, features = ["test-support"] }
 mock-immich = { path = "../mock-immich" }
+# The same bundled SQLite sync-core uses, so a test can break one query on
+# purpose and read the surface the diagnostics view reports.
+rusqlite = { version = "0.40", features = ["bundled"] }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
