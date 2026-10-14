@@ -8,7 +8,9 @@ publish = false
 
 [dependencies]
 base64 = "0.22"
-# The jitter draw for the retry backoff (R6.1). Already in the tree via tempfile.
+# The jitter draw for the retry backoff (R6.1): `backon` gives an exponential
+# backoff but no pinnable seed, and a test that cannot reproduce its waits
+# cannot pin them. Three lines on top of a seeded generator.
 fastrand = "2"
 # The reconciliation scan: one parallel walk plus the hidden-entry filter
 # (docs/research/rust-sync-engine-crates.md §5).

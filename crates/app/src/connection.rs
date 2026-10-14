@@ -159,14 +159,6 @@ impl ConnectionModel {
         }
     }
 
-    /// Records that an authenticated request succeeded with the current
-    /// credential, which restores the one re-login budget (R1.4).
-    pub fn note_authenticated(&mut self) {
-        if let Some(session) = &self.session {
-            session.note_authenticated();
-        }
-    }
-
     /// A test seam onto the session's own 401 handling, so the upload tests can
     /// exhaust the re-login budget and then observe it restored. No request
     /// path calls it yet; the retried request belongs to #7.
@@ -327,5 +319,90 @@ fn log_outcome(state: &ConnectionState) {
             "sign-in outcome"
         ),
         other => tracing::info!(state = other.summary(), "sign-in outcome"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConnectionModel, ServerProfile, worker};
+    use gpui_kit::AppContext as _;
+    use gpui_kit::TestAppContext;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use sync_core::connection::{Attention, AuthMethod, ConnectionState, Secret, SignIn};
+    use sync_core::credential::{MemoryCredentialStore, SharedCredentialStore};
+
+    /// Starts the offline Immich double on its own runtime.
+    fn mock_server() -> (tokio::runtime::Runtime, mock_immich::MockImmich) {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("start the mock runtime");
+        let server = runtime.block_on(mock_immich::MockImmich::start());
+        (runtime, server)
+    }
+
+    /// Pumps GPUI's test executor until the condition holds.
+    async fn wait_until(cx: &mut TestAppContext, mut done: impl FnMut(&mut gpui_kit::App) -> bool) {
+        for _ in 0..600 {
+            if cx.update(&mut done) {
+                return;
+            }
+            cx.executor().timer(Duration::from_millis(10)).await;
+            cx.run_until_parked();
+        }
+        panic!("the test condition never became true");
+    }
+
+    /// The one bridge from a refusal the engine answered on its own thread back
+    /// to the model the tray and the dashboard read (R1.4).
+    #[gpui_kit::test]
+    async fn a_refusal_the_engine_answered_reaches_the_model_on_refresh(cx: &mut TestAppContext) {
+        let (_runtime, server) = mock_server();
+        cx.executor().allow_parking();
+        let profile = ServerProfile {
+            server_url: server.base_url().to_string(),
+            email: "sync@example.com".to_string(),
+            method: AuthMethod::Password,
+        };
+        let credentials: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+        let connection = cx.update(|cx| {
+            let connection = cx.new(|_| ConnectionModel::new(profile.clone(), credentials));
+            let request = SignIn {
+                email: profile.email.clone(),
+                secret: Secret::new("correct horse"),
+                method: AuthMethod::Password,
+            };
+            connection.update(cx, |model, cx| model.sign_in(request, profile.clone(), cx));
+            connection
+        });
+        wait_until(cx, |cx| connection.read(cx).state().is_connected()).await;
+
+        // What the engine's 401 handling does, off this model's thread: the one
+        // re-login, then the refusal that needs the user.
+        let session = cx
+            .read(|cx| connection.read(cx).session())
+            .expect("a live session");
+        for _ in 0..2 {
+            let _ = cx.update(|_| {
+                worker()
+                    .expect("the worker runtime starts in tests")
+                    .block_on(session.handle_unauthorized())
+            });
+        }
+        let before = cx.read(|cx| connection.read(cx).state().clone());
+        assert!(
+            before.is_connected(),
+            "the model has not heard about the refusal yet: {before:?}"
+        );
+
+        cx.update(|cx| connection.update(cx, |model, cx| model.refresh_state(cx)));
+
+        assert_eq!(
+            cx.read(|cx| connection.read(cx).state().clone()),
+            ConnectionState::NeedsAttention(Attention::Rejected),
+            "R1.4: the tray reads the refusal the engine answered as needing attention"
+        );
     }
 }
