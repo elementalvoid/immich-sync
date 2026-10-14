@@ -142,6 +142,40 @@ fn folder_progress_survives_counts_above_a_u16() {
 }
 
 #[gpui_kit::test]
+fn the_album_line_reads_the_scope_whether_the_mapping_is_on_or_off() {
+    use sync_core::store::AlbumScope;
+
+    let model = sample();
+    let mapped = model
+        .folders
+        .iter()
+        .find(|folder| folder.album_mapping && folder.album_scope == AlbumScope::WholeFolder)
+        .expect("the sample data has a mapped folder");
+    assert_eq!(
+        mapped.content().album.as_deref(),
+        Some("Albums: One album for this folder")
+    );
+
+    let off = model
+        .folders
+        .iter()
+        .find(|folder| !folder.album_mapping)
+        .expect("the sample data has an unmapped folder");
+    assert_eq!(
+        off.content().album.as_deref(),
+        Some("Albums: off"),
+        "R3.4: the scope radios change what the folder will map to, so the card says which \
+         scope is stored even while the mapping is off"
+    );
+
+    assert_eq!(
+        model.global.content().album,
+        None,
+        "the all-folders card is not one folder's album"
+    );
+}
+
+#[gpui_kit::test]
 fn system_theme_maps_to_the_kit_theme_mode() {
     assert_eq!(theme_mode(SystemTheme::Light), ThemeMode::Light);
     assert_eq!(theme_mode(SystemTheme::Dark), ThemeMode::Dark);

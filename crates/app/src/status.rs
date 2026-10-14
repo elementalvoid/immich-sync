@@ -78,7 +78,8 @@ pub struct CardContent {
     pub progress_percent: String,
     pub counts: String,
     pub review: Option<String>,
-    /// The album line: `None` while album mapping is off (R3.4).
+    /// The album line: `None` only on the card that has no folder of its own
+    /// (R3.4).
     pub album: Option<String>,
     /// Whether the folder is readable; the counts line says so when it is not.
     pub available: bool,
@@ -110,9 +111,16 @@ impl StatusCard {
             },
             review: (self.review_count > 0)
                 .then(|| format!("{} missing files to review", self.review_count)),
-            album: self
-                .album_mapping
-                .then(|| format!("Album mapping: {}", self.album_scope.label())),
+            // The line is always there for a folder: the scope radios change
+            // what the folder will map to, so the card must show the stored
+            // scope while the mapping is still off (R3.4).
+            album: self.path.as_ref().map(|_| {
+                if self.album_mapping {
+                    format!("Albums: {}", self.album_scope.label())
+                } else {
+                    "Albums: off".to_string()
+                }
+            }),
             available: self.available,
             connection: self.connection.clone(),
             error: self.last_error.clone(),
