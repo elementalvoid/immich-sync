@@ -124,7 +124,12 @@ pub fn skip_reason_below(
         }
     }
     // R3.3: only the file itself can be a sidecar; a folder named `album.xmp`
-    // is an ordinary folder and its contents are ordinary files.
+    // is an ordinary folder and its contents are ordinary files. The caller
+    // passes the metadata when it read it, and without it the name is the only
+    // thing there is to judge by.
+    if metadata.is_some_and(|metadata| !metadata.is_file()) {
+        return None;
+    }
     path.file_name()
         .is_some_and(|name| is_sidecar_name(&name.to_string_lossy()))
         .then_some(SkipReason::Sidecar)
@@ -293,6 +298,36 @@ mod tests {
             skip_reason_below(root, &PathBuf::from("/photos/album.xmp/inside.jpg"), None),
             None,
             "a folder that happens to end in .xmp prunes nothing"
+        );
+    }
+
+    #[test]
+    fn a_folder_named_like_a_sidecar_is_an_ordinary_folder() {
+        // R3.3: only a *file* can be a sidecar. The predicate says so, and the
+        // scan prunes whole subtrees by it, so a folder named `album.xmp` and
+        // everything under it must survive.
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let folder = temp.path().join("album.xmp");
+        std::fs::create_dir_all(&folder).expect("create the fixture folder");
+        let inside = folder.join("IMG_0001.jpg");
+        std::fs::write(&inside, b"bytes").expect("write the fixture file");
+        let sidecar_file = temp.path().join("IMG_0001.jpg.xmp");
+        std::fs::write(&sidecar_file, b"<xmp/>").expect("write the sidecar fixture");
+
+        assert_eq!(
+            skip_reason_below(temp.path(), &folder, Some(&metadata(&folder))),
+            None,
+            "a folder is not a sidecar, however it is spelled"
+        );
+        assert_eq!(
+            skip_reason_below(temp.path(), &inside, Some(&metadata(&inside))),
+            None,
+            "the files inside it are ordinary files"
+        );
+        assert_eq!(
+            skip_reason_below(temp.path(), &sidecar_file, Some(&metadata(&sidecar_file))),
+            Some(SkipReason::Sidecar),
+            "a real sidecar file is still refused"
         );
     }
 

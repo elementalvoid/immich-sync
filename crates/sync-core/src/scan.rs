@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use ignore::WalkBuilder;
 
-use crate::skip::skip_reason_below;
+use crate::skip::{SkipReason, skip_reason_below};
 use crate::store::SourceFolder;
 
 /// What one reconciliation scan found.
@@ -83,7 +83,16 @@ pub fn scan_folder(folder: &SourceFolder) -> Result<ScanReport, ScanError> {
             }
             continue;
         }
-        if skip_reason_below(root, path, None).is_some() {
+        if let Some(reason) = skip_reason_below(root, path, None) {
+            if reason == SkipReason::Sidecar {
+                // An orphan sidecar — the media file is not there, or is
+                // already on the server — leaves no item and no count anyone
+                // reads, so the log is the only trace it ever existed.
+                tracing::debug!(
+                    path = %path.display(),
+                    "an XMP sidecar is not an asset of its own; it rides along with its media file"
+                );
+            }
             report.skipped += 1;
             continue;
         }

@@ -14,6 +14,14 @@
 //!   folder are one live photo. The video uploads first and the photo links it
 //!   with `livePhotoVideoId`; [`FolderIndex::live_photo_video_for`] finds it.
 //!
+//! shortcut: the live photo rule pairs by folder and stem, while Immich pairs
+//! by the pointer inside the photo's own XMP (`ContentIdentifier` /
+//! `MicroVideoOffset`). A `DSC_0001.JPG` next to an unrelated `DSC_0001.MOV`
+//! therefore links server-side where Immich itself would not, and no Stable
+//! operation unlinks an asset, so the client cannot take it back. Reading the
+//! pointer means parsing XMP, which the sidecar rule today sends blind; pair on
+//! the name until a follow-up reads the photo.
+//!
 //! Both rules compare names under [`PathCase`], so a case-only spelling
 //! difference is one file on Windows (R2.4).
 
@@ -25,9 +33,9 @@ use crate::paths::{PathCase, equal, key};
 
 /// The extensions that count as a live photo's motion video (R3.3).
 ///
-/// `.mov` is what an iPhone writes and `.mp4` what Android and most cameras
-/// write. An Android *motion photo* is one file with the video inside it; it
-/// needs no pairing and is an ordinary asset here.
+/// `.mov` is what an iPhone writes and `.mp4` what most cameras write. An
+/// Android *motion photo* keeps the video inside the JPEG, so it needs no
+/// pairing and is an ordinary asset here.
 pub const LIVE_PHOTO_VIDEO_EXTENSIONS: [&str; 2] = ["mov", "mp4"];
 
 /// The extension of an XMP sidecar.
@@ -73,6 +81,22 @@ pub fn is_sidecar_of(media: &Path, sidecar: &Path, case: PathCase) -> bool {
     let sidecar_stem = sidecar.with_file_name(sidecar_stem);
     equal(&media.with_file_name(media_name), &sidecar_stem, case)
         || equal(&media.with_file_name(media_stem), &sidecar_stem, case)
+}
+
+/// Whether the sidecar is named after the media file's whole name, which
+/// Immich prefers over the bare stem (`IMG_0001.jpg.xmp` over
+/// `IMG_0001.xmp`) (R3.3). Compared under `case` like every other name here,
+/// so a case-only spelling difference cannot demote the preferred form (R2.4).
+#[must_use]
+pub fn names_whole_media(media: &Path, sidecar: &Path, case: PathCase) -> bool {
+    match (media.file_name(), sidecar.file_stem()) {
+        (Some(media_name), Some(sidecar_stem)) => equal(
+            &media.with_file_name(media_name),
+            &sidecar.with_file_name(sidecar_stem),
+            case,
+        ),
+        _ => false,
+    }
 }
 
 /// Whether two paths sit in one folder and have the same stem, compared under
@@ -146,7 +170,7 @@ impl FolderIndex {
             }
             // `IMG_0001.jpg.xmp` is preferred over `IMG_0001.xmp`, whatever
             // order the folder listed them in.
-            if candidate.file_stem() == media.file_name() {
+            if names_whole_media(media, candidate, case) {
                 return Some(candidate);
             }
             fallback.get_or_insert(candidate.as_path());
@@ -186,6 +210,10 @@ impl FolderIndex {
 }
 
 /// The files of one folder, or none when it cannot be read.
+///
+/// `symlink_metadata` is what decides: `Path::is_file` follows a link, and a
+/// symlinked `.mov` or `.xmp` next to a photo would then pair and be uploaded,
+/// which is what R2.2 refuses everywhere else.
 fn read_files(folder: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(folder) else {
         return Vec::new();
@@ -193,7 +221,11 @@ fn read_files(folder: &Path) -> Vec<PathBuf> {
     entries
         .flatten()
         .map(|entry| entry.path())
-        .filter(|path| path.is_file())
+        .filter(|path| {
+            std::fs::symlink_metadata(path)
+                .map(|metadata| metadata.is_file())
+                .unwrap_or(false)
+        })
         .collect()
 }
 
@@ -279,6 +311,54 @@ mod tests {
         let index = index_of(&["IMG_0001.jpg", "IMG_0002.jpg", "IMG_0002.jpg.xmp"]);
 
         assert_eq!(index.sidecar_for(&photo(), PathCase::Sensitive), None);
+    }
+
+    #[test]
+    fn the_preferred_spelling_wins_under_the_windows_case_rule() {
+        // R2.4 + R3.3: the preference test must fold case like the rest of the
+        // rules, or the truly preferred sidecar loses to the fallback on
+        // Windows.
+        let index = index_of(&["IMG_0001.JPG", "IMG_0001.xmp", "img_0001.jpg.xmp"]);
+        let media = PathBuf::from("/photos/IMG_0001.JPG");
+
+        assert_eq!(
+            index.sidecar_for(&media, PathCase::Insensitive),
+            Some(Path::new("/photos/img_0001.jpg.xmp")),
+            "R2.4: the preferred spelling wins whatever the listing order"
+        );
+    }
+
+    #[test]
+    fn a_symlinked_pairing_candidate_is_never_paired() {
+        // R2.2: the scan and the watcher refuse a symlink, so the pairing
+        // index must not resurrect one.
+        let directory = tempfile::tempdir().expect("create a temp dir");
+        let photo = directory.path().join("IMG_0007.jpg");
+        std::fs::write(&photo, b"photo").expect("write the photo");
+        let video = directory.path().join("real.mov");
+        std::fs::write(&video, b"motion").expect("write the real video");
+        let sidecar = directory.path().join("real.xmp");
+        std::fs::write(&sidecar, b"<xmp/>").expect("write the sidecar");
+        for (name, target) in [("IMG_0007.mov", &video), ("IMG_0007.jpg.xmp", &sidecar)] {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(target, directory.path().join(name))
+                .expect("create the fixture symlink");
+            #[cfg(windows)]
+            std::os::windows::fs::symlink_file(target, directory.path().join(name))
+                .expect("create the fixture symlink");
+        }
+        let index = FolderIndex::read(std::slice::from_ref(&photo));
+
+        assert_eq!(
+            index.live_photo_video_for(&photo, PathCase::Sensitive),
+            None,
+            "a symlinked video is not the photo's motion video"
+        );
+        assert_eq!(
+            index.sidecar_for(&photo, PathCase::Sensitive),
+            None,
+            "a symlinked sidecar is not the photo's sidecar"
+        );
     }
 
     #[test]
