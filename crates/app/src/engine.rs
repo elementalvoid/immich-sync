@@ -100,6 +100,7 @@ impl EngineModel {
             // notification and fills the view at start (R5.3, R5.4).
             cx.observe(&store_model, |this, _, cx| {
                 this.try_start_engine(cx);
+                this.refresh_status(cx);
                 this.refresh_review(cx);
             }),
             cx.observe(&connection, |this, _, cx| this.try_start_engine(cx)),
@@ -264,28 +265,16 @@ impl EngineModel {
                 model.refresh_status(cx);
                 // Without a running engine the status is the store's cached
                 // counts, which do not know about the write that just landed,
-                // so the one item this decision cleared comes off here.
+                // so re-read the affected folder's counts instead of patching
+                // the UI model: a later refresh must not resurrect the item.
                 if decided && model.engine.is_none() {
-                    model.note_review_decided(&path);
+                    model
+                        .store_model
+                        .update(cx, |store, cx| store.refresh_counts(&path, cx));
                 }
             });
         })
         .detach();
-    }
-
-    /// Takes one decided item off the published review count (R5.4).
-    fn note_review_decided(&mut self, path: &str) {
-        self.status.counts.review = self.status.counts.review.saturating_sub(1);
-        let case = sync_core::paths::PathCase::for_platform();
-        for folder in &mut self.status.folders {
-            if sync_core::paths::is_within(
-                std::path::Path::new(&folder.path),
-                std::path::Path::new(path),
-                case,
-            ) {
-                folder.counts.review = folder.counts.review.saturating_sub(1);
-            }
-        }
     }
 
     /// Re-reads the missing files from the store on the background executor

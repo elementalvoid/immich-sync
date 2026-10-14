@@ -125,6 +125,22 @@ fn review_count(cx: &mut TestAppContext, window: AnyWindowHandle) -> usize {
     .unwrap_or(0)
 }
 
+/// Pumps the executor until the tray shows `count` items to review.
+async fn wait_for_review_count(
+    cx: &mut TestAppContext,
+    engine: &gpui_kit::Entity<EngineModel>,
+    count: u32,
+) {
+    for _ in 0..600 {
+        if cx.read(|cx| engine.read(cx).status().counts.review) == count {
+            return;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    panic!("the tray never showed {count} items to review");
+}
+
 /// Moves focus to the next tab stop, as the Root's Tab binding does.
 fn tab(window: &mut Window, cx: &mut App) {
     window.focus_next(cx);
@@ -351,4 +367,91 @@ async fn a_new_review_item_raises_one_notification(cx: &mut TestAppContext) {
         1,
         "R5.4: the status poll must not repeat the notification"
     );
+}
+
+#[gpui_kit::test]
+async fn a_later_status_refresh_must_not_resurrect_a_decided_item(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    seed(&paths, &photos, &["keep.jpg", "other.jpg"]);
+    let paths_for_model = paths.clone();
+    let (window, engine, store_model) = cx.update(|cx| {
+        gpui_kit::init(cx);
+        let connection = cx.new(|_| {
+            let store: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+            ConnectionModel::new(ServerProfile::default(), store)
+        });
+        let store_model = cx.new(|cx| StoreModel::open(&paths_for_model, cx));
+        let engine =
+            cx.new(|cx| EngineModel::new(connection, store_model.clone(), &paths_for_model, cx));
+        let window = gpui_kit::open_window(window_options(), cx, |window, cx| {
+            cx.new(|cx| ReviewView::new(engine.clone(), window, cx))
+        })
+        .expect("open the review window")
+        .0;
+        (window, engine, store_model)
+    });
+    wait_for_rows(cx, window, 2).await;
+    assert_eq!(cx.read(|cx| engine.read(cx).status().counts.review), 2);
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("review-keep-0", cx);
+    })
+    .expect("click Keep");
+    wait_for_rows(cx, window, 1).await;
+    wait_for_review_count(cx, &engine, 1).await;
+
+    // Any later status refresh re-reads the counts the store cached at open.
+    cx.update(|cx| {
+        store_model.update(cx, |store, cx| {
+            store.set_folders(store.folders().to_vec(), cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read(|cx| engine.read(cx).status().counts.review),
+        1,
+        "the tray count must not resurrect a decided item while the list shows one"
+    );
+}
+
+#[gpui_kit::test]
+async fn a_second_keep_of_the_same_row_must_not_double_count(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    seed(&paths, &photos, &["keep.jpg", "other.jpg"]);
+    let paths_for_model = paths.clone();
+    let (window, engine) = cx.update(|cx| {
+        gpui_kit::init(cx);
+        let connection = cx.new(|_| {
+            let store: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+            ConnectionModel::new(ServerProfile::default(), store)
+        });
+        let store_model = cx.new(|cx| StoreModel::open(&paths_for_model, cx));
+        let engine =
+            cx.new(|cx| EngineModel::new(connection, store_model.clone(), &paths_for_model, cx));
+        let window = gpui_kit::open_window(window_options(), cx, |window, cx| {
+            cx.new(|cx| ReviewView::new(engine.clone(), window, cx))
+        })
+        .expect("open the review window")
+        .0;
+        (window, engine)
+    });
+    wait_for_rows(cx, window, 2).await;
+
+    // Two fast clicks on the same control: both actions run, but only the first
+    // changes a row.
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("review-keep-0", cx);
+        window.click("review-keep-0", cx);
+    })
+    .expect("click Keep twice");
+    wait_for_rows(cx, window, 1).await;
+    wait_for_review_count(cx, &engine, 1).await;
 }
