@@ -148,6 +148,10 @@ fn quota_exceeded(message: &str) -> bool {
 impl ImmichClient {
     /// Builds a client for one server. TLS verification stays on (N3).
     ///
+    /// The client carries no deadline of its own: [`send`] puts the ordinary
+    /// window on every request but an upload, and an upload is bounded by the
+    /// stall guard instead.
+    ///
     /// # Errors
     ///
     /// Returns [`ClientError::InvalidUrl`] for a URL that is not `http` or
