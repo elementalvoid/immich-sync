@@ -683,6 +683,50 @@ fn a_recorded_version_chain_keeps_the_old_versions_and_one_current() {
     );
 }
 
+/// The chain reads oldest-first by recording time. Row ids stop reflecting
+/// that after a version is re-recorded — a revert gives an old row a new
+/// recording time while its id stays — so a reader must not order by id.
+#[test]
+fn the_chain_stays_chronological_after_a_revert() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    store
+        .record(&record("hello.txt", ItemState::Uploaded))
+        .expect("write the item");
+    let version = |asset_id: &str, created_at_ns| NewVersion {
+        path: "hello.txt".to_string(),
+        asset_id: asset_id.to_string(),
+        sha1: hello_world_sha1(),
+        created_at_ns,
+        stack_id: None,
+    };
+    store
+        .record_version(&version("asset-1", 1_700_000_000_000_000_000))
+        .expect("record the first version");
+    store
+        .record_version(&version("asset-2", 1_700_000_000_000_000_500))
+        .expect("record the second version");
+    // The user reverts to the first version: its row keeps its id but takes
+    // the new recording time.
+    store
+        .record_version(&version("asset-1", 1_700_000_000_000_001_000))
+        .expect("record the revert");
+
+    let chain = store.versions("hello.txt").expect("read the chain");
+    assert_eq!(
+        chain
+            .iter()
+            .map(|version| version.asset_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["asset-2", "asset-1"],
+        "oldest first by recording time, not by row id"
+    );
+    assert!(
+        chain[1].is_current,
+        "the reverted-to version is the current one"
+    );
+}
+
 /// A version recorded twice is one row, so a retried flow cannot grow the
 /// chain (R4.4, R6.7).
 #[test]

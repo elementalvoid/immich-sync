@@ -1133,7 +1133,9 @@ impl StateStore {
             .map_err(|source| self.query_error(source))
     }
 
-    /// Every version of one item, oldest first (SPEC §5).
+    /// Every version of one item, oldest first (SPEC §5) — by recording time,
+    /// because a re-recorded version (a revert) keeps its row id and only its
+    /// timestamp moves.
     ///
     /// The old versions stay in the list: the client keeps them (R4.4), and a
     /// reader can show a file's history from it.
@@ -1147,7 +1149,7 @@ impl StateStore {
             .prepare(
                 "SELECT v.item_id, v.asset_id, v.sha1, v.created_at_ns, v.is_current
                  FROM version v JOIN sync_item i ON i.id = v.item_id
-                 WHERE i.path_key = ?1 ORDER BY v.id",
+                 WHERE i.path_key = ?1 ORDER BY v.created_at_ns, v.id",
             )
             .map_err(|source| self.query_error(source))?;
         let rows = statement
