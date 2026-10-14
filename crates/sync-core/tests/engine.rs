@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use immich_client::BandwidthLimit;
 use mock_immich::{Fault, MockImmich, Operation};
 use sync_core::backoff::RetryPolicy;
 use sync_core::connection::{
@@ -1807,6 +1808,7 @@ async fn a_duplicate_the_server_already_has_joins_the_album_too() {
                 modified_at: std::time::UNIX_EPOCH,
                 sidecar: None,
                 live_photo_video_id: None,
+                bandwidth: BandwidthLimit::default(),
             },
         )
         .await

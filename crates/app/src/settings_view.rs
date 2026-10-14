@@ -11,6 +11,7 @@ use std::rc::Rc;
 use crate::autostart::Autostart;
 use crate::connection::{ConnectionModel, apply_profile, profile_from_settings};
 use crate::dashboard::CardPalette;
+use crate::engine::EngineModel;
 use crate::logging::LogLevel;
 use crate::paths::AppPaths;
 use crate::settings::{Settings, SettingsStore};
@@ -78,7 +79,7 @@ impl FieldKey {
     #[must_use]
     pub fn help(self) -> &'static str {
         match self {
-            Self::Bandwidth => "Zero means unlimited.",
+            Self::Bandwidth => "Zero means unlimited; under 0.001 MB/s the client uses 0.001 MB/s.",
             Self::Concurrency => "Uploads that run at the same time.",
             Self::ScanInterval => {
                 "The watcher uploads changes as they happen; this scan finds what the watcher missed."
@@ -228,6 +229,9 @@ pub struct SettingsView {
     /// The credential kind the form signs in with (R1.1, R1.5).
     auth_method: AuthMethod,
     fields: Vec<Field>,
+    /// The engine the Limits card pushes a change to (R7.1, R7.2), once the
+    /// shell has installed one. A view with no engine still saves the values.
+    engine: Option<Entity<EngineModel>>,
     /// The last failed save or autostart change, shown with the load problem.
     action_error: Option<String>,
     /// A failure before the store opened, such as path resolution. It stays
@@ -314,6 +318,7 @@ impl SettingsView {
             secret_input,
             auth_method: initial.auth_method,
             fields,
+            engine: None,
             action_error: None,
             environment_problem: None,
             _subscriptions: subscriptions,
@@ -388,6 +393,12 @@ impl SettingsView {
     #[must_use]
     pub fn log_level(&self) -> LogLevel {
         self.store.settings().log_level
+    }
+
+    /// Points the Limits card at the engine, so a change to either limit is
+    /// applied to a running sync without a restart (R7.1, R7.2).
+    pub fn set_engine(&mut self, engine: Entity<EngineModel>) {
+        self.engine = Some(engine);
     }
 
     /// Persists a log level and applies it to the running subscriber.
@@ -511,6 +522,16 @@ impl SettingsView {
     fn write_field(&mut self, key: FieldKey, value: f64, cx: &mut Context<Self>) {
         let result = self.store.update(|settings| key.set(settings, value));
         self.record(SAVE_PROBLEM, result, cx);
+        // The stored value is what the engine gets, so a failed save cannot
+        // move the engine away from the file.
+        if matches!(key, FieldKey::Bandwidth | FieldKey::Concurrency)
+            && let Some(engine) = self.engine.clone()
+        {
+            let settings = self.store.settings();
+            let bandwidth = settings.bandwidth_bytes_per_second;
+            let concurrency = usize::try_from(settings.concurrency.max(1)).unwrap_or(4);
+            engine.update(cx, |model, _| model.set_limits(bandwidth, concurrency));
+        }
     }
 
     /// Applies the autostart setting to the OS, then records it.

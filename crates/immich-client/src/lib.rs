@@ -10,10 +10,12 @@
 //! disabled, an unreachable server, and an unusable response (R1.4, R1.6).
 //! TLS verification stays on (N3).
 
+mod bandwidth;
 mod client;
 mod error;
 mod model;
 
+pub use bandwidth::BandwidthLimit;
 pub use client::ImmichClient;
 pub use error::ClientError;
 pub use model::{

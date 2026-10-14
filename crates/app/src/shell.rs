@@ -252,6 +252,9 @@ pub fn open_main_window(cx: &mut App) -> anyhow::Result<()> {
         // and reopening the window after a hide reuses the same state.
         let dashboard = cx.new(|cx| Dashboard::with_engine(engine.clone(), window, cx));
         let settings = cx.new(|cx| SettingsView::from_environment(window, cx, connection.clone()));
+        // The Limits card pushes a change straight to the running engine
+        // (R7.1, R7.2).
+        settings.update(cx, |view, _| view.set_engine(engine.clone()));
         let upload_view = cx.new(|cx| UploadView::new(upload.clone(), window, cx));
         let failed_view = cx.new(|cx| FailedView::new(engine.clone(), window, cx));
         cx.new(|cx| {

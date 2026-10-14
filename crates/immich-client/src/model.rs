@@ -6,6 +6,8 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
+use crate::bandwidth::BandwidthLimit;
+
 /// The opaque Immich session token (GLOSSARY).
 ///
 /// The token is a secret. Its `Debug` output is redacted, and the value is only
@@ -129,6 +131,11 @@ pub struct AssetUpload<'a> {
     /// The asset id of the live photo video that is already on the server,
     /// sent as `livePhotoVideoId` (R3.3). `None` uploads the photo unlinked.
     pub live_photo_video_id: Option<&'a str>,
+    /// The live bandwidth limit the body is metered against (R7.1). The
+    /// default, `BandwidthLimit::default()`, is 0: the network's pace. A limit
+    /// is shared by every upload that clones it, so it caps the total rate and
+    /// not each upload's.
+    pub bandwidth: BandwidthLimit,
 }
 
 /// The result of `POST /assets` (R3.6).

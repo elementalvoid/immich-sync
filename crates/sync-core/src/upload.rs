@@ -31,7 +31,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use immich_client::{AssetUpload, BulkAction, BulkCheckItem, ClientError, RejectReason};
+use immich_client::{
+    AssetUpload, BandwidthLimit, BulkAction, BulkCheckItem, ClientError, RejectReason,
+};
 
 use crate::connection::SharedSession;
 use crate::failure::{FailureClass, FailureKind, classify};
@@ -317,11 +319,14 @@ impl Uploader {
             }
         }
 
+        // This path is the caller's own, not the engine's: no limit is in
+        // force, so the body streams at the network's pace.
         self.send_upload(
             &mut item,
             &checksum,
             sidecar.as_ref(),
             live_photo_video.as_deref(),
+            &BandwidthLimit::default(),
         )
         .await
     }
@@ -331,11 +336,14 @@ impl Uploader {
     /// leaves it re-queueable (R6.7).
     ///
     /// The gate is checked immediately before the request, so a pause stops
-    /// the next upload even inside an already-dispatched worker (R8.7).
+    /// the next upload even inside an already-dispatched worker (R8.7). The
+    /// bandwidth limit is live, so the request streams under whatever limit is
+    /// set when its bytes are read (R7.1).
     pub async fn upload_prepared(
         &self,
         prepared: &PreparedItem,
         gate: &UploadGate,
+        bandwidth: &BandwidthLimit,
     ) -> UploadOutcome {
         let mut item = ItemRecord {
             path: prepared.path.to_string_lossy().into_owned(),
@@ -362,6 +370,7 @@ impl Uploader {
             &prepared.sha1.base64(),
             prepared.sidecar.as_ref(),
             prepared.live_photo_video.as_deref(),
+            bandwidth,
         )
         .await
     }
@@ -422,12 +431,14 @@ impl Uploader {
     }
 
     /// Sends one accepted file and records the outcome (R3.2, R3.3, R3.6).
+    /// Sends one accepted file and records the outcome (R3.2, R3.3, R3.6).
     async fn send_upload(
         &self,
         item: &mut ItemRecord,
         checksum: &str,
         sidecar: Option<&SidecarFile>,
         live_photo_video: Option<&Path>,
+        bandwidth: &BandwidthLimit,
     ) -> UploadOutcome {
         // R3.3: the motion video uploads first, so the link never names an
         // asset the server does not have. A video that fails is parked by its
@@ -436,7 +447,8 @@ impl Uploader {
         let live_photo_video_id = match live_photo_video {
             Some(video) => self.live_photo_video_id(Path::new(&item.path), video).await,
             None => None,
-        }; // Immich requires the file's own dates on the asset (R3.1). The
+        };
+        // Immich requires the file's own dates on the asset (R3.1). The
         // creation time is missing on some platforms and filesystems; the
         // modification time is the honest fallback.
         let metadata = std::fs::metadata(Path::new(&item.path)).ok();
@@ -462,6 +474,7 @@ impl Uploader {
                     modified_at,
                     sidecar: sidecar.map(|sidecar| sidecar.path.as_path()),
                     live_photo_video_id: live_photo_video_id.as_deref(),
+                    bandwidth: bandwidth.clone(),
                 };
                 async move { client.upload_asset(credential.auth(), &upload).await }
             })

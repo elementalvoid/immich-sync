@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
+use immich_client::BandwidthLimit;
 use mock_immich::{Fault, MockImmich, Operation};
 use sync_core::connection::{AuthMethod, Connection, Secret, SharedSession, SignIn};
 use sync_core::credential::MemoryCredentialStore;
@@ -434,7 +435,9 @@ async fn a_paused_upload_leaves_the_sidecar_owed() {
         }),
         live_photo_video: None,
     };
-    let outcome = uploader.upload_prepared(&prepared, &gate).await;
+    let outcome = uploader
+        .upload_prepared(&prepared, &gate, &BandwidthLimit::default())
+        .await;
 
     assert_eq!(outcome, UploadOutcome::Deferred);
     assert_eq!(server.upload_requests(), 0, "nothing was sent");

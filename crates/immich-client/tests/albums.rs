@@ -4,7 +4,7 @@
 //! Both operations are `x-immich-state: Stable` in the v3.3.1 spec, which is
 //! what R3.5 allows sync correctness to depend on.
 
-use immich_client::{AssetUpload, Auth, ClientError, ImmichClient, SessionToken};
+use immich_client::{AssetUpload, Auth, BandwidthLimit, ClientError, ImmichClient, SessionToken};
 use mock_immich::{Fault, MockImmich, Operation};
 
 /// `sha1("hello world")`, base64.
@@ -37,6 +37,7 @@ async fn upload_asset(client: &ImmichClient, token: &SessionToken) -> String {
                 modified_at: std::time::UNIX_EPOCH,
                 sidecar: None,
                 live_photo_video_id: None,
+                bandwidth: BandwidthLimit::default(),
             },
         )
         .await

@@ -10,6 +10,7 @@ use reqwest::{Body, Client, RequestBuilder, Response, StatusCode, Url};
 use serde::Serialize;
 use tokio_util::io::ReaderStream;
 
+use crate::bandwidth::{MeteredReader, Progress};
 use crate::error::ClientError;
 use crate::model::{
     Album, AlbumAssetsRequest, AlbumBody, AssetUpload, Auth, AuthStatus, BulkAction, BulkCheckBody,
@@ -23,6 +24,67 @@ const MESSAGE_LIMIT: usize = 200;
 
 /// A request that has not finished within this window is unreachable.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long an upload may hand the server no byte before it is called stalled.
+///
+/// The ordinary request window, so an upload meets a server that stops taking
+/// its bytes in the 30 s every request always had. The bound is on progress,
+/// not on a rate sampled when the request was built: it does not shorten when
+/// the user lowers the limit while the upload is on the wire, and it does not
+/// grow for a large file at a slow one (R7.1).
+///
+/// A window that sees bytes move is renewed whole, so the stall is called at
+/// the last byte the server took plus this budget: at most twice it, never at
+/// one window from the start of the gap.
+const STALL_BUDGET: Duration = REQUEST_TIMEOUT;
+
+/// Sends a request under the ordinary window.
+///
+/// An upload does not come through here: a total deadline cannot tell a slow
+/// upload from a stalled server, and one derived from the limit in force when
+/// the request was built aborts a healthy upload the moment the limit changes.
+async fn send(request: RequestBuilder) -> Result<Response, ClientError> {
+    request
+        .timeout(REQUEST_TIMEOUT)
+        .send()
+        .await
+        .map_err(ClientError::Unreachable)
+}
+
+/// Sends an upload, failing it when the body has made no progress for
+/// [`STALL_BUDGET`].
+///
+/// The upload carries no total deadline: the client's 30 s would cut off any
+/// throttled upload larger than `limit x 30 s`, and a deadline scaled by the
+/// limit in force when the request was built grows without bound for a large
+/// file at a slow one (R7.1). Progress is watched instead, so the bound holds
+/// whatever the limit does while the request is on the wire. A window that saw
+/// bytes is renewed in full, so the call comes at the last byte moved plus
+/// [`STALL_BUDGET`] - at most twice that budget.
+async fn send_upload(
+    request: RequestBuilder,
+    progress: &Progress,
+) -> Result<Response, ClientError> {
+    let mut send = Box::pin(request.send());
+    // The last byte that had moved when this window opened.
+    let mut waited = progress.stamp();
+    loop {
+        if let Ok(response) =
+            tokio::time::timeout(STALL_BUDGET.saturating_sub(progress.idle()), &mut send).await
+        {
+            return response.map_err(ClientError::Unreachable);
+        }
+        // The window closed with nothing moving, and a timer that fires a
+        // fraction late must not count as progress on its own: the server
+        // stopped reading.
+        let moved = progress.stamp();
+        if moved == waited {
+            return Err(ClientError::Stalled);
+        }
+        // Bytes did move: the request is healthy and waits out a full window.
+        waited = moved;
+    }
+}
 
 /// A typed client for the Immich Stable operations the client uses.
 ///
@@ -108,6 +170,10 @@ fn quota_exceeded(message: &str) -> bool {
 impl ImmichClient {
     /// Builds a client for one server. TLS verification stays on (N3).
     ///
+    /// The client carries no deadline of its own: [`send`] puts the ordinary
+    /// window on every request but an upload, and an upload is bounded by the
+    /// stall guard instead.
+    ///
     /// # Errors
     ///
     /// Returns [`ClientError::InvalidUrl`] for a URL that is not `http` or
@@ -141,10 +207,7 @@ impl ImmichClient {
             let path = format!("{}/", base.path());
             base.set_path(&path);
         }
-        let http = Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .map_err(ClientError::HttpClient)?;
+        let http = Client::builder().build().map_err(ClientError::HttpClient)?;
         Ok(Self { http, base })
     }
 
@@ -156,13 +219,12 @@ impl ImmichClient {
     /// [`ClientError::PasswordLoginDisabled`] when the server has password
     /// login turned off (R1.6), and the transport and protocol variants.
     pub async fn login(&self, email: &str, password: &str) -> Result<LoginResponse, ClientError> {
-        let response = self
-            .http
-            .post(self.endpoint("auth/login"))
-            .json(&LoginRequest { email, password })
-            .send()
-            .await
-            .map_err(ClientError::Unreachable)?;
+        let response = send(
+            self.http
+                .post(self.endpoint("auth/login"))
+                .json(&LoginRequest { email, password }),
+        )
+        .await?;
         let result = self.read_login(response).await;
         log_outcome("login", &result);
         result
@@ -175,13 +237,12 @@ impl ImmichClient {
     /// [`ClientError::InvalidToken`] when the server refuses the token, plus the
     /// transport and protocol variants.
     pub async fn validate_token(&self, token: &SessionToken) -> Result<(), ClientError> {
-        let response = self
-            .http
-            .post(self.endpoint("auth/validateToken"))
-            .bearer_auth(token.expose())
-            .send()
-            .await
-            .map_err(ClientError::Unreachable)?;
+        let response = send(
+            self.http
+                .post(self.endpoint("auth/validateToken"))
+                .bearer_auth(token.expose()),
+        )
+        .await?;
         let result = self
             .read_auth_status(response, ClientError::InvalidToken)
             .await;
@@ -196,13 +257,12 @@ impl ImmichClient {
     /// [`ClientError::InvalidApiKey`] when the server refuses the key, plus the
     /// transport and protocol variants.
     pub async fn validate_api_key(&self, key: &str) -> Result<(), ClientError> {
-        let response = self
-            .http
-            .post(self.endpoint("auth/validateToken"))
-            .header("x-api-key", key)
-            .send()
-            .await
-            .map_err(ClientError::Unreachable)?;
+        let response = send(
+            self.http
+                .post(self.endpoint("auth/validateToken"))
+                .header("x-api-key", key),
+        )
+        .await?;
         let result = self
             .read_auth_status(response, ClientError::InvalidApiKey)
             .await;
@@ -216,12 +276,7 @@ impl ImmichClient {
     ///
     /// Returns the transport and protocol variants.
     pub async fn about(&self) -> Result<ServerAbout, ClientError> {
-        let response = self
-            .http
-            .get(self.endpoint("server/about"))
-            .send()
-            .await
-            .map_err(ClientError::Unreachable)?;
+        let response = send(self.http.get(self.endpoint("server/about"))).await?;
         let status = response.status();
         let retry_after = retry_after(&response);
         let result = if status.is_success() {
@@ -254,15 +309,14 @@ impl ImmichClient {
         auth: Auth<'_>,
         items: &[BulkCheckItem],
     ) -> Result<Vec<BulkCheckResult>, ClientError> {
-        let response = self
-            .authorize(
+        let response = send(
+            self.authorize(
                 self.http.post(self.endpoint("assets/bulk-upload-check")),
                 auth,
             )
-            .json(&BulkCheckRequest { assets: items })
-            .send()
-            .await
-            .map_err(ClientError::Unreachable)?;
+            .json(&BulkCheckRequest { assets: items }),
+        )
+        .await?;
         let result = self.read_bulk_check(response).await;
         log_outcome("bulk-upload-check", &result);
         result
@@ -307,7 +361,16 @@ impl ImmichClient {
             .and_then(|name| name.to_str())
             .unwrap_or("asset")
             .to_string();
-        let part = file_part(upload.path).await?;
+        let file = tokio::fs::File::open(upload.path)
+            .await
+            .map_err(ClientError::LocalRead)?;
+        let length = file.metadata().await.map_err(ClientError::LocalRead)?.len();
+        // The throttle is below the multipart reader, so it meters the file
+        // bytes themselves, and it is live: a settings change is read on the
+        // next poll (R7.1).
+        let (reader, progress) = MeteredReader::new(file, upload.bandwidth.clone());
+        let part = Part::stream_with_length(Body::wrap_stream(ReaderStream::new(reader)), length)
+            .file_name(filename.clone());
         // R3.3: the sidecar part goes before every text field. Immich's multer
         // filter resolves the `sidecarData` part's name from
         // `body.filename || file.originalName` while it parses the stream, and
@@ -333,16 +396,16 @@ impl ImmichClient {
         if let Some(video_id) = upload.live_photo_video_id {
             form = form.text("livePhotoVideoId", video_id.to_string());
         }
-        let sent = self
-            .authorize(self.http.post(self.endpoint("assets")), auth)
-            .header("x-immich-checksum", upload.checksum)
-            .multipart(form)
-            .send()
-            .await;
+        let sent = send_upload(
+            self.authorize(self.http.post(self.endpoint("assets")), auth)
+                .header("x-immich-checksum", upload.checksum)
+                .multipart(form),
+            &progress,
+        )
+        .await;
         let result = match sent {
             Ok(response) => self.read_upload(response).await,
-            Err(error) => {
-                let lost = ClientError::Unreachable(error);
+            Err(lost) => {
                 match self
                     .asset_for_checksum(auth, &filename, upload.checksum)
                     .await

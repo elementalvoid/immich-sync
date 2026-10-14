@@ -82,6 +82,13 @@ struct Inner {
     validate_token_requests: u64,
     /// How many `POST /assets` requests arrived, whether or not one uploaded.
     upload_requests: u64,
+    /// How many `POST /assets` requests are being handled right now.
+    uploads_in_flight: u64,
+    /// The most uploads that were ever in flight at one time.
+    peak_uploads: u64,
+    /// How long the upload handler waits before it reads a body. A test uses
+    /// it to hold uploads open and observe the client's concurrency.
+    upload_delay: Option<Duration>,
     /// How many `POST /albums` requests arrived, whether or not one created an
     /// album (R3.4).
     create_album_requests: u64,
@@ -373,6 +380,43 @@ impl MockImmich {
             .lock()
             .expect("mock state poisoned")
             .upload_requests
+    }
+
+    /// Hold every upload open for `delay` before reading its body, so a test
+    /// can watch how many the client runs at once.
+    pub fn set_upload_delay(&self, delay: Duration) {
+        self.state
+            .inner
+            .lock()
+            .expect("mock state poisoned")
+            .upload_delay = Some(delay);
+    }
+
+    /// How many `POST /assets` requests are being handled right now.
+    #[must_use]
+    pub fn upload_concurrency(&self) -> u64 {
+        self.state
+            .inner
+            .lock()
+            .expect("mock state poisoned")
+            .uploads_in_flight
+    }
+
+    /// The most uploads that were ever in flight at one time.
+    #[must_use]
+    pub fn peak_upload_concurrency(&self) -> u64 {
+        self.state
+            .inner
+            .lock()
+            .expect("mock state poisoned")
+            .peak_uploads
+    }
+
+    /// Forgets the peak recorded so far, so a test can watch the next wave of
+    /// uploads alone. The uploads in flight right now count as the new peak.
+    pub fn reset_upload_peaks(&self) {
+        let mut inner = self.state.inner.lock().expect("mock state poisoned");
+        inner.peak_uploads = inner.uploads_in_flight;
     }
 
     /// Configure the one API key the server accepts. Without one the mock
@@ -715,24 +759,34 @@ async fn upload(
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Response {
-    state
-        .inner
-        .lock()
-        .expect("mock state poisoned")
-        .upload_requests += 1;
-
-    // Immich answers a known checksum from the header before it reads the
-    // body: `AssetUploadInterceptor` checks `x-immich-checksum` and runs before
-    // `FileUploadInterceptor`, so multer never parses the form of a duplicate.
-    let header_checksum = headers
-        .get("x-immich-checksum")
-        .and_then(|value| value.to_str().ok())
-        .and_then(canonical_checksum);
+    // Counted from arrival, so a test sees how many requests the client has
+    // open at once even while the bodies are still being read.
+    let _in_flight = InFlight::enter(&state);
+    let (delay, header_checksum) = {
+        let mut inner = state.inner.lock().expect("mock state poisoned");
+        inner.upload_requests += 1;
+        let delay = inner.upload_delay;
+        drop(inner);
+        // Immich answers a known checksum from the header before it reads the
+        // body: `AssetUploadInterceptor` checks `x-immich-checksum` and runs
+        // before `FileUploadInterceptor`, so multer never parses the form of a
+        // duplicate.
+        let checksum = headers
+            .get("x-immich-checksum")
+            .and_then(|value| value.to_str().ok())
+            .and_then(canonical_checksum);
+        (delay, checksum)
+    };
     if let Some(checksum) = &header_checksum {
         let inner = state.inner.lock().expect("mock state poisoned");
         if let Some(asset) = inner.asset_by_checksum(checksum) {
             return duplicate_response(&asset.id);
         }
+    }
+    // A test holds the upload here, before the body is read, so several
+    // requests can be open at the same time.
+    if let Some(delay) = delay {
+        tokio::time::sleep(delay).await;
     }
 
     // The real server buffers the upload before it validates the format or the
@@ -818,6 +872,28 @@ async fn upload(
         Json(json!({ "id": id, "status": "created" })),
     )
         .into_response()
+}
+
+/// Counts one upload as in flight until the handler returns, however it
+/// returns.
+struct InFlight(Arc<State>);
+
+impl InFlight {
+    fn enter(state: &Arc<State>) -> Self {
+        {
+            let mut inner = state.inner.lock().expect("mock state poisoned");
+            inner.uploads_in_flight += 1;
+            inner.peak_uploads = inner.peak_uploads.max(inner.uploads_in_flight);
+        }
+        Self(Arc::clone(state))
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        let mut inner = self.0.inner.lock().expect("mock state poisoned");
+        inner.uploads_in_flight = inner.uploads_in_flight.saturating_sub(1);
+    }
 }
 
 /// Decode an Immich checksum: 28 characters is base64, anything else is hex.

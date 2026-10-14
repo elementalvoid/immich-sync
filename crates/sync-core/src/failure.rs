@@ -78,7 +78,7 @@ pub enum FailureKind {
 #[must_use]
 pub fn classify(error: &ClientError) -> (Option<FailureClass>, FailureKind) {
     match error {
-        ClientError::Unreachable(_) => {
+        ClientError::Unreachable(_) | ClientError::Stalled => {
             (Some(FailureClass::NetworkTransient), FailureKind::Transient)
         }
         ClientError::LocalRead(_) => (Some(FailureClass::LocalReadError), FailureKind::Permanent),
@@ -108,5 +108,20 @@ pub fn classify(error: &ClientError) -> (Option<FailureClass>, FailureKind) {
         // `ClientError` is `#[non_exhaustive]`: a newer variant is not retried
         // by accident.
         _ => (None, FailureKind::Permanent),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stalled_upload_is_a_transient_network_failure() {
+        // The catch-all below turns a variant nobody classified into a
+        // permanent failure, so each new one has to say which it is.
+        assert_eq!(
+            classify(&ClientError::Stalled),
+            (Some(FailureClass::NetworkTransient), FailureKind::Transient)
+        );
     }
 }
