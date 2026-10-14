@@ -3144,7 +3144,7 @@ async fn the_first_edit_of_a_migrated_item_copies_from_its_recorded_asset() {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'uploaded', NULL)",
                 rusqlite::params![
                     file.display().to_string(),
-                    file.display().to_string(),
+                    sync_core::paths::path_key(&file),
                     i64::try_from(metadata.len()).expect("the size fits"),
                     mtime_ns,
                     sha1_file(&file).expect("hash the fixture").as_bytes().as_slice(),
