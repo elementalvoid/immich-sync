@@ -299,11 +299,28 @@ impl EngineModel {
     /// The engine is stopped first, so the rebuild replaces the store while
     /// nothing writes through the old one. It starts again over the fresh
     /// store, and a start runs one reconciliation scan immediately, which is
-    /// the rescan this promises.
+    /// the rescan this promises. While the first open or another rebuild is
+    /// still running this is a no-op.
     pub fn rebuild(&mut self, cx: &mut Context<Self>) {
+        // A second click while a rebuild runs cannot start another (R10.4).
+        if self.rebuilding {
+            return;
+        }
+        // The first open owns the store until it lands; the store model
+        // refuses the rebuild and publishes the reason. Waiting here would
+        // leave this model rebuilding against a generation that may never
+        // arrive if the open fails (R10.4).
+        if !self.store_model.read(cx).settled() {
+            self.store_model.update(cx, |store, cx| store.rebuild(cx));
+            cx.notify();
+            return;
+        }
         if let Some(engine) = self.engine.take() {
             engine.stop();
         }
+        // A start already in flight must not install its engine over the
+        // store this rebuild replaces (R10.4).
+        self.start_generation = self.start_generation.wrapping_add(1);
         self.limits = None;
         self.rebuilding = true;
         self.status = empty_status();

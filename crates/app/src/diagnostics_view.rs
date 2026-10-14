@@ -1,6 +1,7 @@
 //! The Diagnostics view (SPEC R10.2, R10.4): the server, the sqlite state, the
 //! last error per class, the throughput, and the rebuild action.
 
+use gpui_kit::base::Disableable as _;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::Button;
 use gpui_kit::*;
@@ -250,6 +251,7 @@ impl DiagnosticsView {
                     Button::new("diagnostics-rebuild")
                         .label("Rebuild")
                         .accessibility_label("Rebuild the state database and rescan the folders")
+                        .disabled(rebuilding)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.model.update(cx, |model, cx| model.rebuild(cx));
                         })),

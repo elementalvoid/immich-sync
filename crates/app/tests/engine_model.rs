@@ -266,6 +266,65 @@ async fn a_superseded_engine_start_leaves_exactly_one_engine_watching(cx: &mut T
     );
 }
 
+/// R10.4: an engine start already in flight when a rebuild lands must not be
+/// installed over the store the rebuild replaces.
+///
+/// Unix only: the test makes the rebuild fail by replacing the database file
+/// with a directory, and Windows refuses to remove a file an open handle still
+/// maps. The failing rebuild is what makes the interleaving observable: with
+/// the start discarded no engine may exist afterwards, while an installed
+/// pre-rebuild engine has nothing that could ever replace it.
+#[cfg(unix)]
+#[gpui_kit::test]
+async fn a_rebuild_discards_an_engine_start_already_in_flight(cx: &mut TestAppContext) {
+    let (_runtime, server) = mock_server();
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+
+    let connection = signed_in(cx, &server);
+    let store = cx.update(|cx| cx.new(|cx| StoreModel::open(&paths, cx)));
+    wait_for_inputs(cx, &connection, &store).await;
+
+    let engine =
+        cx.update(|cx| cx.new(|cx| EngineModel::new(connection, store.clone(), &paths, cx)));
+    // The start is in flight when the rebuild lands.
+    cx.update(|cx| {
+        engine.update(cx, |model, cx| {
+            model.start(cx);
+            model.rebuild(cx);
+        });
+    });
+    // Make that rebuild fail, so the fresh store never arrives: a directory
+    // where the database file goes.
+    std::fs::remove_file(&paths.state_db).expect("remove the database file");
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = std::path::PathBuf::from(format!("{}{suffix}", paths.state_db.display()));
+        match std::fs::remove_file(&sidecar) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("remove {}: {error}", sidecar.display()),
+        }
+    }
+    std::fs::create_dir(&paths.state_db).expect("put a directory at the database path");
+
+    for _ in 0..600 {
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+        if !cx.read(|cx| engine.read(cx).is_rebuilding()) {
+            break;
+        }
+    }
+    assert!(
+        cx.read(|cx| store.read(cx).problem().is_some()),
+        "the rebuild fails, so no fresh store arrives"
+    );
+    assert!(
+        !cx.read(|cx| engine.read(cx).is_running()),
+        "the engine start that predates the rebuild must not be installed"
+    );
+}
+
 /// The documented recovery from a connection that needs the user: re-enter the
 /// credentials in Settings and sign in. The dashboard and the tray recover from
 /// the form's own state, so the engine's queue must recover from the same
