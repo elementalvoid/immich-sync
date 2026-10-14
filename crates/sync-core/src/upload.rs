@@ -39,7 +39,7 @@ use crate::failure::{FailureClass, FailureKind, classify};
 use crate::hash::{HashError, Sha1};
 use crate::pairing::FolderIndex;
 use crate::paths::PathCase;
-use crate::store::{ItemRecord, ItemState, StateStore};
+use crate::store::{ItemRecord, ItemState, SidecarDigest, StateStore};
 
 /// What one pipeline run produced (R3.2, R3.6).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -101,9 +101,9 @@ impl UploadGate {
 pub struct SidecarFile {
     /// The sidecar path, sent as the `sidecarData` part.
     pub path: PathBuf,
-    /// The SHA-1 of the sidecar's content, which the store records as sent, so
-    /// the same sidecar is not uploaded twice (R4.5).
-    pub sha1: Sha1,
+    /// What the sidecar is: its content digest, its size and its modification
+    /// time, recorded once the asset carries it (R4.5).
+    pub digest: SidecarDigest,
 }
 
 /// One file that was hashed and is ready to upload (R3.1).
@@ -213,7 +213,7 @@ impl Uploader {
             error_class: None,
             // R4.5: no sidecar has been sent yet. Only the request that
             // carried it and was accepted may claim one.
-            sidecar_sha1: None,
+            sidecar: None,
         };
 
         let checksum = sha1.base64();
@@ -334,7 +334,7 @@ impl Uploader {
             state: ItemState::Uploading,
             error_class: None,
             // R4.5: the request carrying the sidecar has not gone out yet.
-            sidecar_sha1: None,
+            sidecar: None,
         };
         if gate.is_paused() {
             item.state = ItemState::Pending;
@@ -475,7 +475,7 @@ impl Uploader {
                     && let Some(sidecar) = sidecar
                 {
                     let sidecar_path = sidecar.path.display().to_string();
-                    item.sidecar_sha1 = None;
+                    item.sidecar = None;
                     item.state = ItemState::FailedPermanent;
                     item.error_class = None;
                     self.record(item);
@@ -495,7 +495,7 @@ impl Uploader {
                         ),
                     });
                 }
-                item.sidecar_sha1 = sent_sidecar(response.duplicate, sidecar);
+                item.sidecar = sent_sidecar(response.duplicate, sidecar);
                 item.state = if response.duplicate {
                     ItemState::Duplicate
                 } else {
@@ -528,7 +528,7 @@ impl Uploader {
         let (class, kind) = classify(error);
         item.asset_id = None;
         // R4.5: the request never landed, so neither did the sidecar.
-        item.sidecar_sha1 = None;
+        item.sidecar = None;
         item.state = match kind {
             FailureKind::Permanent => ItemState::FailedPermanent,
             FailureKind::Transient => ItemState::RetryWait,
@@ -603,12 +603,17 @@ pub(crate) async fn hash_in_background(path: PathBuf) -> Result<Sha1, HashError>
 
 /// The XMP sidecar for `media` that the asset does not carry yet (R3.3).
 ///
-/// `row` is what the store recorded for this item. A sidecar with the recorded
-/// digest has reached the server and is not sent again (R4.5); an item parked
-/// with an asset gave up on its sidecar, because the only Stable way to carry
-/// one is answered `duplicate` before the server reads the body (see
-/// [`Uploader::send_upload`]). A sidecar that cannot be read is left for a
-/// later pass rather than failing the media file with it.
+/// `row` is what the store recorded for this item. A sidecar that still has the
+/// size and modification time the store recorded has reached the server and is
+/// not sent again (R4.5); an item parked with an asset gave up on its sidecar,
+/// because the only Stable way to carry one is answered `duplicate` before the
+/// server reads the body (see [`Uploader::send_upload`]). A sidecar that cannot
+/// be read is left for a later pass rather than failing the media file with it.
+///
+/// shortcut: the size and mtime are trusted instead of the digest, so a
+/// sidecar rewritten within the same size and the same mtime tick is not sent
+/// again; compare a stored digest once the scan cost matters more than that
+/// edge.
 pub(crate) async fn pending_sidecar(
     media: &Path,
     index: &FolderIndex,
@@ -619,6 +624,19 @@ pub(crate) async fn pending_sidecar(
         return None;
     }
     let found = index.sidecar_for(media, case)?.to_path_buf();
+    let metadata = std::fs::metadata(&found).ok()?;
+    let size = metadata.len();
+    let mtime_ns = system_time_ns(metadata.modified().ok());
+    // R4.5: an unchanged sidecar is not read again. Comparing the size and
+    // mtime the store recorded is what keeps a settled library from re-hashing
+    // every sidecar on every reconciliation scan — the same trade the media
+    // file's own columns make.
+    if row
+        .and_then(|row| row.sidecar)
+        .is_some_and(|sent| sent.size == size && sent.mtime_ns == mtime_ns)
+    {
+        return None;
+    }
     let sha1 = match hash_in_background(found.clone()).await {
         Ok(sha1) => sha1,
         Err(error) => {
@@ -630,10 +648,14 @@ pub(crate) async fn pending_sidecar(
             return None;
         }
     };
-    if row.and_then(|row| row.sidecar_sha1) == Some(sha1) {
-        return None;
-    }
-    Some(SidecarFile { path: found, sha1 })
+    Some(SidecarFile {
+        path: found,
+        digest: SidecarDigest {
+            sha1,
+            size,
+            mtime_ns,
+        },
+    })
 }
 
 /// Whether the item gave up on its sidecar: it is parked permanently while its
@@ -651,11 +673,11 @@ fn parked_with_an_asset(row: &ItemRecord) -> bool {
 /// checksum it already holds as `duplicate` from the `x-immich-checksum`
 /// header, in an interceptor that runs before multer parses the form, so that
 /// answer says nothing about the sidecar it was sent with.
-fn sent_sidecar(duplicate: bool, sidecar: Option<&SidecarFile>) -> Option<Sha1> {
+fn sent_sidecar(duplicate: bool, sidecar: Option<&SidecarFile>) -> Option<SidecarDigest> {
     if duplicate {
         None
     } else {
-        sidecar.map(|sidecar| sidecar.sha1)
+        sidecar.map(|sidecar| sidecar.digest)
     }
 }
 
@@ -670,5 +692,194 @@ fn system_time_ns(time: Option<SystemTime>) -> i64 {
     match time.duration_since(UNIX_EPOCH) {
         Ok(duration) => i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX),
         Err(error) => -i64::try_from(error.duration().as_nanos()).unwrap_or(i64::MAX),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Whether a row carries the identity of the sidecar the asset carries.
+    fn sent_sidecar_of(sha1: &str, path: &Path) -> SidecarDigest {
+        let metadata = std::fs::metadata(path).expect("read the sidecar fixture");
+        SidecarDigest {
+            sha1: Sha1::from_hex(sha1).expect("a hex SHA-1"),
+            size: metadata.len(),
+            mtime_ns: system_time_ns(metadata.modified().ok()),
+        }
+    }
+
+    /// `sha1("hello world")`, hex.
+    const HELLO_WORLD_SHA1_HEX: &str = "2aae6c35c94fcfb415dbe95f408b9ce91ee846ed";
+
+    /// A sidecar fixture, and the digest of its exact bytes as a literal.
+    const SIDECAR: &[u8] = b"<x:xmpmeta>sidecar</x:xmpmeta>";
+    const SIDECAR_SHA1_HEX: &str = "f8d2e9cfb0466aeebda758acb4dbbdfa7ce77140";
+
+    /// Different bytes, same length as [`SIDECAR`], and a different digest.
+    const REWRITTEN_SIDECAR: &[u8] = b"<x:xmpmeta>tagged!</x:xmpmeta>";
+
+    /// The media, its sidecar, and the index that pairs them.
+    fn paired_folder(temp: &Path) -> (PathBuf, PathBuf, FolderIndex) {
+        let folder = temp.to_path_buf();
+        let media = folder.join("IMG_0001.jpg");
+        std::fs::write(&media, b"photo bytes").expect("write the media fixture");
+        let sidecar = folder.join("IMG_0001.jpg.xmp");
+        std::fs::write(&sidecar, SIDECAR).expect("write the sidecar fixture");
+        let index = FolderIndex::read(std::slice::from_ref(&media));
+        (media, sidecar, index)
+    }
+
+    /// A row that sent `sent`, and nothing else the rule looks at.
+    fn row_with(media: &Path, sent: Option<SidecarDigest>) -> ItemRecord {
+        ItemRecord {
+            path: media.display().to_string(),
+            size: 1,
+            mtime_ns: 0,
+            sha1: Sha1::from_hex(HELLO_WORLD_SHA1_HEX).expect("a hex SHA-1"),
+            asset_id: Some("asset-1".to_string()),
+            state: ItemState::Uploaded,
+            error_class: None,
+            sidecar: sent,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sidecar_with_the_recorded_size_and_mtime_is_not_read_again() {
+        // R4.5: a settled library is not re-read on every reconciliation scan, and
+        // that has to hold for the sidecars too — a large library would re-hash
+        // every sidecar every scan interval otherwise.
+        //
+        // The fixture replaces the sidecar's bytes with different ones of the same
+        // length and puts the modification time back, so a client that hashes to
+        // decide would still see a changed digest. The rule trusts size and mtime,
+        // exactly as the media file's own columns do.
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let (media, sidecar, index) = paired_folder(temp.path());
+        let sent = sent_sidecar_of(SIDECAR_SHA1_HEX, &sidecar);
+        let modified = std::fs::metadata(&sidecar)
+            .expect("read the sidecar fixture")
+            .modified()
+            .expect("a modification time");
+        std::fs::write(&sidecar, REWRITTEN_SIDECAR).expect("rewrite the sidecar");
+        std::fs::File::options()
+            .write(true)
+            .open(&sidecar)
+            .expect("reopen the sidecar")
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .expect("restore the modification time");
+        assert_eq!(std::fs::metadata(&sidecar).expect("read").len(), sent.size);
+        assert_ne!(
+            crate::hash::sha1_file(&sidecar)
+                .expect("hash the rewritten sidecar")
+                .hex(),
+            SIDECAR_SHA1_HEX,
+            "the bytes really are different, so a hashing client would re-send"
+        );
+
+        let pending = pending_sidecar(
+            &media,
+            &index,
+            PathCase::for_platform(),
+            Some(&row_with(&media, Some(sent))),
+        )
+        .await;
+
+        assert!(
+            pending.is_none(),
+            "the sidecar still has the size and mtime the store recorded: {pending:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sidecar_edited_since_it_was_sent_is_pending_again() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let (media, sidecar, index) = paired_folder(temp.path());
+        let mut sent = sent_sidecar_of(SIDECAR_SHA1_HEX, &sidecar);
+        // One nanosecond of mtime is what the media file's own rule turns on.
+        sent.mtime_ns -= 1;
+
+        let pending = pending_sidecar(
+            &media,
+            &index,
+            PathCase::for_platform(),
+            Some(&row_with(&media, Some(sent))),
+        )
+        .await;
+
+        assert_eq!(
+            pending.map(|sidecar| sidecar.digest),
+            Some(SidecarDigest {
+                sha1: Sha1::from_hex(SIDECAR_SHA1_HEX).expect("a hex SHA-1"),
+                ..sent_sidecar_of(SIDECAR_SHA1_HEX, &sidecar)
+            }),
+            "an edited sidecar rides along with the asset again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sidecar_is_pending_when_the_row_sent_none() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let (media, _, index) = paired_folder(temp.path());
+
+        let pending = pending_sidecar(
+            &media,
+            &index,
+            PathCase::for_platform(),
+            Some(&row_with(&media, None)),
+        )
+        .await;
+
+        assert_eq!(
+            pending.map(|sidecar| sidecar.digest.sha1.hex()),
+            Some(SIDECAR_SHA1_HEX.to_string()),
+            "a sidecar the asset never carried is pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_parked_item_with_an_asset_is_not_offered_a_sidecar() {
+        // R3.3: `POST /assets` is the only Stable way to carry one and the server
+        // answers `duplicate` before it reads the body, so a parked item stops
+        // offering the same sidecar for ever.
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let (media, sidecar, index) = paired_folder(temp.path());
+        let mut row = row_with(&media, None);
+        row.state = ItemState::FailedPermanent;
+
+        let pending = pending_sidecar(&media, &index, PathCase::for_platform(), Some(&row)).await;
+
+        assert!(pending.is_none(), "{pending:?}");
+        let _ = sidecar;
+    }
+
+    #[test]
+    fn a_row_before_the_sidecar_columns_is_read_as_sending_no_sidecar() {
+        // The migration leaves the columns NULL, which must mean "unknown", not a
+        // sidecar with no size: the worst it costs is one more hash.
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let (media, _, _) = paired_folder(temp.path());
+        let store = StateStore::open(temp.path().join("state.db")).expect("open the store");
+        store
+            .record(&ItemRecord {
+                path: media.display().to_string(),
+                size: 1,
+                mtime_ns: 0,
+                sha1: Sha1::from_hex(HELLO_WORLD_SHA1_HEX).expect("a hex SHA-1"),
+                asset_id: None,
+                state: ItemState::Uploaded,
+                error_class: None,
+                sidecar: None,
+            })
+            .expect("record the row");
+
+        assert_eq!(
+            store
+                .item(&media.display().to_string())
+                .expect("read the row")
+                .expect("the row exists")
+                .sidecar,
+            None
+        );
     }
 }

@@ -36,7 +36,7 @@ fn row(folder: &Path, name: &str, state: ItemState, index: usize) -> ItemRecord 
         asset_id,
         state,
         error_class,
-        sidecar_sha1: None,
+        sidecar: None,
     }
 }
 

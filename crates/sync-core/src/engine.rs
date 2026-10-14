@@ -707,7 +707,7 @@ impl EngineInner {
             state,
             error_class: class,
             // A failure sends nothing, so the sidecar is still owed (R3.3).
-            sidecar_sha1: None,
+            sidecar: None,
         };
         if let Err(store_error) = self.store.record(&record) {
             tracing::error!(error = %store_error, "the state database could not record the failure");
@@ -949,7 +949,9 @@ fn record_terminal(inner: &EngineInner, item: &PreparedItem, asset_id: &str, sta
         asset_id: Some(asset_id.to_string()),
         state,
         error_class: None,
-        sidecar_sha1: item.sidecar.as_ref().map(|sidecar| sidecar.sha1),
+        // R4.5: this branch only runs when no sidecar was owed, so the asset
+        // carries none.
+        sidecar: None,
     };
     if let Err(error) = inner.store.record(&record) {
         tracing::error!(error = %error, "the state database could not record the outcome");
@@ -1064,7 +1066,7 @@ async fn prepare(
         error_class: None,
         // R4.5: nothing has been sent yet, so the row claims no sidecar. A
         // crash here re-queues the item and sends it again (R6.7).
-        sidecar_sha1: None,
+        sidecar: None,
     };
     if let Err(error) = inner.store.record(&record) {
         tracing::error!(error = %error, "the state database could not record the pending item");

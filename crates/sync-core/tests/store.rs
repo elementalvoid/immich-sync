@@ -4,7 +4,7 @@ use std::path::Path;
 
 use sync_core::failure::FailureClass;
 use sync_core::hash::Sha1;
-use sync_core::store::{ItemRecord, ItemState, StateStore};
+use sync_core::store::{ItemRecord, ItemState, SidecarDigest, StateStore};
 
 /// `sha1("hello world")`, hex.
 const HELLO_WORLD_SHA1_HEX: &str = "2aae6c35c94fcfb415dbe95f408b9ce91ee846ed";
@@ -22,7 +22,7 @@ fn record(path: &str, state: ItemState) -> ItemRecord {
         asset_id: Some("asset-1".to_string()),
         state,
         error_class: None,
-        sidecar_sha1: None,
+        sidecar: None,
     }
 }
 
@@ -40,7 +40,11 @@ fn the_sidecar_digest_survives_a_reopen() {
     {
         let store = StateStore::open(&path).expect("open a fresh store");
         let mut row = record("IMG_0001.jpg", ItemState::Uploaded);
-        row.sidecar_sha1 = Some(sidecar_sha1);
+        row.sidecar = Some(SidecarDigest {
+            sha1: sidecar_sha1,
+            size: 6,
+            mtime_ns: 1_700_000_000_000_000_001,
+        });
         store.record(&row).expect("write the row with its sidecar");
     }
 
@@ -50,9 +54,17 @@ fn the_sidecar_digest_survives_a_reopen() {
         .expect("read the item")
         .expect("the row survives the reopen");
 
-    assert_eq!(read.sidecar_sha1, Some(sidecar_sha1));
     assert_eq!(
-        record("IMG_0001.jpg", ItemState::Uploaded).sidecar_sha1,
+        read.sidecar,
+        Some(SidecarDigest {
+            sha1: sidecar_sha1,
+            size: 6,
+            mtime_ns: 1_700_000_000_000_000_001,
+        }),
+        "R4.5: the sidecar's digest, size and mtime all survive the reopen"
+    );
+    assert_eq!(
+        record("IMG_0001.jpg", ItemState::Uploaded).sidecar,
         None,
         "an item without a sidecar records no sidecar digest"
     );

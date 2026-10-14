@@ -316,7 +316,7 @@ async fn a_failed_upload_leaves_the_sidecar_owed_and_a_later_pass_sends_it() {
         .expect("read the row")
         .expect("the failure was recorded");
     assert_eq!(
-        row.sidecar_sha1, None,
+        row.sidecar, None,
         "the request failed, so the asset carries no sidecar yet"
     );
 
@@ -332,7 +332,8 @@ async fn a_failed_upload_leaves_the_sidecar_owed_and_a_later_pass_sends_it() {
             .item(&path.display().to_string())
             .expect("read the row")
             .expect("the row exists")
-            .sidecar_sha1,
+            .sidecar
+            .map(|sidecar| sidecar.sha1),
         Some(Sha1::from_hex(SIDECAR_SHA1_HEX).expect("a hex SHA-1")),
         "R4.5: the digest is recorded once the asset carries the sidecar"
     );
@@ -354,8 +355,12 @@ async fn a_paused_upload_leaves_the_sidecar_owed() {
         mtime_ns: expected_mtime_ns(&path),
         sha1: Sha1::from_hex(HELLO_WORLD_SHA1_HEX).expect("a hex SHA-1"),
         sidecar: Some(sync_core::upload::SidecarFile {
+            digest: sync_core::store::SidecarDigest {
+                sha1: Sha1::from_hex(SIDECAR_SHA1_HEX).expect("a hex SHA-1"),
+                size: std::fs::metadata(&sidecar).expect("read the sidecar").len(),
+                mtime_ns: expected_mtime_ns(&sidecar),
+            },
             path: sidecar,
-            sha1: Sha1::from_hex(SIDECAR_SHA1_HEX).expect("a hex SHA-1"),
         }),
         live_photo_video: None,
     };
@@ -370,7 +375,7 @@ async fn a_paused_upload_leaves_the_sidecar_owed() {
         .expect("read the row")
         .expect("the deferred item was recorded");
     assert_eq!(
-        row.sidecar_sha1, None,
+        row.sidecar, None,
         "the request never went out, so the asset carries no sidecar yet"
     );
 }

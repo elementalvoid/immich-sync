@@ -187,7 +187,7 @@ async fn a_photo_and_its_sidecar_upload_as_one_asset() {
         .expect("read")
         .expect("the photo row");
     assert_eq!(
-        row.sidecar_sha1,
+        row.sidecar.map(|sidecar| sidecar.sha1),
         Some(sidecar_fixture_sha1()),
         "R4.5: the store remembers which sidecar the asset carries"
     );
@@ -245,7 +245,7 @@ async fn a_late_sidecar_cannot_be_attached_and_the_client_says_so() {
         .expect("read")
         .expect("the photo row");
     assert_eq!(
-        row.sidecar_sha1, None,
+        row.sidecar, None,
         "the request was never read, so the asset carries no sidecar"
     );
     assert_eq!(
