@@ -11,8 +11,8 @@ use gpui_kit::component::Theme;
 use gpui_kit::component::ThemeMode;
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, Bounds, Entity, Hsla, Point, TestAppContext, Window,
-    WindowAppearance, WindowBounds, WindowOptions, px, size,
+    AnyWindowHandle, App, AppContext as _, Bounds, ElementId, Entity, Hsla, Point, TestAppContext,
+    Window, WindowAppearance, WindowBounds, WindowOptions, px, size,
 };
 use immich_sync::dashboard::{CardPalette, Dashboard, state_border};
 use immich_sync::status::{ActivityState, DashboardModel, StatusCard, sample};
@@ -121,6 +121,8 @@ fn folder_progress_survives_counts_above_a_u16() {
         folders: vec![FolderStatus {
             path: "/photos".to_string(),
             recursive: true,
+            album_mapping: true,
+            album_scope: sync_core::store::AlbumScope::Leaf,
             available: true,
             counts,
             last_error: None,
@@ -406,18 +408,19 @@ fn open_live_dashboard(
 }
 
 /// Moves focus to the next tab stop, as the Root's Tab binding does.
-fn tab_to(window: &mut Window, id: &'static str, cx: &mut App) {
+fn tab_to(window: &mut Window, id: impl Into<ElementId> + Clone, cx: &mut App) {
+    let id = id.into();
     for _ in 0..16 {
-        if window.find(id).focused() == Some(true) {
+        if window.find(id.clone()).focused() == Some(true) {
             return;
         }
         window.focus_next(cx);
         window.render_frame(cx);
     }
     assert_eq!(
-        window.find(id).focused(),
+        window.find(id.clone()).focused(),
         Some(true),
-        "{id} is not keyboard reachable"
+        "{id:?} is not keyboard reachable"
     );
 }
 
@@ -432,6 +435,8 @@ fn engine_status_maps_to_the_global_card_and_one_card_per_folder() {
             FolderStatus {
                 path: "/home/you/Pictures".to_string(),
                 recursive: true,
+                album_mapping: true,
+                album_scope: sync_core::store::AlbumScope::Leaf,
                 available: true,
                 counts: FolderCounts {
                     uploaded: 7,
@@ -443,6 +448,8 @@ fn engine_status_maps_to_the_global_card_and_one_card_per_folder() {
             FolderStatus {
                 path: "/mnt/unplugged".to_string(),
                 recursive: false,
+                album_mapping: true,
+                album_scope: sync_core::store::AlbumScope::Leaf,
                 available: false,
                 counts: FolderCounts::default(),
                 last_error: None,
@@ -537,6 +544,8 @@ async fn folder_add_and_remove_controls_reach_the_store(cx: &mut TestAppContext)
         vec![sync_core::store::SourceFolder {
             path: photos.display().to_string(),
             recursive: true,
+            album_mapping: false,
+            album_scope: sync_core::store::AlbumScope::Leaf,
         }],
         "R2.1: the add control persisted the folder"
     );
@@ -566,4 +575,169 @@ async fn folder_add_and_remove_controls_reach_the_store(cx: &mut TestAppContext)
         cx.run_until_parked();
     }
     assert!(removed, "R2.1: the remove control deleted the folder");
+}
+
+/// Adds one source folder through the dashboard controls and waits until the
+/// store holds it, so a test can act on the card the user sees.
+async fn add_folder_through_ui(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    store: &Entity<immich_sync::store::StoreModel>,
+    path: &std::path::Path,
+) {
+    // The store opens off the UI thread (N2); an add before it is ready is
+    // refused, so the controls are only driven once it is.
+    for _ in 0..600 {
+        if cx.read(|cx| store.read(cx).store().is_some()) {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+        cx.run_until_parked();
+    }
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        tab_to(window, "dashboard-folder-path", cx);
+        window.input(path.to_str().expect("a UTF-8 path"), cx);
+        window.click("dashboard-add-folder", cx);
+    })
+    .expect("add the folder through the dashboard");
+    for _ in 0..600 {
+        if cx.read(|cx| store.read(cx).folders().len() == 1) {
+            return;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+        cx.run_until_parked();
+    }
+    panic!("the folder did not reach the store");
+}
+
+/// Polls the one folder the store holds until `check` accepts it.
+async fn wait_for_folder(
+    cx: &mut TestAppContext,
+    store: &Entity<immich_sync::store::StoreModel>,
+    check: impl Fn(&sync_core::store::SourceFolder) -> bool,
+) -> sync_core::store::SourceFolder {
+    for _ in 0..600 {
+        let folders = cx.read(|cx| store.read(cx).folders().to_vec());
+        if let Some(folder) = folders.first()
+            && check(folder)
+        {
+            return folder.clone();
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+        cx.run_until_parked();
+    }
+    panic!("the folder never reached the wanted state");
+}
+
+#[gpui_kit::test]
+async fn a_folder_card_names_the_album_mapping_and_its_scope(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the fixture folder");
+    let (window, store) = open_live_dashboard(cx, temp.path());
+    add_folder_through_ui(cx, window, &store, &photos).await;
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        // N5: every control carries an accessible name, and the album scope
+        // says which folder it belongs to.
+        assert_eq!(
+            window.find(("folder-album", 0_usize)).label(),
+            Some("Album mapping for photos")
+        );
+        assert_eq!(
+            window.find(("folder-album-leaf", 0_usize)).label(),
+            Some("Album scope for photos: one album per folder")
+        );
+        assert_eq!(
+            window.find(("folder-album-whole", 0_usize)).label(),
+            Some("Album scope for photos: one album for this folder")
+        );
+        // R3.4: the mapping is opt-in, so it starts off and the scope it would
+        // use is not yet in force.
+        assert_eq!(
+            window.find(("folder-album", 0_usize)).checked(),
+            Some(false),
+            "album mapping starts off"
+        );
+        assert_eq!(
+            window.find(("folder-album-leaf", 0_usize)).selected(),
+            Some(true),
+            "the leaf scope is the default"
+        );
+        // The scope stays choosable before the mapping is on: it is the
+        // folder's stored scope and applies once the mapping is on (R3.4).
+        assert_eq!(
+            window.find(("folder-album-whole", 0_usize)).checked(),
+            Some(false),
+            "the other scope is not chosen"
+        );
+    })
+    .expect("read the album controls");
+}
+
+#[gpui_kit::test]
+async fn the_album_controls_reach_the_store_by_pointer_and_by_keyboard(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the fixture folder");
+    let (window, store) = open_live_dashboard(cx, temp.path());
+    add_folder_through_ui(cx, window, &store, &photos).await;
+
+    // The switch is a tab stop that activates with Space (N5).
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        tab_to(window, ("folder-album", 0_usize), cx);
+        window.press("space", cx);
+    })
+    .expect("turn album mapping on with the keyboard");
+    let mapped = wait_for_folder(cx, &store, |folder| folder.album_mapping).await;
+    assert_eq!(
+        mapped.album_scope,
+        sync_core::store::AlbumScope::Leaf,
+        "R3.4: the scope is per folder and starts at one album per folder"
+    );
+
+    // With mapping on, the scope radios take focus and answer the keyboard.
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find(("folder-album", 0_usize)).checked(),
+            Some(true),
+            "the switch shows the mapping the store holds"
+        );
+        tab_to(window, ("folder-album-whole", 0_usize), cx);
+        window.press("enter", cx);
+    })
+    .expect("choose the whole-folder scope with the keyboard");
+    let whole = wait_for_folder(cx, &store, |folder| {
+        folder.album_scope == sync_core::store::AlbumScope::WholeFolder
+    })
+    .await;
+    assert!(whole.album_mapping, "the mapping is still on");
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find(("folder-album-whole", 0_usize)).checked(),
+            Some(true),
+            "the radio shows the scope the store holds"
+        );
+        window.click(("folder-album-leaf", 0_usize), cx);
+    })
+    .expect("choose the leaf scope with the pointer");
+    let leaf = wait_for_folder(cx, &store, |folder| {
+        folder.album_scope == sync_core::store::AlbumScope::Leaf
+    })
+    .await;
+    assert!(leaf.album_mapping);
 }

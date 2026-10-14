@@ -5,7 +5,7 @@
 //! never uses it.
 
 use sync_core::engine::{Activity, EngineStatus};
-use sync_core::store::FolderCounts;
+use sync_core::store::{AlbumScope, FolderCounts};
 
 /// The activity state of the client or one source folder (SPEC R8.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -51,6 +51,11 @@ pub struct StatusCard {
     pub counts: Counts,
     /// The deletion review items that await a decision.
     pub review_count: u32,
+    /// Whether this source folder's files join an album (R3.4); always `false`
+    /// on the global card, which is not a mapped folder.
+    pub album_mapping: bool,
+    /// The album scope for this folder (R3.4).
+    pub album_scope: AlbumScope,
     /// Whether the source folder is readable (R2.5); always `true` for the
     /// global card.
     pub available: bool,
@@ -73,6 +78,8 @@ pub struct CardContent {
     pub progress_percent: String,
     pub counts: String,
     pub review: Option<String>,
+    /// The album line: `None` while album mapping is off (R3.4).
+    pub album: Option<String>,
     /// Whether the folder is readable; the counts line says so when it is not.
     pub available: bool,
     /// The connection line, on the global card.
@@ -103,6 +110,9 @@ impl StatusCard {
             },
             review: (self.review_count > 0)
                 .then(|| format!("{} missing files to review", self.review_count)),
+            album: self
+                .album_mapping
+                .then(|| format!("Album mapping: {}", self.album_scope.label())),
             available: self.available,
             connection: self.connection.clone(),
             error: self.last_error.clone(),
@@ -169,6 +179,8 @@ impl DashboardModel {
             available: true,
             connection,
             last_error: status.last_error.clone(),
+            album_mapping: false,
+            album_scope: AlbumScope::Leaf,
         };
         let folders = status
             .folders
@@ -193,6 +205,8 @@ impl DashboardModel {
                 available: folder.available,
                 connection: None,
                 last_error: folder.last_error.clone(),
+                album_mapping: folder.album_mapping,
+                album_scope: folder.album_scope,
             })
             .collect();
         Self { global, folders }
@@ -224,6 +238,8 @@ pub fn sample() -> DashboardModel {
             available: true,
             connection: Some("Connected".to_string()),
             last_error: None,
+            album_mapping: false,
+            album_scope: AlbumScope::Leaf,
         },
         folders: vec![
             StatusCard {
@@ -240,6 +256,8 @@ pub fn sample() -> DashboardModel {
                 available: true,
                 connection: None,
                 last_error: None,
+                album_mapping: true,
+                album_scope: AlbumScope::WholeFolder,
             },
             StatusCard {
                 title: "DCIM".to_string(),
@@ -255,6 +273,8 @@ pub fn sample() -> DashboardModel {
                 available: true,
                 connection: None,
                 last_error: None,
+                album_mapping: true,
+                album_scope: AlbumScope::Leaf,
             },
             StatusCard {
                 title: "Videos".to_string(),
@@ -272,6 +292,8 @@ pub fn sample() -> DashboardModel {
                 last_error: Some(
                     "permission_denied: the API key cannot write to this album".to_string(),
                 ),
+                album_mapping: true,
+                album_scope: AlbumScope::WholeFolder,
             },
             StatusCard {
                 title: "Archive".to_string(),
@@ -287,6 +309,8 @@ pub fn sample() -> DashboardModel {
                 available: true,
                 connection: None,
                 last_error: None,
+                album_mapping: false,
+                album_scope: AlbumScope::Leaf,
             },
         ],
     }

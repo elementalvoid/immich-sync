@@ -15,7 +15,7 @@
 use std::path::Path;
 
 use sync_core::hash::Sha1;
-use sync_core::store::{ItemRecord, ItemState, SourceFolder, StateStore};
+use sync_core::store::{AlbumScope, ItemRecord, ItemState, SourceFolder, StateStore};
 
 fn row(folder: &Path, name: &str, state: ItemState, index: usize) -> ItemRecord {
     let error_class = match state {
@@ -52,11 +52,19 @@ fn seed_capture_state() {
     let videos = Path::new(&root).join("Videos");
     std::fs::create_dir_all(&pictures).expect("create the Pictures folder");
     std::fs::create_dir_all(&videos).expect("create the Videos folder");
-    for folder in [&pictures, &videos] {
+    for (folder, album_mapping) in [(&pictures, true), (&videos, false)] {
         store
             .add_folder(&SourceFolder {
                 path: folder.display().to_string(),
                 recursive: true,
+                // R3.4: the capture shows one mapped and one unmapped folder, so
+                // the album scope controls are visible in both states.
+                album_mapping,
+                album_scope: if album_mapping {
+                    AlbumScope::WholeFolder
+                } else {
+                    AlbumScope::Leaf
+                },
             })
             .expect("add the capture folder");
     }
