@@ -1031,21 +1031,62 @@ async fn copy_asset(
     if !inner.has_asset(source) || !inner.has_asset(target) {
         return message(StatusCode::NOT_FOUND, "Asset not found");
     }
-    // shortcut: the double records the flags and moves stack membership, which
-    // is what a later test needs of the copy. Model album, shared-link,
+    // shortcut: the double records the flags and models the server's
+    // `copyStack` (asset.service.ts, v3.3.1): no source stack is a no-op; a
+    // target that is already stacked absorbs the source stack and the source
+    // stack is then deleted — which, when both assets share one stack, means
+    // that stack is deleted and its assets end up unstacked; only an
+    // unstacked target joins the source stack. Model album, shared-link,
     // favorite, and sidecar state when a ticket asserts those states.
-    let stack = inner
-        .assets
-        .get(source)
-        .and_then(|asset| asset.stack_id.clone());
-    if let Some(stack_id) = stack {
-        if let Some(members) = inner.stacks.get_mut(&stack_id)
-            && !members.contains(&target.to_string())
-        {
-            members.push(target.to_string());
-        }
-        if let Some(target_asset) = inner.assets.get_mut(target) {
-            target_asset.stack_id = Some(stack_id);
+    if flag("stack") {
+        let source_stack = inner
+            .assets
+            .get(source)
+            .and_then(|asset| asset.stack_id.clone());
+        let target_stack = inner
+            .assets
+            .get(target)
+            .and_then(|asset| asset.stack_id.clone());
+        match (source_stack, target_stack) {
+            // `merge({sourceId, targetId})` moves the source stack's assets
+            // onto the target stack — a no-op when they are the same stack —
+            // and `delete(sourceId)` then drops the source stack row. The
+            // assets the deleted stack still points at are left unstacked.
+            (Some(source_id), Some(target_id)) => {
+                if source_id != target_id
+                    && let Some(members) = inner.stacks.remove(&source_id)
+                {
+                    for member_id in members {
+                        if let Some(asset) = inner.assets.get_mut(&member_id) {
+                            asset.stack_id = Some(target_id.clone());
+                        }
+                        if let Some(target_members) = inner.stacks.get_mut(&target_id)
+                            && !target_members.contains(&member_id)
+                        {
+                            target_members.push(member_id);
+                        }
+                    }
+                }
+                inner.stacks.remove(&source_id);
+                for asset in inner.assets.values_mut() {
+                    if asset.stack_id.as_deref() == Some(source_id.as_str()) {
+                        asset.stack_id = None;
+                    }
+                }
+            }
+            (Some(source_id), None) => {
+                if let Some(members) = inner.stacks.get_mut(&source_id)
+                    && !members.contains(&target.to_string())
+                {
+                    members.push(target.to_string());
+                }
+                if let Some(target_asset) = inner.assets.get_mut(target) {
+                    target_asset.stack_id = Some(source_id);
+                }
+            }
+            // The server returns before touching any stack when the source is
+            // in none.
+            (None, _) => {}
         }
     }
     StatusCode::NO_CONTENT.into_response()

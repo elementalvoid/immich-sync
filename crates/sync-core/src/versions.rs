@@ -15,7 +15,9 @@
 //! 3. If the old asset was in no stack, `POST /stacks` puts the two in one
 //!    stack with the new asset first, so the new version is the primary one
 //!    (R4.3). If it was already stacked, the copy above moved the membership
-//!    into the existing stack and the stack keeps its id (R4.3).
+//!    into the existing stack and the stack keeps its id (R4.3). A retry that
+//!    finds the new asset already in that stack must not move membership
+//!    again: the server would merge the stack into itself and delete it.
 //! 4. `PUT /tags/assets` applies the old asset's tags to the new one (R4.2).
 //! 5. The state database records the new version and the stack id (R4.4).
 //!
@@ -143,11 +145,30 @@ impl Versioner {
                 client.asset_info(credential.auth(), &id).await
             })
             .await?;
+        // A retry after a partial promote (the copy or the stack answered, the
+        // tags or the record did not) finds the new asset in the stack the
+        // first attempt made. Copying stack membership again would make the
+        // server merge that stack into itself and delete it (v3.3.1
+        // `asset.service.ts::copyStack`), so membership moves only when the
+        // target is not already in the old version's stack.
+        let copy_stack = match &info.stack_id {
+            Some(stack_id) => {
+                let target = self
+                    .request(asset_id.to_string(), |client, credential, id| async move {
+                        client.asset_info(credential.auth(), &id).await
+                    })
+                    .await?;
+                target.stack_id.as_ref() != Some(stack_id)
+            }
+            None => true,
+        };
         // R4.2: albums, shared links, favorite state, sidecar, stack.
         self.request(
-            (previous.asset_id.clone(), asset_id.to_string()),
-            |client, credential, (source, target)| async move {
-                client.copy_asset(credential.auth(), &source, &target).await
+            (previous.asset_id.clone(), asset_id.to_string(), copy_stack),
+            |client, credential, (source, target, stack)| async move {
+                client
+                    .copy_asset(credential.auth(), &source, &target, stack)
+                    .await
             },
         )
         .await?;

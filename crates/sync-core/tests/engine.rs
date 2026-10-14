@@ -2831,6 +2831,96 @@ async fn a_refused_tag_call_is_retried_and_the_tags_land() {
     engine.stop();
 }
 
+/// R4.3, R4.4, R6.1: a retry after a half-finished promote must not delete the
+/// stack the first attempt made.
+///
+/// Attempt one copies, creates the stack, and then loses the tag call, so
+/// nothing is recorded. The retry finds both assets already in that stack; a
+/// copy that moves stack membership again makes the server merge the stack
+/// into itself and delete it (asset.service.ts `copyStack`), and the item
+/// would record a stack id that names nothing. The retry must leave the stack
+/// alone, and the recorded id must be a live stack holding both versions.
+#[tokio::test]
+async fn a_retry_after_a_partial_promote_keeps_the_recorded_stack_live() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let file = write_file(&photos, "partial.jpg", b"first bytes");
+    add_folder(&store, &photos, true);
+    let engine = start_engine(&server, &store, retry_config(4)).await;
+
+    assert!(
+        wait_until(
+            || all_terminal(&store, std::slice::from_ref(&file)),
+            Duration::from_secs(20)
+        )
+        .await,
+        "the first upload did not finish"
+    );
+    let old = asset_of(&store, &file);
+    // Without a tag on the old asset the tag call is skipped, and the tag call
+    // is the one this test makes fail after the stack exists.
+    let tags = vec![tag_id(3)];
+    api(&server)
+        .bulk_tag_assets(
+            immich_client::Auth::ApiKey("test-key"),
+            &tags,
+            std::slice::from_ref(&old),
+        )
+        .await
+        .expect("the double tags the asset");
+    // One fault: the copy and the stack answer, the tag call does not, so the
+    // first attempt records nothing and the retry runs the whole flow again.
+    server.fail(
+        Operation::TagAssets,
+        Fault::Status {
+            code: 503,
+            retry_after: None,
+        },
+    );
+    std::fs::write(&file, b"second bytes").expect("edit the file in place");
+    engine.sync_now();
+
+    assert!(
+        wait_until(|| chain_len(&store, &file) == 2, Duration::from_secs(30)).await,
+        "R6.1: the refused tag call was not retried: {:?}",
+        chain(&store, &file)
+    );
+    let new = asset_of(&store, &file);
+    assert_ne!(new, old, "the edit is a new asset");
+
+    let recorded = store
+        .stack_id(&file.display().to_string())
+        .expect("read the stack id")
+        .expect("the versions are stacked");
+    let stack = server
+        .stack_of(&new)
+        .expect("the stack the first attempt made still exists after the retry");
+    assert_eq!(
+        stack.stack_id, recorded,
+        "R4.4: the stack id the item records names a live stack"
+    );
+    assert!(
+        stack.asset_ids.contains(&old) && stack.asset_ids.contains(&new),
+        "R4.3: both versions are in the stack: {:?}",
+        stack.asset_ids
+    );
+    let copies = server.copy_calls();
+    assert_eq!(copies.len(), 2, "R6.1: one copy per attempt");
+    assert!(
+        !copies[1].stack,
+        "R4.3: the retry must not ask the server to move stack membership the \
+         target already has"
+    );
+    assert_eq!(
+        server.tags_of(&new),
+        tags,
+        "R4.2: the retried tag call still lands"
+    );
+    engine.stop();
+}
+
 /// R4.4: the chain and the stack id survive a reopen of the state database, and
 /// the current flag still points at the newest version.
 #[tokio::test]

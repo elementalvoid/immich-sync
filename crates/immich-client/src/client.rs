@@ -459,10 +459,13 @@ impl ImmichClient {
 
     /// Copies the associations of one asset onto another (R4.2).
     ///
-    /// R4.2 names the associations a new version needs, so every flag is on:
-    /// albums, shared links, favorite state, the sidecar, and stack membership.
-    /// Faces, descriptions, and custom metadata are not copied by this
-    /// endpoint; they stay on the source (ADR 0004).
+    /// R4.2 names the associations a new version needs, so the album, shared
+    /// link, favorite, and sidecar flags are on. `stack` carries whether stack
+    /// membership moves too: the version flow turns it off when a retry finds
+    /// the new asset already in the old version's stack, because the server
+    /// would then merge that stack into itself and delete it. Faces,
+    /// descriptions, and custom metadata are not copied by this endpoint; they
+    /// stay on the source (ADR 0004).
     ///
     /// # Errors
     ///
@@ -473,6 +476,7 @@ impl ImmichClient {
         auth: Auth<'_>,
         source_id: &str,
         target_id: &str,
+        stack: bool,
     ) -> Result<(), ClientError> {
         let response = self
             .authorize(self.http.put(self.endpoint("assets/copy")), auth)
@@ -483,7 +487,7 @@ impl ImmichClient {
                 shared_links: true,
                 favorite: true,
                 sidecar: true,
-                stack: true,
+                stack,
             })
             .send()
             .await
