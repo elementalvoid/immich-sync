@@ -29,11 +29,7 @@ async fn signed_in(server: &MockImmich) -> SharedSession {
 
 /// Signs in with the credential the test names, so a test can drive the
 /// API-key path of R1.5.
-async fn signed_in_with(
-    server: &MockImmich,
-    method: AuthMethod,
-    secret: &str,
-) -> SharedSession {
+async fn signed_in_with(server: &MockImmich, method: AuthMethod, secret: &str) -> SharedSession {
     let mut connection = Connection::new(server.base_url(), Arc::new(MemoryCredentialStore::new()))
         .expect("a valid URL");
     connection
@@ -1058,7 +1054,11 @@ async fn a_server_that_stops_answering_produces_backoff_not_a_hot_loop() {
     // sleep satisfies every bound above, so without this the test cannot tell
     // a backoff from a pause.
     let ceilings: Vec<Duration> = (1..=5)
-        .map(|attempt| config.retry.ceiling(u32::try_from(attempt).expect("a small index")))
+        .map(|attempt| {
+            config
+                .retry
+                .ceiling(u32::try_from(attempt).expect("a small index"))
+        })
         .collect();
     assert!(
         *ceilings.last().expect("a ceiling") > ceilings[0],
@@ -1600,7 +1600,10 @@ async fn a_batch_during_a_dead_session_stays_pending_until_the_user_signs_in_aga
         0,
         "R1.4: nothing was uploaded, because nothing could authenticate"
     );
-    assert_eq!(engine.failed_items().expect("read the failed items").len(), 0);
+    assert_eq!(
+        engine.failed_items().expect("read the failed items").len(),
+        0
+    );
 
     // R1.4: signing in again uploads what the refused batch left pending.
     let state = session
@@ -1671,7 +1674,9 @@ async fn a_restart_requeues_a_retry_wait_row_with_its_attempt_count() {
     store
         .record(&ItemRecord {
             path: path_text.clone(),
-            size: std::fs::metadata(&file).expect("read the fixture metadata").len(),
+            size: std::fs::metadata(&file)
+                .expect("read the fixture metadata")
+                .len(),
             mtime_ns: mtime_ns_of(&file),
             sha1: sha1_file(&file).expect("hash the fixture"),
             asset_id: None,
