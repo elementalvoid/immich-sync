@@ -412,9 +412,10 @@ impl Engine {
         // One resize at a time, so a second change cannot race the permits.
         let _resize = self.inner.limits_lock.lock().await;
         let target = limits.concurrency.max(1);
-        let current = self.inner.concurrency.swap(target, Ordering::AcqRel);
+        let current = self.inner.concurrency.load(Ordering::Acquire);
         if target > current {
             self.inner.upload_slots.add_permits(target - current);
+            self.inner.concurrency.store(target, Ordering::Release);
         } else if target < current {
             // Take the whole pool first, so nothing new starts while it
             // drains; then forget the difference, so the pool stays smaller
@@ -422,11 +423,18 @@ impl Engine {
             let slots = Arc::clone(&self.inner.upload_slots);
             let remove = current - target;
             let permits = u32::try_from(current).unwrap_or(u32::MAX);
+            // Only a closed semaphore fails this, and a closed pool is an
+            // engine on its way down: then the published limit stays the one
+            // the pool really has.
             if let Ok(mut held) = slots.acquire_many_owned(permits).await {
-                match held.split(remove) {
-                    Some(removed) => removed.forget(),
-                    None => held.forget(),
+                // `remove` is below the permits just taken, so the split is
+                // never `None`.
+                if let Some(removed) = held.split(remove) {
+                    removed.forget();
                 }
+                // Published only once the permits are really gone, so the
+                // reported limit and the pool it stands for cannot disagree.
+                self.inner.concurrency.store(target, Ordering::Release);
             }
         }
         tracing::info!(

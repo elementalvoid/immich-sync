@@ -89,19 +89,27 @@ fn all_terminal(store: &StateStore, paths: &[PathBuf]) -> bool {
     })
 }
 
-/// Writes `bytes` deterministic bytes to `root/name`.
+/// Writes `bytes` deterministic bytes to `root/name`. The content differs per
+/// name, so the double treats two fixtures as two files instead of one file
+/// uploaded twice.
 fn write_file(root: &Path, name: &str, bytes: usize) -> PathBuf {
     std::fs::create_dir_all(root).expect("create the fixture directory");
     let path = root.join(name);
-    let content: Vec<u8> = (0..bytes).map(|index| (index % 251) as u8).collect();
+    let seed = name
+        .bytes()
+        .fold(0_usize, |sum, byte| sum + usize::from(byte));
+    let content: Vec<u8> = (0..bytes)
+        .map(|index| (index.wrapping_add(seed) % 251) as u8)
+        .collect();
     std::fs::write(&path, content).expect("write the fixture");
     path
 }
 
-/// `count` small distinct files, so each one uploads separately.
-fn small_files(root: &Path, count: usize) -> Vec<PathBuf> {
+/// `count` small distinct files named `<prefix>-<index>.bin`, so each one
+/// uploads separately and two waves never collide.
+fn small_files(root: &Path, prefix: &str, count: usize) -> Vec<PathBuf> {
     (0..count)
-        .map(|index| write_file(root, &format!("small-{index}.bin"), 64 * 1024))
+        .map(|index| write_file(root, &format!("{prefix}-{index}.bin"), 64 * 1024))
         .collect()
 }
 
@@ -232,7 +240,7 @@ async fn raising_concurrency_mid_sync_starts_new_workers() {
     let temp = tempfile::tempdir().expect("create a temp dir");
     let store = store_in(&temp);
     let photos = temp.path().join("photos");
-    let files = small_files(&photos, SMALL_FILES);
+    let files = small_files(&photos, "small", SMALL_FILES);
     add_folder(&store, &photos);
 
     let engine = start_engine(
@@ -284,7 +292,7 @@ async fn lowering_concurrency_does_not_abandon_an_in_flight_upload() {
     let temp = tempfile::tempdir().expect("create a temp dir");
     let store = store_in(&temp);
     let photos = temp.path().join("photos");
-    let files = small_files(&photos, SMALL_FILES);
+    let files = small_files(&photos, "small", SMALL_FILES);
     add_folder(&store, &photos);
 
     let engine = start_engine(
@@ -323,5 +331,74 @@ async fn lowering_concurrency_does_not_abandon_an_in_flight_upload() {
         engine.limits().concurrency,
         1,
         "the new limit is the live one"
+    );
+}
+
+#[tokio::test]
+async fn lowering_concurrency_shrinks_the_pool_for_the_next_wave() {
+    let server = MockImmich::start().await;
+    server.set_upload_delay(Duration::from_millis(200));
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let first_wave = small_files(&photos, "first", SMALL_FILES);
+    add_folder(&store, &photos);
+
+    let engine = start_engine(
+        &server,
+        &store,
+        EngineConfig {
+            concurrency: SMALL_FILES,
+            ..EngineConfig::default()
+        },
+    )
+    .await;
+    assert!(
+        wait_until(
+            || all_terminal(&store, &first_wave),
+            Duration::from_secs(20)
+        )
+        .await,
+        "the first wave never finished"
+    );
+    assert_eq!(
+        server.peak_upload_concurrency(),
+        SMALL_FILES as u64,
+        "the pool must start at the configured four"
+    );
+
+    engine
+        .set_limits(Limits {
+            bandwidth_bytes_per_second: 0,
+            concurrency: 1,
+        })
+        .await;
+
+    // Work that appears after the first wave. The reconciliation scan walks a
+    // folder it has already walked, so this does not lean on the watcher
+    // re-reporting a folder it is watching (R8.3).
+    let second_wave = small_files(&photos, "second", SMALL_FILES);
+    // The peak so far belongs to the first wave; what matters now is what the
+    // pool admits next.
+    server.reset_upload_peaks();
+    engine.sync_now();
+
+    assert!(
+        wait_until(
+            || all_terminal(&store, &second_wave),
+            Duration::from_secs(30)
+        )
+        .await,
+        "the second wave never finished"
+    );
+    assert_eq!(
+        server.peak_upload_concurrency(),
+        1,
+        "R7.2: the pool admitted more uploads at once than the new limit"
+    );
+    assert_eq!(
+        server.upload_requests(),
+        2 * SMALL_FILES as u64,
+        "the settled first wave must not be uploaded again"
     );
 }

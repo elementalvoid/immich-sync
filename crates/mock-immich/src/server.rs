@@ -345,6 +345,13 @@ impl MockImmich {
             .peak_uploads
     }
 
+    /// Forgets the peak recorded so far, so a test can watch the next wave of
+    /// uploads alone. The uploads in flight right now count as the new peak.
+    pub fn reset_upload_peaks(&self) {
+        let mut inner = self.state.inner.lock().expect("mock state poisoned");
+        inner.peak_uploads = inner.uploads_in_flight;
+    }
+
     /// Configure the one API key the server accepts. Without one the mock
     /// accepts any non-empty `x-api-key`, as it always has.
     pub fn set_api_key(&self, key: &str) {
