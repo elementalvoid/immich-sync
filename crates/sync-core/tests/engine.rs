@@ -1,5 +1,5 @@
 //! The folder sync engine against the offline Immich double (SPEC R2.1–R2.5,
-//! R3.1, R3.2, R4.5, R6.7, R8.7).
+//! R3.1, R3.2, R4.1–R4.5, R6.7, R8.7).
 //!
 //! Every test drives the real pipeline: a real directory, the real watcher and
 //! scan, the real state store, and the mock server's request counters.
@@ -2328,4 +2328,621 @@ async fn a_restart_requeues_a_retry_wait_row_with_its_attempt_count() {
         "R6.7: the count continued across the restart"
     );
     engine.stop();
+}
+
+/// The version chain of one item, oldest first (R4.4).
+fn chain(store: &StateStore, file: &Path) -> Vec<sync_core::store::Version> {
+    store
+        .versions(&file.display().to_string())
+        .expect("read the version chain")
+}
+
+/// The number of recorded versions of one item.
+fn chain_len(store: &StateStore, file: &Path) -> usize {
+    chain(store, file).len()
+}
+
+/// The asset id one item currently points at.
+fn asset_of(store: &StateStore, file: &Path) -> String {
+    store
+        .item(&file.display().to_string())
+        .expect("read the row")
+        .expect("the row exists")
+        .asset_id
+        .expect("a recorded asset id (R3.6)")
+}
+
+/// The state one item is in.
+fn state_of(store: &StateStore, file: &Path) -> ItemState {
+    store
+        .item(&file.display().to_string())
+        .expect("read the row")
+        .expect("the row exists")
+        .state
+}
+
+/// A client for the tests that set the server up themselves, the way the app
+/// does. The double accepts any non-empty API key.
+fn api(server: &MockImmich) -> sync_core::ImmichClient {
+    sync_core::ImmichClient::new(server.base_url()).expect("the mock URL is valid")
+}
+
+/// A tag id, in the UUID form Immich uses.
+fn tag_id(n: u64) -> String {
+    format!("00000000-0000-4000-8000-0000000000{n:02}")
+}
+
+/// The asset id of one asset uploaded straight through the API, for the tests
+/// that need a second asset on the server.
+async fn other_asset_id(server: &MockImmich) -> String {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let path = temp.path().join("other.jpg");
+    std::fs::write(&path, b"other bytes").expect("write the fixture");
+    let sha1 = sha1_file(&path).expect("hash the fixture");
+    api(server)
+        .upload_asset(
+            immich_client::Auth::ApiKey("test-key"),
+            &immich_client::AssetUpload {
+                path: &path,
+                checksum: &sha1.base64(),
+                created_at: std::time::UNIX_EPOCH,
+                modified_at: std::time::UNIX_EPOCH,
+            },
+        )
+        .await
+        .expect("the double accepts the upload")
+        .asset_id
+}
+
+/// Waits for `file`'s first upload, edits it in place, and waits for the edit to
+/// become a second version. Hands back the first asset id.
+///
+/// The file must already hold `first_bytes` when the engine starts, so the
+/// startup scan finds it (R2.3).
+async fn sync_twice(
+    store: &Arc<StateStore>,
+    engine: &Arc<Engine>,
+    file: &Path,
+    second_bytes: &[u8],
+) -> String {
+    assert!(
+        wait_until(
+            || all_terminal(store, std::slice::from_ref(&file.to_path_buf())),
+            Duration::from_secs(20)
+        )
+        .await,
+        "the first upload did not finish"
+    );
+    let first = asset_of(store, file);
+
+    std::fs::write(file, second_bytes).expect("edit the file in place");
+    engine.sync_now();
+    assert!(
+        wait_until(
+            || chain_len(store, file) == 2 && asset_of(store, file) != first,
+            Duration::from_secs(20)
+        )
+        .await,
+        "the edit did not become a second version: {:?}",
+        chain(store, file)
+    );
+    first
+}
+
+/// R4.1, R4.2, R4.3, R4.4: an edited file keeps its sync item, uploads as a new
+/// asset, copies its associations, and both versions end in one stack with the
+/// new asset primary. The old version stays recorded and retrievable.
+#[tokio::test]
+async fn an_edited_file_becomes_a_new_version_beside_the_old_one() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let file = write_file(&photos, "photo.jpg", b"first bytes");
+    add_folder(&store, &photos, true);
+    let engine = start_engine(&server, &store, retry_config(4)).await;
+
+    let old = sync_twice(&store, &engine, &file, b"second bytes").await;
+    let new = asset_of(&store, &file);
+
+    // R4.1: one item, one path, one identity. The chain holds both versions
+    // under the same `sync_item.id`.
+    let versions = chain(&store, &file);
+    assert_eq!(versions.len(), 2, "R4.4: both versions are recorded");
+    assert_eq!(
+        versions[0].item_id, versions[1].item_id,
+        "R4.1: the edited file keeps its sync item identity"
+    );
+    assert_eq!(
+        versions
+            .iter()
+            .map(|version| version.asset_id.clone())
+            .collect::<Vec<_>>(),
+        vec![old.clone(), new.clone()],
+        "R4.4: the chain keeps the old asset, so the old version stays retrievable"
+    );
+    assert_eq!(
+        versions[0].sha1,
+        sync_core::hash::sha1(b"first bytes"),
+        "each version keeps the checksum of its own content (SPEC §5)"
+    );
+    assert_eq!(
+        versions[1].sha1,
+        sha1_file(&file).expect("hash the edited file")
+    );
+    assert!(
+        !versions[0].is_current && versions[1].is_current,
+        "R4.4: the current flag points at the newest version, and only there"
+    );
+
+    // R4.2: the copy ran with the flags the spec names, old as source and new as
+    // target. The mock records the call, so this asserts the request itself and
+    // not only the outcome.
+    let copies = server.copy_calls();
+    assert_eq!(copies.len(), 1, "R4.2: one copy for one edited file");
+    let copy = &copies[0];
+    assert_eq!(copy.source_id, old, "R4.2: the old asset is the source");
+    assert_eq!(copy.target_id, new, "R4.2: the new asset is the target");
+    assert!(
+        copy.albums && copy.shared_links && copy.favorite && copy.sidecar,
+        "R4.2: albums, shared links, favorite, and the sidecar carry over"
+    );
+    assert!(copy.stack, "R4.3: stack membership carries over");
+
+    // R4.3: the old asset was in no stack, so one stack was made with the new
+    // asset first.
+    let stacks = server.stack_calls();
+    assert_eq!(stacks.len(), 1, "R4.3: one stack for one version chain");
+    assert_eq!(
+        stacks[0].asset_ids,
+        vec![new.clone(), old.clone()],
+        "R4.3: the new asset is first, so it is the primary"
+    );
+    assert_eq!(
+        store
+            .stack_id(&file.display().to_string())
+            .expect("read the stack id"),
+        Some(stacks[0].stack_id.clone()),
+        "R4.4: the state database records the stack id"
+    );
+    engine.stop();
+}
+
+/// R4.2: the old asset's tags are applied to the new asset, and the old version
+/// keeps its own.
+#[tokio::test]
+async fn the_old_version_tags_carry_over_to_the_new_one() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let file = write_file(&photos, "tagged.jpg", b"first bytes");
+    add_folder(&store, &photos, true);
+    let engine = start_engine(&server, &store, retry_config(4)).await;
+
+    sync_twice(&store, &engine, &file, b"second bytes").await;
+    let first = chain(&store, &file)[0].asset_id.clone();
+    // The user tags the version that is current now, then edits the file, so
+    // the tagged asset is the one this version replaces (R4.2).
+    let current = asset_of(&store, &file);
+    let tags = vec![tag_id(1), tag_id(2)];
+    api(&server)
+        .bulk_tag_assets(
+            immich_client::Auth::ApiKey("test-key"),
+            &tags,
+            std::slice::from_ref(&current),
+        )
+        .await
+        .expect("the double tags the asset");
+    assert_eq!(server.tags_of(&current), tags);
+
+    std::fs::write(&file, b"third bytes, edited again").expect("edit the file again");
+    engine.sync_now();
+    assert!(
+        wait_until(|| chain_len(&store, &file) == 3, Duration::from_secs(20)).await,
+        "R4.2: the third version did not upload: {:?}",
+        chain(&store, &file)
+    );
+    let newest = asset_of(&store, &file);
+
+    assert_ne!(newest, current);
+    assert_eq!(
+        server.tags_of(&newest),
+        tags,
+        "R4.2: the new version carries the tags of the version it replaces"
+    );
+    assert_eq!(
+        server.tags_of(&current),
+        tags,
+        "R4.4: the old version keeps its tags; tags are copied, not moved"
+    );
+    assert_eq!(
+        server.tags_of(&first),
+        Vec::<String>::new(),
+        "a version takes the tags of the version it replaces, not of one further back"
+    );
+    engine.stop();
+}
+
+/// R4.3: an old asset that is already in a stack keeps that stack, so the copy
+/// alone moves the membership and no second stack is made.
+#[tokio::test]
+async fn an_old_version_that_is_already_stacked_joins_no_new_stack() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let file = write_file(&photos, "stacked.jpg", b"first bytes");
+    add_folder(&store, &photos, true);
+    let engine = start_engine(&server, &store, retry_config(4)).await;
+
+    sync_twice(&store, &engine, &file, b"second bytes").await;
+    // The user stacks the version that is current now, so the version this edit
+    // replaces is already in a stack (R4.3).
+    let current = asset_of(&store, &file);
+    let other = other_asset_id(&server).await;
+    let existing = api(&server)
+        .create_stack(
+            immich_client::Auth::ApiKey("test-key"),
+            &[current.clone(), other],
+        )
+        .await
+        .expect("the user stacked the current version by hand");
+    // One stack from the version flow above, one from the test.
+    let stacks_before = server.stack_calls().len();
+
+    std::fs::write(&file, b"third bytes, edited again").expect("edit the file again");
+    engine.sync_now();
+    assert!(
+        wait_until(|| chain_len(&store, &file) == 3, Duration::from_secs(20)).await,
+        "R4.3: the third version did not finish: {:?}",
+        chain(&store, &file)
+    );
+    let newest = asset_of(&store, &file);
+
+    assert_eq!(
+        server.stack_calls().len(),
+        stacks_before,
+        "R4.3: the old version was already stacked, so the client asked for no new stack"
+    );
+    assert_eq!(
+        store
+            .stack_id(&file.display().to_string())
+            .expect("read the stack id"),
+        Some(existing.clone()),
+        "R4.3: the item keeps the stack its versions were already in"
+    );
+    let members = server
+        .stack_of(&newest)
+        .expect("the copy moved the new asset into the existing stack")
+        .asset_ids;
+    assert!(
+        members.contains(&current) && members.contains(&newest),
+        "R4.3: the copy moved the new asset into the existing stack: {members:?}"
+    );
+    assert_eq!(
+        server.stack_of(&newest).map(|stack| stack.stack_id),
+        Some(existing),
+        "R4.3: the stack is the one that already existed"
+    );
+    engine.stop();
+}
+
+/// R4.4 and R6.3: a refused copy parks the item permanently, keeps the uploaded
+/// asset, and records no version the server did not make.
+#[tokio::test]
+async fn a_refused_copy_keeps_the_upload_and_records_no_new_version() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let file = write_file(&photos, "refused.jpg", b"first bytes");
+    add_folder(&store, &photos, true);
+    let engine = start_engine(&server, &store, retry_config(4)).await;
+
+    sync_twice(&store, &engine, &file, b"second bytes").await;
+    let before = chain(&store, &file);
+    let old = asset_of(&store, &file);
+    // The credential lacks `asset.copy`, which no retry can fix (R6.3).
+    server.fail(Operation::Copy, Fault::PermissionDenied);
+    std::fs::write(&file, b"third bytes, edited again").expect("edit the file again");
+    engine.sync_now();
+
+    assert!(
+        wait_until(
+            || state_of(&store, &file) == ItemState::FailedPermanent,
+            Duration::from_secs(20)
+        )
+        .await,
+        "R6.3: the refused copy did not park the item: {:?}",
+        store.item(&file.display().to_string())
+    );
+    let row = store
+        .item(&file.display().to_string())
+        .expect("read")
+        .expect("the row exists");
+    let uploaded = row.asset_id.expect("the uploaded asset stays recorded");
+    assert_ne!(
+        uploaded, old,
+        "the new bytes are on the server, so the asset id must not go back"
+    );
+    assert_eq!(
+        row.error_class,
+        Some(FailureClass::PermissionDenied),
+        "R6.4: the failure class is the one the refused call has"
+    );
+    assert_eq!(
+        chain(&store, &file),
+        before,
+        "R4.4: no version was recorded, so the chain still points at the version \
+         that really is current: {:?}",
+        chain(&store, &file)
+    );
+    assert!(
+        !chain(&store, &file)
+            .iter()
+            .any(|version| version.asset_id == uploaded),
+        "R4.4: the store claims no version relationship the server does not have"
+    );
+    assert_eq!(
+        chain(&store, &file)
+            .iter()
+            .filter(|version| version.is_current)
+            .map(|version| version.asset_id.clone())
+            .collect::<Vec<_>>(),
+        vec![old],
+        "R4.4: the current version is the one the server has complete"
+    );
+    assert_eq!(
+        store
+            .failed_items()
+            .expect("read the failed items")
+            .iter()
+            .map(|item| item.path.clone())
+            .collect::<Vec<_>>(),
+        vec![file.display().to_string()],
+        "R6.5: the item is in the failed-items view for a manual retry"
+    );
+    engine.stop();
+}
+
+/// R4.4 and R6.1: a refused stack call is retried by the retry policy, and the
+/// retry finishes the chain without sending the bytes twice.
+///
+/// The first transition is the one that creates a stack: from then on every
+/// version joins the stack the copy moved it into (R4.3), so the stack call is
+/// the one faulted on the first edit.
+#[tokio::test]
+async fn a_refused_stack_call_is_retried_and_the_chain_completes() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let file = write_file(&photos, "stacked-late.jpg", b"first bytes");
+    add_folder(&store, &photos, true);
+    let engine = start_engine(&server, &store, retry_config(4)).await;
+
+    assert!(
+        wait_until(
+            || all_terminal(&store, std::slice::from_ref(&file)),
+            Duration::from_secs(20)
+        )
+        .await,
+        "the first upload did not finish"
+    );
+    let first = asset_of(&store, &file);
+    let uploads_before = server.upload_requests();
+    server.fail(
+        Operation::CreateStack,
+        Fault::Status {
+            code: 503,
+            retry_after: None,
+        },
+    );
+    std::fs::write(&file, b"second bytes").expect("edit the file");
+    engine.sync_now();
+
+    assert!(
+        wait_until(|| chain_len(&store, &file) == 2, Duration::from_secs(30)).await,
+        "R6.1: the refused stack call was not retried: {:?}",
+        chain(&store, &file)
+    );
+    let versions = chain(&store, &file);
+    assert!(
+        !versions[0].is_current && versions[1].is_current,
+        "R4.4: the chain advances once, to the newest version"
+    );
+    assert_eq!(versions[0].asset_id, first, "R4.4: the old version stays");
+    assert_eq!(
+        store
+            .stack_id(&file.display().to_string())
+            .expect("read the stack id"),
+        server
+            .stack_calls()
+            .last()
+            .map(|stack| stack.stack_id.clone()),
+        "R4.4: the retried stack is the one the item records"
+    );
+    assert_eq!(
+        server.upload_requests(),
+        uploads_before + 2,
+        "R6.1: the retry sent one more request, which the server answered as a \
+         duplicate from the checksum header, so the bytes did not go twice"
+    );
+    assert!(
+        state_of(&store, &file).is_terminal_success(),
+        "R6.1: the retry finished the item: {:?}",
+        state_of(&store, &file)
+    );
+    engine.stop();
+}
+
+/// R4.4 and R6.1: a refused tag call is retried, and the tags of the version
+/// being replaced land on the new one.
+#[tokio::test]
+async fn a_refused_tag_call_is_retried_and_the_tags_land() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let file = write_file(&photos, "tagged-late.jpg", b"first bytes");
+    add_folder(&store, &photos, true);
+    let engine = start_engine(&server, &store, retry_config(4)).await;
+
+    sync_twice(&store, &engine, &file, b"second bytes").await;
+    let current = asset_of(&store, &file);
+    let tags = vec![tag_id(7)];
+    api(&server)
+        .bulk_tag_assets(
+            immich_client::Auth::ApiKey("test-key"),
+            &tags,
+            std::slice::from_ref(&current),
+        )
+        .await
+        .expect("the double tags the asset");
+    server.fail(
+        Operation::TagAssets,
+        Fault::Status {
+            code: 503,
+            retry_after: None,
+        },
+    );
+    std::fs::write(&file, b"third bytes, edited again").expect("edit the file again");
+    engine.sync_now();
+
+    assert!(
+        wait_until(
+            || chain_len(&store, &file) == 3 && server.tags_of(&asset_of(&store, &file)) == tags,
+            Duration::from_secs(30)
+        )
+        .await,
+        "R6.1: the refused tag call was not retried: {:?}",
+        chain(&store, &file)
+    );
+    assert_eq!(
+        chain(&store, &file)
+            .iter()
+            .filter(|version| version.is_current)
+            .map(|version| version.asset_id.clone())
+            .collect::<Vec<_>>(),
+        vec![asset_of(&store, &file)],
+        "R4.4: one current version, the newest"
+    );
+    engine.stop();
+}
+
+/// R4.4: the chain and the stack id survive a reopen of the state database, and
+/// the current flag still points at the newest version.
+#[tokio::test]
+async fn the_version_chain_survives_a_store_reopen() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let file = write_file(&photos, "kept.jpg", b"first bytes");
+    add_folder(&store, &photos, true);
+    let engine = start_engine(&server, &store, retry_config(4)).await;
+
+    sync_twice(&store, &engine, &file, b"second bytes").await;
+    let before = chain(&store, &file);
+    let stack = store
+        .stack_id(&file.display().to_string())
+        .expect("read the stack id")
+        .expect("the versions are stacked");
+    engine.stop();
+    drop(engine);
+    drop(store);
+
+    let reopened = store_in(&temp);
+    assert_eq!(
+        chain(&reopened, &file),
+        before,
+        "R4.4: the chain survives a store reopen"
+    );
+    assert_eq!(
+        chain(&reopened, &file)
+            .iter()
+            .filter(|version| version.is_current)
+            .map(|version| version.asset_id.clone())
+            .collect::<Vec<_>>(),
+        vec![asset_of(&reopened, &file)],
+        "R4.4: the current flag points at the newest version after a reopen"
+    );
+    assert_eq!(
+        reopened
+            .stack_id(&file.display().to_string())
+            .expect("read the stack id"),
+        Some(stack),
+        "R4.4: the stack id survives a store reopen"
+    );
+}
+
+/// R4.2: bytes the server already holds are still a new version. The checksum
+/// check resolves them to the asset another upload made, and the version flow
+/// still runs on it.
+#[tokio::test]
+async fn an_edit_to_bytes_the_server_already_holds_becomes_a_version() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let file = write_file(&photos, "elsewhere.jpg", b"first bytes");
+    add_folder(&store, &photos, true);
+    let engine = start_engine(&server, &store, retry_config(4)).await;
+    sync_twice(&store, &engine, &file, b"second bytes").await;
+    let old = asset_of(&store, &file);
+
+    // The edited bytes reach the server by another route, so the check finds
+    // them and answers `duplicate` instead of `accept` (R3.2).
+    let elsewhere = upload_bytes(&server, b"third bytes, edited again").await;
+    let uploads_before = server.upload_requests();
+    std::fs::write(&file, b"third bytes, edited again").expect("edit the file again");
+    engine.sync_now();
+
+    assert!(
+        wait_until(|| chain_len(&store, &file) == 3, Duration::from_secs(20)).await,
+        "R4.2: the duplicate answer did not become a version: {:?}",
+        chain(&store, &file)
+    );
+    let versions = chain(&store, &file);
+    assert_eq!(
+        versions[2].asset_id, elsewhere,
+        "R4.2: the existing asset is the version"
+    );
+    assert!(versions[2].is_current, "R4.4: it is the current version");
+    assert_eq!(
+        server.upload_requests(),
+        uploads_before,
+        "R3.2: the bytes were not uploaded a second time"
+    );
+    let copies = server.copy_calls();
+    let last = copies.last().expect("the copy call is recorded");
+    assert_eq!(
+        (last.source_id.as_str(), last.target_id.as_str()),
+        (old.as_str(), elsewhere.as_str()),
+        "R4.2: the associations carry onto the asset the server already had"
+    );
+    engine.stop();
+}
+
+/// The asset id the server assigns to `bytes` uploaded straight through the
+/// API, for a file whose bytes reach the server by another route.
+async fn upload_bytes(server: &MockImmich, bytes: &[u8]) -> String {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let path = temp.path().join("uploaded.jpg");
+    std::fs::write(&path, bytes).expect("write the fixture");
+    let sha1 = sha1_file(&path).expect("hash the fixture");
+    api(server)
+        .upload_asset(
+            immich_client::Auth::ApiKey("test-key"),
+            &immich_client::AssetUpload {
+                path: &path,
+                checksum: &sha1.base64(),
+                created_at: std::time::UNIX_EPOCH,
+                modified_at: std::time::UNIX_EPOCH,
+            },
+        )
+        .await
+        .expect("the double accepts the upload")
+        .asset_id
 }

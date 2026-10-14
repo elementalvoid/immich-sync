@@ -18,6 +18,7 @@ pub mod scan;
 pub mod skip;
 pub mod store;
 pub mod upload;
+pub mod versions;
 pub mod watch;
 
 // Re-exported so the shell can hand the engine the client it holds without
