@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use immich_client::{AssetUpload, Auth, BandwidthLimit, ClientError, ImmichClient, SessionToken};
 use mock_immich::{Fault, MockImmich, Operation};
+use tokio::io::AsyncReadExt;
 
 /// The acceptance criterion's rate (R7.1): one megabyte per second.
 const ONE_MEGABYTE_PER_SECOND: u64 = 1_000_000;
@@ -18,6 +19,11 @@ const FILE_BYTES: usize = 1_572_864;
 /// A checksum for the request header. The double stores the checksum it
 /// computes from the body, so this one only has to be well-formed.
 const CHECKSUM: &str = "0123456789abcdef0123456789abcdef01234567";
+
+/// The body the backpressure test sends: more than the two socket buffers can
+/// ever hold (Linux caps them at a few megabytes), so the client cannot get
+/// it all out while nobody reads.
+const BACKPRESSURE_BYTES: usize = 16 * 1024 * 1024;
 
 /// A file of `bytes` deterministic bytes, with its path.
 fn fixture(bytes: usize) -> (tempfile::TempDir, PathBuf) {
@@ -108,7 +114,7 @@ async fn a_rate_too_low_to_pay_out_one_read_still_completes_an_upload() {
 }
 
 #[tokio::test]
-async fn a_server_that_stops_reading_fails_the_upload_within_the_stall_budget() {
+async fn a_server_that_stops_answering_fails_the_upload_within_the_stall_budget() {
     let server = MockImmich::start().await;
     // The double takes the whole body and then holds the answer: a server that
     // accepted the upload and stopped talking is exactly this. Nothing is in
@@ -156,6 +162,93 @@ async fn an_unlimited_upload_still_gives_up_at_the_client_wide_window() {
     assert!(
         elapsed >= Duration::from_secs(29) && elapsed <= Duration::from_secs(45),
         "an unlimited upload to a stalled server failed after {elapsed:?}"
+    );
+}
+
+/// A server that reads the head of the request and then stops reading, keeping
+/// the connection open, and can say how many bytes ever arrived.
+///
+/// The double cannot say this. `MockImmich::set_upload_delay` holds a handler
+/// that will read the whole body afterwards, so whether the client's send
+/// blocks comes down to the socket buffers rather than to the client, and
+/// nothing in there counts what arrived. Nothing can accept the connection
+/// before the request comes either, so this hands its answers back over
+/// channels.
+struct StoppedReading {
+    url: String,
+    read_the_rest: tokio::sync::oneshot::Sender<()>,
+    arrived: tokio::sync::oneshot::Receiver<usize>,
+}
+
+impl StoppedReading {
+    /// Reads what the kernel still holds and returns every byte that arrived.
+    async fn arrived(self) -> usize {
+        let _ = self.read_the_rest.send(());
+        self.arrived.await.expect("the server counted its bytes")
+    }
+}
+
+async fn server_that_stops_reading() -> StoppedReading {
+    let (read_the_rest, stop_reading) = tokio::sync::oneshot::channel();
+    let (count, counted) = tokio::sync::oneshot::channel();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the server");
+    let address = listener.local_addr().expect("a loopback address");
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("the client connects");
+        let mut buf = [0_u8; 4096];
+        // One read, so the client's first bytes have somewhere to go, then
+        // nothing: the window fills and the send blocks with the body still to
+        // come. The socket stays open, so the client waits on a full window
+        // instead of meeting a closed connection.
+        let mut arrived = socket.read(&mut buf).await.unwrap_or(0);
+        if stop_reading.await.is_ok() {
+            while let Ok(read) = socket.read(&mut buf).await {
+                if read == 0 {
+                    break;
+                }
+                arrived += read;
+            }
+        }
+        let _ = count.send(arrived);
+    });
+    StoppedReading {
+        url: format!("http://{address}"),
+        read_the_rest,
+        arrived: counted,
+    }
+}
+
+#[tokio::test]
+async fn a_server_that_stops_reading_mid_body_fails_the_upload_within_the_stall_budget() {
+    let server = server_that_stops_reading().await;
+    let client = ImmichClient::new(&server.url).expect("a loopback URL is valid");
+    let (_directory, path) = fixture(BACKPRESSURE_BYTES);
+    // Unlimited, so the only thing that can stop the body is the socket.
+    let limit = BandwidthLimit::new(0);
+
+    let started = Instant::now();
+    let error = client
+        .upload_asset(Auth::ApiKey("api-key-1234"), &upload_request(&path, &limit))
+        .await
+        .expect_err("a server that stops reading cannot finish the upload");
+    let elapsed = started.elapsed();
+
+    assert!(matches!(error, ClientError::Stalled), "{error:?}");
+    // The guard can only notice at the end of a window, so it needs at least
+    // one and at most two of them: it saw bytes still moving in the first.
+    assert!(
+        elapsed >= Duration::from_secs(29) && elapsed <= Duration::from_secs(65),
+        "an upload blocked mid-body gave up after {elapsed:?}"
+    );
+    // The client could not get the whole body out, so it was blocked with
+    // bytes still to send when the guard gave up - a server that stopped
+    // reading, not one that stopped answering.
+    let arrived = server.arrived().await;
+    assert!(
+        arrived < BACKPRESSURE_BYTES,
+        "{arrived} of {BACKPRESSURE_BYTES} bytes arrived: the server read the body"
     );
 }
 
