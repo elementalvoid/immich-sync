@@ -2398,6 +2398,9 @@ async fn other_asset_id(server: &MockImmich) -> String {
                 checksum: &sha1.base64(),
                 created_at: std::time::UNIX_EPOCH,
                 modified_at: std::time::UNIX_EPOCH,
+                sidecar: None,
+                live_photo_video_id: None,
+                bandwidth: BandwidthLimit::default(),
             },
         )
         .await
@@ -3228,6 +3231,9 @@ async fn upload_bytes(server: &MockImmich, bytes: &[u8]) -> String {
                 checksum: &sha1.base64(),
                 created_at: std::time::UNIX_EPOCH,
                 modified_at: std::time::UNIX_EPOCH,
+                sidecar: None,
+                live_photo_video_id: None,
+                bandwidth: BandwidthLimit::default(),
             },
         )
         .await
