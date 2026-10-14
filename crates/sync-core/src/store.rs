@@ -954,6 +954,44 @@ mod migration_tests {
         );
     }
 
+    #[test]
+    fn the_album_columns_survive_a_v3_database() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let path = temp.path().join("state.db");
+        {
+            let mut connection = Connection::open(&path).expect("open the raw database");
+            // A v3 database: source folders exist, the album columns do not.
+            Migrations::new(vec![
+                M::up(SCHEMA_V1),
+                M::up_with_hook(SCHEMA_V2, backfill_path_keys),
+                M::up(SCHEMA_V3),
+            ])
+            .to_latest(&mut connection)
+            .expect("create the third schema");
+            connection
+                .execute(
+                    "INSERT INTO source_folder (path, path_key, recursive)
+                     VALUES (?1, ?2, 1)",
+                    params!["/photos", "/photos"],
+                )
+                .expect("insert the source folder");
+            drop(connection);
+        }
+
+        let store = StateStore::open(&path).expect("a v3 database must migrate");
+        assert_eq!(
+            store.folders().expect("read the folders"),
+            vec![SourceFolder {
+                path: "/photos".to_string(),
+                recursive: true,
+                album_mapping: false,
+                album_scope: AlbumScope::Leaf,
+            }],
+            "R3.4: a folder mapped before album mapping existed reads back off, at the default \
+             scope, through the whole composed migration chain"
+        );
+    }
+
     /// The V2 hook under the Windows case rule, so the case-only collision is
     /// reproducible on any platform (R2.4).
     fn backfill_path_keys_insensitive(
