@@ -16,7 +16,8 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use rusqlite::{
-    Connection, OpenFlags, OptionalExtension as _, Transaction, TransactionBehavior, params,
+    Connection, ErrorCode, OpenFlags, OptionalExtension as _, Transaction, TransactionBehavior,
+    params,
 };
 use rusqlite_migration::{M, Migrations};
 
@@ -570,6 +571,22 @@ pub struct StateStore {
     writer: Mutex<Connection>,
 }
 
+/// Classifies a failed startup `quick_check` query: only a corruption verdict
+/// justifies the rebuild removing the file. A busy or locked database means
+/// the check could not run, so it is an open failure the rebuild reports
+/// instead of removing a healthy file (N4, R10.4).
+fn startup_check_error(path: PathBuf, source: rusqlite::Error) -> StoreError {
+    match source.sqlite_error_code() {
+        Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked) => {
+            StoreError::Open { path, source }
+        }
+        _ => StoreError::QuickCheck {
+            path,
+            reason: source.to_string(),
+        },
+    }
+}
+
 impl StateStore {
     /// Opens the database, runs the startup check, applies the pragmas, and
     /// migrates the schema to the latest version (N4).
@@ -608,10 +625,7 @@ impl StateStore {
         // a database, so it runs before the rest of the pragmas.
         let check: String = writer
             .query_row("PRAGMA quick_check", [], |row| row.get(0))
-            .map_err(|source| StoreError::QuickCheck {
-                path: path.clone(),
-                reason: source.to_string(),
-            })?;
+            .map_err(|source| startup_check_error(path.clone(), source))?;
         if check != "ok" {
             return Err(StoreError::QuickCheck {
                 path,
@@ -1999,6 +2013,50 @@ mod migration_tests {
         let row = store.item("hello.txt").expect("read").expect("the row");
         assert_eq!(row.asset_id.as_deref(), Some("asset-1"));
         assert!(store.folders().expect("read folders").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod startup_check_tests {
+    use super::*;
+
+    /// N4, R10.4: a check that could not run because the database is busy or
+    /// locked is not a corruption verdict; the rebuild must report it instead
+    /// of removing the file.
+    #[test]
+    fn a_busy_or_locked_startup_check_is_not_corruption() {
+        let path = PathBuf::from("state.db");
+        for code in [
+            rusqlite::ErrorCode::DatabaseBusy,
+            rusqlite::ErrorCode::DatabaseLocked,
+        ] {
+            let source = rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code,
+                    extended_code: 0,
+                },
+                None,
+            );
+            let error = startup_check_error(path.clone(), source);
+            assert!(
+                matches!(error, StoreError::Open { .. }),
+                "{code:?} means the check could not run, so the rebuild must not delete the file: \
+                 {error}"
+            );
+        }
+        // Everything else keeps the corruption verdict the rebuild acts on.
+        let source = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::DatabaseCorrupt,
+                extended_code: 0,
+            },
+            None,
+        );
+        let error = startup_check_error(path, source);
+        assert!(
+            matches!(error, StoreError::QuickCheck { .. }),
+            "a corrupt database keeps the verdict: {error}"
+        );
     }
 }
 
