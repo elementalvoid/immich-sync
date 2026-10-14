@@ -11,9 +11,10 @@ use tokio_util::io::ReaderStream;
 
 use crate::error::ClientError;
 use crate::model::{
-    Album, AlbumAssetsRequest, AlbumBody, AssetUpload, Auth, AuthStatus, BulkAction, BulkCheckBody,
-    BulkCheckItem, BulkCheckResult, CreateAlbumRequest, LoginResponse, RejectReason, ServerAbout,
-    SessionToken, UploadBody, UploadResponse,
+    Album, AlbumAssetsRequest, AlbumBody, AssetCopyRequest, AssetInfo, AssetInfoBody, AssetUpload,
+    Auth, AuthStatus, BulkAction, BulkCheckBody, BulkCheckItem, BulkCheckResult, BulkTagRequest,
+    CreateAlbumRequest, CreateStackRequest, LoginResponse, RejectReason, ServerAbout, SessionToken,
+    StackBody, UploadBody, UploadResponse,
 };
 
 /// The longest error message body kept from the server. A reverse proxy can
@@ -428,6 +429,122 @@ impl ImmichClient {
         result
     }
 
+    /// Reads the tags and the stack of one asset (R4.2, R4.3).
+    ///
+    /// One request answers both questions a new version asks about the old one,
+    /// so the version flow never walks the asset twice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::InvalidToken`] for a refused credential,
+    /// [`ClientError::Protocol`] with its 404 for an asset the server does not
+    /// hold, the typed refusal classes (R6.3), and the transport variants.
+    pub async fn asset_info(
+        &self,
+        auth: Auth<'_>,
+        asset_id: &str,
+    ) -> Result<AssetInfo, ClientError> {
+        let response = self
+            .authorize(
+                self.http.get(self.endpoint(&format!("assets/{asset_id}"))),
+                auth,
+            )
+            .send()
+            .await
+            .map_err(ClientError::Unreachable)?;
+        let result = self.read_asset_info(response).await;
+        log_outcome("asset-info", &result);
+        result
+    }
+
+    /// Copies the associations of one asset onto another (R4.2).
+    ///
+    /// R4.2 names the associations a new version needs, so every flag is on:
+    /// albums, shared links, favorite state, the sidecar, and stack membership.
+    /// Faces, descriptions, and custom metadata are not copied by this
+    /// endpoint; they stay on the source (ADR 0004).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::InvalidToken`] for a refused credential, the typed
+    /// refusal classes (R6.3), and the transport and protocol variants.
+    pub async fn copy_asset(
+        &self,
+        auth: Auth<'_>,
+        source_id: &str,
+        target_id: &str,
+    ) -> Result<(), ClientError> {
+        let response = self
+            .authorize(self.http.put(self.endpoint("assets/copy")), auth)
+            .json(&AssetCopyRequest {
+                source_id,
+                target_id,
+                albums: true,
+                shared_links: true,
+                favorite: true,
+                sidecar: true,
+                stack: true,
+            })
+            .send()
+            .await
+            .map_err(ClientError::Unreachable)?;
+        let result = self.read_accepted(response).await;
+        log_outcome("copy-asset", &result);
+        result
+    }
+
+    /// Creates one stack from `asset_ids` and returns the stack id (R4.3).
+    ///
+    /// The first asset is the primary one, which is what puts the new version
+    /// at the top of the timeline entry. An asset that is already primary of a
+    /// stack merges that stack into the new one, which is what the server does
+    /// when a version flow is retried.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::InvalidToken`] for a refused credential, the typed
+    /// refusal classes (R6.3), and the transport and protocol variants.
+    pub async fn create_stack(
+        &self,
+        auth: Auth<'_>,
+        asset_ids: &[String],
+    ) -> Result<String, ClientError> {
+        let response = self
+            .authorize(self.http.post(self.endpoint("stacks")), auth)
+            .json(&CreateStackRequest { asset_ids })
+            .send()
+            .await
+            .map_err(ClientError::Unreachable)?;
+        let result = self.read_stack(response).await;
+        log_outcome("create-stack", &result);
+        result
+    }
+
+    /// Adds `tag_ids` to `asset_ids` (R4.2).
+    ///
+    /// One call carries the whole tag set of the old version onto the new one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::InvalidToken`] for a refused credential, the typed
+    /// refusal classes (R6.3), and the transport and protocol variants.
+    pub async fn bulk_tag_assets(
+        &self,
+        auth: Auth<'_>,
+        tag_ids: &[String],
+        asset_ids: &[String],
+    ) -> Result<(), ClientError> {
+        let response = self
+            .authorize(self.http.put(self.endpoint("tags/assets")), auth)
+            .json(&BulkTagRequest { tag_ids, asset_ids })
+            .send()
+            .await
+            .map_err(ClientError::Unreachable)?;
+        let result = self.read_accepted(response).await;
+        log_outcome("bulk-tag-assets", &result);
+        result
+    }
+
     /// Attaches the credential to one request.
     fn authorize(&self, request: RequestBuilder, auth: Auth<'_>) -> RequestBuilder {
         match auth {
@@ -506,6 +623,39 @@ impl ImmichClient {
             id: body.id,
             name: body.album_name,
         })
+    }
+
+    /// Maps an asset response to what the version flow reads.
+    async fn read_asset_info(&self, response: Response) -> Result<AssetInfo, ClientError> {
+        let status = response.status();
+        if !status.is_success() {
+            return Err(failure(response).await);
+        }
+        let body = response
+            .json::<AssetInfoBody>()
+            .await
+            .map_err(|error| body_failure(status, error))?;
+        Ok(body.into_info())
+    }
+
+    /// Maps a stack response to its id.
+    async fn read_stack(&self, response: Response) -> Result<String, ClientError> {
+        let status = response.status();
+        if !status.is_success() {
+            return Err(failure(response).await);
+        }
+        let body = response
+            .json::<StackBody>()
+            .await
+            .map_err(|error| body_failure(status, error))?;
+        if body.id.is_empty() {
+            return Err(ClientError::Protocol {
+                status: status.as_u16(),
+                message: "the server returned a stack without an id".to_string(),
+                retry_after: None,
+            });
+        }
+        Ok(body.id)
     }
 
     /// Accepts a 2xx answer whose body the client has no use for.

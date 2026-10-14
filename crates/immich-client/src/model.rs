@@ -134,6 +134,19 @@ pub struct UploadResponse {
     pub duplicate: bool,
 }
 
+/// What `GET /assets/{id}` says the version flow needs (R4.2, R4.3).
+///
+/// Immich's asset response carries a great deal this client does not need, so
+/// the response is parsed down to the two questions a new version asks about
+/// the old one: which tags does it carry, and is it already in a stack.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AssetInfo {
+    /// The ids of the tags on the asset, which a new version gets (R4.2).
+    pub tag_ids: Vec<String>,
+    /// The stack the asset is in, when it is in one (R4.3).
+    pub stack_id: Option<String>,
+}
+
 /// One Immich album (GLOSSARY).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Album {
@@ -147,6 +160,76 @@ pub struct Album {
 #[derive(Deserialize)]
 pub(crate) struct UploadBody {
     pub(crate) id: String,
+}
+
+/// The part of the `GET /assets/{id}` response the version flow reads.
+#[derive(Deserialize)]
+pub(crate) struct AssetInfoBody {
+    /// The stack the asset is in, or nothing when it is in none (R4.3).
+    #[serde(default)]
+    pub(crate) stack: Option<StackBody>,
+    /// The tags on the asset (R4.2).
+    #[serde(default)]
+    pub(crate) tags: Vec<TagBody>,
+}
+
+impl AssetInfoBody {
+    /// Maps the response onto what the version flow needs.
+    pub(crate) fn into_info(self) -> AssetInfo {
+        AssetInfo {
+            tag_ids: self.tags.into_iter().map(|tag| tag.id).collect(),
+            stack_id: self.stack.map(|stack| stack.id),
+        }
+    }
+}
+
+/// One tag on an asset, as the asset response carries it (R4.2).
+#[derive(Deserialize)]
+pub(crate) struct TagBody {
+    pub(crate) id: String,
+}
+
+/// One stack, as the asset and stack responses carry it (R4.3, R4.4).
+///
+/// Both answers carry it: the `stack` of an asset, and the stack
+/// `POST /stacks` creates. The rest of `POST /stacks`'s answer (`primaryAssetId`
+/// and the assets) is what the server already applied.
+#[derive(Deserialize)]
+pub(crate) struct StackBody {
+    pub(crate) id: String,
+}
+
+/// The `PUT /assets/copy` request body (R4.2).
+///
+/// Every association R4.2 names is requested: albums, shared links, favorite
+/// state, the sidecar, and stack membership. Faces, descriptions, and custom
+/// metadata are not copied by this endpoint and stay on the source (ADR 0004).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AssetCopyRequest<'a> {
+    pub(crate) source_id: &'a str,
+    pub(crate) target_id: &'a str,
+    pub(crate) albums: bool,
+    pub(crate) shared_links: bool,
+    pub(crate) favorite: bool,
+    pub(crate) sidecar: bool,
+    pub(crate) stack: bool,
+}
+
+/// The `PUT /tags/assets` request body (R4.2).
+#[derive(Serialize)]
+pub(crate) struct BulkTagRequest<'a> {
+    #[serde(rename = "tagIds")]
+    pub(crate) tag_ids: &'a [String],
+    #[serde(rename = "assetIds")]
+    pub(crate) asset_ids: &'a [String],
+}
+
+/// The `POST /stacks` request body (R4.3).
+#[derive(Serialize)]
+pub(crate) struct CreateStackRequest<'a> {
+    #[serde(rename = "assetIds")]
+    pub(crate) asset_ids: &'a [String],
 }
 
 /// The `POST /albums` request body.
