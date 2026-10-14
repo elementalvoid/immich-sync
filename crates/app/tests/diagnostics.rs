@@ -35,7 +35,7 @@ use immich_sync::{status, theme};
 use mock_immich::MockImmich;
 use sync_core::connection::{AuthMethod, Secret, ServerProfile, SignIn};
 use sync_core::credential::{MemoryCredentialStore, SharedCredentialStore};
-use sync_core::store::{AlbumScope, SourceFolder};
+use sync_core::store::{AlbumScope, SourceFolder, StateStore};
 
 const API_KEY: &str = "api-key-abc123";
 /// The schema stands at the eighth migration.
@@ -525,6 +525,11 @@ async fn a_missing_version_permission_is_an_actionable_message(cx: &mut TestAppC
     .expect("update the shell window");
 }
 
+// Unix only: this test deletes the database out from under the open store,
+// and Windows refuses to remove a file an open handle still maps. Windows
+// recovery of a hand-deleted database happens with the client stopped, and
+// `StateStore::open` and the `rebuild_store` unit tests cover it there.
+#[cfg(unix)]
 #[gpui_kit::test]
 async fn a_rebuild_recovers_a_deleted_state_database_and_rescans_the_folder(
     cx: &mut TestAppContext,
@@ -636,6 +641,127 @@ async fn a_rebuild_recovers_a_deleted_state_database_and_rescans_the_folder(
         server.about_requests() > probes_before
     })
     .await;
+}
+
+/// R10.4: the first open owns the store until it lands. A rebuild clicked
+/// before then must not reset an empty database and wipe the folders.
+#[gpui_kit::test]
+async fn a_rebuild_during_the_first_open_keeps_the_stored_folders(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    fs::create_dir_all(&photos).expect("create the source folder");
+    // A database a previous run left behind, folder and all.
+    {
+        let store = StateStore::open(&paths.state_db).expect("open the state database");
+        store
+            .add_folder(&SourceFolder {
+                path: photos.display().to_string(),
+                recursive: true,
+                album_mapping: false,
+                album_scope: AlbumScope::Leaf,
+            })
+            .expect("add the source folder");
+    }
+
+    let store_model = open_store(cx, &paths);
+    // The click lands before the open settles.
+    cx.update(|cx| store_model.update(cx, |model, cx| model.rebuild(cx)));
+    assert_eq!(
+        cx.read(|cx| store_model.read(cx).problem().map(str::to_string)),
+        Some("The state database is still opening.".to_string()),
+        "the refused rebuild carries the reason the user sees"
+    );
+
+    wait_until(cx, "the store", |cx| store_model.read(cx).store().is_some()).await;
+    assert!(
+        cx.read(|cx| store_model
+            .read(cx)
+            .folders()
+            .iter()
+            .any(|folder| folder.path == photos.display().to_string())),
+        "the refused rebuild must not wipe the folders the database holds"
+    );
+    cx.read(|cx| store_model.read(cx).store())
+        .expect("the store is open")
+        .quick_check()
+        .expect("the database is intact");
+}
+
+/// R10.2: a broken errors read is reported, not silently dropped.
+#[gpui_kit::test]
+async fn a_failed_error_read_is_surfaced(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let (_runtime, server) = mock_server();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let connection = connection_model(cx, &server, AuthMethod::Password);
+    let store = open_store(cx, &paths);
+    let (_engine, diagnostics) = open_models(cx, &paths, connection, store);
+    wait_until(cx, "the sqlite read", |cx| {
+        diagnostics.read(cx).info().is_some()
+    })
+    .await;
+
+    // Break only the query behind the error section: the schema, the size,
+    // and the integrity check stay readable.
+    {
+        let raw = rusqlite::Connection::open(&paths.state_db).expect("open the database directly");
+        raw.execute_batch("DROP TABLE attempt")
+            .expect("drop the attempt log");
+    }
+    cx.update(|cx| diagnostics.update(cx, |model, cx| model.refresh(cx)));
+
+    wait_until(cx, "the problem", |cx| {
+        diagnostics.read(cx).problem().is_some()
+    })
+    .await;
+    let problem = cx.read(|cx| diagnostics.read(cx).problem().unwrap().to_string());
+    assert!(
+        problem.contains("failures"),
+        "the message says what could not be read: {problem}"
+    );
+}
+
+/// R10.4: a double click cannot start two rebuilds; the second click is a
+/// no-op while the first still runs.
+#[gpui_kit::test]
+async fn a_second_rebuild_cannot_start_while_one_runs(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let (_runtime, server) = mock_server();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let connection = connection_model(cx, &server, AuthMethod::Password);
+    let (window, store, _engine, diagnostics) = open_shell(
+        cx,
+        SettingsStore::open(paths.config_file.clone()),
+        paths,
+        connection,
+    );
+    wait_until(cx, "the store", |cx| store.read(cx).store().is_some()).await;
+    let generation = cx.read(|cx| store.read(cx).generation());
+    cx.update_window(window, |_, window, cx| show_diagnostics(window, cx))
+        .expect("update the shell window");
+
+    // A double click: the second click lands while the first rebuild runs. The
+    // button is also disabled while rebuilding, and this model guard is what a
+    // direct call cannot bypass.
+    cx.update_window(window, |_, window, cx| {
+        window.click("diagnostics-rebuild", cx);
+        window.click("diagnostics-rebuild", cx);
+    })
+    .expect("update the shell window");
+
+    wait_until(cx, "the rebuild", |cx| {
+        !diagnostics.read(cx).is_rebuilding() && store.read(cx).store().is_some()
+    })
+    .await;
+    assert_eq!(
+        cx.read(|cx| store.read(cx).generation()),
+        generation + 1,
+        "the second click must not replace the store a second time"
+    );
 }
 
 #[gpui_kit::test]

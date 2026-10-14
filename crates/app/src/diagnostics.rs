@@ -62,6 +62,8 @@ pub struct DiagnosticsModel {
     throughput: Throughput,
     problem: Option<String>,
     rebuilding: bool,
+    /// Bumped by every refresh, so a slow read cannot land over a newer one.
+    read_generation: u64,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -96,6 +98,7 @@ impl DiagnosticsModel {
             throughput: Throughput::default(),
             problem: None,
             rebuilding: false,
+            read_generation: 0,
             _subscriptions: subscriptions,
         };
         model.refresh(cx);
@@ -168,9 +171,16 @@ impl DiagnosticsModel {
         let read = cx
             .background_executor()
             .spawn(async move { (store.sqlite_info(), store.last_error_per_class()) });
+        // A newer refresh supersedes an older one, so a slow read cannot land
+        // over it (R10.2).
+        self.read_generation = self.read_generation.wrapping_add(1);
+        let generation = self.read_generation;
         cx.spawn(async move |this, cx| {
             let (info, errors) = read.await;
             let _ = this.update(cx, |model, cx| {
+                if model.read_generation != generation {
+                    return;
+                }
                 match info {
                     Ok(info) => {
                         model.info = Some(info);
@@ -181,8 +191,12 @@ impl DiagnosticsModel {
                             Some(format!("The state database could not be read: {error}"));
                     }
                 }
-                if let Ok(errors) = errors {
-                    model.errors = errors;
+                match errors {
+                    Ok(errors) => model.errors = errors,
+                    Err(error) => {
+                        model.problem =
+                            Some(format!("The last failures could not be read: {error}"));
+                    }
                 }
                 cx.notify();
             });
@@ -352,13 +366,14 @@ impl Throughput {
     }
 }
 
-/// The rate as the view shows it, with the unit that reads best.
+/// The rate as the view shows it, in the same binary units as the sizes.
 #[must_use]
 pub fn format_rate(bytes_per_second: f64) -> String {
-    if bytes_per_second >= 1_000_000.0 {
-        format!("{:.1} MB/s", bytes_per_second / 1_000_000.0)
-    } else if bytes_per_second >= 1_000.0 {
-        format!("{:.1} kB/s", bytes_per_second / 1_000.0)
+    const KIB: f64 = 1024.0;
+    if bytes_per_second >= KIB * KIB {
+        format!("{:.1} MiB/s", bytes_per_second / (KIB * KIB))
+    } else if bytes_per_second >= KIB {
+        format!("{:.1} KiB/s", bytes_per_second / KIB)
     } else {
         format!("{bytes_per_second:.0} B/s")
     }
@@ -370,11 +385,11 @@ pub fn format_bytes(bytes: u64) -> String {
     const KIB: f64 = 1024.0;
     let bytes = bytes as f64;
     if bytes >= KIB * KIB * KIB {
-        format!("{:.1} GB", bytes / (KIB * KIB * KIB))
+        format!("{:.1} GiB", bytes / (KIB * KIB * KIB))
     } else if bytes >= KIB * KIB {
-        format!("{:.1} MB", bytes / (KIB * KIB))
+        format!("{:.1} MiB", bytes / (KIB * KIB))
     } else if bytes >= KIB {
-        format!("{:.1} kB", bytes / KIB)
+        format!("{:.1} KiB", bytes / KIB)
     } else {
         format!("{bytes:.0} B")
     }
@@ -411,10 +426,11 @@ mod tests {
     fn rates_and_sizes_are_formatted_for_reading() {
         assert_eq!(format_rate(0.0), "0 B/s");
         assert_eq!(format_rate(900.0), "900 B/s");
-        assert_eq!(format_rate(1_500.0), "1.5 kB/s");
-        assert_eq!(format_rate(2_500_000.0), "2.5 MB/s");
+        assert_eq!(format_rate(1_500.0), "1.5 KiB/s");
+        assert_eq!(format_rate(2_500_000.0), "2.4 MiB/s");
         assert_eq!(format_bytes(0), "0 B");
-        assert_eq!(format_bytes(4096), "4.0 kB");
-        assert_eq!(format_bytes(3 * 1024 * 1024), "3.0 MB");
+        assert_eq!(format_bytes(4096), "4.0 KiB");
+        assert_eq!(format_bytes(3 * 1024 * 1024), "3.0 MiB");
+        assert_eq!(format_bytes(2 * 1024 * 1024 * 1024), "2.0 GiB");
     }
 }
