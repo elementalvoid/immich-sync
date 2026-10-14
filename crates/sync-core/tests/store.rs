@@ -4,9 +4,7 @@ use std::path::Path;
 
 use sync_core::failure::FailureClass;
 use sync_core::hash::Sha1;
-use sync_core::store::{
-    ItemRecord, ItemState, NewVersion, SidecarDigest, StateStore, StoreError,
-};
+use sync_core::store::{ItemRecord, ItemState, NewVersion, SidecarDigest, StateStore, StoreError};
 
 /// `sha1("hello world")`, hex.
 const HELLO_WORLD_SHA1_HEX: &str = "2aae6c35c94fcfb415dbe95f408b9ce91ee846ed";
