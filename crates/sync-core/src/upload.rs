@@ -495,7 +495,10 @@ impl Uploader {
                         ),
                     });
                 }
-                item.sidecar = sent_sidecar(response.duplicate, sidecar);
+                // R4.5: this request was read, so the asset carries the sidecar
+                // it carried. A `duplicate` answer never reaches this line
+                // with one: the branch above parked the item instead.
+                item.sidecar = sidecar.map(|sidecar| sidecar.digest);
                 item.state = if response.duplicate {
                     ItemState::Duplicate
                 } else {
@@ -666,20 +669,6 @@ pub(crate) async fn pending_sidecar(
 /// #7's manual retry will own.
 fn parked_with_an_asset(row: &ItemRecord) -> bool {
     row.state == ItemState::FailedPermanent && row.asset_id.is_some()
-}
-
-/// The digest to record for the sidecar one request carried (R4.5).
-///
-/// Only a `created` answer proves the server read the body: Immich answers a
-/// checksum it already holds as `duplicate` from the `x-immich-checksum`
-/// header, in an interceptor that runs before multer parses the form, so that
-/// answer says nothing about the sidecar it was sent with.
-fn sent_sidecar(duplicate: bool, sidecar: Option<&SidecarFile>) -> Option<SidecarDigest> {
-    if duplicate {
-        None
-    } else {
-        sidecar.map(|sidecar| sidecar.digest)
-    }
 }
 
 /// A modification time as nanoseconds since the Unix epoch.
