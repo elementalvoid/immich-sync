@@ -1173,6 +1173,46 @@ async fn two_added_folders_with_the_same_name_are_two_albums() {
             file.display()
         );
     }
+
+    // R3.4: the album ids live in the state database, so a restart joins the
+    // albums it already made instead of creating a second one for the folder.
+    // The store is reopened so the ids come off disk, not a warm cache.
+    engine.stop();
+    drop(engine);
+    drop(store);
+    let store = store_in(&temp);
+    let engine = start_engine(&server, &store, EngineConfig::default()).await;
+    let after_restart = [
+        write_file(&first, "reef.jpg", b"reef"),
+        write_file(&second, "ice.jpg", b"ice"),
+    ];
+    assert!(
+        wait_until(
+            || all_terminal(&store, &after_restart),
+            Duration::from_secs(15)
+        )
+        .await,
+        "both files must reach a terminal success state after the restart"
+    );
+    assert!(
+        wait_for_albums(&store, &server, &after_restart).await,
+        "both assets must join the albums the first run made"
+    );
+    assert_eq!(
+        server.create_album_requests(),
+        2,
+        "R3.4: a restart reuses the recorded album ids, one per folder"
+    );
+    for file in &after_restart {
+        assert_eq!(
+            server
+                .album_for_asset(&asset_id_of(&store, file))
+                .as_deref(),
+            Some("Pictures"),
+            "{} joined the album its folder already had",
+            file.display()
+        );
+    }
     engine.stop();
 }
 
