@@ -223,6 +223,9 @@ fn open_shell(
             let failed = cx.new(|cx| {
                 immich_sync::failed_view::FailedView::new(engine_model.clone(), window, cx)
             });
+            let review = cx.new(|cx| {
+                immich_sync::review_view::ReviewView::new(engine_model.clone(), window, cx)
+            });
             let shell = cx.new(|cx| {
                 AppShell::new(
                     dashboard,
@@ -230,6 +233,7 @@ fn open_shell(
                     upload,
                     failed,
                     diagnostics,
+                    review,
                     connection.clone(),
                     cx,
                 )

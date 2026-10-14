@@ -36,7 +36,9 @@ fn row(folder: &Path, name: &str, state: ItemState, index: usize) -> ItemRecord 
         _ => None,
     };
     let asset_id = match state {
-        ItemState::Uploaded | ItemState::Duplicate => Some(format!("asset-{index}")),
+        ItemState::Uploaded | ItemState::Duplicate | ItemState::Missing => {
+            Some(format!("asset-{index}"))
+        }
         _ => None,
     };
     ItemRecord {
@@ -157,6 +159,15 @@ fn seed_capture_state() {
             &pictures,
             &format!("RAW_{refused}.cr3"),
             ItemState::FailedPermanent,
+        );
+    }
+    // The deletion-review capture: three files that disappeared and wait for a
+    // keep-or-trash decision (R5.3).
+    for missing in 0..3 {
+        write(
+            &pictures,
+            &format!("GONE_{missing}.jpg"),
+            ItemState::Missing,
         );
     }
 }

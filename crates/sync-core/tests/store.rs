@@ -5,8 +5,8 @@ use std::path::Path;
 use sync_core::failure::FailureClass;
 use sync_core::hash::Sha1;
 use sync_core::store::{
-    AlbumScope, AttemptOutcome, AttemptRecord, ItemRecord, ItemState, NewVersion, SidecarDigest,
-    SourceFolder, StateStore, StoreError,
+    AlbumScope, AttemptOutcome, AttemptRecord, ItemRecord, ItemState, NewVersion, ReviewDecision,
+    SidecarDigest, SourceFolder, StateStore, StoreError,
 };
 
 /// `sha1("hello world")`, hex.
@@ -682,6 +682,9 @@ fn folder_counts_bucket_the_states() {
         ("d.jpg", ItemState::FailedPermanent),
         ("e.jpg", ItemState::RetryWait),
         ("f.jpg", ItemState::DeadLetter),
+        ("g.jpg", ItemState::Missing),
+        ("h.jpg", ItemState::ReviewKeep),
+        ("i.jpg", ItemState::ReviewTrash),
     ] {
         store.record(&path(name, state)).expect("write the row");
     }
@@ -697,9 +700,351 @@ fn folder_counts_bucket_the_states() {
         .folder_counts(&folder.display().to_string())
         .expect("read the counts");
 
-    assert_eq!(counts.uploaded, 2);
+    assert_eq!(
+        counts.uploaded, 3,
+        "a kept item still holds its server copy"
+    );
     assert_eq!(counts.pending, 1);
     assert_eq!(counts.failed, 3, "a dead-letter item counts as failed");
+    assert_eq!(
+        counts.review, 1,
+        "R5.4: only the missing item waits for a decision"
+    );
+}
+
+/// R5.1: the review states are the SPEC §5 names, and a second discovery pass
+/// leaves one row for one deleted file.
+#[test]
+fn a_missing_file_is_marked_once_and_listed_for_review() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    store
+        .record(&record("photos/IMG_0001.jpg", ItemState::Uploaded))
+        .expect("write the uploaded row");
+
+    assert!(
+        store
+            .mark_missing("photos/IMG_0001.jpg")
+            .expect("mark the item missing"),
+        "R5.1: a tracked path that disappeared becomes a missing file"
+    );
+    assert!(
+        !store
+            .mark_missing("photos/IMG_0001.jpg")
+            .expect("mark it again"),
+        "a second discovery pass must not add a second review item"
+    );
+
+    let items = store.review_items().expect("read the review");
+    assert_eq!(items.len(), 1, "R5.1: exactly one review item per file");
+    assert_eq!(items[0].path, "photos/IMG_0001.jpg");
+    assert_eq!(items[0].size, 11);
+    assert_eq!(items[0].asset_id.as_deref(), Some("asset-1"));
+    assert_eq!(items[0].state, ItemState::Missing);
+    assert_eq!(store.review_count().expect("count the review"), 1);
+    assert_eq!(
+        store
+            .item("photos/IMG_0001.jpg")
+            .expect("read the item")
+            .expect("the row exists")
+            .state,
+        ItemState::Missing,
+        "the item is in the missing state the spec names"
+    );
+}
+
+/// R5.1: only an item the server holds can be reviewed. A row whose upload
+/// never landed has nothing to keep or trash.
+#[test]
+fn a_row_without_a_server_copy_is_never_a_review_item() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    for (name, state) in [
+        ("pending.jpg", ItemState::Pending),
+        ("uploading.jpg", ItemState::Uploading),
+        ("retry.jpg", ItemState::RetryWait),
+        ("failed.jpg", ItemState::FailedPermanent),
+        ("parked.jpg", ItemState::DeadLetter),
+    ] {
+        let mut row = record(name, state);
+        row.asset_id = None;
+        store.record(&row).expect("write the row");
+        assert!(
+            !store.mark_missing(name).expect("try to mark it missing"),
+            "{name}: {state:?} has no server copy to review"
+        );
+        assert_eq!(
+            store.item(name).expect("read it").expect("the row").state,
+            state,
+            "a refused mark leaves the row where it was"
+        );
+    }
+    assert_eq!(store.review_count().expect("count the review"), 0);
+}
+
+/// R5.3: both actions clear the item from the review, and only a missing item
+/// can be decided on.
+#[test]
+fn keep_and_trash_clear_the_review_item() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    for name in ["keep.jpg", "trash.jpg"] {
+        store
+            .record(&record(name, ItemState::Uploaded))
+            .expect("write the row");
+        store.mark_missing(name).expect("mark it missing");
+    }
+
+    assert!(
+        store
+            .decide_review("keep.jpg", ReviewDecision::Keep)
+            .expect("keep the asset"),
+        "a missing item can be kept"
+    );
+    assert!(
+        store
+            .decide_review("trash.jpg", ReviewDecision::Trash)
+            .expect("trash the asset"),
+        "a missing item can be trashed"
+    );
+
+    assert_eq!(
+        store
+            .item("keep.jpg")
+            .expect("read it")
+            .expect("the row")
+            .state,
+        ItemState::ReviewKeep,
+        "R5.3: Keep records the SPEC §5 review_keep state"
+    );
+    assert_eq!(
+        store
+            .item("trash.jpg")
+            .expect("read it")
+            .expect("the row")
+            .state,
+        ItemState::ReviewTrash,
+        "R5.3: Trash records the SPEC §5 review_trash state"
+    );
+    assert_eq!(store.review_count().expect("count the review"), 0);
+    assert!(
+        !store
+            .decide_review("keep.jpg", ReviewDecision::Keep)
+            .expect("decide again"),
+        "a decided item is no longer in the review"
+    );
+}
+
+/// R5.3: a trash report only rewrites the Keep that landed while the DELETE
+/// was in flight. A row the file recreated mid-request is live, so stamping
+/// it `review_trash` would count it nowhere and freeze it settled.
+#[test]
+fn record_review_trash_rewrites_only_a_kept_row() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    for (name, state) in [
+        ("kept.jpg", ItemState::ReviewKeep),
+        ("uploaded.jpg", ItemState::Uploaded),
+        ("duplicate.jpg", ItemState::Duplicate),
+    ] {
+        store.record(&record(name, state)).expect("write the row");
+    }
+
+    assert!(
+        store
+            .record_review_trash("kept.jpg")
+            .expect("record the trash"),
+        "a Keep that landed while the DELETE was in flight becomes the trash"
+    );
+    assert_eq!(
+        store
+            .item("kept.jpg")
+            .expect("read the row")
+            .expect("the row exists")
+            .state,
+        ItemState::ReviewTrash,
+        "R5.3: the server's answer is the last word"
+    );
+
+    for (name, state) in [
+        ("uploaded.jpg", ItemState::Uploaded),
+        ("duplicate.jpg", ItemState::Duplicate),
+    ] {
+        assert!(
+            !store
+                .record_review_trash(name)
+                .expect("try to record the trash"),
+            "{name}: a live row is not the in-flight Keep's row"
+        );
+        assert_eq!(
+            store
+                .item(name)
+                .expect("read the row")
+                .expect("the row exists")
+                .state,
+            state,
+            "{name}: the recreated row keeps its state"
+        );
+    }
+
+    assert!(
+        !store
+            .record_review_trash("kept.jpg")
+            .expect("record the trash again"),
+        "a second report of the same trash changes nothing"
+    );
+}
+
+/// R5.2 and the second-copy acceptance line: an item whose content another
+/// tracked row still holds leaves the review without a user decision.
+#[test]
+fn a_content_twin_retires_an_item_and_the_twin_is_findable() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    let folder = temp.path().join("photos");
+    for name in ["a.jpg", "b.jpg"] {
+        store
+            .record(&record(
+                &folder.join(name).display().to_string(),
+                ItemState::Uploaded,
+            ))
+            .expect("write the row");
+    }
+    let a = folder.join("a.jpg").display().to_string();
+    let b = folder.join("b.jpg").display().to_string();
+
+    store.mark_missing(&a).expect("mark a.jpg missing");
+    let twins = store
+        .content_twins(hello_world_sha1(), 11, &a)
+        .expect("find the other copy");
+    assert_eq!(twins.len(), 1);
+    assert_eq!(twins[0].path, b);
+    assert_eq!(
+        store
+            .review_candidates(&folder.display().to_string())
+            .expect("list the candidates")
+            .len(),
+        2,
+        "both the settled row and the missing one are reconciled"
+    );
+
+    assert!(store.retire_item(&a).expect("retire a.jpg"));
+    assert_eq!(
+        store.item(&a).expect("read it").expect("the row").state,
+        ItemState::ReviewKeep,
+        "the asset is kept, and no decision was needed"
+    );
+    assert_eq!(store.review_count().expect("count the review"), 0);
+    assert!(
+        !store.retire_item(&a).expect("retire again"),
+        "a retired item is not in the review any more"
+    );
+}
+
+/// R5.3: a row that is not waiting for a decision is not disturbed by one.
+#[test]
+fn a_decision_does_not_disturb_a_row_that_is_not_in_review() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    store
+        .record(&record("IMG.jpg", ItemState::Uploaded))
+        .expect("write the row");
+
+    assert!(
+        !store
+            .decide_review("IMG.jpg", ReviewDecision::Trash)
+            .expect("decide an item that is not missing"),
+        "only a missing item is in the review"
+    );
+    assert_eq!(
+        store
+            .item("IMG.jpg")
+            .expect("read it")
+            .expect("the row")
+            .state,
+        ItemState::Uploaded,
+        "an uploaded item stays uploaded"
+    );
+}
+
+/// R5.2: a rename moves the item's row, so the asset mapping and the version
+/// chain follow the file to its new path.
+#[test]
+fn a_rename_moves_the_row_and_keeps_its_asset_and_its_versions() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    store
+        .record(&record("photos/old.jpg", ItemState::Uploaded))
+        .expect("write the row");
+    store
+        .record_version(&NewVersion {
+            path: "photos/old.jpg".to_string(),
+            asset_id: "asset-1".to_string(),
+            sha1: hello_world_sha1(),
+            created_at_ns: 1_700_000_000_000_000_000,
+            stack_id: Some("stack-1".to_string()),
+        })
+        .expect("seed the version chain");
+
+    assert!(
+        store
+            .move_item(
+                "photos/old.jpg",
+                "photos/new.jpg",
+                11,
+                1_700_000_000_000_000_001
+            )
+            .expect("move the row"),
+        "an untracked destination accepts the move"
+    );
+
+    assert!(
+        store
+            .item("photos/old.jpg")
+            .expect("read the old")
+            .is_none(),
+        "the old path is no longer tracked"
+    );
+    let moved = store
+        .item("photos/new.jpg")
+        .expect("read the new")
+        .expect("the row moved");
+    assert_eq!(
+        moved.asset_id.as_deref(),
+        Some("asset-1"),
+        "the mapping stayed"
+    );
+    assert_eq!(moved.state, ItemState::Uploaded);
+    assert_eq!(moved.size, 11);
+    assert_eq!(moved.mtime_ns, 1_700_000_000_000_000_001);
+    let versions = store.versions("photos/new.jpg").expect("read the chain");
+    assert_eq!(
+        versions.len(),
+        1,
+        "R5.2: the version chain follows the item"
+    );
+    assert!(versions[0].is_current);
+    assert_eq!(
+        store.stack_id("photos/new.jpg").expect("read the stack"),
+        Some("stack-1".to_string())
+    );
+
+    assert!(
+        !store
+            .move_item("photos/old.jpg", "photos/ghost.jpg", 11, 1)
+            .expect("move an untracked source"),
+        "an untracked source has no row to move"
+    );
+    store
+        .record(&record("photos/other.jpg", ItemState::Uploaded))
+        .expect("write a second row");
+    assert!(
+        !store
+            .move_item("photos/new.jpg", "photos/other.jpg", 11, 1)
+            .expect("move onto a tracked path"),
+        "a move never overwrites another item's row"
+    );
+    assert_eq!(store.review_count().expect("count the review"), 0);
 }
 
 /// R4.4: the chain keeps every version, one current flag, and the stack id on

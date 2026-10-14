@@ -152,6 +152,7 @@ fn the_tray_tooltip_carries_the_activity_and_the_progress() {
         uploaded: 3,
         pending: 1,
         failed: 0,
+        review: 2,
     };
     let tooltip = shell::tray_status_tooltip(
         sync_core::engine::Activity::Syncing,
@@ -162,6 +163,10 @@ fn the_tray_tooltip_carries_the_activity_and_the_progress() {
     assert!(tooltip.contains("Syncing"), "R8.2: {tooltip}");
     assert!(tooltip.contains("Connected"), "{tooltip}");
     assert!(tooltip.contains("3/4 uploaded"), "R8.2: {tooltip}");
+    assert!(
+        tooltip.contains("2 to review"),
+        "R5.4: the tray shows the review count: {tooltip}"
+    );
 
     let attention = shell::tray_status_tooltip(
         sync_core::engine::Activity::NeedsAttention,

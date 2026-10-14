@@ -8,14 +8,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use immich_client::BandwidthLimit;
-use mock_immich::{Fault, MockImmich, Operation};
+use immich_client::{BandwidthLimit, ClientError};
+use mock_immich::{DeleteCall, Fault, MockImmich, Operation};
 use sync_core::backoff::RetryPolicy;
 use sync_core::connection::{
     Attention, AuthMethod, Connection, ConnectionState, Secret, SharedSession, SignIn,
 };
 use sync_core::credential::MemoryCredentialStore;
-use sync_core::engine::{Activity, Engine, EngineConfig};
+use sync_core::engine::{Activity, Engine, EngineConfig, ReviewError};
 use sync_core::failure::FailureClass;
 use sync_core::hash::{Sha1, sha1_file};
 use sync_core::store::{
@@ -883,6 +883,7 @@ async fn a_re_added_folder_seeds_its_counts_from_the_store() {
             pending: 0,
             uploaded: 2,
             failed: 0,
+            review: 0,
         }),
         "a re-added folder starts from the rows the store holds"
     );
@@ -3267,6 +3268,628 @@ async fn the_engine_reports_the_bytes_it_put_on_the_wire() {
         engine.uploaded_bytes(),
         8 * 1024,
         "the meter counts every byte of the one uploaded file"
+    );
+    engine.stop();
+}
+
+/// An engine for the deletion review tests: the scan interval the test waits
+/// out, and no watcher unless the test is about the watcher (R2.3, R5.1).
+fn review_config(scan_interval: Duration, watch: bool) -> EngineConfig {
+    EngineConfig {
+        scan_interval,
+        watch,
+        watch_debounce: Duration::from_millis(100),
+        ..EngineConfig::default()
+    }
+}
+
+/// Syncs one file through the real pipeline and returns the asset id the
+/// server assigned.
+async fn sync_one(store: &Arc<StateStore>, file: &Path) -> String {
+    assert!(
+        wait_until(
+            || all_terminal(store, &[file.to_path_buf()]),
+            Duration::from_secs(30)
+        )
+        .await,
+        "{} never reached a terminal state",
+        file.display()
+    );
+    store
+        .item(&file.display().to_string())
+        .expect("read the row")
+        .expect("the row exists")
+        .asset_id
+        .expect("R3.6: the upload recorded an asset id")
+}
+
+/// Waits until `count` files are in the review, or fails with the count it
+/// last saw.
+async fn wait_for_review(engine: &Arc<Engine>, count: usize) {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(usize::MAX));
+    let watched = std::sync::Arc::clone(&seen);
+    let reached = wait_until(
+        || {
+            let len = engine.review_items().map(|items| items.len()).unwrap_or(0);
+            *watched.lock().expect("the review count lock") = len;
+            len == count
+        },
+        Duration::from_secs(15),
+    )
+    .await;
+    assert!(
+        reached,
+        "the review never held {count} items (last saw {})",
+        seen.lock().expect("the review count lock")
+    );
+}
+
+#[tokio::test]
+async fn a_deleted_file_becomes_exactly_one_review_item() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let file = write_file(&photos, "IMG_0001.jpg", b"photo bytes");
+    add_folder(&store, &photos, true);
+    let engine = start_engine(
+        &server,
+        &store,
+        review_config(Duration::from_secs(1), false),
+    )
+    .await;
+    let asset_id = sync_one(&store, &file).await;
+
+    std::fs::remove_file(&file).expect("delete the fixture");
+    wait_for_review(&engine, 1).await;
+
+    let items = engine.review_items().expect("read the review");
+    assert_eq!(items.len(), 1, "R5.1: exactly one review item per file");
+    assert_eq!(items[0].path, file.display().to_string());
+    assert_eq!(items[0].asset_id.as_deref(), Some(asset_id.as_str()));
+    assert_eq!(
+        engine.status().counts.review,
+        1,
+        "R5.4: the review count reaches the tray status"
+    );
+    assert_eq!(
+        store
+            .item(&file.display().to_string())
+            .expect("read the row")
+            .expect("the row exists")
+            .state,
+        ItemState::Missing,
+        "R5.1: the item is in the spec's missing state"
+    );
+
+    // The scan interval is one second, so several more scans walk the same
+    // disappearance. None of them may add a second row.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    assert_eq!(
+        engine.review_items().expect("read the review").len(),
+        1,
+        "R5.1: a later discovery pass must not add a second review item"
+    );
+    assert_eq!(store.review_count().expect("count the review"), 1);
+    engine.stop();
+}
+
+#[tokio::test]
+async fn keep_leaves_the_server_asset_and_clears_the_item() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let file = write_file(&photos, "keep.jpg", b"keep me");
+    add_folder(&store, &photos, true);
+    let engine = start_engine(&server, &store, EngineConfig::default()).await;
+    let asset_id = sync_one(&store, &file).await;
+    std::fs::remove_file(&file).expect("delete the fixture");
+    wait_for_review(&engine, 1).await;
+
+    assert!(
+        engine
+            .keep_review_item(&file.display().to_string())
+            .expect("keep the asset"),
+        "R5.3: Keep clears a missing item"
+    );
+
+    assert_eq!(engine.review_items().expect("read the review").len(), 0);
+    assert_eq!(engine.status().counts.review, 0);
+    assert!(
+        !server.trashed(&asset_id),
+        "R5.3: Keep leaves the server asset alone"
+    );
+    assert_eq!(
+        store
+            .item(&file.display().to_string())
+            .expect("read the row")
+            .expect("the row exists")
+            .state,
+        ItemState::ReviewKeep
+    );
+    assert!(
+        !engine
+            .keep_review_item(&file.display().to_string())
+            .expect("keep it again"),
+        "an item carries one decision"
+    );
+    engine.stop();
+}
+
+#[tokio::test]
+async fn trash_moves_the_asset_to_the_trash_and_clears_the_item() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let file = write_file(&photos, "trash.jpg", b"trash me");
+    add_folder(&store, &photos, true);
+    let engine = start_engine(&server, &store, EngineConfig::default()).await;
+    let asset_id = sync_one(&store, &file).await;
+    std::fs::remove_file(&file).expect("delete the fixture");
+    wait_for_review(&engine, 1).await;
+
+    engine
+        .trash_review_item(&file.display().to_string())
+        .await
+        .expect("R5.3: the asset moves to the trash");
+
+    assert_eq!(engine.review_items().expect("read the review").len(), 0);
+    assert_eq!(engine.status().counts.review, 0);
+    assert!(
+        server.trashed(&asset_id),
+        "R5.3: the asset is in the trash, not deleted (ADR 0002)"
+    );
+    assert_eq!(
+        server.delete_calls(),
+        vec![DeleteCall {
+            ids: vec![asset_id.clone()],
+            force: false,
+        }],
+        "R5.3: the one request is a trash call, never a permanent delete"
+    );
+    assert_eq!(
+        store
+            .item(&file.display().to_string())
+            .expect("read the row")
+            .expect("the row exists")
+            .state,
+        ItemState::ReviewTrash
+    );
+    engine.stop();
+}
+
+#[tokio::test]
+async fn a_keep_that_lands_while_the_delete_is_in_flight_still_records_the_trash() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let file = write_file(&photos, "race.jpg", b"race bytes");
+    add_folder(&store, &photos, true);
+    let engine = start_engine(&server, &store, EngineConfig::default()).await;
+    let asset_id = sync_one(&store, &file).await;
+    std::fs::remove_file(&file).expect("delete the fixture");
+    wait_for_review(&engine, 1).await;
+
+    // The DELETE sits on the wire long enough for a Keep to land inside the
+    // same window: Trash already read the row and is awaiting the response.
+    server.fail(
+        Operation::DeleteAssets,
+        Fault::Slow(Duration::from_millis(500)),
+    );
+    let path = file.display().to_string();
+    let trash_engine = Arc::clone(&engine);
+    let trash_path = path.clone();
+    let trash = tokio::spawn(async move { trash_engine.trash_review_item(&trash_path).await });
+    // Yield so the trash task runs up to its awaiting DELETE before Keep.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        engine.keep_review_item(&path).expect("keep the asset"),
+        "the item is still waiting when Keep lands"
+    );
+
+    let outcome = trash.await.expect("the trash task");
+    assert!(outcome.is_ok(), "the DELETE succeeded: {outcome:?}");
+    assert!(server.trashed(&asset_id), "the DELETE reached the server");
+    assert_eq!(
+        store
+            .item(&path)
+            .expect("read the row")
+            .expect("the row exists")
+            .state,
+        ItemState::ReviewTrash,
+        "a successful DELETE is the last word, whatever Keep recorded while it waited"
+    );
+    assert_eq!(engine.review_items().expect("read the review").len(), 0);
+    assert_eq!(
+        engine.status().counts.review,
+        0,
+        "Keep already took the item off the review count"
+    );
+    engine.stop();
+}
+
+#[tokio::test]
+async fn a_trash_without_the_permission_keeps_the_item_in_the_review() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let file = write_file(&photos, "denied.jpg", b"no permission");
+    add_folder(&store, &photos, true);
+    let engine = start_engine(&server, &store, EngineConfig::default()).await;
+    let asset_id = sync_one(&store, &file).await;
+    std::fs::remove_file(&file).expect("delete the fixture");
+    wait_for_review(&engine, 1).await;
+    server.fail(Operation::DeleteAssets, Fault::PermissionDenied);
+
+    let error = engine
+        .trash_review_item(&file.display().to_string())
+        .await
+        .expect_err("the missing permission is refused");
+
+    assert!(
+        matches!(error, ReviewError::Client(ClientError::PermissionDenied(_))),
+        "R5.5: the refusal keeps its class, got {error:?}"
+    );
+    assert_eq!(
+        engine.review_items().expect("read the review").len(),
+        1,
+        "R5.5: the item stays in the review"
+    );
+    assert!(!server.trashed(&asset_id), "nothing changed on the server");
+    assert_eq!(
+        store
+            .item(&file.display().to_string())
+            .expect("read the row")
+            .expect("the row exists")
+            .state,
+        ItemState::Missing
+    );
+    engine.stop();
+}
+
+#[tokio::test]
+async fn a_trash_without_a_server_copy_is_refused_not_silently_kept() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+    add_folder(&store, &photos, true);
+    let path = photos.join("never-uploaded.jpg").display().to_string();
+    store
+        .record(&ItemRecord {
+            path: path.clone(),
+            size: 12,
+            mtime_ns: 1_700_000_000_000_000_000,
+            sha1: Sha1::from_hex("2aae6c35c94fcfb415dbe95f408b9ce91ee846ed").expect("a hex SHA-1"),
+            asset_id: None,
+            state: ItemState::Missing,
+            error_class: None,
+            error_message: None,
+            attempts: 0,
+            sidecar: None,
+        })
+        .expect("write the missing row");
+    let engine = start_engine(&server, &store, EngineConfig::default()).await;
+    wait_for_review(&engine, 1).await;
+
+    let error = engine
+        .trash_review_item(&path)
+        .await
+        .expect_err("a row with no asset cannot be trashed");
+    assert!(
+        matches!(error, ReviewError::NotInReview(_)),
+        "the click must report instead of silently keeping the asset: {error:?}"
+    );
+    assert_eq!(
+        store
+            .item(&path)
+            .expect("read the row")
+            .expect("the row exists")
+            .state,
+        ItemState::Missing,
+        "a refused trash leaves the row in the review"
+    );
+    assert!(
+        server.delete_calls().is_empty(),
+        "no request is sent for a row with no server copy"
+    );
+    assert_eq!(engine.review_items().expect("read the review").len(), 1);
+    engine.stop();
+}
+
+#[tokio::test]
+async fn a_rename_keeps_the_mapping_and_raises_no_review_item() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let old = write_file(&photos, "old.jpg", b"renamed bytes");
+    add_folder(&store, &photos, true);
+    let engine = start_engine(
+        &server,
+        &store,
+        review_config(Duration::from_secs(1), false),
+    )
+    .await;
+    let asset_id = sync_one(&store, &old).await;
+
+    let renamed = photos.join("renamed.jpg");
+    std::fs::rename(&old, &renamed).expect("rename the fixture");
+    engine.sync_now();
+    assert!(
+        wait_until(
+            || store
+                .item(&renamed.display().to_string())
+                .ok()
+                .flatten()
+                .is_some(),
+            Duration::from_secs(15)
+        )
+        .await,
+        "R5.2: the item never moved to the renamed path"
+    );
+
+    let moved = store
+        .item(&renamed.display().to_string())
+        .expect("read the new path")
+        .expect("the row moved");
+    assert_eq!(
+        moved.asset_id.as_deref(),
+        Some(asset_id.as_str()),
+        "R5.2: the item keeps its asset mapping"
+    );
+    assert!(
+        store
+            .item(&old.display().to_string())
+            .expect("read the old path")
+            .is_none(),
+        "the old path is no longer tracked"
+    );
+    assert_eq!(
+        store.review_count().expect("count the review"),
+        0,
+        "R5.2: a rename creates no review item"
+    );
+    // Later scans walk the same rename; none may raise a review item.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    assert_eq!(
+        store.review_count().expect("count the review"),
+        0,
+        "a later scan must not turn the rename into a missing file"
+    );
+    engine.stop();
+}
+
+#[tokio::test]
+async fn a_second_copy_of_the_same_content_raises_no_review_item() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let archive = temp.path().join("archive");
+    let first = write_file(&photos, "one.jpg", b"the same bytes");
+    let second = write_file(&archive, "two.jpg", b"the same bytes");
+    add_folder(&store, &photos, true);
+    add_folder(&store, &archive, true);
+    let engine = start_engine(
+        &server,
+        &store,
+        review_config(Duration::from_secs(1), false),
+    )
+    .await;
+    let asset_id = sync_one(&store, &first).await;
+    assert!(
+        wait_until(
+            || all_terminal(&store, std::slice::from_ref(&second)),
+            Duration::from_secs(30)
+        )
+        .await,
+        "the copy never finished"
+    );
+
+    std::fs::remove_file(&first).expect("delete the first copy");
+    assert!(
+        wait_until(
+            || store
+                .item(&first.display().to_string())
+                .ok()
+                .flatten()
+                .is_some_and(|row| row.state == ItemState::ReviewKeep),
+            Duration::from_secs(15)
+        )
+        .await,
+        "the disappeared copy was never retired behind its twin"
+    );
+
+    assert_eq!(
+        store.review_count().expect("count the review"),
+        0,
+        "the second-copy acceptance line: the same content in another folder \
+         creates no review item"
+    );
+    assert!(
+        !server.trashed(&asset_id),
+        "the asset another item still holds is not touched"
+    );
+    engine.stop();
+}
+
+#[tokio::test]
+async fn the_watcher_reports_a_deleted_file_without_a_scan_tick() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let file = write_file(&photos, "watched.jpg", b"watched bytes");
+    add_folder(&store, &photos, true);
+    // An hour between scans: only the watcher can notice this deletion in
+    // time for the test (R2.3, R5.1).
+    let engine = start_engine(
+        &server,
+        &store,
+        review_config(Duration::from_secs(60 * 60), true),
+    )
+    .await;
+    sync_one(&store, &file).await;
+
+    std::fs::remove_file(&file).expect("delete the fixture");
+
+    wait_for_review(&engine, 1).await;
+    assert_eq!(
+        engine.review_items().expect("read the review")[0].path,
+        file.display().to_string(),
+        "the watcher's disappearance reaches the same review"
+    );
+    engine.stop();
+}
+
+#[tokio::test]
+async fn a_file_that_comes_back_leaves_the_review() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let file = write_file(&photos, "back.jpg", b"restored bytes");
+    add_folder(&store, &photos, true);
+    let engine = start_engine(&server, &store, EngineConfig::default()).await;
+    let asset_id = sync_one(&store, &file).await;
+    std::fs::remove_file(&file).expect("delete the fixture");
+    wait_for_review(&engine, 1).await;
+
+    write_file(&photos, "back.jpg", b"restored bytes");
+    assert!(
+        wait_until(
+            || store.review_count().ok() == Some(0),
+            Duration::from_secs(15)
+        )
+        .await,
+        "a restored file never left the review"
+    );
+    // The item goes back through the pipeline: the server already holds the
+    // bytes, so the upload resolves to the same asset (R3.2, R4.5).
+    assert!(
+        wait_until(
+            || store
+                .item(&file.display().to_string())
+                .ok()
+                .flatten()
+                .is_some_and(|row| row.state.is_terminal_success()),
+            Duration::from_secs(15)
+        )
+        .await,
+        "the restored file never finished"
+    );
+    let row = store
+        .item(&file.display().to_string())
+        .expect("read the row")
+        .expect("the row exists");
+    assert_eq!(
+        row.asset_id.as_deref(),
+        Some(asset_id.as_str()),
+        "the restored file keeps pointing at the asset the server holds"
+    );
+    engine.stop();
+}
+
+#[tokio::test]
+async fn a_review_item_whose_content_reappears_elsewhere_leaves_the_review() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let file = write_file(&photos, "moved-after-review.jpg", b"late rename bytes");
+    add_folder(&store, &photos, true);
+    let engine = start_engine(
+        &server,
+        &store,
+        review_config(Duration::from_secs(1), false),
+    )
+    .await;
+    let asset_id = sync_one(&store, &file).await;
+
+    std::fs::remove_file(&file).expect("delete the fixture");
+    wait_for_review(&engine, 1).await;
+
+    // The file comes back at another path after the review already listed it.
+    let renamed = photos.join("found-again.jpg");
+    write_file(&photos, "found-again.jpg", b"late rename bytes");
+    assert!(
+        wait_until(
+            || store
+                .item(&renamed.display().to_string())
+                .ok()
+                .flatten()
+                .is_some_and(|row| row.state.is_terminal_success()),
+            Duration::from_secs(15)
+        )
+        .await,
+        "the item never reunited with its content"
+    );
+
+    let moved = store
+        .item(&renamed.display().to_string())
+        .expect("read the new path")
+        .expect("the row moved");
+    assert_eq!(moved.asset_id.as_deref(), Some(asset_id.as_str()));
+    assert_eq!(
+        store.review_count().expect("count the review"),
+        0,
+        "R5.4: an item whose content is back leaves the review"
+    );
+    assert_eq!(engine.status().counts.review, 0);
+    engine.stop();
+}
+
+#[tokio::test]
+async fn a_missing_row_retired_behind_a_restored_twin_leaves_the_review_count() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let first = write_file(&photos, "twin-one.jpg", b"twin bytes");
+    let second = write_file(&photos, "twin-two.jpg", b"twin bytes");
+    add_folder(&store, &photos, true);
+    let engine = start_engine(
+        &server,
+        &store,
+        review_config(Duration::from_secs(1), false),
+    )
+    .await;
+    assert!(
+        wait_until(
+            || all_terminal(&store, &[first.clone(), second.clone()]),
+            Duration::from_secs(30)
+        )
+        .await,
+        "the twins never reached a terminal state"
+    );
+
+    // Both copies disappear: both wait for a decision.
+    std::fs::remove_file(&first).expect("delete the first twin");
+    std::fs::remove_file(&second).expect("delete the second twin");
+    wait_for_review(&engine, 2).await;
+    assert_eq!(engine.status().counts.review, 2, "both twins are counted");
+
+    // One copy comes back at the same path: the other is retired behind its
+    // present twin, which must also take it off the tray count (R5.4).
+    write_file(&photos, "twin-two.jpg", b"twin bytes");
+    assert!(
+        wait_until(
+            || engine.review_items().is_ok_and(|items| items.is_empty()),
+            Duration::from_secs(20)
+        )
+        .await,
+        "the review never drained"
+    );
+    assert_eq!(
+        engine.status().counts.review,
+        0,
+        "a retired missing item must leave the tray count"
     );
     engine.stop();
 }

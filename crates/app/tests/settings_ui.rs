@@ -259,7 +259,7 @@ fn open_shell(
             let diagnostics_model = cx.new(|cx| {
                 immich_sync::diagnostics::DiagnosticsModel::new(
                     store_model.clone(),
-                    engine_model,
+                    engine_model.clone(),
                     connection.clone(),
                     cx,
                 )
@@ -267,6 +267,8 @@ fn open_shell(
             let diagnostics = cx.new(|cx| {
                 immich_sync::diagnostics_view::DiagnosticsView::new(diagnostics_model, cx)
             });
+            let review =
+                cx.new(|cx| immich_sync::review_view::ReviewView::new(engine_model, window, cx));
             cx.new(|cx| {
                 AppShell::new(
                     dashboard,
@@ -274,6 +276,7 @@ fn open_shell(
                     upload,
                     failed,
                     diagnostics,
+                    review,
                     connection.clone(),
                     cx,
                 )

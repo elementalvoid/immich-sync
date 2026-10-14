@@ -185,6 +185,49 @@ impl StoreModel {
         cx.notify();
     }
 
+    /// Re-reads one folder's counts from the store after a review decision
+    /// made with no engine running (R5.4), so the cache a later status refresh
+    /// reads cannot resurrect the decided item.
+    pub fn refresh_counts(&mut self, path: &str, cx: &mut Context<Self>) {
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        let case = sync_core::paths::PathCase::for_platform();
+        let Some(folder) = self
+            .folders
+            .iter()
+            .find(|folder| {
+                sync_core::paths::is_within(
+                    std::path::Path::new(&folder.path),
+                    std::path::Path::new(path),
+                    case,
+                )
+            })
+            .map(|folder| folder.path.clone())
+        else {
+            return;
+        };
+        let read_folder = folder.clone();
+        let read = cx
+            .background_executor()
+            .spawn(async move { store.folder_counts(&read_folder) });
+        cx.spawn(async move |this, cx| {
+            let counts = read.await;
+            let _ = this.update(cx, |model, cx| {
+                let Ok(counts) = counts else {
+                    return;
+                };
+                // The folder list can change while the read runs: find the
+                // folder by path, not by the index found before it.
+                if let Some(index) = model.folders.iter().position(|entry| entry.path == folder) {
+                    model.counts[index] = counts;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     /// The problem that stopped the store, if any.
     #[must_use]
     pub fn problem(&self) -> Option<&str> {

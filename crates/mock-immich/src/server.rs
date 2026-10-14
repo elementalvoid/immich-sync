@@ -126,6 +126,19 @@ struct Inner {
     stacks: HashMap<String, Vec<String>>,
     /// The tag ids on each asset (R4.2).
     asset_tags: HashMap<String, Vec<String>>,
+    /// Every `DELETE /assets` call, in order (R5.3). A test asserts the
+    /// request the client sent, not only the trash state it produced.
+    delete_calls: Vec<DeleteCall>,
+}
+
+/// One `DELETE /assets` call, as the double received it (R5.3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeleteCall {
+    /// The asset ids the body listed.
+    pub ids: Vec<String>,
+    /// The body's `force` field. v1 has no permanent delete, so a real client
+    /// sends `false` (ADR 0002).
+    pub force: bool,
 }
 
 /// One `PUT /assets/copy` call, as the double received it (R4.2).
@@ -707,6 +720,29 @@ impl MockImmich {
             .get(asset_id)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Every `DELETE /assets` call, in order (R5.3).
+    #[must_use]
+    pub fn delete_calls(&self) -> Vec<DeleteCall> {
+        self.state
+            .inner
+            .lock()
+            .expect("mock state poisoned")
+            .delete_calls
+            .clone()
+    }
+
+    /// Whether one asset is in the trash (R5.3).
+    #[must_use]
+    pub fn trashed(&self, asset_id: &str) -> bool {
+        self.state
+            .inner
+            .lock()
+            .expect("mock state poisoned")
+            .assets
+            .get(asset_id)
+            .is_some_and(|asset| asset.trashed)
     }
 
     /// The stack one asset is in, with its members in stack order (R4.3).
@@ -1468,6 +1504,10 @@ async fn delete_assets(
         .unwrap_or(false);
     let ids = id_list(body.get("ids"));
     let mut inner = state.inner.lock().expect("mock state poisoned");
+    inner.delete_calls.push(DeleteCall {
+        ids: ids.clone(),
+        force,
+    });
     for id in ids {
         if force {
             inner.remove_asset(&id);

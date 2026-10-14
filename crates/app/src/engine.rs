@@ -11,7 +11,9 @@ use std::time::Duration;
 
 use gpui_kit::*;
 use sync_core::engine::{Activity, Engine, EngineConfig, EngineStatus, FolderStatus, Limits};
-use sync_core::store::{AlbumScope, FailedItem, FolderCounts, SourceFolder, StateStore};
+use sync_core::store::{
+    AlbumScope, FailedItem, FolderCounts, ReviewDecision, ReviewItem, SourceFolder, StateStore,
+};
 
 use crate::connection::{ConnectionModel, worker};
 use crate::paths::AppPaths;
@@ -23,10 +25,11 @@ use sync_core::connection::SharedSession;
 /// How often the dashboard picks up the engine's live counts.
 const STATUS_POLL: Duration = Duration::from_millis(250);
 
-/// How often the failed-items list is re-read from the store (R6.5).
+/// How often the failed-items list and the deletion review are re-read from
+/// the store (R6.5, R5.3).
 ///
 /// The read runs on the background executor, never on the UI thread (N2), so
-/// this only decides how soon a parked item shows up in the view.
+/// this only decides how soon a parked item or a missing file shows up.
 const FAILED_POLL_TICKS: u32 = 4;
 
 /// The app-scoped engine and the status the views render.
@@ -42,6 +45,16 @@ pub struct EngineModel {
     /// The parked items the failed-items view lists (R6.5), re-read off the UI
     /// thread.
     failed: Vec<FailedItem>,
+    /// The missing files the deletion review lists (R5.3), re-read off the UI
+    /// thread.
+    review: Vec<ReviewItem>,
+    /// The message from a trash the server refused (R5.5). It lives with the
+    /// model, not the row: the item is still in the review, and a later success
+    /// clears it.
+    review_problem: Option<String>,
+    /// The review count the last notification was based on, so the 250 ms
+    /// status poll cannot post the same notification twice (R5.4).
+    notified_review: u32,
     paused: bool,
     problem: Option<String>,
     /// Bumped by every folder edit, so an older edit result cannot overwrite a
@@ -88,9 +101,17 @@ impl EngineModel {
         cx: &mut Context<Self>,
     ) -> Self {
         let subscriptions = vec![
+            // The status and the review list are refreshed when the store opens,
+            // so a review that already waits in the database raises its
+            // notification and fills the view at start (R5.3, R5.4).
             cx.observe(&store_model, |this, store, cx| {
                 let generation = store.read(cx).generation();
                 this.store_changed(generation, cx);
+                // A decision with no engine updates the store's cached counts,
+                // which do not move the generation, so the status follows every
+                // store notification (R5.4).
+                this.refresh_status(cx);
+                this.refresh_review(cx);
             }),
             cx.observe(&connection, |this, _, cx| this.try_start_engine(cx)),
         ];
@@ -111,6 +132,7 @@ impl EngineModel {
                         ticks = ticks.wrapping_add(1);
                         if ticks.is_multiple_of(FAILED_POLL_TICKS) {
                             model.refresh_failed(cx);
+                            model.refresh_review(cx);
                         }
                     })
                     .is_ok();
@@ -127,6 +149,9 @@ impl EngineModel {
             limits: None,
             status: empty_status(),
             failed: Vec::new(),
+            review: Vec::new(),
+            review_problem: None,
+            notified_review: 0,
             paused: false,
             problem: None,
             generation: 0,
@@ -154,6 +179,140 @@ impl EngineModel {
     #[must_use]
     pub fn failed_items(&self) -> &[FailedItem] {
         &self.failed
+    }
+
+    /// The missing files the deletion review lists (R5.3).
+    #[must_use]
+    pub fn review_items(&self) -> &[ReviewItem] {
+        &self.review
+    }
+
+    /// The message from a trash the server refused, if any (R5.5).
+    #[must_use]
+    pub fn review_problem(&self) -> Option<&str> {
+        self.review_problem.as_deref()
+    }
+
+    /// Keeps the server asset for one missing file and clears its row (R5.3).
+    ///
+    /// Nothing is sent to the server, so this works while the client is signed
+    /// out; the state write still runs on the worker runtime (N2).
+    pub fn keep_review(&mut self, path: String, cx: &mut Context<Self>) {
+        let engine = self.engine.clone();
+        let store = self.store_model.read(cx).store();
+        let Ok(runtime) = worker() else {
+            self.review_problem = Some("The network runtime could not start.".to_string());
+            cx.notify();
+            return;
+        };
+        let (results, incoming) = async_channel::bounded(1);
+        let action_path = path.clone();
+        runtime.spawn(async move {
+            // N2: the store write belongs on the worker, not the UI thread.
+            let result = match engine {
+                Some(engine) => engine
+                    .keep_review_item(&action_path)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string()),
+                None => match store {
+                    Some(store) => store
+                        .decide_review(&action_path, ReviewDecision::Keep)
+                        .map(|_| ())
+                        .map_err(|error| error.to_string()),
+                    None => Err("The state database is still opening.".to_string()),
+                },
+            };
+            let _ = results.send(result).await;
+        });
+        self.finish_review_action(incoming, path, cx);
+    }
+
+    /// Moves one missing file's asset to the trash and clears its row (R5.3).
+    ///
+    /// A refusal leaves the item in the review and its reason in
+    /// [`Self::review_problem`], which is what R5.5 asks the view to show.
+    pub fn trash_review(&mut self, path: String, cx: &mut Context<Self>) {
+        let Some(engine) = self.engine.clone() else {
+            self.review_problem = Some("Sign in before moving an asset to the trash.".to_string());
+            cx.notify();
+            return;
+        };
+        let Ok(runtime) = worker() else {
+            self.review_problem = Some("The network runtime could not start.".to_string());
+            cx.notify();
+            return;
+        };
+        let (results, incoming) = async_channel::bounded(1);
+        let action_path = path.clone();
+        runtime.spawn(async move {
+            let result = engine
+                .trash_review_item(&action_path)
+                .await
+                .map_err(|error| crate::review::trash_problem(&error));
+            let _ = results.send(result).await;
+        });
+        self.finish_review_action(incoming, path, cx);
+    }
+
+    /// Publishes the outcome of a keep or a trash and refreshes the rows
+    /// (R5.3-R5.5).
+    fn finish_review_action(
+        &mut self,
+        incoming: async_channel::Receiver<Result<(), String>>,
+        path: String,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            let Ok(result) = incoming.recv().await else {
+                return;
+            };
+            let _ = this.update(cx, |model, cx| {
+                let decided = result.is_ok();
+                match result {
+                    Ok(()) => model.review_problem = None,
+                    Err(problem) => model.review_problem = Some(problem),
+                }
+                model.refresh_review(cx);
+                // R5.4: the tray count follows the decision at once.
+                model.refresh_status(cx);
+                // Without a running engine the status is the store's cached
+                // counts, which do not know about the write that just landed,
+                // so re-read the affected folder's counts instead of patching
+                // the UI model: a later refresh must not resurrect the item.
+                if decided && model.engine.is_none() {
+                    model
+                        .store_model
+                        .update(cx, |store, cx| store.refresh_counts(&path, cx));
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Re-reads the missing files from the store on the background executor
+    /// (N2) and republishes them when they changed.
+    pub fn refresh_review(&mut self, cx: &mut Context<Self>) {
+        let Some(store) = self.store_model.read(cx).store() else {
+            return;
+        };
+        let read = cx
+            .background_executor()
+            .spawn(async move { store.review_items() });
+        cx.spawn(async move |this, cx| {
+            let read = read.await;
+            let _ = this.update(cx, |model, cx| match read {
+                Ok(items) => {
+                    if items != model.review {
+                        model.review = items;
+                        cx.notify();
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "the deletion review could not be read");
+                }
+            });
+        })
+        .detach();
     }
 
     /// Re-attempts one parked item by hand (R6.5).
@@ -732,6 +891,7 @@ impl EngineModel {
                     counts.pending += folder.counts.pending;
                     counts.uploaded += folder.counts.uploaded;
                     counts.failed += folder.counts.failed;
+                    counts.review += folder.counts.review;
                 }
                 EngineStatus {
                     activity: if paused {
@@ -740,7 +900,7 @@ impl EngineModel {
                         Activity::NeedsAttention
                     } else if counts.pending > 0 {
                         Activity::Syncing
-                    } else if counts.failed > 0 {
+                    } else if counts.failed > 0 || counts.review > 0 {
                         Activity::NeedsAttention
                     } else {
                         Activity::Idle
@@ -751,6 +911,20 @@ impl EngineModel {
                 }
             }
         };
+        // R5.4, R10.1: a new review item is the one thing the tray cannot show
+        // on its own, so it also raises a system notification. The count the
+        // last one was based on is kept, so the poll cannot repeat it.
+        let review = self.status.counts.review;
+        if let Some(notification) =
+            crate::shell::new_review_notification(review, self.notified_review)
+        {
+            tracing::info!(
+                count = review,
+                "R5.4: the deletion review raised a notification"
+            );
+            cx.show_system_notification(notification);
+        }
+        self.notified_review = review;
         cx.notify();
     }
 

@@ -13,6 +13,8 @@ pub mod instance;
 pub mod logging;
 pub mod logs_view;
 pub mod paths;
+pub mod review;
+pub mod review_view;
 pub mod settings;
 pub mod settings_view;
 pub mod shell;
