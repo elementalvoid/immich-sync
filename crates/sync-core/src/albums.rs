@@ -184,7 +184,10 @@ mod tests {
     fn an_unmapped_folder_names_no_album_whatever_the_scope() {
         for scope in [AlbumScope::Leaf, AlbumScope::WholeFolder] {
             assert_eq!(
-                album_of(&folder(false, scope), Path::new("/photos/Holiday/beach.jpg")),
+                album_of(
+                    &folder(false, scope),
+                    Path::new("/photos/Holiday/beach.jpg")
+                ),
                 None,
                 "R3.4: album mapping is opt-in per folder"
             );
@@ -220,10 +223,7 @@ mod tests {
         ] {
             assert_eq!(
                 album_of(&whole, Path::new(file)),
-                Some((
-                    "photos".to_string(),
-                    path_key(Path::new("/photos"))
-                )),
+                Some(("photos".to_string(), path_key(Path::new("/photos")))),
                 "{file} maps to the source folder's album"
             );
         }
