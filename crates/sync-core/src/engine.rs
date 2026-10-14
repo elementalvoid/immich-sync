@@ -461,14 +461,16 @@ impl Engine {
             .iter_mut()
             .find(|entry| path_key(Path::new(&entry.folder.path)) == key)
             .ok_or_else(|| EngineError::UnknownFolder(path.to_string()))?;
-        change(&mut entry.folder);
-        let folder = entry.folder.clone();
-        drop(folders);
+        // Write the change before it reaches the cards: a store that refuses
+        // it must not leave the live status disagreeing with the store.
+        let mut folder = entry.folder.clone();
+        change(&mut folder);
         self.inner.store.add_folder(&folder)?;
+        entry.folder = folder;
         tracing::info!(
-            folder = %folder.path,
-            album_mapping = folder.album_mapping,
-            album_scope = folder.album_scope.as_str(),
+            folder = %entry.folder.path,
+            album_mapping = entry.folder.album_mapping,
+            album_scope = entry.folder.album_scope.as_str(),
             "the album mapping changed"
         );
         Ok(())
@@ -731,10 +733,14 @@ async fn dispatch_loop(inner: Arc<EngineInner>, mut queue_rx: mpsc::UnboundedRec
 
 /// Adds a finished asset to the albums its folder maps to (R3.4).
 ///
-/// The upload is already recorded when this runs, so a failure here never
-/// costs the upload: the row keeps its terminal state and its asset mapping,
-/// and the folder's last error says what could not be done. A retry of the
-/// album call belongs with the retry work, not here.
+/// The upload is already recorded when this runs, so a failure here never costs
+/// the upload: the row keeps its terminal state and its asset mapping. What is
+/// lost is the membership, and the only trace of the loss is the folder's last
+/// error: it lives in memory, `scan_once` clears it on the next successful
+/// scan, and `Engine::start` starts every folder with none, so within one scan
+/// interval or any restart the asset is on the server and in no album with
+/// nothing durable saying so. The retry policy (#7) owns making that durable
+/// and re-attempting the album call.
 async fn attach_albums(inner: &Arc<EngineInner>, file: &Path, asset_id: &str) {
     let Some(folder) = folder_entry_for(inner, file) else {
         return;
@@ -765,14 +771,9 @@ async fn attach_albums(inner: &Arc<EngineInner>, file: &Path, asset_id: &str) {
 
 /// The source folder that contains `path`, as stored.
 fn folder_entry_for(inner: &EngineInner, path: &Path) -> Option<SourceFolder> {
-    let case = PathCase::for_platform();
-    inner
-        .folders
-        .lock()
-        .expect("the folder lock")
-        .iter()
-        .find(|entry| is_within(Path::new(&entry.folder.path), path, case))
-        .map(|entry| entry.folder.clone())
+    let index = inner.folder_index_for(path)?;
+    let folders = inner.folders.lock().expect("the folder lock");
+    folders.get(index).map(|entry| entry.folder.clone())
 }
 
 /// Prepares one batch and checks it with one `bulk-upload-check` (R3.1).
