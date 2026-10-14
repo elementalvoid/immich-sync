@@ -115,6 +115,7 @@ fn folder_progress_survives_counts_above_a_u16() {
         uploaded: 100_000,
         pending: 100_000,
         failed: 0,
+        review: 0,
     };
     let status = EngineStatus {
         activity: Activity::Syncing,
@@ -476,6 +477,7 @@ fn engine_status_maps_to_the_global_card_and_one_card_per_folder() {
                     uploaded: 7,
                     pending: 3,
                     failed: 1,
+                    review: 2,
                 },
                 last_error: None,
             },
@@ -493,6 +495,7 @@ fn engine_status_maps_to_the_global_card_and_one_card_per_folder() {
             uploaded: 7,
             pending: 3,
             failed: 1,
+            review: 2,
         },
         last_error: Some("unsupported_format: the file type".to_string()),
     };
@@ -508,6 +511,14 @@ fn engine_status_maps_to_the_global_card_and_one_card_per_folder() {
         Some("unsupported_format: the file type")
     );
     assert!((model.global.progress - 0.7).abs() < 0.01);
+    assert_eq!(
+        model.global.review_count, 2,
+        "R5.4: the global card shows the review count"
+    );
+    assert_eq!(
+        model.global.content().review.as_deref(),
+        Some("2 missing files to review")
+    );
     assert_eq!(model.folders.len(), 2, "one card per source folder");
 
     let pictures = &model.folders[0];
@@ -517,6 +528,10 @@ fn engine_status_maps_to_the_global_card_and_one_card_per_folder() {
     assert_eq!(
         pictures.content().counts,
         "7 uploaded · 3 pending · 1 failed"
+    );
+    assert_eq!(
+        pictures.review_count, 2,
+        "R5.4: a folder card shows its own review count"
     );
 
     // R2.5: a folder that disappeared is a folder status, not per-file errors.

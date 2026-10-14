@@ -12,6 +12,7 @@ use crate::engine::EngineModel;
 use crate::failed_view::FailedView;
 use crate::logs_view::LogsView;
 use crate::paths::AppPaths;
+use crate::review_view::ReviewView;
 use crate::settings_view::SettingsView;
 use crate::store::StoreModel;
 use crate::upload::UploadModel;
@@ -37,6 +38,10 @@ pub fn init(cx: &mut App) {
     // Without this, GPUI quits when the last window closes on Windows and
     // Linux, which would end the tray app.
     cx.set_quit_mode(QuitMode::Explicit);
+    // A system notification needs an identity on Windows (the AppUserModelID)
+    // and on the test platform, so it is set before any can be posted (R5.4,
+    // R10.1).
+    cx.set_app_identity("com.immichsync.desktop", "Immich Sync");
     cx.on_action(show)
         .on_action(hide)
         .on_action(quit)
@@ -257,12 +262,14 @@ pub fn open_main_window(cx: &mut App) -> anyhow::Result<()> {
         settings.update(cx, |view, _| view.set_engine(engine.clone()));
         let upload_view = cx.new(|cx| UploadView::new(upload.clone(), window, cx));
         let failed_view = cx.new(|cx| FailedView::new(engine.clone(), window, cx));
+        let review_view = cx.new(|cx| ReviewView::new(engine.clone(), window, cx));
         cx.new(|cx| {
             AppShell::new(
                 dashboard,
                 settings,
                 upload_view,
                 failed_view,
+                review_view,
                 connection,
                 cx,
             )
@@ -285,16 +292,17 @@ pub enum ViewMode {
     Upload,
     /// The parked items and their manual retry (R6.5).
     Failed,
+    /// The missing files and their keep-or-trash decision (R5.3).
+    Review,
     /// The log file and its level control (R10.3).
     Logs,
 }
 
 /// The environment variable that pins the visible surface.
 ///
-/// Set it to `dashboard`, `settings`, `upload`, `failed`, or `logs` to open the
-/// window on
-/// that surface and skip the observer that would otherwise decide. A screenshot
-/// run uses it so the capture is reproducible.
+/// Set it to `dashboard`, `settings`, `upload`, `failed`, `review`, or `logs`
+/// to open the window on that surface and skip the observer that would
+/// otherwise decide. A screenshot run uses it so the capture is reproducible.
 pub const FORCE_VIEW_ENV: &str = "IMMICH_SYNC_VIEW";
 
 /// The surface a pinned value names, when one is set.
@@ -311,6 +319,7 @@ pub fn view_for_name(value: &str) -> Option<ViewMode> {
         "settings" => Some(ViewMode::Settings),
         "upload" => Some(ViewMode::Upload),
         "failed" => Some(ViewMode::Failed),
+        "review" => Some(ViewMode::Review),
         "logs" => Some(ViewMode::Logs),
         _ => None,
     }
@@ -325,6 +334,7 @@ pub struct AppShell {
     logs: Entity<LogsView>,
     upload: Entity<UploadView>,
     failed: Entity<FailedView>,
+    review: Entity<ReviewView>,
     _connection: Entity<ConnectionModel>,
     _connection_subscription: Subscription,
 }
@@ -333,11 +343,13 @@ impl AppShell {
     /// A shell that starts on the dashboard, or on the surface
     /// [`FORCE_VIEW_ENV`] pins, and mirrors the connection state onto the
     /// global status card (R8.1).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         dashboard: Entity<Dashboard>,
         settings: Entity<SettingsView>,
         upload: Entity<UploadView>,
         failed: Entity<FailedView>,
+        review: Entity<ReviewView>,
         connection: Entity<ConnectionModel>,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -361,6 +373,7 @@ impl AppShell {
             logs,
             upload,
             failed,
+            review,
             _connection: connection,
             _connection_subscription: subscription,
         }
@@ -409,6 +422,13 @@ impl AppShell {
                 cx,
             ))
             .child(view_button(
+                "nav-review",
+                "Review",
+                ViewMode::Review,
+                self.mode,
+                cx,
+            ))
+            .child(view_button(
                 "nav-settings",
                 "Settings",
                 ViewMode::Settings,
@@ -451,6 +471,7 @@ impl Render for AppShell {
             ViewMode::Settings => self.settings.clone().into_any_element(),
             ViewMode::Upload => self.upload.clone().into_any_element(),
             ViewMode::Failed => self.failed.clone().into_any_element(),
+            ViewMode::Review => self.review.clone().into_any_element(),
             ViewMode::Logs => self.logs.clone().into_any_element(),
         };
 
@@ -508,8 +529,8 @@ pub fn tray_tooltip(state: &ConnectionState) -> String {
     format!("Immich Sync — {}", state.message())
 }
 
-/// The tray tooltip for the live activity, the connection, and the progress
-/// (R8.2).
+/// The tray tooltip for the live activity, the connection, the review count,
+/// and the progress (R8.2, R5.4).
 #[must_use]
 pub fn tray_status_tooltip(
     activity: Activity,
@@ -522,10 +543,40 @@ pub fn tray_status_tooltip(
     if total > 0 {
         text.push_str(&format!(" — {}/{} uploaded", counts.uploaded, total));
     }
+    if counts.review > 0 {
+        text.push_str(&format!(" — {} to review", counts.review));
+    }
     if let Some(error) = last_error {
         text.push_str(&format!(" — last error: {error}"));
     }
     text
+}
+
+/// The system notification a new deletion review item raises (R5.4, R10.1).
+///
+/// `None` when the count did not rise, so the 250 ms status poll cannot post
+/// the same notification again. The tag is stable, so a later notification
+/// replaces the previous one where the platform supports it.
+#[must_use]
+pub fn new_review_notification(count: u32, previous: u32) -> Option<SystemNotification> {
+    if count <= previous {
+        return None;
+    }
+    let body = match count {
+        1 => "A file disappeared from a source folder. Review it to keep the server copy or move \
+              it to the trash."
+            .to_string(),
+        files => format!(
+            "{files} files disappeared from your source folders. Review them to keep the server \
+             copies or move them to the trash."
+        ),
+    };
+    Some(SystemNotification {
+        tag: "deletion-review".into(),
+        title: "Immich Sync".into(),
+        body: body.into(),
+        actions: Vec::new(),
+    })
 }
 
 /// Shows a connection state on the tray tooltip, when a tray is installed.
