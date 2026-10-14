@@ -176,6 +176,38 @@ fn opening_a_file_that_is_not_a_database_fails_the_startup_check() {
     );
 }
 
+/// The startup check must wait out a transient lock instead of reporting it as
+/// corruption: a rebuild that trusted that verdict would delete a healthy
+/// database (N4, R10.4). The store pins its timeout before the check runs.
+#[test]
+fn the_startup_check_waits_out_a_transient_lock() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let path = temp.path().join("state.db");
+    {
+        // A valid database in the default journal mode, so the blocking
+        // connection below takes a real lock on it.
+        let connection = rusqlite::Connection::open(&path).expect("create the database");
+        connection
+            .execute_batch("CREATE TABLE marker (value INTEGER)")
+            .expect("create a table");
+    }
+    let blocker = rusqlite::Connection::open(&path).expect("open the blocking connection");
+    blocker
+        .execute_batch("BEGIN EXCLUSIVE")
+        .expect("take the exclusive lock");
+    let released = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        drop(blocker);
+    });
+
+    let store = StateStore::open(&path)
+        .expect("the startup check waits out the lock instead of failing the file");
+    store
+        .quick_check()
+        .expect("the database is sound once the lock is gone");
+    released.join().expect("the releasing thread finishes");
+}
+
 #[test]
 fn opening_twice_applies_no_migration_twice() {
     let temp = tempfile::tempdir().expect("create a temp dir");

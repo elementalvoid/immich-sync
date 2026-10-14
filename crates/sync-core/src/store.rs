@@ -6,15 +6,18 @@
 //! read-modify-write. The database lives in the local data directory; the
 //! caller passes the path from the platform-directory abstraction (R9.2).
 //!
-//! Reader connections for the UI arrive with the views that need them; until
-//! then the writer serves the engine's own reads.
+//! Reader connections for the UI: `sqlite_info` and `last_error_per_class`
+//! open their own read-only connection, so a diagnostics read never queues
+//! behind the engine's writer (ADR 0005, R10.2).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension as _, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension as _, Transaction, TransactionBehavior, params,
+};
 use rusqlite_migration::{M, Migrations};
 
 use crate::failure::FailureClass;
@@ -592,8 +595,17 @@ impl StateStore {
             path: path.clone(),
             source,
         })?;
-        // Before the pragmas: a file that is not a database fails every pragma
-        // too, and `quick_check` is the honest reason to report.
+        // The busy timeout is set before the startup check, so a transient
+        // lock makes the check wait rather than read as corruption (the
+        // rebuild only replaces a database the check calls bad).
+        writer
+            .busy_timeout(BUSY_TIMEOUT)
+            .map_err(|source| StoreError::Open {
+                path: path.clone(),
+                source,
+            })?;
+        // `quick_check` is the honest reason to report for a file that is not
+        // a database, so it runs before the rest of the pragmas.
         let check: String = writer
             .query_row("PRAGMA quick_check", [], |row| row.get(0))
             .map_err(|source| StoreError::QuickCheck {
@@ -684,19 +696,19 @@ impl StateStore {
     /// Returns [`StoreError::Query`] when a pragma, the catalog, or a row
     /// count cannot be read.
     pub fn sqlite_info(&self) -> Result<SqliteInfo, StoreError> {
-        let writer = self.writer()?;
+        let reader = self.reader()?;
         let read = |name: &str| -> Result<i64, StoreError> {
-            writer
+            reader
                 .query_row(name, [], |row| row.get(0))
                 .map_err(|source| self.query_error(source))
         };
         let migration_version = read("PRAGMA user_version")?;
         let page_size = read("PRAGMA page_size")?.max(0);
         let page_count = read("PRAGMA page_count")?.max(0);
-        let integrity: String = writer
+        let integrity: String = reader
             .query_row("PRAGMA quick_check", [], |row| row.get(0))
             .map_err(|source| self.query_error(source))?;
-        let names: Vec<String> = writer
+        let names: Vec<String> = reader
             .prepare(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
                  ORDER BY name",
@@ -712,7 +724,7 @@ impl StateStore {
             // The name comes from the catalog, so it cannot be a bind
             // parameter; the quotes are doubled so a name with one still works.
             let query = format!("SELECT COUNT(*) FROM \"{}\"", table.replace('"', "\"\""));
-            let rows = writer
+            let rows = reader
                 .query_row(&query, [], |row| row.get(0))
                 .map_err(|source| self.query_error(source))?;
             tables.push(TableCount { table, rows });
@@ -738,9 +750,9 @@ impl StateStore {
     ///
     /// Returns [`StoreError`] when the query fails.
     pub fn last_error_per_class(&self) -> Result<Vec<ClassError>, StoreError> {
-        let writer = self.writer()?;
+        let reader = self.reader()?;
         let newest: Vec<String> = {
-            let mut statement = writer
+            let mut statement = reader
                 .prepare(
                     "SELECT error_class FROM attempt WHERE error_class IS NOT NULL \
                      GROUP BY error_class ORDER BY MAX(started_ns) DESC",
@@ -756,7 +768,7 @@ impl StateStore {
             let Some(class) = FailureClass::parse(&text) else {
                 continue;
             };
-            let message: Option<String> = writer
+            let message: Option<String> = reader
                 .query_row(
                     "SELECT i.error_message FROM attempt a JOIN sync_item i ON i.id = a.item_id \
                      WHERE a.error_class = ?1 AND i.error_class = ?1 \
@@ -1409,6 +1421,22 @@ impl StateStore {
         self.writer.lock().map_err(|_| StoreError::Poisoned)
     }
 
+    /// A fresh read-only connection to the same file, so a UI read never
+    /// queues behind the one writer (ADR 0005).
+    fn reader(&self) -> Result<Connection, StoreError> {
+        let open_error = |source| StoreError::Open {
+            path: self.path.clone(),
+            source,
+        };
+        let reader = Connection::open_with_flags(
+            &self.path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(open_error)?;
+        reader.busy_timeout(BUSY_TIMEOUT).map_err(open_error)?;
+        Ok(reader)
+    }
+
     /// One query failure, tagged with the database path.
     fn query_error(&self, source: rusqlite::Error) -> StoreError {
         StoreError::Query {
@@ -1971,5 +1999,35 @@ mod migration_tests {
         let row = store.item("hello.txt").expect("read").expect("the row");
         assert_eq!(row.asset_id.as_deref(), Some("asset-1"));
         assert!(store.folders().expect("read folders").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod diagnostics_read_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::mpsc;
+
+    /// R10.2, ADR 0005: the diagnostics reads take their own reader
+    /// connections, so a read never queues behind the engine's writer. Holding
+    /// the writer lock here stands in for a slow engine write.
+    #[test]
+    fn the_diagnostics_reads_do_not_wait_for_the_writer() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let store =
+            Arc::new(StateStore::open(temp.path().join("state.db")).expect("open a fresh store"));
+        let writer = store.writer.lock().expect("lock the writer");
+        let (sender, receiver) = mpsc::channel();
+        {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                let _ = sender.send((store.sqlite_info(), store.last_error_per_class()));
+            });
+        }
+        let read = receiver.recv_timeout(Duration::from_secs(5));
+        drop(writer);
+        let (info, errors) = read.expect("the diagnostics read must not wait for the writer lock");
+        info.expect("read the sqlite info while the writer is held");
+        errors.expect("read the last errors while the writer is held");
     }
 }
