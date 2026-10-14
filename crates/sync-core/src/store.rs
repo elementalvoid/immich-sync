@@ -452,6 +452,38 @@ pub struct StorePragmas {
     pub foreign_keys: i64,
 }
 
+/// One table's row count, for the diagnostics view (R10.2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TableCount {
+    /// The table name the catalog holds.
+    pub table: String,
+    /// How many rows the table holds.
+    pub rows: i64,
+}
+
+/// What the state database reports about itself, for the diagnostics view
+/// (R10.2). [`StateStore::sqlite_info`] reads it without writing anything.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SqliteInfo {
+    /// `PRAGMA user_version`: the migration the schema stands at.
+    pub migration_version: i64,
+    /// The database's page footprint, `page_count * page_size`, in bytes.
+    pub size_bytes: u64,
+    /// Every table the catalog holds, with its row count.
+    pub tables: Vec<TableCount>,
+    /// The `PRAGMA quick_check` result: `ok`, or SQLite's reason.
+    pub integrity: String,
+}
+
+/// The newest failure of one class in the attempt log (R10.2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClassError {
+    /// The persisted failure class.
+    pub class: FailureClass,
+    /// The user-facing reason, when the item still holds this class.
+    pub message: Option<String>,
+}
+
 /// Why the state store could not be used.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -639,6 +671,134 @@ impl StateStore {
             busy_timeout_ms: read("PRAGMA busy_timeout")?,
             foreign_keys: read("PRAGMA foreign_keys")?,
         })
+    }
+
+    /// Reads what the state database says about itself: the migration it
+    /// stands at, its size, one row count per table, and the integrity check
+    /// (R10.2).
+    ///
+    /// Read-only: the diagnostics view calls it while the engine writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Query`] when a pragma, the catalog, or a row
+    /// count cannot be read.
+    pub fn sqlite_info(&self) -> Result<SqliteInfo, StoreError> {
+        let writer = self.writer()?;
+        let read = |name: &str| -> Result<i64, StoreError> {
+            writer
+                .query_row(name, [], |row| row.get(0))
+                .map_err(|source| self.query_error(source))
+        };
+        let migration_version = read("PRAGMA user_version")?;
+        let page_size = read("PRAGMA page_size")?.max(0);
+        let page_count = read("PRAGMA page_count")?.max(0);
+        let integrity: String = writer
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .map_err(|source| self.query_error(source))?;
+        let names: Vec<String> = writer
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
+                 ORDER BY name",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()
+            })
+            .map_err(|source| self.query_error(source))?;
+        let mut tables = Vec::with_capacity(names.len());
+        for table in names {
+            // The name comes from the catalog, so it cannot be a bind
+            // parameter; the quotes are doubled so a name with one still works.
+            let query = format!("SELECT COUNT(*) FROM \"{}\"", table.replace('"', "\"\""));
+            let rows = writer
+                .query_row(&query, [], |row| row.get(0))
+                .map_err(|source| self.query_error(source))?;
+            tables.push(TableCount { table, rows });
+        }
+        Ok(SqliteInfo {
+            migration_version,
+            size_bytes: u64::try_from(page_size)
+                .unwrap_or(0)
+                .saturating_mul(u64::try_from(page_count).unwrap_or(0)),
+            tables,
+            integrity,
+        })
+    }
+
+    /// The newest failure of each class the attempt log holds, newest first
+    /// (R10.2).
+    ///
+    /// The message is the item's own reason and only when the item still
+    /// carries the class, so a later outcome cannot label an older class with
+    /// the wrong reason.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the query fails.
+    pub fn last_error_per_class(&self) -> Result<Vec<ClassError>, StoreError> {
+        let writer = self.writer()?;
+        let newest: Vec<String> = {
+            let mut statement = writer
+                .prepare(
+                    "SELECT error_class FROM attempt WHERE error_class IS NOT NULL \
+                     GROUP BY error_class ORDER BY MAX(started_ns) DESC",
+                )
+                .map_err(|source| self.query_error(source))?;
+            statement
+                .query_map([], |row| row.get(0))
+                .and_then(|rows| rows.collect::<rusqlite::Result<Vec<String>>>())
+                .map_err(|source| self.query_error(source))?
+        };
+        let mut errors = Vec::with_capacity(newest.len());
+        for text in newest {
+            let Some(class) = FailureClass::parse(&text) else {
+                continue;
+            };
+            let message: Option<String> = writer
+                .query_row(
+                    "SELECT i.error_message FROM attempt a JOIN sync_item i ON i.id = a.item_id \
+                     WHERE a.error_class = ?1 AND i.error_class = ?1 \
+                     ORDER BY a.started_ns DESC, a.id DESC LIMIT 1",
+                    [&text],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|source| self.query_error(source))?
+                .flatten();
+            errors.push(ClassError { class, message });
+        }
+        Ok(errors)
+    }
+
+    /// Starts the state tables over (R10.4), in one transaction: the item,
+    /// attempt, album, and folder rows go, and the schema stays at the latest
+    /// migration.
+    ///
+    /// The caller re-adds the folders the user chose, because those choices
+    /// live only in the database and only the caller knows them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the transaction cannot run.
+    pub fn reset(&self) -> Result<(), StoreError> {
+        let mut writer = self.writer()?;
+        let transaction = writer
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| self.query_error(source))?;
+        transaction
+            .execute_batch(
+                "DELETE FROM version;
+                 DELETE FROM attempt;
+                 DELETE FROM sync_item;
+                 DELETE FROM album;
+                 DELETE FROM source_folder;",
+            )
+            .map_err(|source| self.query_error(source))?;
+        transaction
+            .commit()
+            .map_err(|source| self.query_error(source))
     }
 
     /// Writes one item's outcome, replacing the row for the same path.

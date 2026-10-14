@@ -4,7 +4,10 @@ use std::path::Path;
 
 use sync_core::failure::FailureClass;
 use sync_core::hash::Sha1;
-use sync_core::store::{ItemRecord, ItemState, NewVersion, SidecarDigest, StateStore, StoreError};
+use sync_core::store::{
+    AlbumScope, AttemptOutcome, AttemptRecord, ItemRecord, ItemState, NewVersion, SidecarDigest,
+    SourceFolder, StateStore, StoreError,
+};
 
 /// `sha1("hello world")`, hex.
 const HELLO_WORLD_SHA1_HEX: &str = "2aae6c35c94fcfb415dbe95f408b9ce91ee846ed";
@@ -796,6 +799,155 @@ fn recording_the_same_version_twice_keeps_one_row() {
         1,
         "a repeat is idempotent"
     );
+}
+
+/// The diagnostics read (R10.2): the schema version, the size, the per-table
+/// counts, and the integrity check, read without changing anything.
+#[test]
+fn the_sqlite_info_reports_the_schema_the_size_and_the_table_counts() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+
+    let empty = store.sqlite_info().expect("read the sqlite info");
+    assert_eq!(
+        empty.migration_version, 8,
+        "the schema stands at the eighth migration"
+    );
+    assert!(empty.size_bytes > 0, "a migrated database occupies pages");
+    assert_eq!(empty.integrity, "ok", "a fresh database is sound");
+    assert_eq!(
+        table_rows(&empty, "sync_item"),
+        0,
+        "a fresh database holds no items"
+    );
+    for table in ["sync_item", "source_folder", "album", "attempt", "version"] {
+        assert!(
+            empty.tables.iter().any(|count| count.table == table),
+            "the catalog names {table}: {:?}",
+            empty.tables
+        );
+    }
+
+    store
+        .record(&record("hello.txt", ItemState::Uploaded))
+        .expect("write the item");
+    store
+        .add_folder(&SourceFolder {
+            path: temp.path().join("photos").display().to_string(),
+            recursive: true,
+            album_mapping: false,
+            album_scope: AlbumScope::Leaf,
+        })
+        .expect("add the folder");
+
+    let filled = store.sqlite_info().expect("read the sqlite info again");
+    assert_eq!(table_rows(&filled, "sync_item"), 1);
+    assert_eq!(table_rows(&filled, "source_folder"), 1);
+    assert!(
+        filled.size_bytes >= empty.size_bytes,
+        "the size does not shrink as rows arrive: {} then {}",
+        empty.size_bytes,
+        filled.size_bytes
+    );
+}
+
+/// The per-table row count for one table, which must be counted.
+fn table_rows(info: &sync_core::store::SqliteInfo, table: &str) -> i64 {
+    info.tables
+        .iter()
+        .find(|count| count.table == table)
+        .unwrap_or_else(|| panic!("the catalog holds {table}: {:?}", info.tables))
+        .rows
+}
+
+/// The most recent failure of each class the attempt log holds (R10.2).
+#[test]
+fn the_last_error_of_each_class_is_reported_with_its_message() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+
+    let mut unsupported = record("raw.cr3", ItemState::FailedPermanent);
+    unsupported.error_class = Some(FailureClass::UnsupportedFormat);
+    unsupported.error_message = Some("the server does not accept this file format".to_string());
+    store.record(&unsupported).expect("write the item");
+    store
+        .record_attempt(&AttemptRecord {
+            path: unsupported.path.clone(),
+            started_ns: 100,
+            outcome: AttemptOutcome::Failed,
+            error_class: Some(FailureClass::UnsupportedFormat),
+        })
+        .expect("record the attempt");
+
+    let mut transient = record("large.bin", ItemState::DeadLetter);
+    transient.error_class = Some(FailureClass::ServerTransient);
+    transient.error_message = Some("the server answered 503".to_string());
+    store.record(&transient).expect("write the item");
+    store
+        .record_attempt(&AttemptRecord {
+            path: transient.path.clone(),
+            started_ns: 200,
+            outcome: AttemptOutcome::Failed,
+            error_class: Some(FailureClass::ServerTransient),
+        })
+        .expect("record the attempt");
+
+    let errors = store
+        .last_error_per_class()
+        .expect("read the last errors by class");
+
+    assert_eq!(
+        errors
+            .iter()
+            .map(|error| error.class)
+            .collect::<Vec<_>>(),
+        vec![FailureClass::ServerTransient, FailureClass::UnsupportedFormat],
+        "newest first, one entry per class"
+    );
+    assert_eq!(
+        errors[0].message.as_deref(),
+        Some("the server answered 503")
+    );
+    assert_eq!(
+        errors[1].message.as_deref(),
+        Some("the server does not accept this file format")
+    );
+}
+
+/// A rebuild starts the state tables over (R10.4): the item, attempt, album,
+/// and version rows go, and the folder list is re-added by the caller that
+/// knows the user's choices.
+#[test]
+fn a_reset_empties_every_state_table_and_leaves_the_database_sound() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    store
+        .record(&record("hello.txt", ItemState::Uploaded))
+        .expect("write the item");
+    store
+        .record_attempt(&AttemptRecord {
+            path: "hello.txt".to_string(),
+            started_ns: 1,
+            outcome: AttemptOutcome::Succeeded,
+            error_class: None,
+        })
+        .expect("record the attempt");
+    store
+        .add_folder(&SourceFolder {
+            path: temp.path().join("photos").display().to_string(),
+            recursive: true,
+            album_mapping: true,
+            album_scope: AlbumScope::Leaf,
+        })
+        .expect("add the folder");
+
+    store.reset().expect("reset the state tables");
+
+    let info = store.sqlite_info().expect("read the sqlite info");
+    assert_eq!(info.integrity, "ok", "the reset database is sound");
+    for table in ["sync_item", "source_folder", "album", "attempt", "version"] {
+        assert_eq!(table_rows(&info, table), 0, "{table} starts over");
+    }
 }
 
 /// R4.4: a version needs an item row; a path the store does not track is an
