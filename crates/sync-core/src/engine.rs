@@ -1159,7 +1159,12 @@ fn is_settled(state: ItemState) -> bool {
 async fn spawn_upload(inner: &Arc<EngineInner>, item: PreparedItem) {
     let permit = match Arc::clone(&inner.upload_slots).acquire_owned().await {
         Ok(permit) => permit,
-        Err(_) => return,
+        // No worker can take the item, so the claim goes back: `prepare` skips
+        // a claimed path, and nothing else would ever queue it again (R6.7).
+        Err(_) => {
+            inner.release_item(&item);
+            return;
+        }
     };
     if inner.gate.is_paused() {
         drop(permit);
@@ -1170,6 +1175,8 @@ async fn spawn_upload(inner: &Arc<EngineInner>, item: PreparedItem) {
     let mut uploads = inner.uploads.lock().expect("the upload list");
     if inner.stopped.load(Ordering::SeqCst) {
         // `stop` ran first: the item stays pending for the next engine (R6.7).
+        drop(permit);
+        inner.release_item(&item);
         return;
     }
     // Reap finished workers first, so a long run does not accumulate handles.
@@ -1421,5 +1428,53 @@ mod tests {
         assert_eq!(status.progress(), 1.0);
         status.counts.pending = 1;
         assert!((status.progress() - 0.75).abs() < f32::EPSILON);
+    }
+
+    /// An item the upload pool could not hand to a worker stays claimable
+    /// (R6.7).
+    ///
+    /// `prepare` skips a path that is already claimed, so an item left claimed
+    /// by either early return in `spawn_upload` was never queued again for the
+    /// life of the engine, whatever the run that claimed it was doing.
+    #[tokio::test]
+    async fn an_item_the_pool_could_not_spawn_is_claimable_again() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let store = Arc::new(
+            StateStore::open(temp.path().join("state.db")).expect("open the state store"),
+        );
+        let file = temp.path().join("queued.jpg");
+        std::fs::write(&file, b"queued bytes").expect("write the file");
+        // The session is never used: neither path below sends a request.
+        let session = crate::connection::Connection::new(
+            "http://127.0.0.1:1",
+            Arc::new(crate::credential::MemoryCredentialStore::new()),
+        )
+        .expect("a valid URL")
+        .shared();
+        let engine = Arc::new(
+            Engine::new(store, session, EngineConfig::default()).expect("build the engine"),
+        );
+        let inner = Arc::clone(&engine.inner);
+
+        // `stop` ran between the batch and the worker: the item stays pending
+        // for the next engine (R6.7), so its claim must go with it.
+        let Some(item) = prepare(&inner, &file).await else {
+            panic!("the first prepare must claim the file");
+        };
+        inner.stopped.store(true, Ordering::SeqCst);
+        spawn_upload(&inner, item).await;
+        // The claim is what `prepare` skips on, so claiming the file again is
+        // the proof that the pool released it.
+        let Some(reclaimed) = prepare(&inner, &file).await else {
+            panic!("an item a stopped engine could not spawn is stuck claimed forever");
+        };
+
+        // The pool is closed, so no permit is left to take.
+        inner.upload_slots.close();
+        spawn_upload(&inner, reclaimed).await;
+        assert!(
+            prepare(&inner, &file).await.is_some(),
+            "an item a closed pool could not spawn is stuck claimed forever"
+        );
     }
 }
