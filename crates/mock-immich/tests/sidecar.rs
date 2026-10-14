@@ -67,6 +67,31 @@ async fn an_asset_without_a_sidecar_is_not_marked() {
 }
 
 #[tokio::test]
+async fn the_upload_log_keeps_the_arrival_order_and_the_parts() {
+    // R3.3: a test proves the motion video went on the wire before the photo
+    // that links it, so the double has to remember the order.
+    let server = MockImmich::start().await;
+    let client = reqwest::Client::new();
+
+    upload(&client, &server, b"video bytes", Some(b"<xmp/>"), None).await;
+    upload(&client, &server, b"photo bytes", None, Some("video-id")).await;
+
+    let uploads = server.uploads();
+    assert_eq!(uploads.len(), 2, "both requests were read: {uploads:?}");
+    assert_eq!(uploads[0].filename, "a.jpg");
+    assert!(
+        uploads[0].has_sidecar,
+        "the first request carried sidecarData"
+    );
+    assert_eq!(uploads[0].live_photo_video_id, None);
+    assert_eq!(
+        uploads[1].live_photo_video_id.as_deref(),
+        Some("video-id"),
+        "the second request came last"
+    );
+}
+
+#[tokio::test]
 async fn a_live_photo_video_id_is_recorded() {
     let server = MockImmich::start().await;
     let client = reqwest::Client::new();

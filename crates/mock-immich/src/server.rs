@@ -65,6 +65,10 @@ struct Inner {
     faults: HashMap<Operation, VecDeque<Fault>>,
     assets: HashMap<String, Asset>,
     checksums: HashMap<Vec<u8>, String>,
+    /// The `POST /assets` requests whose body the server read, in arrival
+    /// order. A duplicate answered from the `x-immich-checksum` header never
+    /// reaches this list, exactly as on the real server.
+    uploads: Vec<UploadRecord>,
     /// Checksums `bulk-upload-check` rejects as an unsupported format.
     unsupported: HashSet<Vec<u8>>,
     albums: HashMap<String, Album>,
@@ -96,6 +100,21 @@ struct Album {
     id: String,
     name: String,
     asset_ids: Vec<String>,
+}
+
+/// One `POST /assets` request, as the server received it.
+///
+/// The double keeps the order so a test can prove *when* a request arrived:
+/// a live photo's video has to go on the wire before the photo that links it
+/// (R3.3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UploadRecord {
+    /// The `filename` field of the request.
+    pub filename: String,
+    /// Whether the request carried a `sidecarData` part (R3.3).
+    pub has_sidecar: bool,
+    /// The `livePhotoVideoId` field, when the request carried one (R3.3).
+    pub live_photo_video_id: Option<String>,
 }
 
 impl Inner {
@@ -316,6 +335,23 @@ impl MockImmich {
             .lock()
             .expect("mock state poisoned")
             .api_key = Some(key.to_string());
+    }
+
+    /// The `POST /assets` requests whose body the server read, in arrival
+    /// order.
+    ///
+    /// A request answered `duplicate` from the `x-immich-checksum` header is
+    /// not here: the server answers it before it reads the body, so a second
+    /// request for bytes it already holds is counted by
+    /// [`Self::upload_requests`] but never appears in this list.
+    #[must_use]
+    pub fn uploads(&self) -> Vec<UploadRecord> {
+        self.state
+            .inner
+            .lock()
+            .expect("mock state poisoned")
+            .uploads
+            .clone()
     }
 
     /// Whether the asset was uploaded with a sidecar.
@@ -615,6 +651,7 @@ async fn upload(
     let mut asset_data = Vec::new();
     let mut has_sidecar = false;
     let mut live_photo_video_id = None;
+    let mut filename = None;
     let mut file_created_at = None;
     let mut file_modified_at = None;
     loop {
@@ -635,6 +672,10 @@ async fn upload(
             },
             Some("livePhotoVideoId") => match field.text().await {
                 Ok(text) => live_photo_video_id = Some(text),
+                Err(error) => return message(StatusCode::BAD_REQUEST, &error.to_string()),
+            },
+            Some("filename") => match field.text().await {
+                Ok(text) => filename = Some(text),
                 Err(error) => return message(StatusCode::BAD_REQUEST, &error.to_string()),
             },
             Some("fileCreatedAt") => match field.text().await {
@@ -663,6 +704,11 @@ async fn upload(
     // Immich stores the checksum it computes from the body, not the header.
     let checksum = checksum_of(&asset_data);
     let mut inner = state.inner.lock().expect("mock state poisoned");
+    inner.uploads.push(UploadRecord {
+        filename: filename.unwrap_or_default(),
+        has_sidecar,
+        live_photo_video_id: live_photo_video_id.clone(),
+    });
     if let Some(asset) = inner.asset_by_checksum(&checksum) {
         return duplicate_response(&asset.id);
     }
