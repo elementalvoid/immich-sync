@@ -465,6 +465,18 @@ impl MockImmich {
             .is_some_and(|asset| asset.has_sidecar)
     }
 
+    /// The id the server gave the asset holding `checksum` (base64 or hex),
+    /// when the server holds one. A test can name the asset an upload made
+    /// without reading the state row that is under test.
+    #[must_use]
+    pub fn asset_id_for_checksum(&self, checksum: &str) -> Option<String> {
+        let inner = self.state.inner.lock().expect("mock state poisoned");
+        let bytes = canonical_checksum(checksum)?;
+        inner
+            .asset_by_checksum(&bytes)
+            .map(|asset| asset.id.clone())
+    }
+
     /// The live photo video id linked to an asset, if any.
     #[must_use]
     pub fn live_photo_video_id(&self, id: &str) -> Option<String> {

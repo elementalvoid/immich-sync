@@ -2706,6 +2706,78 @@ async fn a_refused_copy_keeps_the_upload_and_records_no_new_version() {
     engine.stop();
 }
 
+/// R6.5 and R4.4: the dead letter keeps the asset the server already holds,
+/// the same rule `park_row` follows when a promote fails — the upload made the
+/// mapping, and dropping it claims the server holds nothing.
+#[tokio::test]
+async fn the_dead_letter_keeps_an_asset_the_upload_already_made() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let file = write_file(&photos, "parked-after-upload.jpg", b"first bytes");
+    add_folder(&store, &photos, true);
+    let engine = start_engine(&server, &store, retry_config(4)).await;
+
+    sync_twice(&store, &engine, &file, b"second bytes").await;
+    let before = chain(&store, &file);
+    // Every copy answers 503 until the attempt cap parks the item. The faults
+    // are queued one per request, so the promote fails on each attempt until
+    // the cap is spent — each one after the upload has landed.
+    for _ in 0..4 {
+        server.fail(
+            Operation::Copy,
+            Fault::Status {
+                code: 503,
+                retry_after: None,
+            },
+        );
+    }
+    std::fs::write(&file, b"third bytes, edited again").expect("edit the file again");
+    engine.sync_now();
+
+    assert!(
+        wait_until(
+            || state_of(&store, &file) == ItemState::DeadLetter,
+            Duration::from_secs(30)
+        )
+        .await,
+        "R6.5: the attempt cap did not park the item: {:?}",
+        store.item(&file.display().to_string())
+    );
+    // The asset the edit's upload made, named by the checksum the server
+    // holds — an expectation independent of the row under test.
+    let uploaded = server
+        .asset_id_for_checksum(&sha1_file(&file).expect("hash the edit").base64())
+        .expect("the server holds the bytes the engine uploaded");
+    let row = store
+        .item(&file.display().to_string())
+        .expect("read")
+        .expect("the row exists");
+    assert_eq!(
+        row.asset_id.as_deref(),
+        Some(uploaded.as_str()),
+        "R6.5: the dead letter keeps the asset the upload already made; clearing \
+         it hides the mapping the failed-items view and a manual retry need"
+    );
+    assert_eq!(
+        chain(&store, &file),
+        before,
+        "R4.4: no version is recorded for an asset the flow did not finish with"
+    );
+    assert_eq!(
+        store
+            .failed_items()
+            .expect("read the failed items")
+            .iter()
+            .map(|item| item.path.clone())
+            .collect::<Vec<_>>(),
+        vec![file.display().to_string()],
+        "R6.5: the item is in the failed-items view"
+    );
+    engine.stop();
+}
+
 /// R4.4 and R6.1: a refused stack call is retried by the retry policy, and the
 /// retry finishes the chain without sending the bytes twice.
 ///

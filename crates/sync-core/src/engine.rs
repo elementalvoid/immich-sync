@@ -761,7 +761,11 @@ impl EngineInner {
     ///
     /// The last reason the store holds is kept when this call has no failure of
     /// its own, which is how a restart that finds the cap already spent still
-    /// shows why the item is parked.
+    /// shows why the item is parked. The asset id the row already knows is
+    /// kept too, the same rule `park_row` follows: a promote that failed after
+    /// the upload landed put it there, and the dead letter must not claim the
+    /// server holds nothing (R4.4). An upload that never reached the server
+    /// wrote `None`, so the row still claims no asset that does not exist.
     fn park_dead_letter(
         &self,
         item: &PreparedItem,
@@ -781,7 +785,7 @@ impl EngineInner {
             size: item.size,
             mtime_ns: item.mtime_ns,
             sha1: item.sha1,
-            asset_id: None,
+            asset_id: existing.as_ref().and_then(|row| row.asset_id.clone()),
             state: ItemState::DeadLetter,
             error_class,
             error_message,
