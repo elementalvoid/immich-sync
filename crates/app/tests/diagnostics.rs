@@ -578,6 +578,7 @@ async fn a_rebuild_recovers_a_deleted_state_database_and_rescans_the_folder(
     }
     assert!(!paths.state_db.exists(), "the database file is gone");
 
+    let probes_before = server.about_requests();
     cx.update(|cx| diagnostics.update(cx, |model, cx| model.rebuild(cx)));
 
     wait_until_reported(
@@ -622,14 +623,17 @@ async fn a_rebuild_recovers_a_deleted_state_database_and_rescans_the_folder(
         DB_MIGRATION_VERSION
     );
 
-    // The folders were rescanned: a fresh database has no rows until the scan
-    // re-uploads the file.
+    // R10.4: the rebuild rescans the folders and re-checks the server.
     wait_until(cx, "the rescan", |cx| {
         store_model
             .read(cx)
             .store()
             .and_then(|store| store.item(&file_path).ok().flatten())
             .is_some_and(|row| row.state.is_terminal_success())
+    })
+    .await;
+    wait_until(cx, "the server re-check", |_| {
+        server.about_requests() > probes_before
     })
     .await;
 }
