@@ -46,9 +46,17 @@ const BUCKET_FLOOR: u64 = 64 * 1024;
 ///
 /// The client fails an upload that has moved no byte for 30 s, and the first
 /// read out of an empty bucket costs `read / rate`. One read is at most 4 KiB,
-/// so below about 137 B/s the wait is longer than the guard's budget and a
-/// healthy server looks dead before the body has sent anything. A kilobyte
-/// makes the first read cost 4 s and leaves the steady state far inside it.
+/// the default chunk capacity of `ReaderStream` - the body is streamed from
+/// `ReaderStream::new` in `upload_asset` and nowhere else - so below about
+/// 137 B/s the wait is longer than the guard's budget and a healthy server
+/// looks dead before the body has sent anything. A kilobyte makes the first
+/// read cost 4 s and leaves the steady state far inside it.
+///
+/// That 4 KiB is not this crate's to keep: tokio-util documents the default as
+/// an implementation detail outside its semver contract. A chunk of about
+/// 29 KiB would spend the whole guard budget on one read and stall every
+/// healthy upload again, so anyone changing the body's chunking moves this
+/// floor with it.
 const RATE_FLOOR: u64 = 1_000;
 
 /// A shareable limit on upload bytes per second; 0 means unlimited.

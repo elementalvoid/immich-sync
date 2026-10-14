@@ -245,10 +245,18 @@ async fn a_server_that_stops_reading_mid_body_fails_the_upload_within_the_stall_
     // The client could not get the whole body out, so it was blocked with
     // bytes still to send when the guard gave up - a server that stopped
     // reading, not one that stopped answering.
+    //
+    // Both bounds earn their place. The ceiling alone is satisfied by a client
+    // that sent the head and then nothing, which would pass this test while
+    // proving nothing about a body blocked mid-flight; the floor sits many
+    // times above that head (the double reads one 4 KiB chunk and stops) and
+    // at about half of what a blocked client fills the socket buffers with, so
+    // it stands clear of both ends.
     let arrived = server.arrived().await;
     assert!(
-        arrived < BACKPRESSURE_BYTES,
-        "{arrived} of {BACKPRESSURE_BYTES} bytes arrived: the server read the body"
+        arrived > 64 * 1024 && arrived < BACKPRESSURE_BYTES,
+        "{arrived} of {BACKPRESSURE_BYTES} bytes arrived: the client must be blocked \
+         partway into the body, not after the head and not with the body sent"
     );
 }
 

@@ -31,6 +31,10 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// not on a rate sampled when the request was built: it does not shorten when
 /// the user lowers the limit while the upload is on the wire, and it does not
 /// grow for a large file at a slow one (R7.1).
+///
+/// A window that sees bytes move is renewed whole, so the stall is called at
+/// the last byte the server took plus this budget: at most twice it, never at
+/// one window from the start of the gap.
 const STALL_BUDGET: Duration = REQUEST_TIMEOUT;
 
 /// Sends a request under the ordinary window.
@@ -53,7 +57,9 @@ async fn send(request: RequestBuilder) -> Result<Response, ClientError> {
 /// throttled upload larger than `limit x 30 s`, and a deadline scaled by the
 /// limit in force when the request was built grows without bound for a large
 /// file at a slow one (R7.1). Progress is watched instead, so the bound holds
-/// whatever the limit does while the request is on the wire.
+/// whatever the limit does while the request is on the wire. A window that saw
+/// bytes is renewed in full, so the call comes at the last byte moved plus
+/// [`STALL_BUDGET`] - at most twice that budget.
 async fn send_upload(
     request: RequestBuilder,
     progress: &Progress,
