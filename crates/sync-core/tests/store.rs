@@ -270,7 +270,9 @@ fn a_remembered_album_id_survives_a_restart() {
         Some("album-7".to_string())
     );
     assert_eq!(
-        store.album("/photos/2024/Holiday").expect("read an unknown folder"),
+        store
+            .album("/photos/2024/Holiday")
+            .expect("read an unknown folder"),
         None
     );
     store
@@ -297,14 +299,32 @@ fn two_folders_with_the_same_name_keep_two_album_ids() {
         .expect("record the second folder's album");
 
     assert_eq!(
-        store.album("/photos/2023/Holiday").expect("read the first album"),
+        store
+            .album("/photos/2023/Holiday")
+            .expect("read the first album"),
         Some("album-1".to_string())
     );
     assert_eq!(
-        store.album("/photos/2024/Holiday").expect("read the second album"),
+        store
+            .album("/photos/2024/Holiday")
+            .expect("read the second album"),
         Some("album-2".to_string()),
         "one album per folder, whatever the folder names agree on"
     );
+}
+
+#[test]
+fn an_album_scope_this_build_does_not_know_is_not_guessed_at() {
+    use sync_core::store::AlbumScope;
+
+    assert_eq!(AlbumScope::parse("leaf"), Some(AlbumScope::Leaf));
+    assert_eq!(
+        AlbumScope::parse("whole_folder"),
+        Some(AlbumScope::WholeFolder)
+    );
+    // The scope is stored as text, so a value a newer build wrote must come
+    // back as unknown rather than as a scope the user never chose (R3.4).
+    assert_eq!(AlbumScope::parse("future"), None);
 }
 
 #[test]
