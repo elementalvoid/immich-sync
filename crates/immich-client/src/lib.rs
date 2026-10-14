@@ -19,6 +19,6 @@ pub use bandwidth::BandwidthLimit;
 pub use client::ImmichClient;
 pub use error::ClientError;
 pub use model::{
-    AssetUpload, Auth, BulkAction, BulkCheckItem, BulkCheckResult, LoginResponse, RejectReason,
-    ServerAbout, SessionToken, UploadResponse,
+    ApiKeyInfo, AssetUpload, Auth, BulkAction, BulkCheckItem, BulkCheckResult, LoginResponse,
+    RejectReason, ServerAbout, SessionToken, UploadResponse,
 };

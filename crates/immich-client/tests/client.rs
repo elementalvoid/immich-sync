@@ -109,7 +109,7 @@ async fn an_unreachable_server_is_its_own_error() {
 
     let client = ImmichClient::new(&format!("http://127.0.0.1:{port}")).expect("a valid URL");
     let error = client
-        .about()
+        .about(Auth::ApiKey("api-key-1234"))
         .await
         .expect_err("nothing listens on the released port");
 
@@ -149,7 +149,10 @@ async fn a_500_stays_a_protocol_error_with_its_status() {
             retry_after: None,
         },
     );
-    let error = client.about().await.expect_err("the server failed");
+    let error = client
+        .about(Auth::ApiKey("api-key-1234"))
+        .await
+        .expect_err("the server failed");
     assert!(
         matches!(error, ClientError::Protocol { status: 500, .. }),
         "{error:?}"
@@ -204,7 +207,10 @@ async fn a_refusal_without_the_header_asks_for_no_wait() {
             retry_after: None,
         },
     );
-    let error = client.about().await.expect_err("the server failed");
+    let error = client
+        .about(Auth::ApiKey("api-key-1234"))
+        .await
+        .expect_err("the server failed");
 
     assert_eq!(error.retry_after(), None, "{error:?}");
 }
@@ -213,13 +219,91 @@ async fn a_refusal_without_the_header_asks_for_no_wait() {
 async fn about_reports_the_server_version() {
     let server = MockImmich::start().await;
     let client = client(&server);
+    // The double requires a credential, as the real permission-checked
+    // `GET /server/about` does.
+    let token = client
+        .login("sync@example.com", "correct horse")
+        .await
+        .expect("the mock accepts these credentials")
+        .access_token;
 
     let about = client
-        .about()
+        .about(Auth::Token(&token))
         .await
         .expect("the mock answers /server/about");
 
     assert_eq!(about.version, "v3.3.1");
+    assert_eq!(
+        server.about_auth().as_deref(),
+        Some("bearer"),
+        "the version read carries the session credential"
+    );
+}
+
+#[tokio::test]
+async fn a_key_without_the_server_about_permission_is_a_permission_refusal() {
+    let server = MockImmich::start().await;
+    server.set_api_key("api-key-abc123");
+    server.set_api_key_permissions(&["asset.upload"]);
+    let client = client(&server);
+
+    let error = client
+        .about(Auth::ApiKey("api-key-abc123"))
+        .await
+        .expect_err("the key lacks server.about");
+
+    match &error {
+        ClientError::PermissionDenied(message) => assert!(
+            message.contains("server.about"),
+            "the refusal names the permission to grant: {message}"
+        ),
+        other => panic!("a 403 must be an actionable permission refusal: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_api_key_reads_its_granted_permissions() {
+    let server = MockImmich::start().await;
+    server.set_api_key("api-key-abc123");
+    server.set_api_key_permissions(&["asset.upload", "server.about"]);
+    let client = client(&server);
+
+    let key = client
+        .api_key_permissions(Auth::ApiKey("api-key-abc123"))
+        .await
+        .expect("the mock answers /api-keys/me");
+
+    assert_eq!(key.name, "Mock API Key");
+    assert_eq!(key.permissions, vec!["asset.upload", "server.about"]);
+    assert_eq!(
+        server.api_key_me_requests(),
+        1,
+        "one GET /api-keys/me carried the read"
+    );
+}
+
+#[tokio::test]
+async fn a_session_token_cannot_read_api_key_permissions() {
+    let server = MockImmich::start().await;
+    let client = client(&server);
+    let token = client
+        .login("sync@example.com", "correct horse")
+        .await
+        .expect("the mock accepts these credentials")
+        .access_token;
+
+    let error = client
+        .api_key_permissions(Auth::Token(&token))
+        .await
+        .expect_err("a session token is not an API key");
+
+    match &error {
+        ClientError::PermissionDenied(message) => assert!(
+            message.contains("Not authenticated with an API Key"),
+            "the refusal names what the server needs: {message}"
+        ),
+        other => panic!("the refusal must stay actionable: {other:?}"),
+    }
 }
 
 #[test]

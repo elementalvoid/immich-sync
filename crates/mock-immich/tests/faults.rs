@@ -128,10 +128,16 @@ async fn a_fault_is_consumed_by_the_next_request() {
         },
     );
 
-    let first = reqwest::get(format!("{}/server/about", server.base_url()))
+    let first = reqwest::Client::new()
+        .get(format!("{}/server/about", server.base_url()))
+        .header("x-api-key", "api-key-abc123")
+        .send()
         .await
         .unwrap();
-    let second = reqwest::get(format!("{}/server/about", server.base_url()))
+    let second = reqwest::Client::new()
+        .get(format!("{}/server/about", server.base_url()))
+        .header("x-api-key", "api-key-abc123")
+        .send()
         .await
         .unwrap();
 
@@ -151,7 +157,10 @@ async fn reset_faults_removes_pending_faults() {
     );
     server.reset_faults();
 
-    let response = reqwest::get(format!("{}/server/about", server.base_url()))
+    let response = reqwest::Client::new()
+        .get(format!("{}/server/about", server.base_url()))
+        .header("x-api-key", "api-key-abc123")
+        .send()
         .await
         .unwrap();
 

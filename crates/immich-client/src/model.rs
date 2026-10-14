@@ -319,6 +319,21 @@ pub struct ServerAbout {
     pub version: String,
 }
 
+/// The part of `GET /api-keys/me` the diagnostics view reads (R10.2).
+///
+/// The response also carries `createdAt`, `updatedAt`, and the permission
+/// strings Immich's `Permission` enum names; the view shows the granted ones.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiKeyInfo {
+    /// The key's id.
+    pub id: String,
+    /// The key's name, which is what the user called it in Immich.
+    pub name: String,
+    /// The permissions the key was granted.
+    pub permissions: Vec<String>,
+}
+
 /// The response of `POST /auth/validateToken`.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
