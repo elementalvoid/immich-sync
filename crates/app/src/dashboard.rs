@@ -12,9 +12,12 @@ use gpui_kit::component::Theme;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::progress::Progress;
+use gpui_kit::component::radio::Radio;
+use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tag::Tag;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use sync_core::store::AlbumScope;
 
 /// The dashboard view: a status card per source folder, the global card, and
 /// the folder controls (R8.1).
@@ -142,6 +145,20 @@ impl Dashboard {
         }
     }
 
+    /// Turns album mapping on or off for one source folder (R3.4).
+    fn set_album_mapping(&mut self, path: String, enabled: bool, cx: &mut Context<Self>) {
+        if let Some(engine) = &self.engine {
+            engine.update(cx, |model, cx| model.set_album_mapping(path, enabled, cx));
+        }
+    }
+
+    /// Sets the album scope for one source folder (R3.4).
+    fn set_album_scope(&mut self, path: String, scope: AlbumScope, cx: &mut Context<Self>) {
+        if let Some(engine) = &self.engine {
+            engine.update(cx, |model, cx| model.set_album_scope(path, scope, cx));
+        }
+    }
+
     /// Shows the connection state on the global card (SPEC R8.1).
     pub fn set_connection(&mut self, state: Option<String>, cx: &mut Context<Self>) {
         if self.model.global.connection != state {
@@ -187,6 +204,74 @@ impl Dashboard {
                         })),
                 )
             })
+    }
+
+    /// The album mapping switch and the album scope choice for one folder
+    /// card (R3.4).
+    ///
+    /// The scope stays choosable while the mapping is off: it is the folder's
+    /// stored scope (R3.4) and takes effect as soon as the mapping is on, and
+    /// the kit's `Radio` does not announce a disabled state, so a disabled
+    /// radio would read as an enabled one (N5).
+    fn album_controls(
+        &self,
+        index: usize,
+        card: &StatusCard,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let muted = cx.theme().muted_foreground;
+        let title = card.title.clone();
+        let path = card.path.clone().unwrap_or_default();
+        let leaf = card.album_scope == AlbumScope::Leaf;
+        div()
+            .flex()
+            .flex_row()
+            // The card is narrow; the controls wrap instead of clipping.
+            .flex_wrap()
+            .items_center()
+            .gap_2()
+            .child(div().text_xs().text_color(muted).child("Album mapping"))
+            .child(
+                Switch::new(("folder-album", index))
+                    .checked(card.album_mapping)
+                    .accessibility_label(format!("Album mapping for {title}"))
+                    .on_click(cx.listener({
+                        let path = path.clone();
+                        move |this, enabled, _, cx| {
+                            this.set_album_mapping(path.clone(), *enabled, cx);
+                        }
+                    })),
+            )
+            .child(
+                Radio::new(("folder-album-leaf", index))
+                    .label(AlbumScope::Leaf.label())
+                    .accessibility_label(format!("Album scope for {title}: one album per folder"))
+                    .checked(leaf)
+                    .on_change(cx.listener({
+                        let path = path.clone();
+                        move |this, checked, _, cx| {
+                            if *checked {
+                                this.set_album_scope(path.clone(), AlbumScope::Leaf, cx);
+                            }
+                        }
+                    })),
+            )
+            .child(
+                Radio::new(("folder-album-whole", index))
+                    .label(AlbumScope::WholeFolder.label())
+                    .accessibility_label(format!(
+                        "Album scope for {title}: one album for this folder"
+                    ))
+                    .checked(!leaf)
+                    .on_change(cx.listener({
+                        let path = path.clone();
+                        move |this, checked, _, cx| {
+                            if *checked {
+                                this.set_album_scope(path.clone(), AlbumScope::WholeFolder, cx);
+                            }
+                        }
+                    })),
+            )
     }
 
     fn header(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -256,11 +341,16 @@ impl Render for Dashboard {
         let removed = self.engine.is_some();
 
         div()
+            .id("dashboard-scroll")
+            .test_support()
             .flex()
             .flex_col()
             .size_full()
             .bg(background)
             .text_color(foreground)
+            // A short window scrolls instead of hiding the last card's controls
+            // (R8.1: every card stays reachable).
+            .overflow_y_scroll()
             .p_6()
             .gap_4()
             .child(header)
@@ -269,6 +359,7 @@ impl Render for Dashboard {
                 "status-state-global".into(),
                 Some("status-connection-global".into()),
                 &self.model.global,
+                None,
                 None,
                 cx,
             ))
@@ -293,11 +384,14 @@ impl Render for Dashboard {
                                     }))
                                     .into_any_element()
                             });
+                            let album = removed
+                                .then(|| self.album_controls(index, folder, cx).into_any_element());
                             div().w(rems(17.5)).flex().child(status_card(
                                 ("status-folder", index).into(),
                                 ("status-state-folder", index).into(),
                                 None,
                                 folder,
+                                album,
                                 remove,
                                 cx,
                             ))
@@ -363,12 +457,14 @@ pub fn state_border(state: ActivityState, theme: &Theme) -> Hsla {
 
 /// One status card. The text comes from [`StatusCard::content`], so the view
 /// does no formatting. `remove` is the per-folder remove control, when the
-/// dashboard is attached to an engine (R2.1).
+/// dashboard is attached to an engine (R2.1), and `album` the per-folder album
+/// mapping controls (R3.4).
 fn status_card(
     id: ElementId,
     state_id: ElementId,
     connection_id: Option<ElementId>,
     card: &StatusCard,
+    album: Option<AnyElement>,
     remove: Option<AnyElement>,
     cx: &App,
 ) -> impl IntoElement {
@@ -451,7 +547,10 @@ fn status_card(
                 .text_sm()
                 .text_color(palette.meta)
                 .child(content.counts),
-        );
+        )
+        .when_some(content.album.clone(), |this, album| {
+            this.child(div().text_sm().text_color(palette.meta).child(album))
+        });
 
     if let Some(connection) = content.connection.clone()
         && let Some(id) = connection_id
@@ -475,6 +574,9 @@ fn status_card(
             theme.danger,
             &palette,
         ));
+    }
+    if let Some(album) = album {
+        root = root.child(album);
     }
     if let Some(remove) = remove {
         root = root.child(div().flex().flex_row().justify_end().child(remove));

@@ -12,8 +12,9 @@ use tokio_util::io::ReaderStream;
 use crate::bandwidth::{MeteredReader, Progress};
 use crate::error::ClientError;
 use crate::model::{
-    AssetUpload, Auth, AuthStatus, BulkAction, BulkCheckBody, BulkCheckItem, BulkCheckResult,
-    LoginResponse, RejectReason, ServerAbout, SessionToken, UploadBody, UploadResponse,
+    Album, AlbumAssetsRequest, AlbumBody, AssetUpload, Auth, AuthStatus, BulkAction, BulkCheckBody,
+    BulkCheckItem, BulkCheckResult, CreateAlbumRequest, LoginResponse, RejectReason, ServerAbout,
+    SessionToken, UploadBody, UploadResponse,
 };
 
 /// The longest error message body kept from the server. A reverse proxy can
@@ -400,6 +401,69 @@ impl ImmichClient {
         }
     }
 
+    /// Creates one album, optionally with the assets it already holds (R3.4).
+    ///
+    /// `POST /albums` is `x-immich-state: Stable` in the v3.3.1 spec, which is
+    /// what R3.5 allows sync correctness to depend on.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::InvalidToken`] for a refused credential, the typed
+    /// refusal classes (R6.3), and the transport and protocol variants.
+    pub async fn create_album(
+        &self,
+        auth: Auth<'_>,
+        name: &str,
+        asset_ids: &[String],
+    ) -> Result<Album, ClientError> {
+        let response = self
+            .authorize(self.http.post(self.endpoint("albums")), auth)
+            .json(&CreateAlbumRequest {
+                album_name: name,
+                asset_ids,
+            })
+            .send()
+            .await
+            .map_err(ClientError::Unreachable)?;
+        let result = self.read_album(response).await;
+        log_outcome("create-album", &result);
+        result
+    }
+
+    /// Adds assets to one album (R3.4).
+    ///
+    /// An asset the album already holds is not an error: Immich answers with
+    /// `success: false` for it and 200 for the request, so one call is
+    /// idempotent and a retry after a lost answer cannot duplicate a
+    /// membership.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::InvalidToken`] for a refused credential, the typed
+    /// refusal classes (R6.3), and the transport and protocol variants. An
+    /// unknown album id is a [`ClientError::Protocol`] with its 404 status, so
+    /// the caller can tell it from transport noise.
+    pub async fn add_assets_to_album(
+        &self,
+        auth: Auth<'_>,
+        album_id: &str,
+        asset_ids: &[String],
+    ) -> Result<(), ClientError> {
+        let response = self
+            .authorize(
+                self.http
+                    .put(self.endpoint(&format!("albums/{album_id}/assets"))),
+                auth,
+            )
+            .json(&AlbumAssetsRequest { ids: asset_ids })
+            .send()
+            .await
+            .map_err(ClientError::Unreachable)?;
+        let result = self.read_accepted(response).await;
+        log_outcome("add-album-assets", &result);
+        result
+    }
+
     /// Attaches the credential to one request.
     fn authorize(&self, request: RequestBuilder, auth: Auth<'_>) -> RequestBuilder {
         match auth {
@@ -453,6 +517,37 @@ impl ImmichClient {
             // Immich answers 201 for a created asset and 200 for a duplicate.
             duplicate: status == StatusCode::OK,
         })
+    }
+
+    /// Maps an album response to its id and name.
+    async fn read_album(&self, response: Response) -> Result<Album, ClientError> {
+        let status = response.status();
+        if !status.is_success() {
+            return Err(failure(response).await);
+        }
+        let body = response
+            .json::<AlbumBody>()
+            .await
+            .map_err(|error| body_failure(status, error))?;
+        if body.id.is_empty() || body.album_name.is_empty() {
+            return Err(ClientError::Protocol {
+                status: status.as_u16(),
+                message: "the server returned an album without an id or a name".to_string(),
+            });
+        }
+        Ok(Album {
+            id: body.id,
+            name: body.album_name,
+        })
+    }
+
+    /// Accepts a 2xx answer whose body the client has no use for.
+    async fn read_accepted(&self, response: Response) -> Result<(), ClientError> {
+        let status = response.status();
+        if !status.is_success() {
+            return Err(failure(response).await);
+        }
+        Ok(())
     }
 
     /// The absolute URL of one endpoint.

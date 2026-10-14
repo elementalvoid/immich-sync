@@ -139,6 +139,8 @@ async fn a_resume_during_engine_startup_leaves_uploads_flowing(cx: &mut TestAppC
         .add_folder(&SourceFolder {
             path: photos.display().to_string(),
             recursive: true,
+            album_mapping: false,
+            album_scope: sync_core::store::AlbumScope::Leaf,
         })
         .expect("add the source folder");
 
@@ -207,6 +209,8 @@ async fn a_superseded_engine_start_leaves_exactly_one_engine_watching(cx: &mut T
         .add_folder(&SourceFolder {
             path: photos.display().to_string(),
             recursive: true,
+            album_mapping: false,
+            album_scope: sync_core::store::AlbumScope::Leaf,
         })
         .expect("add the source folder");
 

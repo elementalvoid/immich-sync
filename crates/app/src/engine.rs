@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use gpui_kit::*;
 use sync_core::engine::{Activity, Engine, EngineConfig, EngineStatus, FolderStatus, Limits};
-use sync_core::store::{FolderCounts, SourceFolder, StateStore};
+use sync_core::store::{AlbumScope, FolderCounts, SourceFolder, StateStore};
 
 use crate::connection::{ConnectionModel, worker};
 use crate::paths::AppPaths;
@@ -42,6 +42,25 @@ pub struct EngineModel {
     start_generation: u64,
     _subscriptions: Vec<Subscription>,
     _poll: Task<()>,
+}
+
+/// What one album edit changes on a source folder (R3.4).
+#[derive(Clone, Copy)]
+enum AlbumChange {
+    /// Turn album mapping on or off.
+    Mapping(bool),
+    /// Set the album scope.
+    Scope(AlbumScope),
+}
+
+impl AlbumChange {
+    /// Applies the change to one folder row.
+    fn apply(self, folder: &mut SourceFolder) {
+        match self {
+            Self::Mapping(enabled) => folder.album_mapping = enabled,
+            Self::Scope(scope) => folder.album_scope = scope,
+        }
+    }
 }
 
 impl EngineModel {
@@ -206,6 +225,10 @@ impl EngineModel {
                     Some(store) => match store.add_folder(&SourceFolder {
                         path: path.clone(),
                         recursive,
+                        // R3.4: adding a folder never opts it into album
+                        // mapping; the card's switch does that on purpose.
+                        album_mapping: false,
+                        album_scope: AlbumScope::default(),
                     }) {
                         Ok(()) => store.folders().map(Some).map_err(|error| error.to_string()),
                         Err(error) => Err(error.to_string()),
@@ -287,6 +310,91 @@ impl EngineModel {
                         }
                         model.problem = None;
                     }
+                    Err(problem) => model.problem = Some(problem),
+                }
+                model.refresh_status(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Turns album mapping on or off for one source folder (R3.4).
+    ///
+    /// The store write runs on the worker runtime, so the UI thread never waits
+    /// behind it (N2), and the status republishes when it lands.
+    pub fn set_album_mapping(&mut self, path: String, enabled: bool, cx: &mut Context<Self>) {
+        self.change_album(path, AlbumChange::Mapping(enabled), cx);
+    }
+
+    /// Sets the album scope for one source folder (R3.4).
+    pub fn set_album_scope(&mut self, path: String, scope: AlbumScope, cx: &mut Context<Self>) {
+        self.change_album(path, AlbumChange::Scope(scope), cx);
+    }
+
+    /// Runs one album edit on the worker runtime and republishes the status.
+    ///
+    /// A newer edit supersedes an older result still in flight, the same way an
+    /// add or a remove does, so a slow write cannot undo a later one. The
+    /// folder list comes back with the write, so the card that shows the mapping
+    /// shows what the store now holds (R8.1).
+    fn change_album(&mut self, path: String, change: AlbumChange, cx: &mut Context<Self>) {
+        // A newer edit supersedes an older result still in flight.
+        self.generation = self.generation.wrapping_add(1);
+        let engine = self.engine.clone();
+        let store = self.store_model.read(cx).store();
+        let Ok(runtime) = worker() else {
+            self.problem = Some("The network runtime could not start.".to_string());
+            cx.notify();
+            return;
+        };
+        let generation = self.generation;
+        let (results, incoming) = async_channel::bounded(1);
+        runtime.spawn(async move {
+            // N2: the store write belongs on the worker, not the UI thread.
+            let result = match engine {
+                Some(engine) => match change {
+                    AlbumChange::Mapping(enabled) => engine.set_album_mapping(&path, enabled),
+                    AlbumChange::Scope(scope) => engine.set_album_scope(&path, scope),
+                }
+                .map(|()| None)
+                .map_err(|error| error.to_string()),
+                None => match store {
+                    Some(store) => match store.folders() {
+                        Ok(folders) => match folders.into_iter().find(|folder| folder.path == path)
+                        {
+                            Some(mut folder) => {
+                                change.apply(&mut folder);
+                                match store.add_folder(&folder) {
+                                    Ok(()) => store.folders().map(Some),
+                                    Err(error) => Err(error),
+                                }
+                                .map_err(|error| error.to_string())
+                            }
+                            None => Err("That folder is not in the client.".to_string()),
+                        },
+                        Err(error) => Err(error.to_string()),
+                    },
+                    None => Err("The state database is still opening.".to_string()),
+                },
+            };
+            let _ = results.send(result).await;
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(result) = incoming.recv().await else {
+                return;
+            };
+            let _ = this.update(cx, |model, cx| {
+                if model.generation != generation {
+                    return;
+                }
+                match result {
+                    Ok(Some(folders)) => {
+                        model
+                            .store_model
+                            .update(cx, |store, cx| store.set_folders(folders, cx));
+                        model.problem = None;
+                    }
+                    Ok(None) => model.problem = None,
                     Err(problem) => model.problem = Some(problem),
                 }
                 model.refresh_status(cx);
@@ -417,6 +525,8 @@ impl EngineModel {
                     .map(|(folder, counts)| FolderStatus {
                         path: folder.path.clone(),
                         recursive: folder.recursive,
+                        album_mapping: folder.album_mapping,
+                        album_scope: folder.album_scope,
                         available: Path::new(&folder.path).is_dir(),
                         // The last known counts from the store (R8.1).
                         counts: *counts,
@@ -469,6 +579,8 @@ impl EngineModel {
                 .map(|folder| SourceFolder {
                     path: folder.path.clone(),
                     recursive: folder.recursive,
+                    album_mapping: folder.album_mapping,
+                    album_scope: folder.album_scope,
                 })
                 .collect(),
             None => self.store_model.read(cx).folders().to_vec(),
