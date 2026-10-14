@@ -14,7 +14,7 @@ use sync_core::connection::{AuthMethod, Connection, RequestCredential, Secret, S
 use sync_core::credential::MemoryCredentialStore;
 use sync_core::engine::{Engine, EngineConfig};
 use sync_core::hash::Sha1;
-use sync_core::store::{ItemState, SourceFolder, StateStore};
+use sync_core::store::{AlbumScope, ItemState, SourceFolder, StateStore};
 
 /// Starts the mock and signs in, returning the client and credential the
 /// engine attaches to every request.
@@ -51,6 +51,8 @@ fn add_folder(store: &StateStore, path: &Path, recursive: bool) {
         .add_folder(&SourceFolder {
             path: path.display().to_string(),
             recursive,
+            album_mapping: false,
+            album_scope: AlbumScope::Leaf,
         })
         .expect("add the source folder");
 }

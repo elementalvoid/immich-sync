@@ -214,7 +214,7 @@ fn the_store_compares_paths_with_the_requested_case_rule() {
 
 #[test]
 fn source_folders_persist_with_their_recursive_flag() {
-    use sync_core::store::SourceFolder;
+    use sync_core::store::{AlbumScope, SourceFolder};
 
     let temp = tempfile::tempdir().expect("create a temp dir");
     let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
@@ -222,12 +222,16 @@ fn source_folders_persist_with_their_recursive_flag() {
         .add_folder(&SourceFolder {
             path: "/photos".to_string(),
             recursive: false,
+            album_mapping: false,
+            album_scope: AlbumScope::default(),
         })
         .expect("add the folder");
     store
         .add_folder(&SourceFolder {
             path: "/photos".to_string(),
             recursive: true,
+            album_mapping: false,
+            album_scope: AlbumScope::default(),
         })
         .expect("re-adding updates the flag");
 
@@ -236,7 +240,10 @@ fn source_folders_persist_with_their_recursive_flag() {
         vec![SourceFolder {
             path: "/photos".to_string(),
             recursive: true,
-        }]
+            album_mapping: false,
+            album_scope: AlbumScope::Leaf,
+        }],
+        "R3.4: album mapping is off until the user opts in, and the scope defaults to leaf"
     );
 
     assert!(
@@ -245,6 +252,112 @@ fn source_folders_persist_with_their_recursive_flag() {
     );
     assert!(!store.remove_folder("/photos").expect("remove again"));
     assert!(store.folders().expect("read the folders").is_empty());
+}
+
+#[test]
+fn a_re_added_folder_keeps_the_album_mapping_the_user_chose() {
+    use sync_core::store::{AlbumScope, SourceFolder};
+
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    let mapped = SourceFolder {
+        path: "/photos".to_string(),
+        recursive: true,
+        album_mapping: true,
+        album_scope: AlbumScope::WholeFolder,
+    };
+    store.add_folder(&mapped).expect("add the mapped folder");
+    store
+        .add_folder(&SourceFolder {
+            recursive: false,
+            ..mapped.clone()
+        })
+        .expect("a later add of the same folder");
+
+    assert_eq!(
+        store.folders().expect("read the folders"),
+        vec![SourceFolder {
+            recursive: false,
+            ..mapped
+        }],
+        "R3.4: re-adding a folder changes the recursion, not the mapping the user chose"
+    );
+}
+
+#[test]
+fn a_remembered_album_id_survives_a_restart() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let path = temp.path().join("state.db");
+    {
+        let store = StateStore::open(&path).expect("open a fresh store");
+        store
+            .remember_album("/photos/2023/Holiday", "Holiday", "album-7")
+            .expect("record the album the server assigned");
+    }
+
+    // A restart must reuse the album, or every run creates a second album for
+    // the same folder.
+    let store = StateStore::open(&path).expect("reopen the store");
+    assert_eq!(
+        store.album("/photos/2023/Holiday").expect("read the album"),
+        Some("album-7".to_string())
+    );
+    assert_eq!(
+        store
+            .album("/photos/2024/Holiday")
+            .expect("read an unknown folder"),
+        None
+    );
+    store
+        .remember_album("/photos/2023/Holiday", "Holiday", "album-8")
+        .expect("the server replaced the album");
+    assert_eq!(
+        store.album("/photos/2023/Holiday").expect("read the album"),
+        Some("album-8".to_string()),
+        "the last id the server gave wins"
+    );
+}
+
+#[test]
+fn two_folders_with_the_same_name_keep_two_album_ids() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    // R3.4: the album belongs to the folder. The name is a copy of the folder
+    // name, so the same name twice must not merge two folders into one album.
+    store
+        .remember_album("/photos/2023/Holiday", "Holiday", "album-1")
+        .expect("record the first folder's album");
+    store
+        .remember_album("/photos/2024/Holiday", "Holiday", "album-2")
+        .expect("record the second folder's album");
+
+    assert_eq!(
+        store
+            .album("/photos/2023/Holiday")
+            .expect("read the first album"),
+        Some("album-1".to_string())
+    );
+    assert_eq!(
+        store
+            .album("/photos/2024/Holiday")
+            .expect("read the second album"),
+        Some("album-2".to_string()),
+        "one album per folder, whatever the folder names agree on"
+    );
+}
+
+#[test]
+fn an_album_scope_this_build_does_not_know_is_not_guessed_at() {
+    use sync_core::store::AlbumScope;
+
+    assert_eq!(AlbumScope::parse("leaf"), Some(AlbumScope::Leaf));
+    assert_eq!(
+        AlbumScope::parse("whole_folder"),
+        Some(AlbumScope::WholeFolder)
+    );
+    // The scope is stored as text, so a value a newer build wrote must come
+    // back as unknown rather than as a scope the user never chose (R3.4).
+    assert_eq!(AlbumScope::parse("future"), None);
 }
 
 #[test]

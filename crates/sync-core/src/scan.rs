@@ -101,6 +101,8 @@ mod tests {
         SourceFolder {
             path: path.display().to_string(),
             recursive,
+            album_mapping: false,
+            album_scope: crate::store::AlbumScope::default(),
         }
     }
 

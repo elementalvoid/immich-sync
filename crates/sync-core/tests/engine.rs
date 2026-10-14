@@ -14,7 +14,7 @@ use sync_core::connection::{AuthMethod, Connection, RequestCredential, Secret, S
 use sync_core::credential::MemoryCredentialStore;
 use sync_core::engine::{Activity, Engine, EngineConfig};
 use sync_core::hash::{Sha1, sha1_file};
-use sync_core::store::{FolderCounts, ItemRecord, ItemState, SourceFolder, StateStore};
+use sync_core::store::{AlbumScope, FolderCounts, ItemRecord, ItemState, SourceFolder, StateStore};
 
 /// Starts the mock and signs in, returning the client and credential the
 /// engine attaches to every request.
@@ -47,8 +47,22 @@ fn add_folder(store: &StateStore, path: &Path, recursive: bool) {
         .add_folder(&SourceFolder {
             path: path.display().to_string(),
             recursive,
+            album_mapping: false,
+            album_scope: AlbumScope::Leaf,
         })
         .expect("add the source folder");
+}
+
+/// Adds a folder whose files join an album (R3.4).
+fn add_mapped_folder(store: &StateStore, path: &Path, recursive: bool, scope: AlbumScope) {
+    store
+        .add_folder(&SourceFolder {
+            path: path.display().to_string(),
+            recursive,
+            album_mapping: true,
+            album_scope: scope,
+        })
+        .expect("add the mapped source folder");
 }
 
 /// Builds and starts an engine over `store`.
@@ -896,6 +910,8 @@ async fn adding_a_folder_through_the_engine_syncs_its_existing_files() {
         vec![SourceFolder {
             path: photos.display().to_string(),
             recursive: true,
+            album_mapping: false,
+            album_scope: AlbumScope::Leaf,
         }]
     );
 
@@ -904,5 +920,533 @@ async fn adding_a_folder_through_the_engine_syncs_its_existing_files() {
         .expect("remove the folder");
     assert!(engine.status().folders.is_empty());
     assert!(store.folders().expect("read the folders").is_empty());
+    engine.stop();
+}
+
+/// The asset id the store recorded for one file.
+fn asset_id_of(store: &StateStore, path: &Path) -> String {
+    store
+        .item(&path.display().to_string())
+        .expect("read the row")
+        .expect("the upload was recorded")
+        .asset_id
+        .expect("a finished row carries an asset id (R3.6)")
+}
+
+/// The album names the server holds, sorted, because upload order decides the
+/// order albums were created in.
+fn sorted_album_names(server: &MockImmich) -> Vec<String> {
+    let mut names = server.album_names();
+    names.sort();
+    names
+}
+
+/// Waits until every file's asset is in some album.
+///
+/// The request counters alone cannot be the signal: the double counts a request
+/// when it arrives, so a count can be complete while its album row is not. The
+/// membership the client is after is the observable end state.
+async fn wait_for_albums(store: &StateStore, server: &MockImmich, files: &[PathBuf]) -> bool {
+    wait_until(
+        || {
+            files.iter().all(|file| {
+                store
+                    .item(&file.display().to_string())
+                    .ok()
+                    .flatten()
+                    .and_then(|row| row.asset_id)
+                    .is_some_and(|asset| server.album_for_asset(&asset).is_some())
+            })
+        },
+        Duration::from_secs(15),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_mapped_folder_puts_every_asset_in_the_album_named_after_it() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("Pictures");
+    let nested = write_file(&photos, "Holiday/beach.jpg", b"beach");
+    let at_root = write_file(&photos, "cover.jpg", b"cover");
+    // The whole-source-folder scope maps every file below it, whatever folder
+    // the file sits in (R3.4).
+    add_mapped_folder(&store, &photos, true, AlbumScope::WholeFolder);
+
+    let engine = start_engine(&server, &store, EngineConfig::default()).await;
+    assert!(
+        wait_until(
+            || all_terminal(&store, &[nested.clone(), at_root.clone()]),
+            Duration::from_secs(15)
+        )
+        .await,
+        "both files must reach a terminal success state"
+    );
+    assert!(
+        wait_for_albums(&store, &server, &[nested.clone(), at_root.clone()]).await,
+        "both assets must join an album"
+    );
+
+    assert_eq!(
+        sorted_album_names(&server),
+        vec!["Pictures".to_string()],
+        "R3.4: whole-folder scope makes one album for the source folder"
+    );
+    assert_eq!(
+        server
+            .album_for_asset(&asset_id_of(&store, &nested))
+            .as_deref(),
+        Some("Pictures"),
+        "a file in a subfolder joins the source folder's album"
+    );
+    assert_eq!(
+        server
+            .album_for_asset(&asset_id_of(&store, &at_root))
+            .as_deref(),
+        Some("Pictures")
+    );
+    assert_eq!(
+        server.create_album_requests(),
+        1,
+        "the album is created once, whatever holds how many files"
+    );
+    assert_eq!(
+        server.add_album_requests(),
+        2,
+        "one call per uploaded asset"
+    );
+    engine.stop();
+}
+
+#[tokio::test]
+async fn leaf_scope_creates_one_album_per_folder_that_contains_files() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("Pictures");
+    let files = vec![
+        write_file(&photos, "Holiday/beach.jpg", b"beach"),
+        write_file(&photos, "Holiday/sunset.jpg", b"sunset"),
+        write_file(&photos, "Winter/snow.jpg", b"snow"),
+        // A folder with no files of its own makes no album: the album scope is
+        // per folder that directly contains files (GLOSSARY).
+        write_file(&photos, "Winter/2024/deep.jpg", b"deep"),
+        // A file directly in the source folder maps to the source folder.
+        write_file(&photos, "cover.jpg", b"cover"),
+    ];
+    add_mapped_folder(&store, &photos, true, AlbumScope::Leaf);
+
+    let engine = start_engine(&server, &store, EngineConfig::default()).await;
+    assert!(
+        wait_until(|| all_terminal(&store, &files), Duration::from_secs(20)).await,
+        "every file must reach a terminal success state"
+    );
+    assert!(
+        wait_for_albums(&store, &server, &files).await,
+        "every asset must join its folder's album"
+    );
+
+    assert_eq!(
+        sorted_album_names(&server),
+        vec![
+            "2024".to_string(),
+            "Holiday".to_string(),
+            "Pictures".to_string(),
+            "Winter".to_string()
+        ],
+        "R3.4: leaf scope makes one album per folder that directly contains files"
+    );
+    for file in &files {
+        let album = server
+            .album_for_asset(&asset_id_of(&store, file))
+            .expect("every uploaded asset joined an album");
+        let folder = file
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .expect("the fixture has a folder")
+            .to_str()
+            .expect("the fixture name is UTF-8");
+        assert_eq!(
+            album,
+            folder,
+            "{} joined the album of the folder that holds it",
+            file.display()
+        );
+    }
+    engine.stop();
+}
+
+#[tokio::test]
+async fn two_leaf_folders_with_the_same_name_are_two_albums() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("Pictures");
+    let in_2023 = write_file(&photos, "2023/Holiday/beach.jpg", b"beach");
+    let in_2024 = write_file(&photos, "2024/Holiday/snow.jpg", b"snow");
+    add_mapped_folder(&store, &photos, true, AlbumScope::Leaf);
+
+    let engine = start_engine(&server, &store, EngineConfig::default()).await;
+    assert!(
+        wait_until(
+            || all_terminal(&store, &[in_2023.clone(), in_2024.clone()]),
+            Duration::from_secs(15)
+        )
+        .await,
+        "both files must reach a terminal success state"
+    );
+    assert!(
+        wait_for_albums(&store, &server, &[in_2023.clone(), in_2024.clone()]).await,
+        "both assets must join an album"
+    );
+
+    // R3.4: the album scope is one album per folder, so two folders are two
+    // albums. The name is a copy of the folder name, not the album's identity,
+    // and the client's only album write is "add to album", so an album that
+    // held both could never be split again.
+    assert_eq!(
+        sorted_album_names(&server),
+        vec!["Holiday".to_string(), "Holiday".to_string()],
+        "GLOSSARY: one album per folder that directly contains files"
+    );
+    assert_eq!(
+        server.create_album_requests(),
+        2,
+        "each folder gets its own album, so two folders share nothing"
+    );
+    for file in [&in_2023, &in_2024] {
+        assert_eq!(
+            server
+                .album_for_asset(&asset_id_of(&store, file))
+                .as_deref(),
+            Some("Holiday"),
+            "{} joined an album named after its folder",
+            file.display()
+        );
+    }
+    engine.stop();
+}
+
+#[tokio::test]
+async fn two_added_folders_with_the_same_name_are_two_albums() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    // Two folders the user added, whose basenames agree (R2.4).
+    let first = temp.path().join("a").join("Pictures");
+    let second = temp.path().join("b").join("Pictures");
+    let in_first = write_file(&first, "beach.jpg", b"beach");
+    let in_second = write_file(&second, "snow.jpg", b"snow");
+    add_mapped_folder(&store, &first, true, AlbumScope::WholeFolder);
+    add_mapped_folder(&store, &second, true, AlbumScope::WholeFolder);
+
+    let engine = start_engine(&server, &store, EngineConfig::default()).await;
+    assert!(
+        wait_until(
+            || all_terminal(&store, &[in_first.clone(), in_second.clone()]),
+            Duration::from_secs(15)
+        )
+        .await,
+        "both folders must reach a terminal success state"
+    );
+    assert!(
+        wait_for_albums(&store, &server, &[in_first.clone(), in_second.clone()]).await,
+        "both assets must join an album"
+    );
+
+    // R3.4: whole-folder scope creates one album for the source folder, so two
+    // added folders are two albums, whatever their names agree on.
+    assert_eq!(
+        sorted_album_names(&server),
+        vec!["Pictures".to_string(), "Pictures".to_string()],
+        "each source folder has its own album"
+    );
+    assert_eq!(
+        server.create_album_requests(),
+        2,
+        "one album per source folder, not per name"
+    );
+    for file in [&in_first, &in_second] {
+        assert_eq!(
+            server
+                .album_for_asset(&asset_id_of(&store, file))
+                .as_deref(),
+            Some("Pictures"),
+            "{} joined its own folder's album",
+            file.display()
+        );
+    }
+
+    // R3.4: the album ids live in the state database, so a restart joins the
+    // albums it already made instead of creating a second one for the folder.
+    // The store is reopened so the ids come off disk, not a warm cache.
+    engine.stop();
+    drop(engine);
+    drop(store);
+    let store = store_in(&temp);
+    let engine = start_engine(&server, &store, EngineConfig::default()).await;
+    let after_restart = [
+        write_file(&first, "reef.jpg", b"reef"),
+        write_file(&second, "ice.jpg", b"ice"),
+    ];
+    assert!(
+        wait_until(
+            || all_terminal(&store, &after_restart),
+            Duration::from_secs(15)
+        )
+        .await,
+        "both files must reach a terminal success state after the restart"
+    );
+    assert!(
+        wait_for_albums(&store, &server, &after_restart).await,
+        "both assets must join the albums the first run made"
+    );
+    assert_eq!(
+        server.create_album_requests(),
+        2,
+        "R3.4: a restart reuses the recorded album ids, one per folder"
+    );
+    for file in &after_restart {
+        assert_eq!(
+            server
+                .album_for_asset(&asset_id_of(&store, file))
+                .as_deref(),
+            Some("Pictures"),
+            "{} joined the album its folder already had",
+            file.display()
+        );
+    }
+    engine.stop();
+}
+
+#[tokio::test]
+async fn an_unmapped_folder_creates_no_album_at_all() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("Pictures");
+    let mapped = write_file(&photos, "Holiday/beach.jpg", b"beach");
+    let videos = temp.path().join("Videos");
+    let unmapped = write_file(&videos, "Holiday/snow.jpg", b"snow");
+    add_mapped_folder(&store, &photos, true, AlbumScope::Leaf);
+    // Album mapping is opt-in per folder (R3.4).
+    add_folder(&store, &videos, true);
+
+    let engine = start_engine(&server, &store, EngineConfig::default()).await;
+    assert!(
+        wait_until(
+            || all_terminal(&store, &[mapped.clone(), unmapped.clone()]),
+            Duration::from_secs(15)
+        )
+        .await,
+        "both folders must reach a terminal success state"
+    );
+    assert!(
+        wait_for_albums(&store, &server, std::slice::from_ref(&mapped)).await,
+        "the mapped folder's asset must join its album"
+    );
+
+    assert_eq!(
+        server.create_album_requests(),
+        1,
+        "R3.4: the unmapped folder sends no album request at all"
+    );
+    assert_eq!(
+        server.add_album_requests(),
+        1,
+        "one call for one mapped file, none for the unmapped one"
+    );
+    assert_eq!(
+        server.album_for_asset(&asset_id_of(&store, &unmapped)),
+        None,
+        "a file from an unmapped folder is in no album"
+    );
+    engine.stop();
+}
+
+#[tokio::test]
+async fn a_duplicate_the_server_already_has_joins_the_album_too() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("Pictures");
+    let file = write_file(&photos, "Holiday/beach.jpg", b"beach");
+    add_mapped_folder(&store, &photos, true, AlbumScope::Leaf);
+
+    // The content is already on the server from another client, in no album:
+    // a duplicate counts as success (R3.2) and still maps (R3.4).
+    let (client, credential) = signed_in(&server).await;
+    let existing = client
+        .upload_asset(
+            credential.auth(),
+            &immich_client::AssetUpload {
+                path: &file,
+                checksum: &sha1_file(&file).expect("hash the fixture").base64(),
+                created_at: std::time::UNIX_EPOCH,
+                modified_at: std::time::UNIX_EPOCH,
+                sidecar: None,
+                live_photo_video_id: None,
+            },
+        )
+        .await
+        .expect("the first upload is created");
+    assert!(!existing.duplicate);
+
+    let engine = start_engine(&server, &store, EngineConfig::default()).await;
+    assert!(
+        wait_until(
+            || all_terminal(&store, std::slice::from_ref(&file)),
+            Duration::from_secs(15)
+        )
+        .await,
+        "the duplicate must reach a terminal success state"
+    );
+    assert!(
+        wait_for_albums(&store, &server, std::slice::from_ref(&file)).await,
+        "the duplicate must join the album"
+    );
+
+    assert_eq!(
+        server.upload_requests(),
+        1,
+        "R3.2: the file was not uploaded again"
+    );
+    assert_eq!(
+        store
+            .item(&file.display().to_string())
+            .expect("read the row")
+            .expect("the row")
+            .state,
+        ItemState::Duplicate
+    );
+    assert_eq!(
+        server.album_for_asset(&existing.asset_id).as_deref(),
+        Some("Holiday"),
+        "R3.4: a duplicate that is missing from the album is added to it"
+    );
+    engine.stop();
+}
+
+#[tokio::test]
+async fn the_same_content_twice_in_one_folder_keeps_one_membership() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("Pictures");
+    let first = write_file(&photos, "Holiday/beach.jpg", b"beach");
+    // The same bytes under another name in the same folder: one asset, so one
+    // album membership, and the album itself is created once (R3.2, R3.4).
+    let second = write_file(&photos, "Holiday/beach-copy.jpg", b"beach");
+    add_mapped_folder(&store, &photos, true, AlbumScope::Leaf);
+
+    let engine = start_engine(&server, &store, EngineConfig::default()).await;
+    assert!(
+        wait_until(
+            || all_terminal(&store, &[first.clone(), second.clone()]),
+            Duration::from_secs(15)
+        )
+        .await,
+        "both rows must reach a terminal success state"
+    );
+    assert!(
+        wait_for_albums(&store, &server, &[first.clone(), second.clone()]).await,
+        "both rows must have reached the album"
+    );
+    // Both rows point at the same asset, so the membership above is satisfied
+    // by one call; the second item's own call is what this waits for.
+    assert!(
+        wait_until(|| server.add_album_requests() >= 2, Duration::from_secs(15)).await,
+        "the second item must have asked for the album too"
+    );
+
+    assert_eq!(
+        sorted_album_names(&server),
+        vec!["Holiday".to_string()],
+        "one folder, one album"
+    );
+    assert_eq!(
+        server.create_album_requests(),
+        1,
+        "the second item finds the album the first one created"
+    );
+    assert_eq!(
+        server.add_album_requests(),
+        2,
+        "both items ask for the album, and adding an asset the album already holds is harmless"
+    );
+    assert_eq!(
+        server.album_for_asset(&asset_id_of(&store, &second)),
+        Some("Holiday".to_string())
+    );
+    engine.stop();
+}
+
+#[tokio::test]
+async fn an_album_failure_never_loses_the_uploaded_item() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("Pictures");
+    let file = write_file(&photos, "Holiday/beach.jpg", b"beach");
+    add_mapped_folder(&store, &photos, true, AlbumScope::Leaf);
+    server.fail(Operation::CreateAlbum, Fault::PermissionDenied);
+
+    let engine = start_engine(&server, &store, EngineConfig::default()).await;
+    assert!(
+        wait_until(
+            || all_terminal(&store, std::slice::from_ref(&file)),
+            Duration::from_secs(15)
+        )
+        .await,
+        "the upload itself must finish even when the album call is refused"
+    );
+    assert!(
+        wait_until(
+            || engine
+                .status()
+                .folders
+                .first()
+                .and_then(|folder| folder.last_error.as_deref())
+                .is_some_and(|error| error.contains("album")),
+            Duration::from_secs(15)
+        )
+        .await,
+        "the folder status must report what could not be done"
+    );
+
+    let row = store
+        .item(&file.display().to_string())
+        .expect("read the row")
+        .expect("the upload was recorded");
+    assert_eq!(
+        row.state,
+        ItemState::Uploaded,
+        "R3.2: the item is uploaded; only the album mapping failed"
+    );
+    assert!(
+        row.asset_id.is_some(),
+        "the asset mapping is what the deletion review keys on, so it survives"
+    );
+    let status = engine.status();
+    assert_eq!(
+        status.activity,
+        Activity::NeedsAttention,
+        "the dashboard and the tray show that something needs the user (R8.1)"
+    );
+    assert!(
+        status.folders[0]
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("album mapping failed")),
+        "the folder status says what could not be done: {:?}",
+        status.folders[0].last_error
+    );
+    assert_eq!(
+        server.album_names(),
+        Vec::<String>::new(),
+        "no album exists after a refused create"
+    );
     engine.stop();
 }
