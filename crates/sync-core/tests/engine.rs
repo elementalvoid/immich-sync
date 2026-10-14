@@ -3256,7 +3256,11 @@ async fn the_engine_reports_the_bytes_it_put_on_the_wire() {
     assert_eq!(engine.uploaded_bytes(), 0, "nothing has been sent yet");
 
     assert!(
-        wait_until(|| all_terminal(&store, &[file.clone()]), Duration::from_secs(30)).await,
+        wait_until(
+            || all_terminal(&store, std::slice::from_ref(&file)),
+            Duration::from_secs(30)
+        )
+        .await,
         "the file never reached a terminal success state"
     );
     assert_eq!(

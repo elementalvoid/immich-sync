@@ -24,4 +24,4 @@ pub mod watch;
 
 // Re-exported so the shell can hand the engine the client it holds without
 // depending on the HTTP client crate directly.
-pub use immich_client::ImmichClient;
+pub use immich_client::{ClientError, ImmichClient};

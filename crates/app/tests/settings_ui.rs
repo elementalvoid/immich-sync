@@ -253,9 +253,31 @@ fn open_shell(
                     cx,
                 )
             });
-            let failed =
-                cx.new(|cx| immich_sync::failed_view::FailedView::new(engine_model, window, cx));
-            cx.new(|cx| AppShell::new(dashboard, settings, upload, failed, connection.clone(), cx))
+            let failed = cx.new(|cx| {
+                immich_sync::failed_view::FailedView::new(engine_model.clone(), window, cx)
+            });
+            let diagnostics_model = cx.new(|cx| {
+                immich_sync::diagnostics::DiagnosticsModel::new(
+                    store_model.clone(),
+                    engine_model,
+                    connection.clone(),
+                    cx,
+                )
+            });
+            let diagnostics = cx.new(|cx| {
+                immich_sync::diagnostics_view::DiagnosticsView::new(diagnostics_model, cx)
+            });
+            cx.new(|cx| {
+                AppShell::new(
+                    dashboard,
+                    settings,
+                    upload,
+                    failed,
+                    diagnostics,
+                    connection.clone(),
+                    cx,
+                )
+            })
         })
         .expect("open the shell window")
         .0;

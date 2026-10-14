@@ -541,7 +541,8 @@ impl MockImmich {
             .inner
             .lock()
             .expect("mock state poisoned")
-            .api_key_permissions = Some(permissions.iter().map(|value| value.to_string()).collect());
+            .api_key_permissions =
+            Some(permissions.iter().map(|value| value.to_string()).collect());
     }
 
     /// The number of `GET /server/about` requests that arrived, whether or not
@@ -832,11 +833,7 @@ async fn about(AxumState(state): AxumState<Arc<State>>, headers: HeaderMap) -> R
     if let Some(response) = api_key_permission_refusal(&state, &headers, "server.about") {
         return response;
     }
-    state
-        .inner
-        .lock()
-        .expect("mock state poisoned")
-        .about_auth = auth.map(str::to_string);
+    state.inner.lock().expect("mock state poisoned").about_auth = auth.map(str::to_string);
     Json(json!({ "version": SERVER_VERSION })).into_response()
 }
 
@@ -873,10 +870,7 @@ fn api_key_permission_refusal(
     if let Some(configured) = &inner.api_key
         && configured != key
     {
-        return Some(message(
-            StatusCode::UNAUTHORIZED,
-            "Invalid authentication",
-        ));
+        return Some(message(StatusCode::UNAUTHORIZED, "Invalid authentication"));
     }
     let granted = inner
         .api_key_permissions
@@ -909,19 +903,13 @@ async fn api_key_me(AxumState(state): AxumState<Arc<State>>, headers: HeaderMap)
         .and_then(|value| value.to_str().ok())
         .filter(|key| !key.is_empty())
     else {
-        return message(
-            StatusCode::FORBIDDEN,
-            "Not authenticated with an API Key",
-        );
+        return message(StatusCode::FORBIDDEN, "Not authenticated with an API Key");
     };
     let inner = state.inner.lock().expect("mock state poisoned");
     if let Some(configured) = &inner.api_key
         && configured != key
     {
-        return message(
-            StatusCode::UNAUTHORIZED,
-            "Invalid authentication",
-        );
+        return message(StatusCode::UNAUTHORIZED, "Invalid authentication");
     }
     let permissions = inner
         .api_key_permissions

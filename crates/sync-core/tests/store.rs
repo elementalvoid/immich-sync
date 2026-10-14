@@ -897,11 +897,11 @@ fn the_last_error_of_each_class_is_reported_with_its_message() {
         .expect("read the last errors by class");
 
     assert_eq!(
-        errors
-            .iter()
-            .map(|error| error.class)
-            .collect::<Vec<_>>(),
-        vec![FailureClass::ServerTransient, FailureClass::UnsupportedFormat],
+        errors.iter().map(|error| error.class).collect::<Vec<_>>(),
+        vec![
+            FailureClass::ServerTransient,
+            FailureClass::UnsupportedFormat
+        ],
         "newest first, one entry per class"
     );
     assert_eq!(

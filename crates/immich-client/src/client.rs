@@ -15,8 +15,8 @@ use crate::error::ClientError;
 use crate::model::{
     Album, AlbumAssetsRequest, AlbumBody, ApiKeyInfo, AssetCopyRequest, AssetInfo, AssetInfoBody,
     AssetUpload, Auth, AuthStatus, BulkAction, BulkCheckBody, BulkCheckItem, BulkCheckResult,
-    BulkTagRequest, CreateAlbumRequest, CreateStackRequest, LoginResponse, RejectReason, ServerAbout,
-    SessionToken, StackBody, UploadBody, UploadResponse,
+    BulkTagRequest, CreateAlbumRequest, CreateStackRequest, LoginResponse, RejectReason,
+    ServerAbout, SessionToken, StackBody, UploadBody, UploadResponse,
 };
 
 /// The longest error message body kept from the server. A reverse proxy can

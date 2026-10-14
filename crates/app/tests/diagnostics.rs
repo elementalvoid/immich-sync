@@ -1,0 +1,731 @@
+//! The Diagnostics view and its model (SPEC R10.2, R10.4).
+//!
+//! The view shows the server version, the granted permissions, the sqlite
+//! state, the last error per class, and the upload throughput; its rebuild
+//! action starts the state over and rescans the folders. The headless harness
+//! cannot read pixels, so "readable in both themes" is checked by rendering
+//! under both and reading the same accessibility properties.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Duration;
+
+use gpui_kit::test::TestWindowExt as _;
+use gpui_kit::{
+    AnyWindowHandle, App, AppContext as _, Bounds, Entity, Point, TestAppContext, Window,
+    WindowBounds, WindowOptions, px, size,
+};
+use immich_sync::autostart::{Autostart, UnavailableAutostart};
+use immich_sync::connection::ConnectionModel;
+use immich_sync::dashboard::Dashboard;
+use immich_sync::diagnostics::{DiagnosticsModel, Permissions};
+use immich_sync::diagnostics_view::DiagnosticsView;
+use immich_sync::engine::EngineModel;
+use immich_sync::logging::{LOG_PREFIX, LogLevel, LogPolicy, LogSink};
+use immich_sync::paths::AppPaths;
+use immich_sync::settings::SettingsStore;
+use immich_sync::settings_view::SettingsView;
+use immich_sync::shell::{self, AppShell, ViewMode};
+use immich_sync::store::StoreModel;
+use immich_sync::upload::UploadModel;
+use immich_sync::upload_view::UploadView;
+use immich_sync::{status, theme};
+use mock_immich::MockImmich;
+use sync_core::connection::{AuthMethod, Secret, ServerProfile, SignIn};
+use sync_core::credential::{MemoryCredentialStore, SharedCredentialStore};
+use sync_core::store::{AlbumScope, SourceFolder};
+
+const API_KEY: &str = "api-key-abc123";
+/// The schema stands at the eighth migration.
+const DB_MIGRATION_VERSION: i64 = 8;
+
+fn temporary_paths(dir: &Path) -> AppPaths {
+    AppPaths {
+        config_file: dir.join("config").join("settings.toml"),
+        state_db: dir.join("data").join("state.db"),
+        autostart_dir: dir.join("config").join("autostart"),
+    }
+}
+
+fn window_options() -> WindowOptions {
+    WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds {
+            origin: Point::default(),
+            size: size(px(1200.), px(1600.)),
+        })),
+        ..Default::default()
+    }
+}
+
+fn autostart() -> Rc<dyn Autostart> {
+    Rc::new(UnavailableAutostart::new(
+        "the test run has no OS autostart mechanism".to_string(),
+    ))
+}
+
+/// Starts the offline Immich double on its own runtime: a GPUI test runs on
+/// the GPUI executor, which is not a Tokio runtime.
+fn mock_server() -> (tokio::runtime::Runtime, MockImmich) {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("start the mock runtime");
+    let server = runtime.block_on(MockImmich::start());
+    (runtime, server)
+}
+
+fn profile_for(server: &MockImmich, method: AuthMethod) -> ServerProfile {
+    ServerProfile {
+        server_url: server.base_url().to_string(),
+        email: "sync@example.com".to_string(),
+        method,
+    }
+}
+
+/// Builds a connection model without signing in yet, as the shell does before
+/// the form is used.
+fn connection_model(
+    cx: &mut TestAppContext,
+    server: &MockImmich,
+    method: AuthMethod,
+) -> Entity<ConnectionModel> {
+    let credentials: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+    let profile = profile_for(server, method);
+    cx.update(|cx| cx.new(|_| ConnectionModel::new(profile, credentials)))
+}
+
+/// Signs in an existing connection model.
+fn sign_in(
+    cx: &mut TestAppContext,
+    connection: &Entity<ConnectionModel>,
+    server: &MockImmich,
+    method: AuthMethod,
+    secret: &str,
+) {
+    let profile = profile_for(server, method);
+    cx.update(|cx| {
+        connection.update(cx, |model, cx| {
+            model.sign_in(
+                SignIn {
+                    email: profile.email.clone(),
+                    secret: Secret::new(secret),
+                    method,
+                },
+                profile,
+                cx,
+            );
+        });
+    })
+}
+
+/// Builds and signs in a connection model in one go.
+fn signed_in(
+    cx: &mut TestAppContext,
+    server: &MockImmich,
+    method: AuthMethod,
+    secret: &str,
+) -> Entity<ConnectionModel> {
+    let connection = connection_model(cx, server, method);
+    sign_in(cx, &connection, server, method, secret);
+    connection
+}
+
+/// Pumps the executor until `ready` holds, or panics after the timeout.
+async fn wait_until(cx: &mut TestAppContext, what: &str, ready: impl FnMut(&mut App) -> bool) {
+    wait_until_reported(cx, what, ready, |_| String::new()).await;
+}
+
+/// The same wait, with a description of the stuck state on failure.
+async fn wait_until_reported(
+    cx: &mut TestAppContext,
+    what: &str,
+    mut ready: impl FnMut(&mut App) -> bool,
+    report: impl Fn(&mut App) -> String,
+) {
+    for _ in 0..900 {
+        if cx.update(|cx| ready(cx)) {
+            return;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    let report = cx.update(|cx| report(cx));
+    panic!("{what} never happened: {report}");
+}
+
+/// Opens the store alone, so a test can seed it before the engine exists.
+fn open_store(cx: &mut TestAppContext, paths: &AppPaths) -> Entity<StoreModel> {
+    let paths = paths.clone();
+    cx.update(|cx| cx.new(|cx| StoreModel::open(&paths, cx)))
+}
+
+/// Builds the engine and the diagnostics model over an open store.
+fn open_models(
+    cx: &mut TestAppContext,
+    paths: &AppPaths,
+    connection: Entity<ConnectionModel>,
+    store: Entity<StoreModel>,
+) -> (Entity<EngineModel>, Entity<DiagnosticsModel>) {
+    let paths = paths.clone();
+    cx.update(|cx| {
+        let engine = cx.new(|cx| EngineModel::new(connection.clone(), store.clone(), &paths, cx));
+        let diagnostics =
+            cx.new(|cx| DiagnosticsModel::new(store.clone(), engine.clone(), connection, cx));
+        (engine, diagnostics)
+    })
+}
+
+/// Opens the real shell over the real settings and diagnostics views.
+fn open_shell(
+    cx: &mut TestAppContext,
+    store: SettingsStore,
+    paths: AppPaths,
+    connection: Entity<ConnectionModel>,
+) -> (
+    AnyWindowHandle,
+    Entity<StoreModel>,
+    Entity<EngineModel>,
+    Entity<DiagnosticsModel>,
+) {
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        let mut opened = None;
+        let (window, _) = gpui_kit::open_window(window_options(), cx, |window, cx| {
+            let dashboard = cx.new(|_| Dashboard::new(status::sample()));
+            let settings = cx.new(|cx| {
+                SettingsView::new(
+                    store.clone(),
+                    paths.clone(),
+                    autostart(),
+                    connection.clone(),
+                    window,
+                    cx,
+                )
+            });
+            let store_model = cx.new(|cx| StoreModel::open(&paths, cx));
+            let upload_model =
+                cx.new(|cx| UploadModel::new(connection.clone(), store_model.clone(), cx));
+            let upload = cx.new(|cx| UploadView::new(upload_model, window, cx));
+            let engine_model =
+                cx.new(|cx| EngineModel::new(connection.clone(), store_model.clone(), &paths, cx));
+            let diagnostics_model = cx.new(|cx| {
+                DiagnosticsModel::new(
+                    store_model.clone(),
+                    engine_model.clone(),
+                    connection.clone(),
+                    cx,
+                )
+            });
+            let diagnostics = cx.new(|cx| DiagnosticsView::new(diagnostics_model.clone(), cx));
+            let failed = cx.new(|cx| {
+                immich_sync::failed_view::FailedView::new(engine_model.clone(), window, cx)
+            });
+            let shell = cx.new(|cx| {
+                AppShell::new(
+                    dashboard,
+                    settings,
+                    upload,
+                    failed,
+                    diagnostics,
+                    connection.clone(),
+                    cx,
+                )
+            });
+            opened = Some((
+                store_model.clone(),
+                engine_model.clone(),
+                diagnostics_model.clone(),
+            ));
+            shell
+        })
+        .expect("open the shell window");
+        theme::apply_system_theme(theme::SystemTheme::Light, cx);
+        let (store_model, engine_model, diagnostics_model) =
+            opened.expect("the shell built its models");
+        (window, store_model, engine_model, diagnostics_model)
+    })
+}
+
+/// Moves focus to the next tab stop, as the Root's Tab binding does.
+fn tab_to(window: &mut Window, id: &'static str, cx: &mut App) {
+    for _ in 0..24 {
+        if window.find(id).focused() == Some(true) {
+            return;
+        }
+        window.focus_next(cx);
+        window.render_frame(cx);
+    }
+    assert_eq!(
+        window.find(id).focused(),
+        Some(true),
+        "{id} is not keyboard reachable"
+    );
+}
+
+/// Switches the shell to the Diagnostics surface.
+fn show_diagnostics(window: &mut Window, cx: &mut App) {
+    window.render_frame(cx);
+    tab_to(window, "nav-diagnostics", cx);
+    window.press("enter", cx);
+}
+
+/// Adds one source folder straight to the store, before the engine exists.
+fn seed_folder(store: &Entity<StoreModel>, cx: &mut App, path: &Path) {
+    store
+        .read(cx)
+        .store()
+        .expect("the store is open")
+        .add_folder(&SourceFolder {
+            path: path.display().to_string(),
+            recursive: true,
+            album_mapping: false,
+            album_scope: AlbumScope::Leaf,
+        })
+        .expect("add the source folder");
+}
+
+/// Every log file's text, concatenated, as #17's grep does.
+fn log_text(directory: &Path) -> String {
+    let mut text = String::new();
+    for entry in fs::read_dir(directory).expect("read the log directory") {
+        let path = entry.expect("read a log directory entry").path();
+        if path.is_file()
+            && path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(LOG_PREFIX))
+        {
+            text.push_str(&fs::read_to_string(&path).expect("read a log file"));
+        }
+    }
+    text
+}
+
+#[test]
+fn the_screenshot_view_override_names_the_diagnostics_surface() {
+    assert_eq!(
+        shell::view_for_name("diagnostics"),
+        Some(ViewMode::Diagnostics)
+    );
+}
+
+#[gpui_kit::test]
+async fn the_view_shows_the_sqlite_state_the_server_and_the_permissions(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let (_runtime, server) = mock_server();
+    server.set_api_key(API_KEY);
+    server.set_api_key_permissions(&["asset.upload", "server.about"]);
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let connection = connection_model(cx, &server, AuthMethod::ApiKey);
+    let (window, _store, _engine, diagnostics) = open_shell(
+        cx,
+        SettingsStore::open(paths.config_file.clone()),
+        paths,
+        connection.clone(),
+    );
+    sign_in(cx, &connection, &server, AuthMethod::ApiKey, API_KEY);
+
+    wait_until(cx, "the server probe", |cx| {
+        diagnostics.read(cx).server().version.is_some()
+    })
+    .await;
+    wait_until(cx, "the sqlite read", |cx| {
+        diagnostics.read(cx).info().is_some()
+    })
+    .await;
+    assert!(
+        matches!(
+            cx.read(|cx| diagnostics.read(cx).server().permissions.clone()),
+            Permissions::Granted { .. }
+        ),
+        "the API key's permissions were read"
+    );
+
+    for system in [theme::SystemTheme::Light, theme::SystemTheme::Dark] {
+        cx.update(|cx| theme::apply_system_theme(system, cx));
+        cx.update_window(window, |_, window, cx| {
+            show_diagnostics(window, cx);
+            assert!(
+                window.find("diagnostics-view").visible(),
+                "the Diagnostics view is shown"
+            );
+            assert_eq!(
+                window.find("diagnostics-server-version-value").label(),
+                Some("v3.3.1"),
+                "the server version is shown"
+            );
+            let permissions = window
+                .find("diagnostics-permissions-value")
+                .label()
+                .expect("the permissions are shown")
+                .to_string();
+            assert!(
+                permissions.contains("asset.upload") && permissions.contains("server.about"),
+                "the granted permissions are listed: {permissions}"
+            );
+            assert_eq!(
+                window.find("diagnostics-sqlite-version-value").label(),
+                Some(DB_MIGRATION_VERSION.to_string().as_str()),
+                "the migration version is shown"
+            );
+            assert_eq!(
+                window.find("diagnostics-integrity-value").label(),
+                Some("ok"),
+                "the integrity check is shown"
+            );
+            assert!(
+                window
+                    .find("diagnostics-sqlite-size-value")
+                    .label()
+                    .is_some_and(|size| !size.is_empty()),
+                "the database size is shown"
+            );
+            assert_eq!(
+                window.find("diagnostics-table-sync_item").label(),
+                Some("sync_item: 0"),
+                "every tracked table is counted"
+            );
+            assert_eq!(
+                window.find("diagnostics-throughput-value").label(),
+                Some("0 B/s"),
+                "the throughput starts at zero"
+            );
+            assert_eq!(
+                window.find("diagnostics-errors-empty").label(),
+                Some("No failure has been recorded."),
+                "with no recorded failure the section says so"
+            );
+        })
+        .expect("update the shell window");
+    }
+}
+
+#[gpui_kit::test]
+async fn every_diagnostics_control_is_named_and_keyboard_reachable(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let (_runtime, server) = mock_server();
+    server.set_api_key(API_KEY);
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let connection = connection_model(cx, &server, AuthMethod::ApiKey);
+    let (window, _store, _engine, _diagnostics) = open_shell(
+        cx,
+        SettingsStore::open(paths.config_file.clone()),
+        paths,
+        connection.clone(),
+    );
+    sign_in(cx, &connection, &server, AuthMethod::ApiKey, API_KEY);
+
+    cx.update_window(window, |_, window, cx| {
+        show_diagnostics(window, cx);
+        for (id, label) in [
+            ("nav-diagnostics", "Diagnostics"),
+            (
+                "diagnostics-refresh",
+                "Re-check the server and the state database",
+            ),
+            (
+                "diagnostics-rebuild",
+                "Rebuild the state database and rescan the folders",
+            ),
+        ] {
+            assert_eq!(window.find(id).label(), Some(label), "{id} is named");
+        }
+        for id in [
+            "nav-diagnostics",
+            "diagnostics-refresh",
+            "diagnostics-rebuild",
+        ] {
+            tab_to(window, id, cx);
+        }
+    })
+    .expect("update the shell window");
+}
+
+#[gpui_kit::test]
+async fn a_password_session_shows_the_account_permissions_without_a_key_read(
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let (_runtime, server) = mock_server();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let connection = connection_model(cx, &server, AuthMethod::Password);
+    let store = open_store(cx, &paths);
+    let (_engine, diagnostics) = open_models(cx, &paths, connection.clone(), store);
+    sign_in(
+        cx,
+        &connection,
+        &server,
+        AuthMethod::Password,
+        "correct horse",
+    );
+
+    wait_until(cx, "the version probe", |cx| {
+        diagnostics.read(cx).server().version.is_some()
+    })
+    .await;
+
+    assert_eq!(
+        cx.read(|cx| diagnostics.read(cx).server().permissions.clone()),
+        Permissions::Account,
+        "a password session has the account's permissions, not a key's list"
+    );
+    assert_eq!(
+        server.api_key_me_requests(),
+        0,
+        "the key read is skipped for a credential that cannot answer it"
+    );
+}
+
+#[gpui_kit::test]
+async fn a_missing_version_permission_is_an_actionable_message(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let (_runtime, server) = mock_server();
+    server.set_api_key(API_KEY);
+    // The key may upload but may not read the server version, which the real
+    // server answers with 403 Missing required permission: server.about.
+    server.set_api_key_permissions(&["asset.upload"]);
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let connection = connection_model(cx, &server, AuthMethod::ApiKey);
+    let (window, _store, _engine, diagnostics) = open_shell(
+        cx,
+        SettingsStore::open(paths.config_file.clone()),
+        paths,
+        connection.clone(),
+    );
+    sign_in(cx, &connection, &server, AuthMethod::ApiKey, API_KEY);
+
+    wait_until(cx, "the refusal", |cx| {
+        diagnostics.read(cx).server().problem.is_some()
+    })
+    .await;
+    let problem = cx.read(|cx| diagnostics.read(cx).server().problem.clone().unwrap());
+    assert!(
+        problem.contains("server.about"),
+        "the message names the permission to grant: {problem}"
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        show_diagnostics(window, cx);
+        let shown = window
+            .find("diagnostics-server-problem")
+            .label()
+            .expect("the refusal is shown")
+            .to_string();
+        assert!(
+            shown.contains("server.about"),
+            "the view repeats the actionable message: {shown}"
+        );
+    })
+    .expect("update the shell window");
+}
+
+#[gpui_kit::test]
+async fn a_rebuild_recovers_a_deleted_state_database_and_rescans_the_folder(
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let (_runtime, server) = mock_server();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    fs::create_dir_all(&photos).expect("create the source folder");
+    let file = photos.join("one.jpg");
+    fs::write(&file, b"one photo").expect("write the fixture");
+    let file_path = file.display().to_string();
+
+    let store_model = open_store(cx, &paths);
+    wait_until(cx, "the store", |cx| store_model.read(cx).store().is_some()).await;
+    // The folder belongs to the store before the engine exists, exactly as it
+    // does when a user adds it in a running client.
+    cx.update(|cx| seed_folder(&store_model, cx, &photos));
+    let connection = signed_in(cx, &server, AuthMethod::Password, "correct horse");
+    let (engine, diagnostics) = open_models(cx, &paths, connection, store_model.clone());
+
+    wait_until_reported(
+        cx,
+        "the first upload",
+        |cx| {
+            store_model
+                .read(cx)
+                .store()
+                .and_then(|store| store.item(&file_path).ok().flatten())
+                .is_some_and(|row| row.state.is_terminal_success())
+        },
+        |cx| {
+            format!(
+                "running={} engine={:?}",
+                engine.read(cx).is_running(),
+                engine.read(cx).status()
+            )
+        },
+    )
+    .await;
+
+    // R10.4's acceptance: the database is deleted by hand.
+    for suffix in ["", "-wal", "-shm"] {
+        let path = PathBuf::from(format!("{}{suffix}", paths.state_db.display()));
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("remove {}: {error}", path.display()),
+        }
+    }
+    assert!(!paths.state_db.exists(), "the database file is gone");
+
+    cx.update(|cx| diagnostics.update(cx, |model, cx| model.rebuild(cx)));
+
+    wait_until_reported(
+        cx,
+        "the rebuilt store",
+        |cx| {
+            let store = store_model.read(cx);
+            store.store().is_some()
+                && store
+                    .folders()
+                    .iter()
+                    .any(|folder| folder.path == photos.display().to_string())
+        },
+        |cx| {
+            let store = store_model.read(cx);
+            format!(
+                "problem={:?} folders={:?} rebuilding={} db_exists={} generation={}",
+                store.problem(),
+                store
+                    .folders()
+                    .iter()
+                    .map(|f| f.path.clone())
+                    .collect::<Vec<_>>(),
+                diagnostics.read(cx).is_rebuilding(),
+                paths.state_db.exists(),
+                store.generation()
+            )
+        },
+    )
+    .await;
+    assert!(
+        paths.state_db.exists(),
+        "the rebuild recreated the database file"
+    );
+    let store = cx.read(|cx| store_model.read(cx).store().expect("the store reopened"));
+    store.quick_check().expect("the rebuilt database is sound");
+    assert_eq!(
+        store
+            .sqlite_info()
+            .expect("read the rebuilt state")
+            .migration_version,
+        DB_MIGRATION_VERSION
+    );
+
+    // The folders were rescanned: a fresh database has no rows until the scan
+    // re-uploads the file.
+    wait_until(cx, "the rescan", |cx| {
+        store_model
+            .read(cx)
+            .store()
+            .and_then(|store| store.item(&file_path).ok().flatten())
+            .is_some_and(|row| row.state.is_terminal_success())
+    })
+    .await;
+}
+
+#[gpui_kit::test]
+async fn the_throughput_follows_the_engine_meter_while_a_file_uploads(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let (_runtime, server) = mock_server();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    fs::create_dir_all(&photos).expect("create the source folder");
+    // A slow limit, so the upload takes seconds and the sampler sees bytes
+    // move between two polls.
+    fs::create_dir_all(paths.config_file.parent().expect("the config directory"))
+        .expect("create the config directory");
+    fs::write(
+        &paths.config_file,
+        "bandwidth_bytes_per_second = 131072\nconcurrency = 1\n",
+    )
+    .expect("write the settings");
+    let file = photos.join("large.bin");
+    fs::write(&file, vec![9_u8; 256 * 1024]).expect("write the fixture");
+    let file_path = file.display().to_string();
+
+    let store_model = open_store(cx, &paths);
+    wait_until(cx, "the store", |cx| store_model.read(cx).store().is_some()).await;
+    cx.update(|cx| seed_folder(&store_model, cx, &photos));
+    let connection = signed_in(cx, &server, AuthMethod::Password, "correct horse");
+    let (engine, diagnostics) = open_models(cx, &paths, connection, store_model.clone());
+
+    wait_until(cx, "a live throughput", |cx| {
+        diagnostics.read(cx).throughput_bytes_per_second() >= 1_000.0
+    })
+    .await;
+
+    wait_until(cx, "the upload", |cx| {
+        store_model
+            .read(cx)
+            .store()
+            .and_then(|store| store.item(&file_path).ok().flatten())
+            .is_some_and(|row| row.state.is_terminal_success())
+    })
+    .await;
+    // With nothing moving, the next sample reports zero: the readout follows
+    // the meter in both directions.
+    wait_until(cx, "the idle throughput", |cx| {
+        diagnostics.read(cx).throughput_bytes_per_second() == 0.0
+    })
+    .await;
+    assert!(
+        cx.read(|cx| engine.read(cx).uploaded_bytes()) >= 256 * 1024,
+        "the engine's meter counted the file"
+    );
+}
+
+#[gpui_kit::test]
+async fn the_probe_logs_its_outcome_without_the_credential(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let (_runtime, server) = mock_server();
+    server.set_api_key(API_KEY);
+    server.set_api_key_permissions(&["server.about"]);
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    LogSink::start(
+        &paths.log_directory(),
+        LogPolicy::default(),
+        LogLevel::Trace,
+    )
+    .expect("start the log")
+    .install()
+    .expect("install the process log sink");
+
+    let connection = signed_in(cx, &server, AuthMethod::ApiKey, API_KEY);
+    let store = open_store(cx, &paths);
+    let (_engine, diagnostics) = open_models(cx, &paths, connection, store);
+    wait_until(cx, "the permissions probe", |cx| {
+        matches!(
+            diagnostics.read(cx).server().permissions,
+            Permissions::Granted { .. }
+        )
+    })
+    .await;
+
+    immich_sync::logging::shutdown();
+    let text = log_text(&paths.log_directory());
+    assert!(
+        text.contains("Immich request finished"),
+        "the probe reaches the #17 logging pipeline: {text}"
+    );
+    assert!(
+        text.contains("api-key-permissions"),
+        "the permissions read logs its outcome: {text}"
+    );
+    assert!(
+        !text.contains(API_KEY),
+        "the log file holds the API key: {text}"
+    );
+}
