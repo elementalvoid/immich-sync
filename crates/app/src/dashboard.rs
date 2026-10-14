@@ -226,8 +226,10 @@ impl Dashboard {
         div()
             .flex()
             .flex_row()
+            // The card is narrow; the controls wrap instead of clipping.
+            .flex_wrap()
             .items_center()
-            .gap_3()
+            .gap_2()
             .child(div().text_xs().text_color(muted).child("Album mapping"))
             .child(
                 Switch::new(("folder-album", index))
