@@ -1,9 +1,10 @@
 //! The one-file upload pipeline (SPEC R3, R3.2, R3.6, R4.5).
 //!
 //! SHA-1 the file, look the checksum up, upload only what the server accepts,
-//! and record the outcome. The pipeline is one file and one attempt: it has no
-//! retry loop, because #7 owns classification-backed retries. It records the
-//! class and the state that the retry work will read.
+//! and record the outcome. The pipeline is one file and one attempt: the
+//! engine's retry loop owns the backoff and the attempt cap, and the session
+//! owns the one re-login of a 401 (R1.4), so a run here either finishes or
+//! reports the class the retry policy reads.
 //!
 //! The shape is what #6 batches: one [`Uploader`] over the shared state store,
 //! called once per item from a worker.
@@ -11,13 +12,13 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use immich_client::{
-    AssetUpload, BandwidthLimit, BulkAction, BulkCheckItem, ClientError, ImmichClient, RejectReason,
+    AssetUpload, BandwidthLimit, BulkAction, BulkCheckItem, ClientError, RejectReason,
 };
 
-use crate::connection::RequestCredential;
+use crate::connection::SharedSession;
 use crate::failure::{FailureClass, FailureKind, classify};
 use crate::hash::{HashError, Sha1};
 use crate::store::{ItemRecord, ItemState, StateStore};
@@ -38,6 +39,9 @@ pub enum UploadOutcome {
     },
     /// The run failed.
     Failed(UploadFailure),
+    /// The retry policy spent the attempt cap, so the item is parked until the
+    /// user retries it by hand (R6.5).
+    DeadLetter(UploadFailure),
     /// New uploads are paused (R8.7). The item stays queued and uploads after
     /// [`UploadGate::resume`].
     Deferred,
@@ -99,6 +103,11 @@ pub struct UploadFailure {
     pub kind: FailureKind,
     /// The user-facing reason.
     pub message: String,
+    /// The wait the server asked for with a `Retry-After` header (R6.2).
+    pub retry_after: Option<Duration>,
+    /// Whether the server could not be reached at all (R6.6), as opposed to
+    /// answering with a refusal.
+    pub connection: bool,
 }
 
 impl UploadFailure {
@@ -112,15 +121,15 @@ impl UploadFailure {
 /// Runs the pipeline for one file over one shared state store.
 #[derive(Debug)]
 pub struct Uploader {
-    client: ImmichClient,
+    session: SharedSession,
     store: Arc<StateStore>,
 }
 
 impl Uploader {
-    /// Builds a pipeline over the client and the app-scoped state store.
+    /// Builds a pipeline over the session and the app-scoped state store.
     #[must_use]
-    pub fn new(client: ImmichClient, store: Arc<StateStore>) -> Self {
-        Self { client, store }
+    pub fn new(session: SharedSession, store: Arc<StateStore>) -> Self {
+        Self { session, store }
     }
 
     /// Hashes `path`, checks the checksum, uploads it when accepted, and records
@@ -130,7 +139,7 @@ impl Uploader {
     ///
     /// Every failure is returned as [`UploadOutcome::Failed`]; a local read
     /// failure leaves no row, because there is no hash to record.
-    pub async fn upload_one(&self, path: &Path, credential: &RequestCredential) -> UploadOutcome {
+    pub async fn upload_one(&self, path: &Path) -> UploadOutcome {
         let path_text = path.to_string_lossy().into_owned();
         let metadata = match std::fs::metadata(path) {
             Ok(metadata) => metadata,
@@ -166,18 +175,22 @@ impl Uploader {
             asset_id: None,
             state: ItemState::RetryWait,
             error_class: None,
+            error_message: None,
+            attempts: 0,
         };
 
         let checksum = sha1.base64();
+        let client = self.session.client();
         let check = self
-            .client
-            .bulk_upload_check(
-                credential.auth(),
-                &[BulkCheckItem {
+            .session
+            .request(|credential| {
+                let client = client.clone();
+                let items = vec![BulkCheckItem {
                     id: path_text.clone(),
                     checksum: checksum.clone(),
-                }],
-            )
+                }];
+                async move { client.bulk_upload_check(credential.auth(), &items).await }
+            })
             .await;
         let action = match check {
             Ok(results) => match results.into_iter().find(|result| result.id == path_text) {
@@ -188,6 +201,7 @@ impl Uploader {
                         &ClientError::Protocol {
                             status: 200,
                             message: "the checksum check answered for a different id".to_string(),
+                            retry_after: None,
                         },
                     );
                 }
@@ -211,6 +225,7 @@ impl Uploader {
                             status: 200,
                             message: "the server reported a duplicate without an asset id"
                                 .to_string(),
+                            retry_after: None,
                         },
                     );
                 };
@@ -243,6 +258,7 @@ impl Uploader {
                     &ClientError::Protocol {
                         status: 200,
                         message: format!("the checksum check refused it: {reason}"),
+                        retry_after: None,
                     },
                 );
             }
@@ -250,7 +266,7 @@ impl Uploader {
 
         // This path is the caller's own, not the engine's: no limit is in
         // force, so the body streams at the network's pace.
-        self.send_upload(&mut item, &checksum, credential, &BandwidthLimit::default())
+        self.send_upload(&mut item, &checksum, &BandwidthLimit::default())
             .await
     }
 
@@ -265,7 +281,6 @@ impl Uploader {
     pub async fn upload_prepared(
         &self,
         prepared: &PreparedItem,
-        credential: &RequestCredential,
         gate: &UploadGate,
         bandwidth: &BandwidthLimit,
     ) -> UploadOutcome {
@@ -277,6 +292,8 @@ impl Uploader {
             asset_id: None,
             state: ItemState::Uploading,
             error_class: None,
+            error_message: None,
+            attempts: 0,
         };
         if gate.is_paused() {
             item.state = ItemState::Pending;
@@ -285,7 +302,7 @@ impl Uploader {
             return UploadOutcome::Deferred;
         }
         self.record(&item);
-        self.send_upload(&mut item, &prepared.sha1.base64(), credential, bandwidth)
+        self.send_upload(&mut item, &prepared.sha1.base64(), bandwidth)
             .await
     }
 
@@ -294,7 +311,6 @@ impl Uploader {
         &self,
         item: &mut ItemRecord,
         checksum: &str,
-        credential: &RequestCredential,
         bandwidth: &BandwidthLimit,
     ) -> UploadOutcome {
         // Immich requires the file's own dates on the asset (R3.1). The
@@ -309,18 +325,22 @@ impl Uploader {
             .as_ref()
             .and_then(|metadata| metadata.created().ok())
             .unwrap_or(modified_at);
+        let checksum = checksum.to_string();
+        let client = self.session.client();
+        let path = Path::new(&item.path);
         match self
-            .client
-            .upload_asset(
-                credential.auth(),
-                &AssetUpload {
-                    path: Path::new(&item.path),
-                    checksum,
+            .session
+            .request(|credential| {
+                let client = client.clone();
+                let upload = AssetUpload {
+                    path,
+                    checksum: &checksum,
                     created_at,
                     modified_at,
                     bandwidth: bandwidth.clone(),
-                },
-            )
+                };
+                async move { client.upload_asset(credential.auth(), &upload).await }
+            })
             .await
         {
             Ok(response) => {
@@ -362,6 +382,8 @@ impl Uploader {
             FailureKind::Transient => ItemState::RetryWait,
         };
         item.error_class = class;
+        let message = error.to_string();
+        item.error_message = Some(message.clone());
         self.record(item);
         tracing::warn!(
             path = %item.path,
@@ -370,11 +392,12 @@ impl Uploader {
             reason = %error.redacted_reason(),
             "the upload failed"
         );
-        let message = error.to_string();
         UploadOutcome::Failed(UploadFailure {
             class,
             kind,
             message,
+            retry_after: error.retry_after(),
+            connection: matches!(error, ClientError::Unreachable(_)),
         })
     }
 
@@ -393,6 +416,8 @@ impl Uploader {
             class: Some(FailureClass::LocalReadError),
             kind: FailureKind::Permanent,
             message,
+            retry_after: None,
+            connection: false,
         })
     }
 

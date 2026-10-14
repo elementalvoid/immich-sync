@@ -19,8 +19,19 @@ use sync_core::store::{AlbumScope, ItemRecord, ItemState, SourceFolder, StateSto
 
 fn row(folder: &Path, name: &str, state: ItemState, index: usize) -> ItemRecord {
     let error_class = match state {
-        ItemState::RetryWait | ItemState::FailedPermanent => {
+        ItemState::RetryWait | ItemState::DeadLetter => {
             Some(sync_core::failure::FailureClass::ServerTransient)
+        }
+        ItemState::FailedPermanent => Some(sync_core::failure::FailureClass::UnsupportedFormat),
+        _ => None,
+    };
+    let error_message = match state {
+        ItemState::DeadLetter => Some(
+            "the server answered 503 in a form this client does not understand: Service Unavailable"
+                .to_string(),
+        ),
+        ItemState::FailedPermanent => {
+            Some("the server does not accept this file format: image/x-canon-cr3".to_string())
         }
         _ => None,
     };
@@ -36,6 +47,24 @@ fn row(folder: &Path, name: &str, state: ItemState, index: usize) -> ItemRecord 
         asset_id,
         state,
         error_class,
+        error_message,
+        attempts: 0,
+    }
+}
+
+/// Records the attempts a parked row spent, which is what the failed-items
+/// view shows. The count lives in the attempt log, so the fixture writes the
+/// same rows the pipeline would (`StateStore::record_attempt`).
+fn record_attempts(store: &StateStore, row: &ItemRecord, count: u32) {
+    for index in 0..count {
+        store
+            .record_attempt(&sync_core::store::AttemptRecord {
+                path: row.path.clone(),
+                started_ns: row.mtime_ns + i64::from(index),
+                outcome: sync_core::store::AttemptOutcome::Failed,
+                error_class: row.error_class,
+            })
+            .expect("record the capture attempt");
     }
 }
 
@@ -72,9 +101,13 @@ fn seed_capture_state() {
     let mut index = 0;
     let mut write = |folder: &Path, name: &str, state: ItemState| {
         index += 1;
-        store
-            .record(&row(folder, name, state, index))
-            .expect("record the capture row");
+        let row = row(folder, name, state, index);
+        store.record(&row).expect("record the capture row");
+        match state {
+            ItemState::DeadLetter => record_attempts(&store, &row, 8),
+            ItemState::FailedPermanent => record_attempts(&store, &row, 1),
+            _ => {}
+        }
     };
     for photo in 0..312 {
         write(
@@ -105,6 +138,22 @@ fn seed_capture_state() {
             &videos,
             &format!("FAILED_{failed}.mp4"),
             ItemState::RetryWait,
+        );
+    }
+    // The failed-items capture: three items the retry cap parked, and two the
+    // server refused permanently (R6.3, R6.5).
+    for parked in 0..3 {
+        write(
+            &videos,
+            &format!("PARKED_{parked}.mp4"),
+            ItemState::DeadLetter,
+        );
+    }
+    for refused in 0..2 {
+        write(
+            &pictures,
+            &format!("RAW_{refused}.cr3"),
+            ItemState::FailedPermanent,
         );
     }
 }

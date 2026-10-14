@@ -11,16 +11,23 @@ use std::time::Duration;
 
 use gpui_kit::*;
 use sync_core::engine::{Activity, Engine, EngineConfig, EngineStatus, FolderStatus, Limits};
-use sync_core::store::{AlbumScope, FolderCounts, SourceFolder, StateStore};
+use sync_core::store::{AlbumScope, FailedItem, FolderCounts, SourceFolder, StateStore};
 
 use crate::connection::{ConnectionModel, worker};
 use crate::paths::AppPaths;
 use crate::settings::SettingsStore;
 use crate::status::DashboardModel;
 use crate::store::StoreModel;
+use sync_core::connection::SharedSession;
 
 /// How often the dashboard picks up the engine's live counts.
 const STATUS_POLL: Duration = Duration::from_millis(250);
+
+/// How often the failed-items list is re-read from the store (R6.5).
+///
+/// The read runs on the background executor, never on the UI thread (N2), so
+/// this only decides how soon a parked item shows up in the view.
+const FAILED_POLL_TICKS: u32 = 4;
 
 /// The app-scoped engine and the status the views render.
 pub struct EngineModel {
@@ -32,6 +39,9 @@ pub struct EngineModel {
     /// engine drains it, so two quick edits cannot land out of order.
     limits: Option<tokio::sync::watch::Sender<Limits>>,
     status: EngineStatus,
+    /// The parked items the failed-items view lists (R6.5), re-read off the UI
+    /// thread.
+    failed: Vec<FailedItem>,
     paused: bool,
     problem: Option<String>,
     /// Bumped by every folder edit, so an older edit result cannot overwrite a
@@ -76,12 +86,22 @@ impl EngineModel {
             cx.observe(&connection, |this, _, cx| this.try_start_engine(cx)),
         ];
         let poll = cx.spawn(async move |this, cx| {
+            let mut ticks = 0_u32;
             loop {
                 cx.background_executor().timer(STATUS_POLL).await;
                 let alive = this
                     .update(cx, |model, cx| {
+                        // R1.4: a 401 the engine answered on its own thread
+                        // reaches the model, and so the tray, on this poll.
+                        model
+                            .connection
+                            .update(cx, |connection, cx| connection.refresh_state(cx));
                         if model.engine.is_some() {
                             model.refresh_status(cx);
+                        }
+                        ticks = ticks.wrapping_add(1);
+                        if ticks.is_multiple_of(FAILED_POLL_TICKS) {
+                            model.refresh_failed(cx);
                         }
                     })
                     .is_ok();
@@ -97,6 +117,7 @@ impl EngineModel {
             engine: None,
             limits: None,
             status: empty_status(),
+            failed: Vec::new(),
             paused: false,
             problem: None,
             generation: 0,
@@ -116,6 +137,81 @@ impl EngineModel {
     #[must_use]
     pub fn problem(&self) -> Option<&str> {
         self.problem.as_deref()
+    }
+
+    /// The parked items the failed-items view lists (R6.5).
+    #[must_use]
+    pub fn failed_items(&self) -> &[FailedItem] {
+        &self.failed
+    }
+
+    /// Re-attempts one parked item by hand (R6.5).
+    pub fn retry_failed(&mut self, path: String, cx: &mut Context<Self>) {
+        let engine = self.engine.clone();
+        let store = self.store_model.read(cx).store();
+        let Ok(runtime) = worker() else {
+            self.problem = Some("The network runtime could not start.".to_string());
+            cx.notify();
+            return;
+        };
+        let (results, incoming) = async_channel::bounded(1);
+        runtime.spawn(async move {
+            // The store write runs on the worker runtime, so the UI thread
+            // never waits behind a worker's `BEGIN IMMEDIATE` (N2).
+            let result = match engine {
+                Some(engine) => engine
+                    .retry_failed(&path)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string()),
+                None => match store {
+                    Some(store) => store
+                        .retry_item(&path)
+                        .map(|_| ())
+                        .map_err(|error| error.to_string()),
+                    None => Err("The state database is still opening.".to_string()),
+                },
+            };
+            let _ = results.send(result).await;
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(result) = incoming.recv().await else {
+                return;
+            };
+            let _ = this.update(cx, |model, cx| {
+                match result {
+                    Ok(()) => model.problem = None,
+                    Err(problem) => model.problem = Some(problem),
+                }
+                model.refresh_failed(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Re-reads the parked items from the store on the background executor
+    /// (N2) and republishes them when they changed.
+    pub fn refresh_failed(&mut self, cx: &mut Context<Self>) {
+        let Some(store) = self.store_model.read(cx).store() else {
+            return;
+        };
+        let read = cx
+            .background_executor()
+            .spawn(async move { store.failed_items() });
+        cx.spawn(async move |this, cx| {
+            let read = read.await;
+            let _ = this.update(cx, |model, cx| match read {
+                Ok(items) => {
+                    if items != model.failed {
+                        model.failed = items;
+                        cx.notify();
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "the failed items could not be read");
+                }
+            });
+        })
+        .detach();
     }
 
     /// The one dashboard model the view renders (R8.1).
@@ -173,6 +269,15 @@ impl EngineModel {
         self.engine.is_some()
     }
 
+    /// The session the running engine sends its requests through (R1.4).
+    ///
+    /// It is the one the connection form signs in on, so the two never observe
+    /// two session state machines.
+    #[must_use]
+    pub fn session(&self) -> Option<SharedSession> {
+        self.engine.as_ref().map(|engine| engine.session().clone())
+    }
+
     /// The live limits of the running engine (R7.1, R7.2). `None` before it
     /// starts; the start path reads the stored values.
     #[must_use]
@@ -193,6 +298,7 @@ impl EngineModel {
             });
         }
     }
+
 
     /// Adds a source folder and starts discovering it (R2.1).
     pub fn add_folder(&mut self, path: String, recursive: bool, cx: &mut Context<Self>) {
@@ -405,7 +511,20 @@ impl EngineModel {
 
     /// Starts the engine when it is not running yet and both inputs exist.
     fn try_start_engine(&mut self, cx: &mut Context<Self>) {
-        if self.engine.is_some() || !self.connection.read(cx).state().is_connected() {
+        let connected = self.connection.read(cx).state().is_connected();
+        if self.engine.is_some() {
+            if connected {
+                // R1.4: a connection that comes back resumes the rows a refused
+                // credential left pending. Without this they wait for the next
+                // reconciliation scan, 30 minutes away by default.
+                if let Some(engine) = &self.engine {
+                    engine.sync_now();
+                }
+            }
+            self.refresh_status(cx);
+            return;
+        }
+        if !connected {
             self.refresh_status(cx);
             return;
         }
@@ -413,10 +532,7 @@ impl EngineModel {
             self.refresh_status(cx);
             return;
         };
-        let (Some(client), Some(credential)) = (
-            self.connection.read(cx).client(),
-            self.connection.read(cx).credential(),
-        ) else {
+        let Some(session) = self.connection.read(cx).session() else {
             self.refresh_status(cx);
             return;
         };
@@ -440,9 +556,11 @@ impl EngineModel {
                 scan_interval: Duration::from_secs(
                     u64::from(settings.scan_interval_minutes.max(1)) * 60,
                 ),
+                // R6.1: the attempt cap is user-settable, 8 by default.
+                attempt_cap: settings.attempt_cap.max(1),
                 ..EngineConfig::default()
             };
-            let started = match Engine::new(store, client, credential, config) {
+            let started = match Engine::new(store, session, config) {
                 Ok(engine) => {
                     let engine = Arc::new(engine);
                     // R8.7: a pause set before the engine existed still holds.

@@ -7,9 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use immich_client::ImmichClient;
 use mock_immich::MockImmich;
-use sync_core::connection::{AuthMethod, Connection, RequestCredential, Secret, SignIn};
+use sync_core::connection::{AuthMethod, Connection, Secret, SharedSession, SignIn};
 use sync_core::credential::MemoryCredentialStore;
 use sync_core::engine::{Engine, EngineConfig, Limits};
 use sync_core::store::{AlbumScope, SourceFolder, StateStore};
@@ -22,8 +21,9 @@ const BIG_BYTES: usize = 1_572_864;
 /// How many small files the concurrency tests sync.
 const SMALL_FILES: usize = 4;
 
-async fn signed_in(server: &MockImmich) -> (ImmichClient, RequestCredential) {
-    let client = ImmichClient::new(server.base_url()).expect("a valid mock URL");
+/// Starts the mock and signs in, returning the session the engine attaches
+/// to every request (R1.4).
+async fn signed_in(server: &MockImmich) -> SharedSession {
     let mut connection = Connection::new(server.base_url(), Arc::new(MemoryCredentialStore::new()))
         .expect("a valid URL");
     connection
@@ -33,11 +33,7 @@ async fn signed_in(server: &MockImmich) -> (ImmichClient, RequestCredential) {
             method: AuthMethod::Password,
         })
         .await;
-    let credential = connection
-        .credential()
-        .expect("a signed-in session")
-        .clone();
-    (client, credential)
+    connection.shared()
 }
 
 fn store_in(temp: &tempfile::TempDir) -> Arc<StateStore> {
@@ -60,9 +56,8 @@ async fn start_engine(
     store: &Arc<StateStore>,
     config: EngineConfig,
 ) -> Arc<Engine> {
-    let (client, credential) = signed_in(server).await;
-    let engine =
-        Arc::new(Engine::new(store.clone(), client, credential, config).expect("build the engine"));
+    let session = signed_in(server).await;
+    let engine = Arc::new(Engine::new(store.clone(), session, config).expect("build the engine"));
     engine.start();
     engine
 }

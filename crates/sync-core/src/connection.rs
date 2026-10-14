@@ -11,6 +11,7 @@
 //! file and never handed to the credential store.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use immich_client::{Auth, ClientError, ImmichClient, SessionToken};
 use serde::{Deserialize, Serialize};
@@ -117,9 +118,9 @@ impl From<&ClientError> for Attention {
             ClientError::InvalidApiKey => Self::InvalidApiKey,
             ClientError::InvalidToken => Self::Rejected,
             ClientError::Unreachable(detail) => Self::Unreachable(detail.to_string()),
-            ClientError::Protocol { status, message } => {
-                Self::Server(format!("HTTP {status}: {message}"))
-            }
+            ClientError::Protocol {
+                status, message, ..
+            } => Self::Server(format!("HTTP {status}: {message}")),
             ClientError::InvalidUrl(detail) => Self::Server(detail.clone()),
             ClientError::HttpClient(detail) => Self::Server(detail.to_string()),
             // `ClientError` is `#[non_exhaustive]`: a newer client error still
@@ -238,7 +239,10 @@ pub struct Connection {
     state: ConnectionState,
     credential: Option<RequestCredential>,
     /// Whether the one re-login of this session has already been used.
-    relogin_used: bool,
+    ///
+    /// It is shared with [`SharedSession`], so a successful request can restore
+    /// the budget without waiting for a request that is in flight (R1.4).
+    relogin_used: Arc<AtomicBool>,
 }
 
 impl Connection {
@@ -249,7 +253,23 @@ impl Connection {
     ///
     /// Returns a [`ClientError`] when the server URL cannot be used.
     pub fn new(server_url: &str, store: Arc<dyn CredentialStore>) -> Result<Self, ClientError> {
+        Self::with_budget(server_url, store, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Builds a session that spends a re-login budget a handle already shares,
+    /// so a session replaced inside a live [`SharedSession`] keeps one budget
+    /// with it (R1.4).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ClientError`] when the server URL cannot be used.
+    fn with_budget(
+        server_url: &str,
+        store: Arc<dyn CredentialStore>,
+        relogin_used: Arc<AtomicBool>,
+    ) -> Result<Self, ClientError> {
         let client = ImmichClient::new(server_url)?;
+        relogin_used.store(false, Ordering::SeqCst);
         Ok(Self {
             client,
             store,
@@ -259,7 +279,7 @@ impl Connection {
             },
             state: ConnectionState::NotConfigured,
             credential: None,
-            relogin_used: false,
+            relogin_used,
         })
     }
 
@@ -301,7 +321,7 @@ impl Connection {
     pub async fn restore(&mut self, profile: &ServerProfile) -> ConnectionState {
         self.profile = profile.clone();
         self.credential = None;
-        self.relogin_used = false;
+        self.relogin_used.store(false, Ordering::SeqCst);
         if !profile.is_configured() {
             self.state = ConnectionState::NotConfigured;
             return self.state.clone();
@@ -325,7 +345,7 @@ impl Connection {
         self.profile.email = sign_in.email.clone();
         self.profile.method = sign_in.method;
         self.credential = None;
-        self.relogin_used = false;
+        self.relogin_used.store(false, Ordering::SeqCst);
         self.state = ConnectionState::Connecting;
         self.authenticate(sign_in.method, &sign_in.secret).await;
         if self.state.is_connected()
@@ -345,8 +365,8 @@ impl Connection {
     /// second 401 before any request succeeded returns [`Unauthorized::Stop`]
     /// and leaves the session in the needs-attention state.
     pub async fn handle_unauthorized(&mut self) -> Unauthorized {
-        if self.relogin_used || self.credential.is_none() {
-            self.state = ConnectionState::NeedsAttention(Attention::Rejected);
+        if self.relogin_used.load(Ordering::SeqCst) || self.credential.is_none() {
+            self.reject();
             return Unauthorized::Stop;
         }
         match self.profile.method {
@@ -365,7 +385,7 @@ impl Connection {
             },
         }
         if self.state.is_connected() {
-            self.relogin_used = true;
+            self.relogin_used.store(true, Ordering::SeqCst);
             Unauthorized::Retry
         } else {
             Unauthorized::Stop
@@ -374,8 +394,35 @@ impl Connection {
 
     /// Records that a request with the current credential succeeded, which
     /// restores the one re-login budget (R1.4).
-    pub fn note_authenticated(&mut self) {
-        self.relogin_used = false;
+    pub fn note_authenticated(&self) {
+        self.relogin_used.store(false, Ordering::SeqCst);
+    }
+
+    /// Records that the credential was refused again after the one re-login
+    /// (R1.4).
+    pub(crate) fn reject(&mut self) {
+        self.credential = None;
+        self.state = ConnectionState::NeedsAttention(Attention::Rejected);
+    }
+
+    /// The same session, shared between the app's surfaces and the sync engine
+    /// (R1.4).
+    ///
+    /// The engine sends its requests through [`SharedSession::request`], so a
+    /// 401 on an upload is answered by this one state machine rather than by a
+    /// second copy of the rule.
+    #[must_use]
+    pub fn shared(self) -> SharedSession {
+        let snapshot = SessionSnapshot {
+            state: self.state.clone(),
+            credential: self.credential.clone(),
+            client: self.client.clone(),
+        };
+        SharedSession {
+            snapshot: Arc::new(std::sync::Mutex::new(snapshot)),
+            relogin_used: Arc::clone(&self.relogin_used),
+            connection: Arc::new(tokio::sync::Mutex::new(self)),
+        }
     }
 
     /// Authenticates with `secret` and records the outcome.
@@ -425,6 +472,234 @@ impl AttentionSource for ClientError {
 impl AttentionSource for CredentialError {
     fn attention(&self) -> Attention {
         Attention::from(self)
+    }
+}
+
+/// The state and credential of a session as of its last change.
+#[derive(Clone, Debug)]
+struct SessionSnapshot {
+    state: ConnectionState,
+    credential: Option<RequestCredential>,
+    /// The client of the connection the snapshot describes, so a request path
+    /// reaches the server this session points at.
+    client: ImmichClient,
+}
+
+/// One connection session, shared between the app's surfaces and the sync
+/// engine (R1.4).
+///
+/// The engine needs the credential a request attaches, and it needs a 401 to be
+/// answered by the same one-re-login rule the settings form uses. Both live
+/// here, behind one lock, and a snapshot lets a synchronous reader (the tray,
+/// the dashboard) see the state without waiting on a request in flight.
+#[derive(Clone)]
+pub struct SharedSession {
+    connection: Arc<tokio::sync::Mutex<Connection>>,
+    /// The one re-login budget, so a successful request restores it without
+    /// taking the lock (R1.4).
+    relogin_used: Arc<AtomicBool>,
+    snapshot: Arc<std::sync::Mutex<SessionSnapshot>>,
+}
+
+impl std::fmt::Debug for SharedSession {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The session holds a credential; only its state is safe to print.
+        formatter
+            .debug_struct("SharedSession")
+            .field("state", &self.state())
+            .finish_non_exhaustive()
+    }
+}
+
+impl SharedSession {
+    /// The HTTP client, which is cheap to clone.
+    #[must_use]
+    pub fn client(&self) -> ImmichClient {
+        self.snapshot().client
+    }
+
+    /// Whether both handles wrap the same session state, so a form and the
+    /// engine cannot drift into two session state machines (R1.4).
+    #[must_use]
+    pub fn shares_state_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.connection, &other.connection)
+    }
+
+    /// Points this session at another server and credential store, in place.
+    ///
+    /// The handle is never swapped, because the sync engine holds the handle it
+    /// was constructed with: a form sign-in has to land on that session or the
+    /// engine's queue keeps the rejected state and uploads nothing (R1.4).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ClientError`] when the server URL cannot be used. The
+    /// session then reads as needing attention, so the tray cannot keep
+    /// reporting the state this attempt replaced.
+    pub async fn repoint(
+        &self,
+        server_url: &str,
+        store: Arc<dyn CredentialStore>,
+    ) -> Result<(), ClientError> {
+        let mut connection = self.connection.lock().await;
+        let outcome =
+            match Connection::with_budget(server_url, store, Arc::clone(&self.relogin_used)) {
+                Ok(fresh) => {
+                    *connection = fresh;
+                    Ok(())
+                }
+                Err(error) => {
+                    connection.need_attention(&error);
+                    Err(error)
+                }
+            };
+        self.mirror(&connection);
+        outcome
+    }
+
+    /// The connection state as of the last change (R1.4).
+    #[must_use]
+    pub fn state(&self) -> ConnectionState {
+        self.snapshot().state
+    }
+
+    /// The credential a request attaches right now (R1.3, R1.5).
+    #[must_use]
+    pub fn credential(&self) -> Option<RequestCredential> {
+        self.snapshot().credential
+    }
+
+    /// Signs in with the form's email and secret (R1.2, R1.5).
+    pub async fn sign_in(&self, request: SignIn) -> ConnectionState {
+        let mut connection = self.connection.lock().await;
+        let state = connection.sign_in(request).await;
+        self.mirror(&connection);
+        state
+    }
+
+    /// Restores the session at startup with no user input (R1.3).
+    pub async fn restore(&self, profile: &ServerProfile) -> ConnectionState {
+        let mut connection = self.connection.lock().await;
+        let state = connection.restore(profile).await;
+        self.mirror(&connection);
+        state
+    }
+
+    /// Answers a 401 with the one re-login of this session (R1.4).
+    pub async fn handle_unauthorized(&self) -> Unauthorized {
+        let mut connection = self.connection.lock().await;
+        let outcome = connection.handle_unauthorized().await;
+        self.mirror(&connection);
+        outcome
+    }
+
+    /// Records that a request with the current credential succeeded, which
+    /// restores the one re-login budget (R1.4).
+    pub fn note_authenticated(&self) {
+        self.relogin_used.store(false, Ordering::SeqCst);
+    }
+
+    /// Runs one authenticated request, answering a 401 with the session's one
+    /// re-login and retrying it once (R1.4).
+    ///
+    /// A second 401 leaves the connection in the needs-attention state and
+    /// returns the refusal. A request that succeeds restores the re-login
+    /// budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns the request's own failure. A refusal the session cannot answer
+    /// comes back as [`ClientError::InvalidToken`].
+    pub async fn request<T, F, Fut>(&self, mut run: F) -> Result<T, ClientError>
+    where
+        F: FnMut(RequestCredential) -> Fut,
+        Fut: std::future::Future<Output = Result<T, ClientError>>,
+    {
+        let Some(credential) = self.credential() else {
+            // No credential is not a server refusal; the session is already in
+            // the needs-attention state, so it reads as one to the caller.
+            let _ = self.handle_unauthorized().await;
+            return Err(ClientError::InvalidToken);
+        };
+        match run(credential).await {
+            Ok(value) => {
+                self.note_authenticated();
+                Ok(value)
+            }
+            Err(ClientError::InvalidToken) => {
+                if self.handle_unauthorized().await != Unauthorized::Retry {
+                    return Err(ClientError::InvalidToken);
+                }
+                let Some(fresh) = self.credential() else {
+                    return Err(ClientError::InvalidToken);
+                };
+                match run(fresh).await {
+                    Ok(value) => {
+                        self.note_authenticated();
+                        Ok(value)
+                    }
+                    Err(ClientError::InvalidToken) => {
+                        // The second 401 of R1.4: the one re-login is spent, so
+                        // the connection needs the user.
+                        let _ = self.handle_unauthorized().await;
+                        Err(ClientError::InvalidToken)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Probes the server with the credential-validation endpoint (R6.6).
+    ///
+    /// The probe is not an upload attempt: it does not spend the re-login
+    /// budget and it does not answer a 401 with a re-login. It is how the
+    /// circuit breaker asks whether the server is back before the queue
+    /// resumes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport and protocol variants, and
+    /// [`ClientError::InvalidToken`] when no credential is available.
+    pub async fn validate(&self) -> Result<(), ClientError> {
+        let snapshot = self.snapshot();
+        let client = snapshot.client;
+        let probe = match snapshot.credential {
+            Some(RequestCredential::Session(token)) => client.validate_token(&token).await,
+            Some(RequestCredential::ApiKey(key)) => client.validate_api_key(key.expose()).await,
+            None => Err(ClientError::InvalidToken),
+        };
+        // The probe is the one path that learns a refusal without going through
+        // `request`, so it records it here: the snapshot the tray reads must
+        // not keep saying Connected while nothing can authenticate (R1.4).
+        if let Err(error) = &probe
+            && matches!(
+                error,
+                ClientError::InvalidToken | ClientError::InvalidApiKey
+            )
+        {
+            let mut connection = self.connection.lock().await;
+            connection.reject();
+            self.mirror(&connection);
+        }
+        probe
+    }
+
+    /// The snapshot of the last change.
+    fn snapshot(&self) -> SessionSnapshot {
+        self.snapshot
+            .lock()
+            .expect("the session snapshot lock")
+            .clone()
+    }
+
+    /// Copies the session's state into the snapshot the UI reads.
+    fn mirror(&self, connection: &Connection) {
+        let mut snapshot = self.snapshot.lock().expect("the session snapshot lock");
+        snapshot.state = connection.state().clone();
+        snapshot.credential = connection.credential().cloned();
+        snapshot.client = connection.client().clone();
     }
 }
 

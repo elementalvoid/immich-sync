@@ -9,6 +9,7 @@ use gpui_tray::{Icon, Tray};
 use crate::connection::ConnectionModel;
 use crate::dashboard::Dashboard;
 use crate::engine::EngineModel;
+use crate::failed_view::FailedView;
 use crate::logs_view::LogsView;
 use crate::paths::AppPaths;
 use crate::settings_view::SettingsView;
@@ -255,7 +256,17 @@ pub fn open_main_window(cx: &mut App) -> anyhow::Result<()> {
         // (R7.1, R7.2).
         settings.update(cx, |view, _| view.set_engine(engine.clone()));
         let upload_view = cx.new(|cx| UploadView::new(upload.clone(), window, cx));
-        cx.new(|cx| AppShell::new(dashboard, settings, upload_view, connection, cx))
+        let failed_view = cx.new(|cx| FailedView::new(engine.clone(), window, cx));
+        cx.new(|cx| {
+            AppShell::new(
+                dashboard,
+                settings,
+                upload_view,
+                failed_view,
+                connection,
+                cx,
+            )
+        })
     })?;
     window.update(cx, |_, window, cx| {
         crate::theme::follow_system_theme(window, cx)
@@ -272,13 +283,16 @@ pub enum ViewMode {
     Settings,
     /// The manual one-file upload.
     Upload,
+    /// The parked items and their manual retry (R6.5).
+    Failed,
     /// The log file and its level control (R10.3).
     Logs,
 }
 
 /// The environment variable that pins the visible surface.
 ///
-/// Set it to `dashboard`, `settings`, `upload`, or `logs` to open the window on
+/// Set it to `dashboard`, `settings`, `upload`, `failed`, or `logs` to open the
+/// window on
 /// that surface and skip the observer that would otherwise decide. A screenshot
 /// run uses it so the capture is reproducible.
 pub const FORCE_VIEW_ENV: &str = "IMMICH_SYNC_VIEW";
@@ -296,6 +310,7 @@ pub fn view_for_name(value: &str) -> Option<ViewMode> {
         "dashboard" => Some(ViewMode::Dashboard),
         "settings" => Some(ViewMode::Settings),
         "upload" => Some(ViewMode::Upload),
+        "failed" => Some(ViewMode::Failed),
         "logs" => Some(ViewMode::Logs),
         _ => None,
     }
@@ -309,6 +324,7 @@ pub struct AppShell {
     settings: Entity<SettingsView>,
     logs: Entity<LogsView>,
     upload: Entity<UploadView>,
+    failed: Entity<FailedView>,
     _connection: Entity<ConnectionModel>,
     _connection_subscription: Subscription,
 }
@@ -321,6 +337,7 @@ impl AppShell {
         dashboard: Entity<Dashboard>,
         settings: Entity<SettingsView>,
         upload: Entity<UploadView>,
+        failed: Entity<FailedView>,
         connection: Entity<ConnectionModel>,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -343,6 +360,7 @@ impl AppShell {
             settings,
             logs,
             upload,
+            failed,
             _connection: connection,
             _connection_subscription: subscription,
         }
@@ -380,6 +398,13 @@ impl AppShell {
                 "nav-upload",
                 "Upload",
                 ViewMode::Upload,
+                self.mode,
+                cx,
+            ))
+            .child(view_button(
+                "nav-failed",
+                "Failed items",
+                ViewMode::Failed,
                 self.mode,
                 cx,
             ))
@@ -425,6 +450,7 @@ impl Render for AppShell {
             ViewMode::Dashboard => self.dashboard.clone().into_any_element(),
             ViewMode::Settings => self.settings.clone().into_any_element(),
             ViewMode::Upload => self.upload.clone().into_any_element(),
+            ViewMode::Failed => self.failed.clone().into_any_element(),
             ViewMode::Logs => self.logs.clone().into_any_element(),
         };
 

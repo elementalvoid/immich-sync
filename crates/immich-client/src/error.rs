@@ -6,6 +6,7 @@
 //! password, the API key, or the session token.
 
 use std::borrow::Cow;
+use std::time::Duration;
 
 use thiserror::Error;
 
@@ -65,10 +66,28 @@ pub enum ClientError {
         status: u16,
         /// The server's message, or a short description of the unusable body.
         message: String,
+        /// The wait the server asked for in a `Retry-After` header (R6.2).
+        ///
+        /// The header is only meaningful on a refusal, which is why it lives
+        /// on this variant; a success carries no wait.
+        retry_after: Option<Duration>,
     },
 }
 
 impl ClientError {
+    /// The wait the server asked for before the next attempt (R6.2).
+    ///
+    /// Immich sends `Retry-After` in seconds on a 429 or a 503. The header also
+    /// allows an HTTP date; a server that sends one is treated as having sent
+    /// no hint, so the client's own backoff still applies.
+    #[must_use]
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Protocol { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
+
     /// The label a log line records: the variant and, for a protocol failure,
     /// its status.
     ///
@@ -117,6 +136,7 @@ mod tests {
             ClientError::Protocol {
                 status: 500,
                 message: secret.to_string(),
+                retry_after: None,
             },
         ];
         for error in errors {
@@ -130,6 +150,7 @@ mod tests {
             ClientError::Protocol {
                 status: 503,
                 message: String::new(),
+                retry_after: None,
             }
             .redacted_reason()
             .contains("503"),
