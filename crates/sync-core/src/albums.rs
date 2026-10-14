@@ -11,7 +11,7 @@
 //!   uniqueness, so nothing about the server merges two folders.
 //! - The album belongs to the **folder**, not the name, and is keyed by that
 //!   folder's path key. Two folders that share a name are two albums (R3.4),
-//!   and one folder spelled `C:\Photos` and `c:\photos` is one album (R2.4).
+//!   and one folder spelled with another case is one album (R2.4).
 //!   The client's only album write is "add to album", so an album that held
 //!   two folders could never be split again.
 //!
