@@ -268,6 +268,17 @@ pub(crate) struct AlbumBody {
     pub(crate) album_name: String,
 }
 
+/// The `DELETE /assets` request body (R5.3).
+///
+/// `force` is always `false`: v1 moves an asset to the trash and never
+/// permanently deletes it (ADR 0002). The field is sent rather than omitted so
+/// the intent is on the wire, not only in this client.
+#[derive(Serialize)]
+pub(crate) struct AssetBulkDeleteRequest<'a> {
+    pub(crate) ids: &'a [String],
+    pub(crate) force: bool,
+}
+
 /// The `POST /assets/bulk-upload-check` response body.
 #[derive(Deserialize)]
 pub(crate) struct BulkCheckBody {

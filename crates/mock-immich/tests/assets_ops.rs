@@ -1,4 +1,4 @@
-use mock_immich::MockImmich;
+use mock_immich::{DeleteCall, MockImmich};
 use reqwest::multipart::{Form, Part};
 use sha1::{Digest, Sha1};
 
@@ -183,6 +183,29 @@ async fn tag_assets_reports_the_tagged_count() {
 }
 
 #[tokio::test]
+async fn delete_records_the_exact_request_the_client_sent() {
+    let server = MockImmich::start().await;
+    let client = reqwest::Client::new();
+    let id = upload(&client, &server, 1).await;
+
+    client
+        .delete(format!("{}/assets", server.base_url()))
+        .json(&serde_json::json!({ "ids": [id.clone()], "force": false }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        server.delete_calls(),
+        vec![DeleteCall {
+            ids: vec![id],
+            force: false,
+        }],
+        "R5.3: the trash call is a DELETE /assets with force false"
+    );
+}
+
+#[tokio::test]
 async fn delete_moves_an_asset_to_the_trash() {
     let server = MockImmich::start().await;
     let client = reqwest::Client::new();
@@ -199,6 +222,7 @@ async fn delete_moves_an_asset_to_the_trash() {
     let result = bulk_action(&client, &server, &checksum_for(1)).await;
     assert_eq!(result["action"], "reject");
     assert_eq!(result["isTrashed"], true);
+    assert!(server.trashed(&id), "R5.3: the asset is in the trash");
 }
 
 #[tokio::test]

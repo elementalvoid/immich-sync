@@ -6,4 +6,6 @@
 
 mod server;
 
-pub use server::{AssetCopyCall, Fault, MockImmich, Operation, StackCall, UploadRecord};
+pub use server::{
+    AssetCopyCall, DeleteCall, Fault, MockImmich, Operation, StackCall, UploadRecord,
+};

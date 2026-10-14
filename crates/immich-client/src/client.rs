@@ -13,10 +13,10 @@ use tokio_util::io::ReaderStream;
 use crate::bandwidth::{MeteredReader, Progress};
 use crate::error::ClientError;
 use crate::model::{
-    Album, AlbumAssetsRequest, AlbumBody, AssetCopyRequest, AssetInfo, AssetInfoBody, AssetUpload,
-    Auth, AuthStatus, BulkAction, BulkCheckBody, BulkCheckItem, BulkCheckResult, BulkTagRequest,
-    CreateAlbumRequest, CreateStackRequest, LoginResponse, RejectReason, ServerAbout, SessionToken,
-    StackBody, UploadBody, UploadResponse,
+    Album, AlbumAssetsRequest, AlbumBody, AssetBulkDeleteRequest, AssetCopyRequest, AssetInfo,
+    AssetInfoBody, AssetUpload, Auth, AuthStatus, BulkAction, BulkCheckBody, BulkCheckItem,
+    BulkCheckResult, BulkTagRequest, CreateAlbumRequest, CreateStackRequest, LoginResponse,
+    RejectReason, ServerAbout, SessionToken, StackBody, UploadBody, UploadResponse,
 };
 
 /// The longest error message body kept from the server. A reverse proxy can
@@ -631,6 +631,37 @@ impl ImmichClient {
             .map_err(ClientError::Unreachable)?;
         let result = self.read_accepted(response).await;
         log_outcome("bulk-tag-assets", &result);
+        result
+    }
+
+    /// Moves assets to the trash (R5.3).
+    ///
+    /// v1 has no permanent delete: the request always carries `force: false`,
+    /// so the assets stay in the trash and can be restored (ADR 0002). The
+    /// caller records the decision only after this answers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::PermissionDenied`] when the credential lacks
+    /// Immich's `asset.delete` permission (R5.5), the other typed refusal
+    /// classes (R6.3), and the transport and protocol variants. A refusal is
+    /// permanent: it changes nothing on the server.
+    pub async fn trash_assets(
+        &self,
+        auth: Auth<'_>,
+        asset_ids: &[String],
+    ) -> Result<(), ClientError> {
+        let response = self
+            .authorize(self.http.delete(self.endpoint("assets")), auth)
+            .json(&AssetBulkDeleteRequest {
+                ids: asset_ids,
+                force: false,
+            })
+            .send()
+            .await
+            .map_err(ClientError::Unreachable)?;
+        let result = self.read_accepted(response).await;
+        log_outcome("trash-assets", &result);
         result
     }
 
