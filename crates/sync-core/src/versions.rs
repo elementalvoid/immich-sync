@@ -176,7 +176,19 @@ impl Versioner {
         // copy above moved the membership onto the new asset. One that does not
         // exist yet is made here, with the new asset first so it is primary.
         let stack_id = match info.stack_id {
-            Some(stack_id) => stack_id,
+            Some(stack_id) => {
+                // S2 (open, #11): the AC says the new asset ends up primary,
+                // but from the second edit on the copy only joins this stack
+                // and the server never changes `primaryAssetId`, so the new
+                // version is not primary. Making it primary needs a stack
+                // write carrying `primaryAssetId`, and the safe way to take
+                // that step also needs the double to model the server's real
+                // create rule (any listed asset that is a stack's primary
+                // merges that whole stack), or it can split a stack whose
+                // primary is not the old asset. Left for the operator to
+                // decide; not implemented in #11.
+                stack_id
+            }
             None => {
                 let members = vec![asset_id.to_string(), previous.asset_id.clone()];
                 self.request(members.clone(), |client, credential, members| async move {
