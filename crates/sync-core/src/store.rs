@@ -1219,10 +1219,12 @@ impl StateStore {
     /// decision landed while the DELETE was in flight. Returns whether a row
     /// changed.
     ///
-    /// The server's answer is the last word on the asset, so a row that a
-    /// Keep settled during the request must not go on claiming the asset was
-    /// kept. A row already in `review_trash` is left alone, so a second report
-    /// of the same trash changes nothing.
+    /// The server's answer is the last word on the asset, so a `review_keep`
+    /// row that a Keep settled during the request must not go on claiming the
+    /// asset was kept. Other rows are left alone: the file can reappear and
+    /// upload again before the DELETE returns, and that live row must not be
+    /// stamped as trashed. A row already in `review_trash` is one of them, so
+    /// a second report of the same trash changes nothing.
     ///
     /// # Errors
     ///
@@ -1232,7 +1234,7 @@ impl StateStore {
         let changed = writer
             .execute(
                 "UPDATE sync_item SET state = 'review_trash'
-                 WHERE path_key = ?1 AND state <> 'review_trash'",
+                 WHERE path_key = ?1 AND state = 'review_keep'",
                 [path_key(Path::new(path))],
             )
             .map_err(|source| self.query_error(source))?;

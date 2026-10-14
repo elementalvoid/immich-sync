@@ -802,6 +802,66 @@ fn keep_and_trash_clear_the_review_item() {
     );
 }
 
+/// R5.3: a trash report only rewrites the Keep that landed while the DELETE
+/// was in flight. A row the file recreated mid-request is live, so stamping
+/// it `review_trash` would count it nowhere and freeze it settled.
+#[test]
+fn record_review_trash_rewrites_only_a_kept_row() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    for (name, state) in [
+        ("kept.jpg", ItemState::ReviewKeep),
+        ("uploaded.jpg", ItemState::Uploaded),
+        ("duplicate.jpg", ItemState::Duplicate),
+    ] {
+        store.record(&record(name, state)).expect("write the row");
+    }
+
+    assert!(
+        store
+            .record_review_trash("kept.jpg")
+            .expect("record the trash"),
+        "a Keep that landed while the DELETE was in flight becomes the trash"
+    );
+    assert_eq!(
+        store
+            .item("kept.jpg")
+            .expect("read the row")
+            .expect("the row exists")
+            .state,
+        ItemState::ReviewTrash,
+        "R5.3: the server's answer is the last word"
+    );
+
+    for (name, state) in [
+        ("uploaded.jpg", ItemState::Uploaded),
+        ("duplicate.jpg", ItemState::Duplicate),
+    ] {
+        assert!(
+            !store
+                .record_review_trash(name)
+                .expect("try to record the trash"),
+            "{name}: a live row is not the in-flight Keep's row"
+        );
+        assert_eq!(
+            store
+                .item(name)
+                .expect("read the row")
+                .expect("the row exists")
+                .state,
+            state,
+            "{name}: the recreated row keeps its state"
+        );
+    }
+
+    assert!(
+        !store
+            .record_review_trash("kept.jpg")
+            .expect("record the trash again"),
+        "a second report of the same trash changes nothing"
+    );
+}
+
 /// R5.2 and the second-copy acceptance line: an item whose content another
 /// tracked row still holds leaves the review without a user decision.
 #[test]
