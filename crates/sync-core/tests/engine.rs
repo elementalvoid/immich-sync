@@ -457,6 +457,7 @@ async fn a_restart_resumes_without_reuploading_completed_items() {
             asset_id: None,
             state: ItemState::Uploading,
             error_class: None,
+            sidecar_sha1: None,
         })
         .expect("write the interrupted row");
     drop(store);
@@ -622,6 +623,7 @@ async fn a_restart_requeues_a_pending_row_whose_file_is_unchanged() {
             asset_id: None,
             state: ItemState::Pending,
             error_class: None,
+            sidecar_sha1: None,
         })
         .expect("write the pending row");
 
@@ -664,6 +666,7 @@ async fn an_unchanged_size_and_mtime_skips_the_hash_of_a_finished_row() {
             asset_id: Some("asset-1".to_string()),
             state: ItemState::Uploaded,
             error_class: None,
+            sidecar_sha1: None,
         })
         .expect("write the settled row");
     let config = EngineConfig {
@@ -769,6 +772,7 @@ async fn a_restart_with_a_pending_row_does_not_double_count_the_pending_item() {
             asset_id: None,
             state: ItemState::Pending,
             error_class: None,
+            sidecar_sha1: None,
         })
         .expect("write the pending row");
     let config = EngineConfig {
@@ -827,6 +831,7 @@ async fn a_re_added_folder_seeds_its_counts_from_the_store() {
                 asset_id: Some("asset-1".to_string()),
                 state: ItemState::Uploaded,
                 error_class: None,
+                sidecar_sha1: None,
             })
             .expect("write the terminal row");
     }

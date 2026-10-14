@@ -61,6 +61,14 @@ CREATE TABLE source_folder (
 );
 ";
 
+/// The fourth schema (issue #10): the digest of the XMP sidecar the asset
+/// carries (R3.3).
+///
+/// A sidecar is content, not a file of its own, so its digest belongs to the
+/// asset's row rather than to a row of its own. It is what tells a later pass
+/// that a sidecar appeared after the asset was uploaded.
+const SCHEMA_V4: &str = "ALTER TABLE sync_item ADD COLUMN sidecar_sha1 BLOB;";
+
 /// How long the one writer waits for a competing lock before failing.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -155,6 +163,10 @@ pub struct ItemRecord {
     pub state: ItemState,
     /// The failure class of the last outcome, when it failed (R6.4).
     pub error_class: Option<FailureClass>,
+    /// The SHA-1 of the XMP sidecar the asset carries, when one has been sent
+    /// (R3.3). A different digest on disk means the sidecar has to ride along
+    /// with the asset again.
+    pub sidecar_sha1: Option<Sha1>,
 }
 
 /// The pragmas the writer connection runs with, for tests and diagnostics.
@@ -376,8 +388,8 @@ impl StateStore {
             .map_err(|source| self.query_error(source))?;
         transaction
             .execute(
-                "INSERT INTO sync_item (path, path_key, size, mtime_ns, sha1, asset_id, state, error_class)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "INSERT INTO sync_item (path, path_key, size, mtime_ns, sha1, asset_id, state, error_class, sidecar_sha1)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(path_key) DO UPDATE SET
                      path = excluded.path,
                      size = excluded.size,
@@ -385,7 +397,8 @@ impl StateStore {
                      sha1 = excluded.sha1,
                      asset_id = excluded.asset_id,
                      state = excluded.state,
-                     error_class = excluded.error_class",
+                     error_class = excluded.error_class,
+                     sidecar_sha1 = excluded.sidecar_sha1",
                 params![
                     item.path,
                     key(Path::new(&item.path), case),
@@ -395,6 +408,7 @@ impl StateStore {
                     item.asset_id,
                     item.state.as_str(),
                     item.error_class.map(FailureClass::as_str),
+                    item.sidecar_sha1.map(|sha1| sha1.as_bytes().to_vec()),
                 ],
             )
             .map_err(|source| self.query_error(source))?;
@@ -413,7 +427,7 @@ impl StateStore {
         let writer = self.writer()?;
         writer
             .query_row(
-                "SELECT path, size, mtime_ns, sha1, asset_id, state, error_class
+                "SELECT path, size, mtime_ns, sha1, asset_id, state, error_class, sidecar_sha1
                  FROM sync_item WHERE path_key = ?1",
                 [path_key(Path::new(path))],
                 read_item,
@@ -436,7 +450,7 @@ impl StateStore {
         let writer = self.writer()?;
         writer
             .query_row(
-                "SELECT path, size, mtime_ns, sha1, asset_id, state, error_class
+                "SELECT path, size, mtime_ns, sha1, asset_id, state, error_class, sidecar_sha1
                  FROM sync_item WHERE path_key = ?1",
                 [key(Path::new(path), case)],
                 read_item,
@@ -622,6 +636,12 @@ fn read_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<ItemRecord> {
     // A class a newer build wrote reads as `None`, which is the same as "no
     // known class"; the row is not rejected for it.
     let error_class = class_text.as_deref().and_then(FailureClass::parse);
+    // An asset with no sidecar, or one written before the column existed, has
+    // no digest; both read as `None`, which means "no sidecar has been sent".
+    // A digest of the wrong length reads as `None` too: the worst it costs is
+    // that the sidecar is sent again.
+    let sidecar_sha1: Option<Vec<u8>> = row.get(7)?;
+    let sidecar_sha1 = sidecar_sha1.as_deref().and_then(Sha1::from_slice);
     Ok(ItemRecord {
         path: row.get(0)?,
         size,
@@ -630,6 +650,7 @@ fn read_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<ItemRecord> {
         asset_id: row.get(4)?,
         state,
         error_class,
+        sidecar_sha1,
     })
 }
 
@@ -658,6 +679,7 @@ fn migrations() -> Migrations<'static> {
         M::up(SCHEMA_V1),
         M::up_with_hook(SCHEMA_V2, backfill_path_keys),
         M::up(SCHEMA_V3),
+        M::up(SCHEMA_V4),
     ])
 }
 

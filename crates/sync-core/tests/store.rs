@@ -22,7 +22,40 @@ fn record(path: &str, state: ItemState) -> ItemRecord {
         asset_id: Some("asset-1".to_string()),
         state,
         error_class: None,
+        sidecar_sha1: None,
     }
+}
+
+/// `sha1("<xmp/>")`, hex: the digest of the sidecar fixture, which is a
+/// different content than the media file.
+const SIDECAR_SHA1_HEX: &str = "74719584132d8a19599e9be7a2cdb160d93d9d00";
+
+#[test]
+fn the_sidecar_digest_survives_a_reopen() {
+    // R3.3: the store remembers which sidecar the asset carries, so a sidecar
+    // that appears later is the only one that uploads again.
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let path = temp.path().join("state.db");
+    let sidecar_sha1 = Sha1::from_hex(SIDECAR_SHA1_HEX).expect("the fixture is a hex SHA-1");
+    {
+        let store = StateStore::open(&path).expect("open a fresh store");
+        let mut row = record("IMG_0001.jpg", ItemState::Uploaded);
+        row.sidecar_sha1 = Some(sidecar_sha1);
+        store.record(&row).expect("write the row with its sidecar");
+    }
+
+    let reopened = StateStore::open(&path).expect("reopen the store");
+    let read = reopened
+        .item("IMG_0001.jpg")
+        .expect("read the item")
+        .expect("the row survives the reopen");
+
+    assert_eq!(read.sidecar_sha1, Some(sidecar_sha1));
+    assert_eq!(
+        record("IMG_0001.jpg", ItemState::Uploaded).sidecar_sha1,
+        None,
+        "an item without a sidecar records no sidecar digest"
+    );
 }
 
 #[test]
