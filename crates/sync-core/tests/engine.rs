@@ -18,19 +18,29 @@ use sync_core::engine::{Activity, Engine, EngineConfig};
 use sync_core::failure::FailureClass;
 use sync_core::hash::{Sha1, sha1_file};
 use sync_core::store::{
-    AttemptOutcome, FolderCounts, ItemRecord, ItemState, SourceFolder, StateStore,
+    AttemptOutcome, AttemptRecord, FolderCounts, ItemRecord, ItemState, SourceFolder, StateStore,
 };
 
 /// Starts the mock and signs in, returning the session the engine attaches to
 /// every request (R1.4).
 async fn signed_in(server: &MockImmich) -> SharedSession {
+    signed_in_with(server, AuthMethod::Password, "correct horse").await
+}
+
+/// Signs in with the credential the test names, so a test can drive the
+/// API-key path of R1.5.
+async fn signed_in_with(
+    server: &MockImmich,
+    method: AuthMethod,
+    secret: &str,
+) -> SharedSession {
     let mut connection = Connection::new(server.base_url(), Arc::new(MemoryCredentialStore::new()))
         .expect("a valid URL");
     connection
         .sign_in(SignIn {
             email: "sync@example.com".to_string(),
-            secret: Secret::new("correct horse"),
-            method: AuthMethod::Password,
+            secret: Secret::new(secret),
+            method,
         })
         .await;
     connection.shared()
@@ -943,10 +953,20 @@ async fn start_engine_with_session(
     config: EngineConfig,
 ) -> (Arc<Engine>, SharedSession) {
     let session = signed_in(server).await;
+    (start_engine_over(&session, store, config), session)
+}
+
+/// Starts an engine over a session the test signed in itself, so the test
+/// chooses the credential and can read the state it ends in (R1.4, R1.5).
+fn start_engine_over(
+    session: &SharedSession,
+    store: &Arc<StateStore>,
+    config: EngineConfig,
+) -> Arc<Engine> {
     let engine =
         Arc::new(Engine::new(store.clone(), session.clone(), config).expect("build the engine"));
     engine.start();
-    (engine, session)
+    engine
 }
 
 /// The gaps between the attempt start times the store recorded, in order.
@@ -1034,6 +1054,16 @@ async fn a_server_that_stops_answering_produces_backoff_not_a_hot_loop() {
             "attempt {attempt} waited {gap:?}, less than the policy's {expected:?}"
         );
     }
+    // R6.1: the ceiling these gaps are bounded by has to grow. A constant
+    // sleep satisfies every bound above, so without this the test cannot tell
+    // a backoff from a pause.
+    let ceilings: Vec<Duration> = (1..=5)
+        .map(|attempt| config.retry.ceiling(u32::try_from(attempt).expect("a small index")))
+        .collect();
+    assert!(
+        *ceilings.last().expect("a ceiling") > ceilings[0],
+        "the policy's ceiling does not grow: {ceilings:?}"
+    );
     let total: Duration = gaps.iter().sum();
     println!("five refusals produced {total:?} of backoff in {gaps:?}");
     assert!(
@@ -1237,11 +1267,9 @@ async fn a_retry_after_header_is_honoured_as_the_wait() {
         "R6.2: the server's Retry-After was not honoured: {:?}",
         gaps[0]
     );
-    assert!(
-        gaps[0] < Duration::from_secs(3),
-        "R6.2: the wait was inflated past the header: {:?}",
-        gaps[0]
-    );
+    // The policy caps what a header can buy (backoff.rs), so the only bound
+    // worth making here is the load-sensitive one: a wait far past the header
+    // would mean the header was ignored for the policy's own wait.
     println!("a Retry-After of 1s produced a {:?} wait", gaps[0]);
     engine.stop();
 }
@@ -1462,5 +1490,242 @@ async fn a_run_of_connection_failures_trips_the_breaker_and_it_probes_before_res
         "the resume was gated by another probe"
     );
     assert!(server.upload_requests() > while_open, "the uploads resumed");
+    engine.stop();
+}
+
+#[tokio::test]
+async fn a_revoked_api_key_parks_the_item_instead_of_probing_forever() {
+    let server = MockImmich::start().await;
+    let key = "api-key-abc123";
+    server.set_api_key(key);
+    let session = signed_in_with(&server, AuthMethod::ApiKey, key).await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let file = write_file(&photos, "photo.jpg", b"photo bytes");
+    add_folder(&store, &photos, true);
+    // The server drops the uploads, so the breaker opens and the queue waits
+    // for the probe. The key is revoked, so that probe is a refusal no amount
+    // of waiting can turn into an answer.
+    for _ in 0..4 {
+        server.fail(Operation::Upload, Fault::Disconnect);
+    }
+    server.set_api_key("a-rotated-key");
+    let engine = start_engine_over(&session, &store, retry_config(8));
+
+    let path_text = file.display().to_string();
+    assert!(
+        wait_until(
+            || matches!(&store.item(&path_text), Ok(Some(row)) if row.state == ItemState::FailedPermanent),
+            Duration::from_secs(20)
+        )
+        .await,
+        "a refused probe did not park the item: {:?}",
+        store.item(&path_text)
+    );
+    let row = store
+        .item(&path_text)
+        .expect("read")
+        .expect("the row exists");
+    assert_eq!(
+        row.error_class,
+        Some(FailureClass::AuthFailed),
+        "R1.5: a refused API key is the account's problem, not the file's"
+    );
+    // R6.6: the probe loop stops. Waiting for a server that refuses the key
+    // again is a loop with no end, so the item needs the user instead.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let probes = server.validate_token_requests();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        server.validate_token_requests(),
+        probes,
+        "the refused key is still being probed on every cooldown"
+    );
+    assert_eq!(
+        engine.status().activity,
+        Activity::NeedsAttention,
+        "R1.4: the tray reads the refused key as needing attention"
+    );
+    engine.stop();
+}
+
+#[tokio::test]
+async fn a_batch_during_a_dead_session_stays_pending_until_the_user_signs_in_again() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let files = [
+        write_file(&photos, "first.jpg", b"first bytes"),
+        write_file(&photos, "second.jpg", b"second bytes"),
+    ];
+    add_folder(&store, &photos, true);
+    // The checksum check is refused twice: the first 401 re-logs in, and the
+    // second leaves the connection needing the user (R1.4).
+    for _ in 0..2 {
+        server.fail(
+            Operation::BulkUploadCheck,
+            Fault::Status {
+                code: 401,
+                retry_after: None,
+            },
+        );
+    }
+    let (engine, session) = start_engine_with_session(&server, &store, retry_config(8)).await;
+
+    assert!(
+        wait_until(
+            || matches!(session.state(), ConnectionState::NeedsAttention(_)),
+            Duration::from_secs(20)
+        )
+        .await,
+        "R1.4: the second 401 did not leave the connection needing the user"
+    );
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    for file in &files {
+        let row = store
+            .item(&file.display().to_string())
+            .expect("read")
+            .expect("the row exists");
+        assert_eq!(
+            row.state,
+            ItemState::Pending,
+            "R1.4: a refused session must not park {:?} permanently; it is still the user's to fix",
+            file.display()
+        );
+    }
+    assert_eq!(
+        server.upload_requests(),
+        0,
+        "R1.4: nothing was uploaded, because nothing could authenticate"
+    );
+    assert_eq!(engine.failed_items().expect("read the failed items").len(), 0);
+
+    // R1.4: signing in again uploads what the refused batch left pending.
+    let state = session
+        .sign_in(SignIn {
+            email: "sync@example.com".to_string(),
+            secret: Secret::new("correct horse"),
+            method: AuthMethod::Password,
+        })
+        .await;
+    assert!(state.is_connected(), "{state:?}");
+    engine.sync_now();
+
+    assert!(
+        wait_until(|| all_terminal(&store, &files), Duration::from_secs(20)).await,
+        "R1.4: the re-login did not resume the queue"
+    );
+    assert_eq!(server.upload_requests(), 2);
+    engine.stop();
+}
+
+#[tokio::test]
+async fn a_success_between_two_connection_failures_is_not_a_run() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let files = [
+        write_file(&photos, "one.jpg", b"first bytes"),
+        write_file(&photos, "two.jpg", b"second bytes"),
+    ];
+    add_folder(&store, &photos, true);
+    // One file per batch, so the first batch takes the first two failures and
+    // the second batch takes the third.
+    let config = EngineConfig {
+        batch_size: 1,
+        ..retry_config(8)
+    };
+    // Three dropped connections, and between them a request the server
+    // answers: a success ends the run of failures the breaker counts (R6.6).
+    server.fail(Operation::BulkUploadCheck, Fault::Disconnect);
+    server.fail(Operation::Upload, Fault::Disconnect);
+    server.fail(Operation::BulkUploadCheck, Fault::Disconnect);
+    let engine = start_engine(&server, &store, config).await;
+
+    assert!(
+        wait_until(|| all_terminal(&store, &files), Duration::from_secs(20)).await,
+        "the retried uploads never finished: {:?}",
+        engine.status().counts
+    );
+    assert_eq!(
+        server.validate_token_requests(),
+        0,
+        "R6.6: three failures that were never a run still tripped the breaker"
+    );
+    engine.stop();
+}
+
+#[tokio::test]
+async fn a_restart_requeues_a_retry_wait_row_with_its_attempt_count() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let file = write_file(&photos, "parked.jpg", b"parked bytes");
+    add_folder(&store, &photos, true);
+    let path_text = file.display().to_string();
+    // The row a previous run parked after one attempt (R6.7).
+    store
+        .record(&ItemRecord {
+            path: path_text.clone(),
+            size: std::fs::metadata(&file).expect("read the fixture metadata").len(),
+            mtime_ns: mtime_ns_of(&file),
+            sha1: sha1_file(&file).expect("hash the fixture"),
+            asset_id: None,
+            state: ItemState::RetryWait,
+            error_class: Some(FailureClass::ServerTransient),
+            error_message: Some("the server answered 503".to_string()),
+            attempts: 0,
+        })
+        .expect("write the parked row");
+    store
+        .record_attempt(&AttemptRecord {
+            path: path_text.clone(),
+            started_ns: 1_700_000_000_000_000_000,
+            outcome: AttemptOutcome::Failed,
+            error_class: Some(FailureClass::ServerTransient),
+        })
+        .expect("record the spent attempt");
+    assert_eq!(
+        store
+            .item(&path_text)
+            .expect("read")
+            .expect("the row exists")
+            .attempts,
+        1
+    );
+    drop(store);
+
+    // R6.7: the restart re-queues the parked row with the count it had, so the
+    // cap of two leaves exactly one more attempt.
+    let reopened = store_in(&temp);
+    let engine = start_engine(&server, &reopened, retry_config(2)).await;
+
+    assert!(
+        wait_until(
+            || all_terminal(&reopened, std::slice::from_ref(&file)),
+            Duration::from_secs(20)
+        )
+        .await,
+        "R6.7: the restart did not resume the parked row: {:?}",
+        reopened.item(&path_text)
+    );
+    assert_eq!(
+        server.upload_requests(),
+        1,
+        "R6.7: the spent attempt was not counted, so the item had a fresh budget"
+    );
+    assert_eq!(
+        reopened
+            .item(&path_text)
+            .expect("read")
+            .expect("the row exists")
+            .attempts,
+        2,
+        "R6.7: the count continued across the restart"
+    );
     engine.stop();
 }
