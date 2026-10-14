@@ -1074,7 +1074,7 @@ async fn leaf_scope_creates_one_album_per_folder_that_contains_files() {
 }
 
 #[tokio::test]
-async fn two_folders_with_the_same_name_share_one_album() {
+async fn two_leaf_folders_with_the_same_name_are_two_albums() {
     let server = MockImmich::start().await;
     let temp = tempfile::tempdir().expect("create a temp dir");
     let store = store_in(&temp);
@@ -1097,25 +1097,82 @@ async fn two_folders_with_the_same_name_share_one_album() {
         "both assets must join an album"
     );
 
+    // R3.4: the album scope is one album per folder, so two folders are two
+    // albums. The name is a copy of the folder name, not the album's identity,
+    // and the client's only album write is "add to album", so an album that
+    // held both could never be split again.
     assert_eq!(
-        server.album_names(),
-        vec!["Holiday".to_string()],
-        "album mapping copies the folder name to the album name, so two folders with one name \
-         map to one album (GLOSSARY)"
+        sorted_album_names(&server),
+        vec!["Holiday".to_string(), "Holiday".to_string()],
+        "GLOSSARY: one album per folder that directly contains files"
     );
     assert_eq!(
-        server
-            .album_for_asset(&asset_id_of(&store, &in_2023))
-            .as_deref(),
-        Some("Holiday")
+        server.create_album_requests(),
+        2,
+        "each folder gets its own album, so two folders share nothing"
+    );
+    for file in [&in_2023, &in_2024] {
+        assert_eq!(
+            server
+                .album_for_asset(&asset_id_of(&store, file))
+                .as_deref(),
+            Some("Holiday"),
+            "{} joined an album named after its folder",
+            file.display()
+        );
+    }
+    engine.stop();
+}
+
+#[tokio::test]
+async fn two_added_folders_with_the_same_name_are_two_albums() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    // Two folders the user added, whose basenames agree (R2.4).
+    let first = temp.path().join("a").join("Pictures");
+    let second = temp.path().join("b").join("Pictures");
+    let in_first = write_file(&first, "beach.jpg", b"beach");
+    let in_second = write_file(&second, "snow.jpg", b"snow");
+    add_mapped_folder(&store, &first, true, AlbumScope::WholeFolder);
+    add_mapped_folder(&store, &second, true, AlbumScope::WholeFolder);
+
+    let engine = start_engine(&server, &store, EngineConfig::default()).await;
+    assert!(
+        wait_until(
+            || all_terminal(&store, &[in_first.clone(), in_second.clone()]),
+            Duration::from_secs(15)
+        )
+        .await,
+        "both folders must reach a terminal success state"
+    );
+    assert!(
+        wait_for_albums(&store, &server, &[in_first.clone(), in_second.clone()]).await,
+        "both assets must join an album"
+    );
+
+    // R3.4: whole-folder scope creates one album for the source folder, so two
+    // added folders are two albums, whatever their names agree on.
+    assert_eq!(
+        sorted_album_names(&server),
+        vec!["Pictures".to_string(), "Pictures".to_string()],
+        "each source folder has its own album"
     );
     assert_eq!(
-        server
-            .album_for_asset(&asset_id_of(&store, &in_2024))
-            .as_deref(),
-        Some("Holiday")
+        server.create_album_requests(),
+        2,
+        "one album per source folder, not per name"
     );
-    assert_eq!(server.create_album_requests(), 1);
+    for file in [&in_first, &in_second] {
+        assert_eq!(
+            server
+                .album_for_asset(&asset_id_of(&store, file))
+                .as_deref(),
+            Some("Pictures"),
+            "{} joined its own folder's album",
+            file.display()
+        );
+    }
     engine.stop();
 }
 

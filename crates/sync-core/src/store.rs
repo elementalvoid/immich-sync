@@ -65,14 +65,17 @@ CREATE TABLE source_folder (
 /// scope (R3.4), plus the album ids the server assigned.
 ///
 /// The album id is stored so a restart reuses the album instead of creating a
-/// second one with the same name; album mapping is keyed by name, because the
-/// name is what the mapping copies (GLOSSARY).
+/// second one for the same folder. The album is keyed by the mapped folder's
+/// path key (R2.4), not by its name: the name is a copy the mapping makes, so
+/// two folders that share a name are two albums, and one folder spelled with
+/// another case is one.
 const SCHEMA_V4: &str = "
 ALTER TABLE source_folder ADD COLUMN album_mapping INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE source_folder ADD COLUMN album_scope TEXT NOT NULL DEFAULT 'leaf';
 CREATE TABLE album (
-    name     TEXT PRIMARY KEY,
-    album_id TEXT NOT NULL
+    folder_key TEXT PRIMARY KEY,
+    name       TEXT NOT NULL,
+    album_id   TEXT NOT NULL
 );
 ";
 
@@ -579,43 +582,50 @@ impl StateStore {
             .map_err(|source| self.query_error(source))
     }
 
-    /// The album the server assigned for `name`, when this client already made
-    /// one (R3.4).
+    /// The album the server assigned for the mapped folder `folder_key`, when
+    /// this client already made one (R3.4).
     ///
-    /// The name is the key because album mapping copies the folder name to the
-    /// album name (GLOSSARY), so two folders with the same name share one
-    /// album.
+    /// The folder key is the identity, because the album scope is one album per
+    /// folder (GLOSSARY): the album name is a copy the mapping makes, so two
+    /// folders that share a name are two albums (R2.4).
     ///
     /// # Errors
     ///
     /// Returns [`StoreError`] when the query fails.
-    pub fn album(&self, name: &str) -> Result<Option<String>, StoreError> {
+    pub fn album(&self, folder_key: &str) -> Result<Option<String>, StoreError> {
         let writer = self.writer()?;
         writer
             .query_row(
-                "SELECT album_id FROM album WHERE name = ?1",
-                [name],
+                "SELECT album_id FROM album WHERE folder_key = ?1",
+                [folder_key],
                 |row| row.get(0),
             )
             .optional()
             .map_err(|source| self.query_error(source))
     }
 
-    /// Records the album the server assigned for `name`, so the next file in
-    /// the same folder joins the same album (R3.4).
+    /// Records the album the server assigned for the mapped folder
+    /// `folder_key`, so the next file in the same folder joins the same album
+    /// (R3.4).
     ///
     /// # Errors
     ///
     /// Returns [`StoreError`] when the write fails or the lock is poisoned.
-    pub fn remember_album(&self, name: &str, album_id: &str) -> Result<(), StoreError> {
+    pub fn remember_album(
+        &self,
+        folder_key: &str,
+        name: &str,
+        album_id: &str,
+    ) -> Result<(), StoreError> {
         let writer = self.writer()?;
         // One statement, so the single write is atomic on its own and needs no
         // transaction around it.
         writer
             .execute(
-                "INSERT INTO album (name, album_id) VALUES (?1, ?2)
-                 ON CONFLICT(name) DO UPDATE SET album_id = excluded.album_id",
-                params![name, album_id],
+                "INSERT INTO album (folder_key, name, album_id) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(folder_key) DO UPDATE SET
+                     name = excluded.name, album_id = excluded.album_id",
+                params![folder_key, name, album_id],
             )
             .map_err(|source| self.query_error(source))?;
         Ok(())

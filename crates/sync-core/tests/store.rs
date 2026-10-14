@@ -258,25 +258,52 @@ fn a_remembered_album_id_survives_a_restart() {
     {
         let store = StateStore::open(&path).expect("open a fresh store");
         store
-            .remember_album("Holiday", "album-7")
+            .remember_album("/photos/2023/Holiday", "Holiday", "album-7")
             .expect("record the album the server assigned");
     }
 
-    // A restart must reuse the album, or every run creates a second album with
-    // the same name.
+    // A restart must reuse the album, or every run creates a second album for
+    // the same folder.
     let store = StateStore::open(&path).expect("reopen the store");
     assert_eq!(
-        store.album("Holiday").expect("read the album"),
+        store.album("/photos/2023/Holiday").expect("read the album"),
         Some("album-7".to_string())
     );
-    assert_eq!(store.album("Winter").expect("read an unknown name"), None);
+    assert_eq!(
+        store.album("/photos/2024/Holiday").expect("read an unknown folder"),
+        None
+    );
     store
-        .remember_album("Holiday", "album-8")
+        .remember_album("/photos/2023/Holiday", "Holiday", "album-8")
         .expect("the server replaced the album");
     assert_eq!(
-        store.album("Holiday").expect("read the album"),
+        store.album("/photos/2023/Holiday").expect("read the album"),
         Some("album-8".to_string()),
         "the last id the server gave wins"
+    );
+}
+
+#[test]
+fn two_folders_with_the_same_name_keep_two_album_ids() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    // R3.4: the album belongs to the folder. The name is a copy of the folder
+    // name, so the same name twice must not merge two folders into one album.
+    store
+        .remember_album("/photos/2023/Holiday", "Holiday", "album-1")
+        .expect("record the first folder's album");
+    store
+        .remember_album("/photos/2024/Holiday", "Holiday", "album-2")
+        .expect("record the second folder's album");
+
+    assert_eq!(
+        store.album("/photos/2023/Holiday").expect("read the first album"),
+        Some("album-1".to_string())
+    );
+    assert_eq!(
+        store.album("/photos/2024/Holiday").expect("read the second album"),
+        Some("album-2".to_string()),
+        "one album per folder, whatever the folder names agree on"
     );
 }
 
