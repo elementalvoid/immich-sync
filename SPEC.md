@@ -155,6 +155,7 @@ Acceptance: a clean Windows machine installs from the NSIS installer. A clean Li
 ## 5. Data model summary
 
 - `source_folder`: path, recursive flag, album mapping flag, album scope.
+- `album`: mapped folder path key, album name, album id.
 - `sync_item`: path, size, mtime, SHA-1, current asset id, stack id, state, last error class.
 - `version`: item id, asset id, SHA-1, created at, current flag.
 - `attempt`: item id, start time, outcome, error class.

@@ -69,6 +69,9 @@ CREATE TABLE source_folder (
 /// path key (R2.4), not by its name: the name is a copy the mapping makes, so
 /// two folders that share a name are two albums, and one folder spelled with
 /// another case is one.
+///
+/// The `name` column is a breadcrumb for a person reading the file with the
+/// sqlite CLI; nothing reads it, and the album is found by folder key alone.
 const SCHEMA_V4: &str = "
 ALTER TABLE source_folder ADD COLUMN album_mapping INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE source_folder ADD COLUMN album_scope TEXT NOT NULL DEFAULT 'leaf';
@@ -587,7 +590,7 @@ impl StateStore {
     ///
     /// The folder key is the identity, because the album scope is one album per
     /// folder (GLOSSARY): the album name is a copy the mapping makes, so two
-    /// folders that share a name are two albums (R2.4).
+    /// folders that share a name are two albums (R3.4).
     ///
     /// # Errors
     ///
@@ -607,6 +610,9 @@ impl StateStore {
     /// Records the album the server assigned for the mapped folder
     /// `folder_key`, so the next file in the same folder joins the same album
     /// (R3.4).
+    ///
+    /// `name` is recorded for whoever reads the file directly; no query reads
+    /// it back.
     ///
     /// # Errors
     ///
