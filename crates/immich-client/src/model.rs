@@ -123,6 +123,12 @@ pub struct AssetUpload<'a> {
     pub created_at: SystemTime,
     /// The local modification time, sent as `fileModifiedAt`.
     pub modified_at: SystemTime,
+    /// The XMP sidecar, sent as the `sidecarData` part (R3.3). `None` uploads
+    /// the asset without one.
+    pub sidecar: Option<&'a Path>,
+    /// The asset id of the live photo video that is already on the server,
+    /// sent as `livePhotoVideoId` (R3.3). `None` uploads the photo unlinked.
+    pub live_photo_video_id: Option<&'a str>,
 }
 
 /// The result of `POST /assets` (R3.6).

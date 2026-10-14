@@ -3918,10 +3918,12 @@ name = "immich-client"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "hex",
  "mock-immich",
  "reqwest 0.13.5",
  "serde",
  "serde_json",
+ "sha1",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
