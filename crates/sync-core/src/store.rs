@@ -172,6 +172,12 @@ SELECT id, asset_id, sha1, mtime_ns, 1 FROM sync_item WHERE asset_id IS NOT NULL
 /// How long the one writer waits for a competing lock before failing.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The `sync_item` columns [`read_item`] expects, in the order it reads them.
+///
+/// One list, so a new column cannot reach one query and miss another.
+const ITEM_COLUMNS: &str = "path, size, mtime_ns, sha1, asset_id, state, error_class,
+    error_message, attempts, sidecar_sha1, sidecar_size, sidecar_mtime_ns";
+
 /// The state one item is in (SPEC §5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ItemState {
@@ -190,6 +196,13 @@ pub enum ItemState {
     /// The retry policy gave up after the attempt cap; only a manual retry
     /// tries again (R6.5).
     DeadLetter,
+    /// A tracked path that disappeared, waiting for a review decision (R5.1).
+    Missing,
+    /// The user kept the server asset; the local file is gone (R5.3).
+    ReviewKeep,
+    /// The user moved the server asset to the trash (R5.3). No permanent
+    /// delete exists in v1 (ADR 0002).
+    ReviewTrash,
 }
 
 impl ItemState {
@@ -204,6 +217,9 @@ impl ItemState {
             Self::FailedPermanent => "failed_permanent",
             Self::RetryWait => "retry_wait",
             Self::DeadLetter => "dead_letter",
+            Self::Missing => "missing",
+            Self::ReviewKeep => "review_keep",
+            Self::ReviewTrash => "review_trash",
         }
     }
 
@@ -219,16 +235,56 @@ impl ItemState {
             "failed_permanent" => Self::FailedPermanent,
             "retry_wait" => Self::RetryWait,
             "dead_letter" => Self::DeadLetter,
+            "missing" => Self::Missing,
+            "review_keep" => Self::ReviewKeep,
+            "review_trash" => Self::ReviewTrash,
             _ => return None,
         })
     }
 
     /// Whether the item finished for good: no later run uploads it again
     /// (R3.2, R6.7).
+    ///
+    /// A review state is terminal too, but it is not a success: the local file
+    /// is gone, and the asset is kept or trashed by a decision (R5.3).
     #[must_use]
     pub fn is_terminal_success(self) -> bool {
         matches!(self, Self::Uploaded | Self::Duplicate)
     }
+}
+
+/// The user's answer for one missing file (R5.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewDecision {
+    /// Leave the server asset alone; the item leaves the review.
+    Keep,
+    /// Move the server asset to the trash; the item leaves the review.
+    Trash,
+}
+
+impl ReviewDecision {
+    /// The state the item lands in once the decision is recorded (SPEC §5).
+    #[must_use]
+    pub fn state(self) -> ItemState {
+        match self {
+            Self::Keep => ItemState::ReviewKeep,
+            Self::Trash => ItemState::ReviewTrash,
+        }
+    }
+}
+
+/// One missing file the deletion review lists (R5.3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewItem {
+    /// The local path that disappeared.
+    pub path: String,
+    /// The size in bytes of the file the server holds.
+    pub size: u64,
+    /// The Immich asset the item maps to. `None` only for a row written
+    /// before the asset was recorded; a missing item normally has one.
+    pub asset_id: Option<String>,
+    /// The state the row is in, which for a listed item is `missing`.
+    pub state: ItemState,
 }
 
 /// What one mapped source folder maps its files to (GLOSSARY, R3.4).
@@ -291,10 +347,13 @@ pub struct SourceFolder {
 pub struct FolderCounts {
     /// Items queued or in flight.
     pub pending: u32,
-    /// Items in a terminal success state (R3.2).
+    /// Items in a terminal success state (R3.2), plus a kept review item whose
+    /// server copy is still there.
     pub uploaded: u32,
     /// Items in a failed state.
     pub failed: u32,
+    /// Missing files that await a review decision (R5.4).
+    pub review: u32,
 }
 
 /// One `sync_item` row, in Rust form.
@@ -1087,6 +1146,215 @@ impl StateStore {
         Ok(changed > 0)
     }
 
+    /// Marks a tracked item missing: its local file is gone and the item waits
+    /// for a review decision (R5.1). Returns whether a row changed.
+    ///
+    /// Only an item the server holds enters the review. A row whose upload
+    /// never landed has no asset to keep or trash, so it is left where it is.
+    /// Marking the same path again changes nothing, which is what lets the
+    /// watcher and the reconciliation scan both report one disappearance and
+    /// still leave exactly one review item.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the write fails or the lock is poisoned.
+    pub fn mark_missing(&self, path: &str) -> Result<bool, StoreError> {
+        let writer = self.writer()?;
+        let changed = writer
+            .execute(
+                "UPDATE sync_item SET state = 'missing'
+                 WHERE path_key = ?1 AND state IN ('uploaded', 'duplicate')",
+                [path_key(Path::new(path))],
+            )
+            .map_err(|source| self.query_error(source))?;
+        Ok(changed > 0)
+    }
+
+    /// Records the user's decision for one missing file (R5.3). Returns
+    /// whether a missing row was found.
+    ///
+    /// Only a `missing` row is decided on: an item that is not in the review
+    /// has no decision to record, and a decision already made stays made.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the write fails or the lock is poisoned.
+    pub fn decide_review(&self, path: &str, decision: ReviewDecision) -> Result<bool, StoreError> {
+        let writer = self.writer()?;
+        let changed = writer
+            .execute(
+                "UPDATE sync_item SET state = ?2
+                 WHERE path_key = ?1 AND state = 'missing'",
+                params![path_key(Path::new(path)), decision.state().as_str()],
+            )
+            .map_err(|source| self.query_error(source))?;
+        Ok(changed > 0)
+    }
+
+    /// Retires an item whose content another tracked item still holds, so no
+    /// review item appears (R5.2, and the second-copy acceptance line).
+    ///
+    /// The asset stays on the server, exactly as a `Keep` leaves it, and the
+    /// row lands in `review_keep` so it no longer waits for a decision. A
+    /// settled row can be retired before it is ever marked missing: the other
+    /// copy may be found in the same pass that notices the disappearance, and
+    /// the item must never flicker through the review in between.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the write fails or the lock is poisoned.
+    pub fn retire_item(&self, path: &str) -> Result<bool, StoreError> {
+        let writer = self.writer()?;
+        let changed = writer
+            .execute(
+                "UPDATE sync_item SET state = 'review_keep'
+                 WHERE path_key = ?1 AND state IN ('uploaded', 'duplicate', 'missing')",
+                [path_key(Path::new(path))],
+            )
+            .map_err(|source| self.query_error(source))?;
+        Ok(changed > 0)
+    }
+
+    /// Every missing file the deletion review lists, in path order (R5.3).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the query fails or a row cannot be read.
+    pub fn review_items(&self) -> Result<Vec<ReviewItem>, StoreError> {
+        let writer = self.writer()?;
+        let mut statement = writer
+            .prepare(
+                "SELECT path, size, asset_id, state FROM sync_item
+                 WHERE state = 'missing' ORDER BY path",
+            )
+            .map_err(|source| self.query_error(source))?;
+        let rows = statement
+            .query_map([], read_review_item)
+            .map_err(|source| self.query_error(source))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|source| self.query_error(source))
+    }
+
+    /// How many missing files wait for a decision (R5.4).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the query fails.
+    pub fn review_count(&self) -> Result<u32, StoreError> {
+        let writer = self.writer()?;
+        let count: i64 = writer
+            .query_row(
+                "SELECT COUNT(*) FROM sync_item WHERE state = 'missing'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|source| self.query_error(source))?;
+        Ok(u32::try_from(count).unwrap_or(u32::MAX))
+    }
+
+    /// The items under one folder that can enter the review: the ones the
+    /// server holds, and the ones already waiting for a decision.
+    ///
+    /// The reconciliation scan walks this list and asks, for each row whose
+    /// file is absent, whether the content moved, is still held by another
+    /// item, or is really gone (R5.1, R5.2).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the query fails or a row cannot be read.
+    pub fn review_candidates(&self, folder: &str) -> Result<Vec<ItemRecord>, StoreError> {
+        let prefix = format!("{}/", path_key(Path::new(folder)));
+        let writer = self.writer()?;
+        let mut statement = writer
+            .prepare(&format!(
+                "SELECT {ITEM_COLUMNS} FROM sync_item
+                 WHERE state IN ('uploaded', 'duplicate', 'missing')
+                   AND substr(path_key, 1, length(?1)) = ?1
+                 ORDER BY path"
+            ))
+            .map_err(|source| self.query_error(source))?;
+        let rows = statement
+            .query_map([&prefix], read_item)
+            .map_err(|source| self.query_error(source))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|source| self.query_error(source))
+    }
+
+    /// The tracked items whose content is exactly `sha1` and `size`, other
+    /// than `except_path` (R5.2).
+    ///
+    /// This is how a disappearance is told from a rename when the other copy
+    /// was already tracked: the row still points at a file that exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the query fails or a row cannot be read.
+    pub fn content_twins(
+        &self,
+        sha1: Sha1,
+        size: u64,
+        except_path: &str,
+    ) -> Result<Vec<ItemRecord>, StoreError> {
+        let size = i64::try_from(size).map_err(|_| StoreError::SizeOutOfRange(size))?;
+        let writer = self.writer()?;
+        let mut statement = writer
+            .prepare(&format!(
+                "SELECT {ITEM_COLUMNS} FROM sync_item
+                 WHERE sha1 = ?1 AND size = ?2 AND path_key <> ?3 ORDER BY path"
+            ))
+            .map_err(|source| self.query_error(source))?;
+        let rows = statement
+            .query_map(
+                params![
+                    sha1.as_bytes().as_slice(),
+                    size,
+                    path_key(Path::new(except_path))
+                ],
+                read_item,
+            )
+            .map_err(|source| self.query_error(source))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|source| self.query_error(source))
+    }
+
+    /// Moves one item's row to the path its content now lives at (R5.2).
+    ///
+    /// The row keeps its id, so the asset mapping, the version chain, and the
+    /// stack follow the file; only the path, the comparison key, and the size
+    /// and modification time the next scan compares against are rewritten. A
+    /// move onto a path another row already holds is refused rather than
+    /// merging two items into one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the write fails, the size does not fit, or
+    /// the lock is poisoned.
+    pub fn move_item(
+        &self,
+        from: &str,
+        to: &str,
+        size: u64,
+        mtime_ns: i64,
+    ) -> Result<bool, StoreError> {
+        let size = i64::try_from(size).map_err(|_| StoreError::SizeOutOfRange(size))?;
+        let writer = self.writer()?;
+        let changed = writer
+            .execute(
+                "UPDATE sync_item SET path = ?2, path_key = ?3, size = ?4, mtime_ns = ?5
+                 WHERE path_key = ?1
+                   AND NOT EXISTS (SELECT 1 FROM sync_item WHERE path_key = ?3)",
+                params![
+                    path_key(Path::new(from)),
+                    to,
+                    path_key(Path::new(to)),
+                    size,
+                    mtime_ns
+                ],
+            )
+            .map_err(|source| self.query_error(source))?;
+        Ok(changed > 0)
+    }
+
     /// The item counts under one source folder, for its dashboard card
     /// (R8.1).
     ///
@@ -1115,10 +1383,17 @@ impl StateStore {
             let (state, count) = row.map_err(|source| self.query_error(source))?;
             let count = u32::try_from(count).unwrap_or(u32::MAX);
             match ItemState::parse(&state) {
-                Some(ItemState::Uploaded | ItemState::Duplicate) => counts.uploaded += count,
+                Some(ItemState::Uploaded | ItemState::Duplicate | ItemState::ReviewKeep) => {
+                    counts.uploaded += count;
+                }
                 Some(ItemState::FailedPermanent | ItemState::RetryWait | ItemState::DeadLetter) => {
                     counts.failed += count;
                 }
+                Some(ItemState::Missing) => counts.review += count,
+                // A trashed item is a finished decision: the server copy is in
+                // the trash and the local file is gone, so it is neither work
+                // in flight nor a failure (R5.3).
+                Some(ItemState::ReviewTrash) => {}
                 // A state a newer build wrote still counts as work in flight,
                 // and an unknown state is not silently dropped.
                 _ => counts.pending += count,
@@ -1287,6 +1562,28 @@ fn read_folder(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceFolder> {
         recursive: row.get(1)?,
         album_mapping: row.get(2)?,
         album_scope,
+    })
+}
+
+/// Reads one `sync_item` row for the deletion review (R5.3).
+fn read_review_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewItem> {
+    let size: i64 = row.get(1)?;
+    let size = u64::try_from(size).map_err(|_| {
+        conversion_error(1, rusqlite::types::Type::Integer, StoreError::NegativeSize)
+    })?;
+    let state_text: String = row.get(3)?;
+    let state = ItemState::parse(&state_text).ok_or_else(|| {
+        conversion_error(
+            3,
+            rusqlite::types::Type::Text,
+            StoreError::UnknownState(state_text.clone()),
+        )
+    })?;
+    Ok(ReviewItem {
+        path: row.get(0)?,
+        size,
+        asset_id: row.get(2)?,
+        state,
     })
 }
 
