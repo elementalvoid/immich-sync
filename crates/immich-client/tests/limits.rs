@@ -60,6 +60,28 @@ fn upload_request<'a>(path: &'a std::path::Path, limit: &BandwidthLimit) -> Asse
 }
 
 #[tokio::test]
+async fn the_meter_counts_the_bytes_one_body_moved() {
+    // R10.2: the throughput the diagnostics view shows comes from this meter,
+    // so it must count the file's bytes and nothing else.
+    let server = MockImmich::start().await;
+    let (client, token) = client(&server).await;
+    let (_directory, path) = fixture(FILE_BYTES);
+    let limit = BandwidthLimit::new(0);
+    assert_eq!(limit.total_bytes_moved(), 0, "nothing has been sent yet");
+
+    client
+        .upload_asset(Auth::Token(&token), &upload_request(&path, &limit))
+        .await
+        .expect("the mock accepts the upload");
+
+    assert_eq!(
+        limit.total_bytes_moved(),
+        FILE_BYTES as u64,
+        "the meter counts the body's bytes"
+    );
+}
+
+#[tokio::test]
 async fn zero_is_unlimited() {
     let server = MockImmich::start().await;
     let (client, token) = client(&server).await;

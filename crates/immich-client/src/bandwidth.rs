@@ -64,6 +64,9 @@ const RATE_FLOOR: u64 = 1_000;
 pub struct BandwidthLimit {
     bytes_per_second: Arc<AtomicU64>,
     bucket: Arc<Mutex<Bucket>>,
+    /// The bytes every metered body has handed to the server, shared by every
+    /// clone, which is what the diagnostics throughput samples (R10.2).
+    moved: Arc<AtomicU64>,
 }
 
 impl Default for BandwidthLimit {
@@ -79,7 +82,24 @@ impl BandwidthLimit {
         Self {
             bytes_per_second: Arc::new(AtomicU64::new(bytes_per_second)),
             bucket: Arc::new(Mutex::new(Bucket::new())),
+            moved: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// The bytes metered bodies have moved so far (R10.2). Every clone shares
+    /// the count, so this is the client's total, not one upload's.
+    #[must_use]
+    pub fn total_bytes_moved(&self) -> u64 {
+        self.moved.load(Ordering::Relaxed)
+    }
+
+    /// Records `bytes` handed to the server. Separate from [`Self::debit`],
+    /// which only charges a limited bucket: an unlimited upload still counts.
+    fn account(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        self.moved.fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Changes the limit. An upload already on the wire reads the new value on
@@ -271,6 +291,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for MeteredReader<R> {
                     this.progress.moved();
                 }
                 limit.debit(read);
+                limit.account(read);
                 Poll::Ready(Ok(()))
             }
             other => other,

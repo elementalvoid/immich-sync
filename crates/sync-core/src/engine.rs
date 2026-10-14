@@ -447,6 +447,15 @@ impl Engine {
         }
     }
 
+    /// The bytes this engine has put on the wire since it started (R10.2).
+    ///
+    /// The count is the metered upload bodies' own, not a second measurement,
+    /// so the diagnostics throughput and the bandwidth limit cannot disagree.
+    #[must_use]
+    pub fn uploaded_bytes(&self) -> u64 {
+        self.inner.bandwidth.total_bytes_moved()
+    }
+
     /// Moves both limits while the engine runs (R7.1, R7.2).
     ///
     /// The bandwidth limit is read by every upload on its next poll, so a
