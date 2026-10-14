@@ -608,15 +608,17 @@ pub(crate) async fn hash_in_background(path: PathBuf) -> Result<Sha1, HashError>
 ///
 /// `row` is what the store recorded for this item. A sidecar that still has the
 /// size and modification time the store recorded has reached the server and is
-/// not sent again (R4.5); an item parked with an asset gave up on its sidecar,
-/// because the only Stable way to carry one is answered `duplicate` before the
-/// server reads the body (see [`Uploader::send_upload`]). A sidecar that cannot
-/// be read is left for a later pass rather than failing the media file with it.
+/// not sent again (R4.5), and neither is one whose bytes still hash to the
+/// recorded digest: a `touch`, a backup restore or a tool that rewrites XMP
+/// metadata moves the modification time and changes nothing else. An item
+/// parked with an asset gave up on its sidecar, because the only Stable way to
+/// carry one is answered `duplicate` before the server reads the body (see
+/// [`Uploader::send_upload`]). A sidecar that cannot be read is left for a
+/// later pass rather than failing the media file with it.
 ///
-/// shortcut: the size and mtime are trusted instead of the digest, so a
-/// sidecar rewritten within the same size and the same mtime tick is not sent
-/// again; compare a stored digest once the scan cost matters more than that
-/// edge.
+/// shortcut: the size and mtime are trusted when both match, so a sidecar
+/// rewritten within the same size and the same mtime tick is not sent again;
+/// hash it there too when that edge matters more than the scan cost.
 pub(crate) async fn pending_sidecar(
     media: &Path,
     index: &FolderIndex,
@@ -651,6 +653,17 @@ pub(crate) async fn pending_sidecar(
             return None;
         }
     };
+    // R4.5: the digest is what says the asset carries the sidecar, whatever the
+    // metadata says. Bytes that hash to the recorded digest are already sent:
+    // the server answers `duplicate` from the checksum header before it reads
+    // the body, which parks the item claiming a sidecar it does carry could
+    // not be attached.
+    if row
+        .and_then(|row| row.sidecar)
+        .is_some_and(|sent| sent.sha1 == sha1)
+    {
+        return None;
+    }
     Some(SidecarFile {
         path: found,
         digest: SidecarDigest {
@@ -709,6 +722,9 @@ mod tests {
     /// Different bytes, same length as [`SIDECAR`], and a different digest.
     const REWRITTEN_SIDECAR: &[u8] = b"<x:xmpmeta>tagged!</x:xmpmeta>";
 
+    /// The digest of [`REWRITTEN_SIDECAR`]'s exact bytes, as a literal.
+    const REWRITTEN_SIDECAR_SHA1_HEX: &str = "76af39006095c46ffb85cefc8132787804403e45";
+
     /// The media, its sidecar, and the index that pairs them.
     fn paired_folder(temp: &Path) -> (PathBuf, PathBuf, FolderIndex) {
         let folder = temp.to_path_buf();
@@ -718,6 +734,24 @@ mod tests {
         std::fs::write(&sidecar, SIDECAR).expect("write the sidecar fixture");
         let index = FolderIndex::read(std::slice::from_ref(&media));
         (media, sidecar, index)
+    }
+
+    /// Moves `path`'s modification time two seconds on, leaving its bytes alone,
+    /// the way a `touch`, a backup restore or a metadata rewrite does.
+    fn bump_mtime(path: &Path) {
+        let modified = std::fs::metadata(path)
+            .expect("read the sidecar fixture")
+            .modified()
+            .expect("a modification time");
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("reopen the sidecar")
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(modified + std::time::Duration::from_secs(2)),
+            )
+            .expect("move the modification time");
     }
 
     /// A row that sent `sent`, and nothing else the rule looks at.
@@ -785,9 +819,11 @@ mod tests {
     async fn a_sidecar_edited_since_it_was_sent_is_pending_again() {
         let temp = tempfile::tempdir().expect("create a temp dir");
         let (media, sidecar, index) = paired_folder(temp.path());
-        let mut sent = sent_sidecar_of(SIDECAR_SHA1_HEX, &sidecar);
-        // One nanosecond of mtime is what the media file's own rule turns on.
-        sent.mtime_ns -= 1;
+        let sent = sent_sidecar_of(SIDECAR_SHA1_HEX, &sidecar);
+        // The bytes really change: same length, different content, in a file
+        // whose modification time moved.
+        std::fs::write(&sidecar, REWRITTEN_SIDECAR).expect("rewrite the sidecar");
+        bump_mtime(&sidecar);
 
         let pending = pending_sidecar(
             &media,
@@ -798,12 +834,35 @@ mod tests {
         .await;
 
         assert_eq!(
-            pending.map(|sidecar| sidecar.digest),
-            Some(SidecarDigest {
-                sha1: Sha1::from_hex(SIDECAR_SHA1_HEX).expect("a hex SHA-1"),
-                ..sent_sidecar_of(SIDECAR_SHA1_HEX, &sidecar)
-            }),
-            "an edited sidecar rides along with the asset again"
+            pending.map(|sidecar| (sidecar.digest.sha1.hex(), sidecar.digest.size)),
+            Some((REWRITTEN_SIDECAR_SHA1_HEX.to_string(), sent.size)),
+            "different bytes are a sidecar the asset does not carry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sidecar_whose_bytes_match_is_not_pending_after_a_touch() {
+        // R4.5: the digest, not the modification time, says the asset already
+        // carries the sidecar. A `touch`, a backup restore or a tool that
+        // rewrites XMP metadata moves the mtime and leaves the bytes alone, and
+        // offering the sidecar again answers `duplicate` from the checksum
+        // header, which parks the item claiming it could not be attached.
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let (media, sidecar, index) = paired_folder(temp.path());
+        let sent = sent_sidecar_of(SIDECAR_SHA1_HEX, &sidecar);
+        bump_mtime(&sidecar);
+
+        let pending = pending_sidecar(
+            &media,
+            &index,
+            PathCase::for_platform(),
+            Some(&row_with(&media, Some(sent))),
+        )
+        .await;
+
+        assert!(
+            pending.is_none(),
+            "the same bytes in a moved file is still the sidecar the asset carries: {pending:?}"
         );
     }
 

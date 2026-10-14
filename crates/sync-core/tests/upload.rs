@@ -79,10 +79,13 @@ fn success_asset_id(outcome: &UploadOutcome) -> &str {
     }
 }
 
+/// The bytes [`sidecar_of`] writes, whose digest is [`SIDECAR_SHA1_HEX`].
+const SIDECAR: &[u8] = b"<x:xmpmeta>sidecar</x:xmpmeta>";
+
 /// The XMP sidecar of `media`, written next to it.
 fn sidecar_of(media: &Path) -> PathBuf {
     let sidecar = media.with_extension("txt.xmp");
-    std::fs::write(&sidecar, b"<x:xmpmeta>sidecar</x:xmpmeta>").expect("write the sidecar");
+    std::fs::write(&sidecar, SIDECAR).expect("write the sidecar");
     sidecar
 }
 
@@ -175,6 +178,51 @@ async fn an_unchanged_file_that_was_touched_does_not_upload_again() {
         "{outcome:?}"
     );
     assert_eq!(server.upload_requests(), 1);
+}
+
+#[tokio::test]
+async fn a_touched_sidecar_does_not_offer_the_asset_again() {
+    // R3.3, R4.5: the asset already carries these bytes. A `touch` or a backup
+    // restore moves the sidecar's mtime without changing its content, and
+    // offering it again is answered `duplicate` from the checksum header before
+    // the server reads the body — which parks the item claiming the sidecar
+    // could not be attached, although it is attached.
+    let server = MockImmich::start().await;
+    let (uploader, credential, store, temp) = uploader(&server).await;
+    let path = hello_world_file(temp.path(), "hello.txt");
+    let sidecar = sidecar_of(&path);
+
+    let first = uploader.upload_one(&path, &credential).await;
+    let asset_id = success_asset_id(&first).to_string();
+    assert!(
+        server.has_sidecar(&asset_id),
+        "R3.3: the sidecar rode along with the first attempt"
+    );
+
+    // Same bytes, new mtime.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(&sidecar, SIDECAR).expect("rewrite the same bytes");
+    let second = uploader.upload_one(&path, &credential).await;
+
+    assert!(
+        matches!(second, UploadOutcome::Duplicate { .. }),
+        "the sidecar is already attached, so there is nothing to offer: {second:?}"
+    );
+    assert_eq!(success_asset_id(&second), asset_id);
+    assert_eq!(
+        server.upload_requests(),
+        1,
+        "a touched sidecar must not go on the wire again"
+    );
+    let row = store
+        .item(&path.display().to_string())
+        .expect("read the row")
+        .expect("the row exists");
+    assert_eq!(
+        row.state,
+        ItemState::Uploaded,
+        "the item stays uploaded rather than parked: {row:?}"
+    );
 }
 
 #[tokio::test]
