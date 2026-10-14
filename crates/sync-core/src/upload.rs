@@ -151,6 +151,22 @@ impl UploadFailure {
     pub fn is_permanent(&self) -> bool {
         self.kind == FailureKind::Permanent
     }
+
+    /// The failure one client error is, with its class and retry kind (R6.4).
+    ///
+    /// One place builds it, so every path that turns a refusal into a parked
+    /// row classifies the same way.
+    #[must_use]
+    pub fn from_client_error(error: &ClientError) -> Self {
+        let (class, kind) = classify(error);
+        Self {
+            class,
+            kind,
+            message: error.to_string(),
+            retry_after: error.retry_after(),
+            connection: matches!(error, ClientError::Unreachable(_)),
+        }
+    }
 }
 
 /// Runs the pipeline for one file over one shared state store.
@@ -556,32 +572,24 @@ impl Uploader {
 
     /// Records a client failure with its class and state, and returns it.
     fn failed(&self, item: &mut ItemRecord, error: &ClientError) -> UploadOutcome {
-        let (class, kind) = classify(error);
+        let failure = UploadFailure::from_client_error(error);
         item.asset_id = None;
-        // R4.5: the request never landed, so neither did the sidecar.
         item.sidecar = None;
-        item.state = match kind {
+        item.state = match failure.kind {
             FailureKind::Permanent => ItemState::FailedPermanent,
             FailureKind::Transient => ItemState::RetryWait,
         };
-        item.error_class = class;
-        let message = error.to_string();
-        item.error_message = Some(message.clone());
+        item.error_class = failure.class;
+        item.error_message = Some(failure.message.clone());
         self.record(item);
         tracing::warn!(
             path = %item.path,
-            class = class.map_or("none", FailureClass::as_str),
-            permanent = kind == FailureKind::Permanent,
+            class = failure.class.map_or("none", FailureClass::as_str),
+            permanent = failure.is_permanent(),
             reason = %error.redacted_reason(),
             "the upload failed"
         );
-        UploadOutcome::Failed(UploadFailure {
-            class,
-            kind,
-            message,
-            retry_after: error.retry_after(),
-            connection: matches!(error, ClientError::Unreachable(_)),
-        })
+        UploadOutcome::Failed(failure)
     }
 
     /// A failure before the file could be hashed. It leaves no row: the schema

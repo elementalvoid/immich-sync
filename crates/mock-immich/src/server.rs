@@ -28,6 +28,7 @@ pub enum Operation {
     About,
     BulkUploadCheck,
     Upload,
+    GetAsset,
     Copy,
     CreateStack,
     TagAssets,
@@ -104,6 +105,45 @@ struct Inner {
     require_known_credentials: bool,
     /// The `fileCreatedAt` and `fileModifiedAt` fields of the last upload.
     last_upload_dates: Option<(String, String)>,
+    /// Every `PUT /assets/copy` call, in order (R4.2). A test asserts the
+    /// request the client sent, not only the outcome it got.
+    copy_calls: Vec<AssetCopyCall>,
+    /// Every `POST /stacks` call, in order (R4.3).
+    stack_calls: Vec<StackCall>,
+    /// The stacks the double holds, by stack id, with their members in the
+    /// order they joined. The first member is the primary asset.
+    stacks: HashMap<String, Vec<String>>,
+    /// The tag ids on each asset (R4.2).
+    asset_tags: HashMap<String, Vec<String>>,
+}
+
+/// One `PUT /assets/copy` call, as the double received it (R4.2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AssetCopyCall {
+    /// The asset the associations were copied from.
+    pub source_id: String,
+    /// The asset they were copied onto.
+    pub target_id: String,
+    /// Whether album memberships were copied.
+    pub albums: bool,
+    /// Whether shared links were copied.
+    pub shared_links: bool,
+    /// Whether favorite state was copied.
+    pub favorite: bool,
+    /// Whether the sidecar was copied.
+    pub sidecar: bool,
+    /// Whether stack membership was copied.
+    pub stack: bool,
+}
+
+/// One `POST /stacks` call, with the stack the double made for it (R4.3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StackCall {
+    /// The assets the stack was asked for, in request order. The first is the
+    /// primary asset.
+    pub asset_ids: Vec<String>,
+    /// The stack the double created or merged into.
+    pub stack_id: String,
 }
 
 struct Asset {
@@ -112,6 +152,8 @@ struct Asset {
     trashed: bool,
     has_sidecar: bool,
     live_photo_video_id: Option<String>,
+    /// The stack this asset is in, when it is in one (R4.3).
+    stack_id: Option<String>,
 }
 
 struct Album {
@@ -164,6 +206,57 @@ impl Inner {
         if let Some(asset) = self.assets.get_mut(id) {
             asset.trashed = true;
         }
+    }
+
+    /// The stack of one asset, as `AssetResponseDto` reports it (R4.3).
+    fn stack_of(&self, asset_id: &str) -> Option<StackCall> {
+        let id = self.assets.get(asset_id)?.stack_id.clone()?;
+        let asset_ids = self.stacks.get(&id)?.clone();
+        Some(StackCall {
+            asset_ids,
+            stack_id: id,
+        })
+    }
+
+    /// Puts `asset_ids` in one stack and returns the stack id (R4.3).
+    ///
+    /// An asset that is already the primary of a stack merges that stack into
+    /// the new one, which is what the real server does; a version flow that is
+    /// retried after a lost answer therefore lands in the same stack instead of
+    /// splitting the chain.
+    fn create_stack(&mut self, asset_ids: &[String]) -> String {
+        let merged = asset_ids
+            .first()
+            .and_then(|id| self.assets.get(id))
+            .and_then(|asset| asset.stack_id.clone());
+        let id = merged.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let members = self.stacks.entry(id.clone()).or_default();
+        for asset_id in asset_ids {
+            if !members.contains(asset_id) {
+                members.push(asset_id.clone());
+            }
+            if let Some(asset) = self.assets.get_mut(asset_id) {
+                asset.stack_id = Some(id.clone());
+            }
+        }
+        id
+    }
+
+    fn tag(&mut self, asset_ids: &[String], tag_ids: &[String]) -> usize {
+        let mut count = 0;
+        for asset_id in asset_ids {
+            if !self.assets.contains_key(asset_id) {
+                continue;
+            }
+            let tags = self.asset_tags.entry(asset_id.clone()).or_default();
+            for tag_id in tag_ids {
+                if !tags.contains(tag_id) {
+                    tags.push(tag_id.clone());
+                    count += 1;
+                }
+            }
+        }
+        count
     }
 
     fn remove_asset(&mut self, id: &str) {
@@ -457,6 +550,18 @@ impl MockImmich {
             .is_some_and(|asset| asset.has_sidecar)
     }
 
+    /// The id the server gave the asset holding `checksum` (base64 or hex),
+    /// when the server holds one. A test can name the asset an upload made
+    /// without reading the state row that is under test.
+    #[must_use]
+    pub fn asset_id_for_checksum(&self, checksum: &str) -> Option<String> {
+        let inner = self.state.inner.lock().expect("mock state poisoned");
+        let bytes = canonical_checksum(checksum)?;
+        inner
+            .asset_by_checksum(&bytes)
+            .map(|asset| asset.id.clone())
+    }
+
     /// The live photo video id linked to an asset, if any.
     #[must_use]
     pub fn live_photo_video_id(&self, id: &str) -> Option<String> {
@@ -510,6 +615,54 @@ impl MockImmich {
             .add_album_requests
     }
 
+    /// Every `PUT /assets/copy` call, in request order (R4.2).
+    ///
+    /// The recorded call is what proves the flags and the source and target
+    /// the client sent; the outcome alone cannot.
+    #[must_use]
+    pub fn copy_calls(&self) -> Vec<AssetCopyCall> {
+        self.state
+            .inner
+            .lock()
+            .expect("mock state poisoned")
+            .copy_calls
+            .clone()
+    }
+
+    /// Every `POST /stacks` call, in request order, with the stack it made.
+    #[must_use]
+    pub fn stack_calls(&self) -> Vec<StackCall> {
+        self.state
+            .inner
+            .lock()
+            .expect("mock state poisoned")
+            .stack_calls
+            .clone()
+    }
+
+    /// The tag ids on one asset, in the order they were applied (R4.2).
+    #[must_use]
+    pub fn tags_of(&self, asset_id: &str) -> Vec<String> {
+        self.state
+            .inner
+            .lock()
+            .expect("mock state poisoned")
+            .asset_tags
+            .get(asset_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The stack one asset is in, with its members in stack order (R4.3).
+    #[must_use]
+    pub fn stack_of(&self, asset_id: &str) -> Option<StackCall> {
+        self.state
+            .inner
+            .lock()
+            .expect("mock state poisoned")
+            .stack_of(asset_id)
+    }
+
     async fn spawn() -> MockImmich {
         let state = Arc::new(State {
             inner: Mutex::new(Inner::default()),
@@ -521,6 +674,7 @@ impl MockImmich {
             .route("/assets/bulk-upload-check", post(bulk_upload_check))
             .route("/assets", post(upload).delete(delete_assets))
             .route("/assets/copy", put(copy_asset))
+            .route("/assets/{id}", get(get_asset))
             .route("/stacks", post(create_stack))
             .route("/tags/assets", put(tag_assets))
             .route("/albums", post(create_album))
@@ -866,6 +1020,7 @@ async fn upload(
         trashed: false,
         has_sidecar,
         live_photo_video_id,
+        stack_id: None,
     });
     (
         StatusCode::CREATED,
@@ -913,7 +1068,25 @@ fn checksum_of(data: &[u8]) -> Vec<u8> {
     sha1::Sha1::digest(data).to_vec()
 }
 
-fn asset_response(asset: &Asset) -> Value {
+fn asset_response(inner: &Inner, asset: &Asset) -> Value {
+    let stack = inner.stack_of(&asset.id).map_or(Value::Null, |stack| {
+        json!({
+            "id": stack.stack_id,
+            "primaryAssetId": stack.asset_ids.first(),
+            "assetCount": stack.asset_ids.len(),
+        })
+    });
+    // The double keeps no tag table of its own: the ids a tag request carried
+    // are the tags, which is all the client's version flow reads back.
+    let tags: Vec<Value> = inner
+        .asset_tags
+        .get(&asset.id)
+        .map(|tags| {
+            tags.iter()
+                .map(|id| json!({ "id": id, "name": id, "value": id }))
+                .collect()
+        })
+        .unwrap_or_default();
     json!({
         "id": asset.id,
         "checksum": hex::encode(&asset.checksum),
@@ -938,6 +1111,8 @@ fn asset_response(asset: &Asset) -> Value {
         "hasMetadata": asset.has_sidecar,
         "visibility": "timeline",
         "livePhotoVideoId": asset.live_photo_video_id,
+        "stack": stack,
+        "tags": tags,
     })
 }
 
@@ -957,6 +1132,17 @@ fn album_response(album: &Album) -> Value {
     })
 }
 
+async fn get_asset(AxumState(state): AxumState<Arc<State>>, Path(id): Path<String>) -> Response {
+    if let Some(response) = guard(&state, Operation::GetAsset).await {
+        return response;
+    }
+    let inner = state.inner.lock().expect("mock state poisoned");
+    match inner.asset(&id) {
+        Some(asset) => Json(asset_response(&inner, asset)).into_response(),
+        None => message(StatusCode::NOT_FOUND, "Asset not found"),
+    }
+}
+
 async fn copy_asset(
     AxumState(state): AxumState<Arc<State>>,
     Json(body): Json<serde_json::Value>,
@@ -966,13 +1152,86 @@ async fn copy_asset(
     }
     let source = body.get("sourceId").and_then(|value| value.as_str());
     let target = body.get("targetId").and_then(|value| value.as_str());
-    let inner = state.inner.lock().expect("mock state poisoned");
-    match (source, target) {
-        (Some(source), Some(target)) if inner.has_asset(source) && inner.has_asset(target) => {
-            StatusCode::NO_CONTENT.into_response()
-        }
-        _ => message(StatusCode::NOT_FOUND, "Asset not found"),
+    let flag = |name: &str| {
+        body.get(name)
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+    };
+    let mut inner = state.inner.lock().expect("mock state poisoned");
+    let (Some(source), Some(target)) = (source, target) else {
+        return message(StatusCode::NOT_FOUND, "Asset not found");
+    };
+    inner.copy_calls.push(AssetCopyCall {
+        source_id: source.to_string(),
+        target_id: target.to_string(),
+        albums: flag("albums"),
+        shared_links: flag("sharedLinks"),
+        favorite: flag("favorite"),
+        sidecar: flag("sidecar"),
+        stack: flag("stack"),
+    });
+    if !inner.has_asset(source) || !inner.has_asset(target) {
+        return message(StatusCode::NOT_FOUND, "Asset not found");
     }
+    // shortcut: the double records the flags and models the server's
+    // `copyStack` (asset.service.ts, v3.3.1): no source stack is a no-op; a
+    // target that is already stacked absorbs the source stack and the source
+    // stack is then deleted — which, when both assets share one stack, means
+    // that stack is deleted and its assets end up unstacked; only an
+    // unstacked target joins the source stack. Model album, shared-link,
+    // favorite, and sidecar state when a ticket asserts those states.
+    if flag("stack") {
+        let source_stack = inner
+            .assets
+            .get(source)
+            .and_then(|asset| asset.stack_id.clone());
+        let target_stack = inner
+            .assets
+            .get(target)
+            .and_then(|asset| asset.stack_id.clone());
+        match (source_stack, target_stack) {
+            // `merge({sourceId, targetId})` moves the source stack's assets
+            // onto the target stack — a no-op when they are the same stack —
+            // and `delete(sourceId)` then drops the source stack row. The
+            // assets the deleted stack still points at are left unstacked.
+            (Some(source_id), Some(target_id)) => {
+                if source_id != target_id
+                    && let Some(members) = inner.stacks.remove(&source_id)
+                {
+                    for member_id in members {
+                        if let Some(asset) = inner.assets.get_mut(&member_id) {
+                            asset.stack_id = Some(target_id.clone());
+                        }
+                        if let Some(target_members) = inner.stacks.get_mut(&target_id)
+                            && !target_members.contains(&member_id)
+                        {
+                            target_members.push(member_id);
+                        }
+                    }
+                }
+                inner.stacks.remove(&source_id);
+                for asset in inner.assets.values_mut() {
+                    if asset.stack_id.as_deref() == Some(source_id.as_str()) {
+                        asset.stack_id = None;
+                    }
+                }
+            }
+            (Some(source_id), None) => {
+                if let Some(members) = inner.stacks.get_mut(&source_id)
+                    && !members.contains(&target.to_string())
+                {
+                    members.push(target.to_string());
+                }
+                if let Some(target_asset) = inner.assets.get_mut(target) {
+                    target_asset.stack_id = Some(source_id);
+                }
+            }
+            // The server returns before touching any stack when the source is
+            // in none.
+            (None, _) => {}
+        }
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn create_stack(
@@ -988,25 +1247,26 @@ async fn create_stack(
     if asset_ids.len() < 2 {
         return message(StatusCode::BAD_REQUEST, "A stack needs at least two assets");
     }
-    let inner = state.inner.lock().expect("mock state poisoned");
-    let all_known = asset_ids
-        .iter()
-        .all(|id| id.as_str().is_some_and(|id| inner.has_asset(id)));
-    if !all_known {
+    let asset_ids = id_list(Some(body.get("assetIds").expect("checked above")));
+    let mut inner = state.inner.lock().expect("mock state poisoned");
+    if !asset_ids.iter().all(|id| inner.has_asset(id)) {
         return message(StatusCode::NOT_FOUND, "Asset not found");
     }
-    let primary = asset_ids[0].clone();
+    let stack_id = inner.create_stack(&asset_ids);
+    inner.stack_calls.push(StackCall {
+        asset_ids: asset_ids.clone(),
+        stack_id: stack_id.clone(),
+    });
     let assets: Vec<Value> = asset_ids
         .iter()
-        .filter_map(|id| id.as_str())
         .filter_map(|id| inner.asset(id))
-        .map(asset_response)
+        .map(|asset| asset_response(&inner, asset))
         .collect();
     (
         StatusCode::CREATED,
         Json(json!({
-            "id": uuid::Uuid::new_v4().to_string(),
-            "primaryAssetId": primary,
+            "id": stack_id,
+            "primaryAssetId": asset_ids.first(),
             "assets": assets,
         })),
     )
@@ -1020,10 +1280,13 @@ async fn tag_assets(
     if let Some(response) = guard(&state, Operation::TagAssets).await {
         return response;
     }
-    let count = body
-        .get("assetIds")
-        .and_then(|value| value.as_array())
-        .map_or(0, Vec::len);
+    let asset_ids = id_list(body.get("assetIds"));
+    let tag_ids = id_list(body.get("tagIds"));
+    let count = state
+        .inner
+        .lock()
+        .expect("mock state poisoned")
+        .tag(&asset_ids, &tag_ids);
     Json(json!({ "count": count })).into_response()
 }
 

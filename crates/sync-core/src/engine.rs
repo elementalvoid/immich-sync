@@ -48,6 +48,7 @@ use crate::upload::{
     PreparedItem, UploadFailure, UploadGate, UploadOutcome, Uploader, hash_in_background,
     pending_sidecar,
 };
+use crate::versions::Versioner;
 use crate::watch::FolderWatcher;
 
 /// How the engine decides what to do and when (SPEC R2.3, R3.1, R6, R7.2).
@@ -219,6 +220,8 @@ struct EngineInner {
     session: SharedSession,
     uploader: Uploader,
     albums: AlbumMapper,
+    /// Carries a changed file's associations onto its new version (R4.2-R4.4).
+    versions: Versioner,
     config: EngineConfig,
     gate: UploadGate,
     /// Trips after a run of connection failures (R6.6).
@@ -294,12 +297,14 @@ impl Engine {
         // R1.4: the album calls go through the same session, so a 401 on one of
         // them spends the one re-login the engine already shares.
         let albums = AlbumMapper::new(session.clone(), store.clone());
+        let versions = Versioner::new(session.clone(), store.clone());
         let breaker = CircuitBreaker::new(config.breaker_threshold, config.breaker_cooldown);
         let inner = Arc::new(EngineInner {
             store,
             session,
             uploader,
             albums,
+            versions,
             breaker,
             upload_slots: Arc::new(Semaphore::new(config.concurrency.max(1))),
             bandwidth: BandwidthLimit::new(config.bandwidth_bytes_per_second),
@@ -849,7 +854,11 @@ impl EngineInner {
     ///
     /// The last reason the store holds is kept when this call has no failure of
     /// its own, which is how a restart that finds the cap already spent still
-    /// shows why the item is parked.
+    /// shows why the item is parked. The asset id the row already knows is
+    /// kept too, the same rule `park_row` follows: a promote that failed after
+    /// the upload landed put it there, and the dead letter must not claim the
+    /// server holds nothing (R4.4). An upload that never reached the server
+    /// wrote `None`, so the row still claims no asset that does not exist.
     fn park_dead_letter(
         &self,
         item: &PreparedItem,
@@ -869,7 +878,7 @@ impl EngineInner {
             size: item.size,
             mtime_ns: item.mtime_ns,
             sha1: item.sha1,
-            asset_id: None,
+            asset_id: existing.as_ref().and_then(|row| row.asset_id.clone()),
             state: ItemState::DeadLetter,
             error_class,
             error_message,
@@ -920,8 +929,9 @@ impl EngineInner {
             }
             return;
         }
+        let failure = UploadFailure::from_client_error(error);
         for item in prepared {
-            self.fail_item(item, error);
+            self.fail_item(item, &failure, None);
         }
     }
 
@@ -936,22 +946,33 @@ impl EngineInner {
 
     /// Records a failure that happened before an upload could start, and
     /// finishes the item's bookkeeping with it.
-    fn fail_item(&self, item: &PreparedItem, error: &ClientError) {
-        let outcome = self.park_row(item, error);
+    fn fail_item(&self, item: &PreparedItem, failure: &UploadFailure, asset_id: Option<&str>) {
+        let outcome = self.park_row(item, failure, asset_id);
         self.finish_item(item, &outcome);
         tracing::warn!(
             path = %item.path.display(),
-            class = classify(error).0.map_or("none", FailureClass::as_str),
-            reason = %error.redacted_reason(),
+            class = failure.class.map_or("none", FailureClass::as_str),
+            reason = %failure.message,
             "the file was parked after a failure"
         );
     }
 
     /// Records one failure without finishing the item, so a caller that still
     /// holds the item (the retry loop) keeps its own bookkeeping.
-    fn park_row(&self, item: &PreparedItem, error: &ClientError) -> UploadOutcome {
-        let (class, kind) = classify(error);
-        let state = match kind {
+    ///
+    /// `asset_id` is the asset the server already holds for this item, when the
+    /// failure happened after the upload landed. It is kept so the asset is
+    /// never lost: a later attempt resolves the same bytes to the same asset
+    /// (R3.2) and finishes the work that failed (R4.4). An upload that never
+    /// reached the server passes `None`, because the row must not claim an
+    /// asset that does not exist.
+    fn park_row(
+        &self,
+        item: &PreparedItem,
+        failure: &UploadFailure,
+        asset_id: Option<&str>,
+    ) -> UploadOutcome {
+        let state = match failure.kind {
             crate::failure::FailureKind::Permanent => ItemState::FailedPermanent,
             crate::failure::FailureKind::Transient => ItemState::RetryWait,
         };
@@ -960,10 +981,10 @@ impl EngineInner {
             size: item.size,
             mtime_ns: item.mtime_ns,
             sha1: item.sha1,
-            asset_id: None,
+            asset_id: asset_id.map(str::to_string),
             state,
-            error_class: class,
-            error_message: Some(error.to_string()),
+            error_class: failure.class,
+            error_message: Some(failure.message.clone()),
             attempts: 0,
             // A failure sends nothing, so the sidecar is still owed (R3.3).
             sidecar: None,
@@ -971,13 +992,7 @@ impl EngineInner {
         if let Err(store_error) = self.store.record(&record) {
             tracing::error!(error = %store_error, "the state database could not record the failure");
         }
-        UploadOutcome::Failed(crate::upload::UploadFailure {
-            class,
-            kind,
-            message: error.to_string(),
-            retry_after: error.retry_after(),
-            connection: matches!(error, ClientError::Unreachable(_)),
-        })
+        UploadOutcome::Failed(failure.clone())
     }
 }
 
@@ -1209,6 +1224,14 @@ async fn process_batch(inner: &Arc<EngineInner>, batch: Vec<PathBuf>) {
                 asset_id: Some(asset_id),
                 ..
             }) if item.sidecar.is_none() => {
+                // R4.2: bytes the server already holds are still a new version
+                // of a tracked file, so the version flow runs before the row is
+                // settled. A failure here parks the row with its asset id, and
+                // the next scan or "Sync now" finishes the chain (R6.7).
+                if let Err(error) = inner.versions.promote(&id, &asset_id, item.sha1).await {
+                    inner.fail_item(&item, &error.failure(), Some(&asset_id));
+                    continue;
+                }
                 record_terminal(inner, &item, &asset_id, ItemState::Duplicate);
                 inner.finish_item(
                     &item,
@@ -1232,35 +1255,39 @@ async fn process_batch(inner: &Arc<EngineInner>, batch: Vec<PathBuf>) {
                 reason: RejectReason::UnsupportedFormat,
                 ..
             }) => {
-                inner.fail_item(
-                    &item,
-                    &ClientError::UnsupportedFormat(
-                        "the checksum check refused the format".to_string(),
-                    ),
+                let error = ClientError::UnsupportedFormat(
+                    "the checksum check refused the format".to_string(),
                 );
+                inner.fail_item(&item, &UploadFailure::from_client_error(&error), None);
             }
             Some(BulkAction::Reject {
                 reason: RejectReason::Duplicate,
                 asset_id: None,
                 ..
             }) => {
-                inner.fail_item(&item, &missing_asset_error());
+                inner.fail_item(
+                    &item,
+                    &UploadFailure::from_client_error(&missing_asset_error()),
+                    None,
+                );
             }
             Some(BulkAction::Reject {
                 reason: RejectReason::Other(reason),
                 ..
             }) => {
-                inner.fail_item(
-                    &item,
-                    &ClientError::Protocol {
-                        status: 200,
-                        message: format!("the checksum check refused it: {reason}"),
-                        retry_after: None,
-                    },
-                );
+                let error = ClientError::Protocol {
+                    status: 200,
+                    message: format!("the checksum check refused it: {reason}"),
+                    retry_after: None,
+                };
+                inner.fail_item(&item, &UploadFailure::from_client_error(&error), None);
             }
             None => {
-                inner.fail_item(&item, &missing_result_error());
+                inner.fail_item(
+                    &item,
+                    &UploadFailure::from_client_error(&missing_result_error()),
+                    None,
+                );
             }
         }
     }
@@ -1519,7 +1546,7 @@ async fn upload_with_retries(inner: &Arc<EngineInner>, item: &PreparedItem) -> U
         if let Err(error) = wait_for_the_server(inner).await {
             // The credential is refused, not merely gone: the item needs the
             // user, so it is parked rather than retried (R1.4).
-            return inner.park_row(item, &error);
+            return inner.park_row(item, &UploadFailure::from_client_error(&error), None);
         }
         if attempts >= cap {
             // The cap was already spent before this run, so the item is parked
@@ -1528,10 +1555,26 @@ async fn upload_with_retries(inner: &Arc<EngineInner>, item: &PreparedItem) -> U
         }
         let started_ns = now_ns();
         attempts += 1;
-        let outcome = inner
+        let mut outcome = inner
             .uploader
             .upload_prepared(item, &inner.gate, &inner.bandwidth)
             .await;
+        // R4.2: an upload that reached the server is a new version of the file
+        // when the item already has one, so the associations carry over before
+        // the item counts as finished. A failure here keeps the uploaded asset
+        // on the row and spends this attempt, which is what the retry loop and
+        // the dead letter are for (R6.1, R6.5).
+        if let UploadOutcome::Created { asset_id } | UploadOutcome::Duplicate { asset_id } =
+            &outcome
+            && let Err(error) = inner
+                .versions
+                .promote(&path_text, asset_id, item.sha1)
+                .await
+        {
+            let failure = error.failure();
+            inner.park_row(item, &failure, Some(asset_id));
+            outcome = UploadOutcome::Failed(failure);
+        }
         let (attempt_outcome, failure) = match &outcome {
             UploadOutcome::Created { .. } | UploadOutcome::Duplicate { .. } => {
                 // R6.6: a request the server answered ends the run of
@@ -1582,8 +1625,8 @@ async fn upload_with_retries(inner: &Arc<EngineInner>, item: &PreparedItem) -> U
 }
 
 /// The current time in nanoseconds since the Unix epoch, as the attempt log
-/// records it.
-fn now_ns() -> i64 {
+/// and the version chain record it.
+pub(crate) fn now_ns() -> i64 {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(duration) => i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX),
         Err(error) => -i64::try_from(error.duration().as_nanos()).unwrap_or(i64::MAX),

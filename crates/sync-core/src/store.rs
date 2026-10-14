@@ -135,6 +135,40 @@ ALTER TABLE sync_item ADD COLUMN sidecar_size INTEGER;
 ALTER TABLE sync_item ADD COLUMN sidecar_mtime_ns INTEGER;
 ";
 
+/// The eighth schema (issue #11): the version chain and the stack an item's
+/// versions share (R4.4, SPEC §5).
+///
+/// `version` is the §5 table: one row per version of a tracked file, with the
+/// item it belongs to, the asset the server holds, that version's SHA-1, when
+/// it was recorded, and whether it is the item's current version. Exactly one
+/// row per item carries the current flag; `record_version` moves it, so a
+/// reader never has to pick between two "current" versions.
+///
+/// The unique index on `(item_id, asset_id)` makes a retry that records the
+/// same asset twice idempotent, which is what the version flow needs: a lost
+/// answer or a later attempt records the same version again. It also serves the
+/// one read a caller makes, which is every version of one item.
+///
+/// The final `INSERT` seeds the chain from the rows the earlier schemas wrote.
+/// An asset id a migrated row holds lives only on `sync_item`, and `prepare`
+/// clears that column before the first edit uploads, so without the seed the
+/// first edit after the upgrade would record a chain of one and send no copy —
+/// the loss ADR 0004 exists to prevent (R4.2).
+const SCHEMA_V8: &str = "
+ALTER TABLE sync_item ADD COLUMN stack_id TEXT;
+CREATE TABLE version (
+    id            INTEGER PRIMARY KEY,
+    item_id       INTEGER NOT NULL REFERENCES sync_item(id) ON DELETE CASCADE,
+    asset_id      TEXT    NOT NULL,
+    sha1          BLOB    NOT NULL,
+    created_at_ns INTEGER NOT NULL,
+    is_current    INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX version_item_asset ON version(item_id, asset_id);
+INSERT INTO version (item_id, asset_id, sha1, created_at_ns, is_current)
+SELECT id, asset_id, sha1, mtime_ns, 1 FROM sync_item WHERE asset_id IS NOT NULL;
+";
+
 /// How long the one writer waits for a competing lock before failing.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -340,6 +374,39 @@ pub struct AttemptRecord {
     pub error_class: Option<FailureClass>,
 }
 
+/// One version of a sync item, in Rust form (SPEC §5, GLOSSARY).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Version {
+    /// The item the version belongs to, as `sync_item.id`. Two versions of the
+    /// same file share it, which is what keeps the file's identity across an
+    /// edit (R4.1).
+    pub item_id: i64,
+    /// The asset the server holds for this version (R4.4).
+    pub asset_id: String,
+    /// The SHA-1 of the content of this version.
+    pub sha1: Sha1,
+    /// When this version was recorded, in nanoseconds since the Unix epoch.
+    pub created_at_ns: i64,
+    /// Whether this is the item's current version (R4.4).
+    pub is_current: bool,
+}
+
+/// One version to record as the item's current one (SPEC §5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewVersion {
+    /// The item, addressed by its path and compared with the platform's case
+    /// rule (R2.4).
+    pub path: String,
+    /// The asset the server holds for this version (R4.2).
+    pub asset_id: String,
+    /// The SHA-1 of the version's content (SPEC §5).
+    pub sha1: Sha1,
+    /// When this version was recorded, in nanoseconds since the Unix epoch.
+    pub created_at_ns: i64,
+    /// The stack the item's versions share (R4.4).
+    pub stack_id: Option<String>,
+}
+
 /// One item the retry policy gave up on, for the failed-items view (R6.5).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FailedItem {
@@ -380,6 +447,9 @@ pub struct StorePragmas {
     pub synchronous: i64,
     /// `busy_timeout` in milliseconds.
     pub busy_timeout_ms: i64,
+    /// `foreign_keys`; the store turns it on, so the `ON DELETE` actions of
+    /// the state tables are enforced (`1`).
+    pub foreign_keys: i64,
 }
 
 /// Why the state store could not be used.
@@ -447,8 +517,8 @@ pub enum StoreError {
     /// A row holds a negative size.
     #[error("the state database holds a negative file size")]
     NegativeSize,
-    /// An attempt named an item the store does not hold.
-    #[error("the state database has no item {0} to record an attempt for")]
+    /// A write named an item the store does not hold.
+    #[error("the state database has no item {0} to record this for")]
     UnknownItem(String),
     /// A row holds an attempt outcome this build does not know.
     #[error("the state database holds an unknown attempt outcome {0:?}")]
@@ -567,6 +637,7 @@ impl StateStore {
             // SQLite reports `synchronous` as an integer; 2 is FULL.
             synchronous: read("PRAGMA synchronous")?,
             busy_timeout_ms: read("PRAGMA busy_timeout")?,
+            foreign_keys: read("PRAGMA foreign_keys")?,
         })
     }
 
@@ -1056,6 +1127,123 @@ impl StateStore {
         Ok(counts)
     }
 
+    /// Makes `version`'s asset the item's current version (R4.4, SPEC §5).
+    ///
+    /// The chain is written in one transaction: the previous current version
+    /// loses the flag, the new version takes it, and the item points at the new
+    /// asset and at the stack its versions share. A caller that has not copied
+    /// the associations yet must not call this, because the row is what claims
+    /// the version relationship exists.
+    ///
+    /// Recording the same asset again (a retry, or a run that re-reads a
+    /// settled row) moves the existing row to current instead of adding a
+    /// second one, so the chain never lists one asset twice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::UnknownItem`] when no item row holds the path, and
+    /// [`StoreError`] when the transaction fails or the lock is poisoned.
+    pub fn record_version(&self, version: &NewVersion) -> Result<(), StoreError> {
+        let mut writer = self.writer()?;
+        let transaction = writer
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| self.query_error(source))?;
+        let key = path_key(Path::new(&version.path));
+        let item_id: i64 = transaction
+            .query_row(
+                "SELECT id FROM sync_item WHERE path_key = ?1",
+                [&key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|source| self.query_error(source))?
+            .ok_or_else(|| StoreError::UnknownItem(version.path.clone()))?;
+        transaction
+            .execute(
+                "UPDATE version SET is_current = 0
+                 WHERE item_id = ?1 AND is_current = 1 AND asset_id <> ?2",
+                params![item_id, version.asset_id],
+            )
+            .map_err(|source| self.query_error(source))?;
+        transaction
+            .execute(
+                "INSERT INTO version (item_id, asset_id, sha1, created_at_ns, is_current)
+                 VALUES (?1, ?2, ?3, ?4, 1)
+                 ON CONFLICT(item_id, asset_id) DO UPDATE SET
+                     sha1 = excluded.sha1,
+                     created_at_ns = excluded.created_at_ns,
+                     is_current = 1",
+                params![
+                    item_id,
+                    version.asset_id,
+                    version.sha1.as_bytes().as_slice(),
+                    version.created_at_ns,
+                ],
+            )
+            .map_err(|source| self.query_error(source))?;
+        // `COALESCE` keeps the recorded stack when a version records none: the
+        // first version has no stack yet, and a retry must not drop one.
+        transaction
+            .execute(
+                "UPDATE sync_item SET asset_id = ?1, stack_id = COALESCE(?2, stack_id)
+                 WHERE id = ?3",
+                params![version.asset_id, version.stack_id, item_id],
+            )
+            .map_err(|source| self.query_error(source))?;
+        transaction
+            .commit()
+            .map_err(|source| self.query_error(source))
+    }
+
+    /// Every version of one item, oldest first (SPEC §5) — by recording time,
+    /// because a re-recorded version (a revert) keeps its row id and only its
+    /// timestamp moves.
+    ///
+    /// The old versions stay in the list: the client keeps them (R4.4), and a
+    /// reader can show a file's history from it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the query fails or a row cannot be read.
+    pub fn versions(&self, path: &str) -> Result<Vec<Version>, StoreError> {
+        let writer = self.writer()?;
+        let mut statement = writer
+            .prepare(
+                "SELECT v.item_id, v.asset_id, v.sha1, v.created_at_ns, v.is_current
+                 FROM version v JOIN sync_item i ON i.id = v.item_id
+                 WHERE i.path_key = ?1 ORDER BY v.created_at_ns, v.id",
+            )
+            .map_err(|source| self.query_error(source))?;
+        let rows = statement
+            .query_map([path_key(Path::new(path))], read_version)
+            .map_err(|source| self.query_error(source))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|source| self.query_error(source))
+    }
+
+    /// The stack the item's versions share, as R4.4 records it.
+    ///
+    /// `None` before the item has a stack: a first upload has no stack, and a
+    /// file the server never stacked has none either.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the query fails.
+    pub fn stack_id(&self, path: &str) -> Result<Option<String>, StoreError> {
+        let writer = self.writer()?;
+        let row: Option<Option<String>> = writer
+            .query_row(
+                "SELECT stack_id FROM sync_item WHERE path_key = ?1",
+                [path_key(Path::new(path))],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|source| self.query_error(source))?;
+        // An untracked path has no row, which reads as "no stack" like an
+        // untracked item reads as no asset.
+        Ok(row.flatten())
+    }
+
     /// The writer connection, or the poison error after a panic.
     fn writer(&self) -> Result<MutexGuard<'_, Connection>, StoreError> {
         self.writer.lock().map_err(|_| StoreError::Poisoned)
@@ -1068,6 +1256,20 @@ impl StateStore {
             source,
         }
     }
+}
+
+/// Reads one `version` row.
+fn read_version(row: &rusqlite::Row<'_>) -> rusqlite::Result<Version> {
+    let bytes: Vec<u8> = row.get(2)?;
+    let sha1 = Sha1::from_slice(&bytes)
+        .ok_or_else(|| conversion_error(2, rusqlite::types::Type::Blob, StoreError::BadChecksum))?;
+    Ok(Version {
+        item_id: row.get(0)?,
+        asset_id: row.get(1)?,
+        sha1,
+        created_at_ns: row.get(3)?,
+        is_current: row.get(4)?,
+    })
 }
 
 /// Reads one `source_folder` row.
@@ -1161,7 +1363,25 @@ fn set_writer_pragmas(writer: &Connection) -> rusqlite::Result<()> {
     debug_assert_eq!(mode, "wal", "WAL is what ADR 0005 requires");
     writer.pragma_update(None, "synchronous", "FULL")?;
     writer.busy_timeout(BUSY_TIMEOUT)?;
+    // ADR 0005 builds on bundled SQLite, which defaults foreign keys on; the
+    // pragma pins that, so the state tables' ON DELETE actions never depend on
+    // a compile-time default.
+    writer.pragma_update(None, "foreign_keys", "ON")?;
     Ok(())
+}
+
+/// The migration list as it stood before the version schema (issue #11), so
+/// an upgrade-path test can build a database at the schema the upgrade really
+/// starts from.
+#[doc(hidden)]
+pub fn migrations_before_version_schema() -> Migrations<'static> {
+    Migrations::new(vec![
+        M::up(SCHEMA_V1),
+        M::up_with_hook(SCHEMA_V2, backfill_path_keys),
+        M::up(SCHEMA_V3),
+        M::up(SCHEMA_V4),
+        M::up(SCHEMA_V5),
+    ])
 }
 
 /// The schema migrations, in order (ADR 0005: `rusqlite_migration`).
@@ -1174,6 +1394,7 @@ fn migrations() -> Migrations<'static> {
         M::up(SCHEMA_V5),
         M::up(SCHEMA_V6),
         M::up(SCHEMA_V7),
+        M::up(SCHEMA_V8),
     ])
 }
 
@@ -1368,6 +1589,78 @@ mod migration_tests {
             }],
             "R3.4: a folder mapped before album mapping existed reads back off, at the default \
              scope, through the whole composed migration chain"
+        );
+    }
+
+    /// R4.4: a database written before the version table still migrates, and
+    /// the rows it holds keep their asset mappings.
+    #[test]
+    fn the_version_table_survives_a_v5_database() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let path = temp.path().join("state.db");
+        {
+            let mut connection = Connection::open(&path).expect("open the raw database");
+            // A v5 database: the attempt log exists, the version table does not.
+            migrations_before_version_schema()
+                .to_latest(&mut connection)
+                .expect("create the fifth schema");
+            connection
+                .execute(
+                    "INSERT INTO sync_item (path, path_key, size, mtime_ns, sha1, asset_id, state, error_class)
+                     VALUES (?1, ?2, 11, 1, ?3, 'asset-1', 'uploaded', NULL)",
+                    params![
+                        "hello.txt",
+                        "hello.txt",
+                        Sha1::from_hex("2aae6c35c94fcfb415dbe95f408b9ce91ee846ed")
+                            .expect("a hex SHA-1")
+                            .as_bytes()
+                            .as_slice(),
+                    ],
+                )
+                .expect("insert the old row");
+            drop(connection);
+        }
+
+        let store = StateStore::open(&path).expect("a v5 database must migrate");
+        let row = store.item("hello.txt").expect("read").expect("the row");
+        assert_eq!(row.asset_id.as_deref(), Some("asset-1"));
+        assert_eq!(
+            store.stack_id("hello.txt").expect("read the stack id"),
+            None,
+            "a migrated item has no stack until its first edit"
+        );
+        let seeded = store.versions("hello.txt").expect("read the chain");
+        assert_eq!(
+            seeded.len(),
+            1,
+            "R4.2: the migration seeds the chain from the row's asset id, or the \
+             first edit after the upgrade would have nothing to copy from"
+        );
+        assert_eq!(seeded[0].asset_id, "asset-1");
+        assert!(seeded[0].is_current, "the migrated asset starts current");
+        assert_eq!(
+            seeded[0].created_at_ns, 1,
+            "the row's mtime is when the version was recorded"
+        );
+        store
+            .record_version(&NewVersion {
+                path: "hello.txt".to_string(),
+                asset_id: "asset-2".to_string(),
+                sha1: Sha1::from_hex("2aae6c35c94fcfb415dbe95f408b9ce91ee846ed")
+                    .expect("a hex SHA-1"),
+                created_at_ns: 1_700_000_000_000_000_000,
+                stack_id: Some("stack-1".to_string()),
+            })
+            .expect("the version table works after the migration");
+        let chain = store.versions("hello.txt").expect("read the chain");
+        assert_eq!(
+            chain.len(),
+            2,
+            "the seeded version and its successor are both recorded"
+        );
+        assert!(
+            !chain[0].is_current && chain[1].is_current,
+            "the successor takes the current flag from the seeded row"
         );
     }
 

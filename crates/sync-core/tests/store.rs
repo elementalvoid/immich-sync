@@ -4,7 +4,9 @@ use std::path::Path;
 
 use sync_core::failure::FailureClass;
 use sync_core::hash::Sha1;
-use sync_core::store::{ItemRecord, ItemState, SidecarDigest, StateStore};
+use sync_core::store::{
+    ItemRecord, ItemState, NewVersion, SidecarDigest, StateStore, StoreError,
+};
 
 /// `sha1("hello world")`, hex.
 const HELLO_WORLD_SHA1_HEX: &str = "2aae6c35c94fcfb415dbe95f408b9ce91ee846ed";
@@ -98,6 +100,10 @@ fn the_writer_uses_wal_and_full_synchronous() {
         pragmas.busy_timeout_ms >= 1_000,
         "the one writer waits for a lock instead of failing: {}",
         pragmas.busy_timeout_ms
+    );
+    assert_eq!(
+        pragmas.foreign_keys, 1,
+        "foreign keys are enforced, or the state tables' ON DELETE actions are dead SQL"
     );
 }
 
@@ -661,4 +667,158 @@ fn folder_counts_bucket_the_states() {
     assert_eq!(counts.uploaded, 2);
     assert_eq!(counts.pending, 1);
     assert_eq!(counts.failed, 3, "a dead-letter item counts as failed");
+}
+
+/// R4.4: the chain keeps every version, one current flag, and the stack id on
+/// the item.
+#[test]
+fn a_recorded_version_chain_keeps_the_old_versions_and_one_current() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    store
+        .record(&record("hello.txt", ItemState::Uploaded))
+        .expect("write the item");
+
+    for (index, asset_id) in ["asset-1", "asset-2"].into_iter().enumerate() {
+        store
+            .record_version(&NewVersion {
+                path: "hello.txt".to_string(),
+                asset_id: asset_id.to_string(),
+                sha1: hello_world_sha1(),
+                created_at_ns: 1_700_000_000_000_000_000 + i64::try_from(index).expect("fits"),
+                stack_id: Some("stack-1".to_string()),
+            })
+            .expect("record the version");
+    }
+
+    let chain = store.versions("hello.txt").expect("read the chain");
+    assert_eq!(chain.len(), 2, "R4.4: both versions stay recorded");
+    assert_eq!(
+        chain
+            .iter()
+            .map(|version| version.asset_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["asset-1", "asset-2"],
+        "R4.4: the chain is oldest first"
+    );
+    assert_eq!(
+        chain.iter().filter(|version| version.is_current).count(),
+        1,
+        "R4.4: exactly one version is current"
+    );
+    assert!(
+        chain[1].is_current,
+        "R4.4: the current flag follows the newest version"
+    );
+    assert_eq!(
+        chain[0].item_id, chain[1].item_id,
+        "R4.1: both versions belong to one sync item"
+    );
+    assert_eq!(
+        store.stack_id("hello.txt").expect("read the stack id"),
+        Some("stack-1".to_string()),
+        "R4.4: the stack id is recorded on the item"
+    );
+    assert_eq!(
+        store
+            .item("hello.txt")
+            .expect("read")
+            .expect("the row")
+            .asset_id,
+        Some("asset-2".to_string()),
+        "R4.4: the item points at its current version"
+    );
+}
+
+/// The chain reads oldest-first by recording time. Row ids stop reflecting
+/// that after a version is re-recorded — a revert gives an old row a new
+/// recording time while its id stays — so a reader must not order by id.
+#[test]
+fn the_chain_stays_chronological_after_a_revert() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    store
+        .record(&record("hello.txt", ItemState::Uploaded))
+        .expect("write the item");
+    let version = |asset_id: &str, created_at_ns| NewVersion {
+        path: "hello.txt".to_string(),
+        asset_id: asset_id.to_string(),
+        sha1: hello_world_sha1(),
+        created_at_ns,
+        stack_id: None,
+    };
+    store
+        .record_version(&version("asset-1", 1_700_000_000_000_000_000))
+        .expect("record the first version");
+    store
+        .record_version(&version("asset-2", 1_700_000_000_000_000_500))
+        .expect("record the second version");
+    // The user reverts to the first version: its row keeps its id but takes
+    // the new recording time.
+    store
+        .record_version(&version("asset-1", 1_700_000_000_000_001_000))
+        .expect("record the revert");
+
+    let chain = store.versions("hello.txt").expect("read the chain");
+    assert_eq!(
+        chain
+            .iter()
+            .map(|version| version.asset_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["asset-2", "asset-1"],
+        "oldest first by recording time, not by row id"
+    );
+    assert!(
+        chain[1].is_current,
+        "the reverted-to version is the current one"
+    );
+}
+
+/// A version recorded twice is one row, so a retried flow cannot grow the
+/// chain (R4.4, R6.7).
+#[test]
+fn recording_the_same_version_twice_keeps_one_row() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    store
+        .record(&record("hello.txt", ItemState::Uploaded))
+        .expect("write the item");
+    let version = NewVersion {
+        path: "hello.txt".to_string(),
+        asset_id: "asset-1".to_string(),
+        sha1: hello_world_sha1(),
+        created_at_ns: 1_700_000_000_000_000_000,
+        stack_id: None,
+    };
+    store.record_version(&version).expect("record it");
+    store.record_version(&version).expect("record it again");
+
+    assert_eq!(
+        store.versions("hello.txt").expect("read the chain").len(),
+        1,
+        "a repeat is idempotent"
+    );
+}
+
+/// R4.4: a version needs an item row; a path the store does not track is an
+/// error, not a version nothing belongs to.
+#[test]
+fn recording_a_version_for_an_unknown_item_is_an_error() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+
+    let error = store
+        .record_version(&NewVersion {
+            path: "missing.txt".to_string(),
+            asset_id: "asset-1".to_string(),
+            sha1: hello_world_sha1(),
+            created_at_ns: 1,
+            stack_id: None,
+        })
+        .expect_err("a version needs its item");
+
+    assert!(
+        matches!(error, StoreError::UnknownItem(_)),
+        "the error says which item is missing: {error}"
+    );
 }
