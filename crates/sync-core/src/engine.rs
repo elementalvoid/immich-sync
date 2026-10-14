@@ -1927,11 +1927,18 @@ async fn reconcile_files(inner: &Arc<EngineInner>, present: &[PathBuf], folders:
             mtime_ns(&metadata),
         );
         match moved {
-            Ok(true) => tracing::info!(
-                from = %row.path,
-                to = %target.display(),
-                "R5.2: the item was renamed and keeps its asset mapping"
-            ),
+            Ok(true) => {
+                if row.state == ItemState::Missing {
+                    // The item found its content again, so it leaves the review
+                    // (R5.4).
+                    inner.note_review_decided(&row.path);
+                }
+                tracing::info!(
+                    from = %row.path,
+                    to = %target.display(),
+                    "R5.2: the item was renamed and keeps its asset mapping"
+                )
+            }
             // A target another item claimed in this same pass: the row is
             // still gone, and the twin check below decides it.
             Ok(false) => undecided.push(row),

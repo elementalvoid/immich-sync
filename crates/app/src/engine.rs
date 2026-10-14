@@ -95,10 +95,13 @@ impl EngineModel {
         cx: &mut Context<Self>,
     ) -> Self {
         let subscriptions = vec![
-            // The status is refreshed when the store opens, so a review that
-            // already waits in the database raises its notification at start
-            // (R5.4) and a folder edit republishes the counts.
-            cx.observe(&store_model, |this, _, cx| this.try_start_engine(cx)),
+            // The status and the review list are refreshed when the store opens,
+            // so a review that already waits in the database raises its
+            // notification and fills the view at start (R5.3, R5.4).
+            cx.observe(&store_model, |this, _, cx| {
+                this.try_start_engine(cx);
+                this.refresh_review(cx);
+            }),
             cx.observe(&connection, |this, _, cx| this.try_start_engine(cx)),
         ];
         let poll = cx.spawn(async move |this, cx| {

@@ -3663,3 +3663,52 @@ async fn a_file_that_comes_back_leaves_the_review() {
     );
     engine.stop();
 }
+
+#[tokio::test]
+async fn a_review_item_whose_content_reappears_elsewhere_leaves_the_review() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let file = write_file(&photos, "moved-after-review.jpg", b"late rename bytes");
+    add_folder(&store, &photos, true);
+    let engine = start_engine(
+        &server,
+        &store,
+        review_config(Duration::from_secs(1), false),
+    )
+    .await;
+    let asset_id = sync_one(&store, &file).await;
+
+    std::fs::remove_file(&file).expect("delete the fixture");
+    wait_for_review(&engine, 1).await;
+
+    // The file comes back at another path after the review already listed it.
+    let renamed = photos.join("found-again.jpg");
+    write_file(&photos, "found-again.jpg", b"late rename bytes");
+    assert!(
+        wait_until(
+            || store
+                .item(&renamed.display().to_string())
+                .ok()
+                .flatten()
+                .is_some_and(|row| row.state.is_terminal_success()),
+            Duration::from_secs(15)
+        )
+        .await,
+        "the item never reunited with its content"
+    );
+
+    let moved = store
+        .item(&renamed.display().to_string())
+        .expect("read the new path")
+        .expect("the row moved");
+    assert_eq!(moved.asset_id.as_deref(), Some(asset_id.as_str()));
+    assert_eq!(
+        store.review_count().expect("count the review"),
+        0,
+        "R5.4: an item whose content is back leaves the review"
+    );
+    assert_eq!(engine.status().counts.review, 0);
+    engine.stop();
+}

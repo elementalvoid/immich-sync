@@ -1325,6 +1325,10 @@ impl StateStore {
     /// move onto a path another row already holds is refused rather than
     /// merging two items into one.
     ///
+    /// A missing row that finds its content again is settled: the server
+    /// already held those bytes, so the item is a duplicate and leaves the
+    /// review (R5.2, R5.3).
+    ///
     /// # Errors
     ///
     /// Returns [`StoreError`] when the write fails, the size does not fit, or
@@ -1340,7 +1344,8 @@ impl StateStore {
         let writer = self.writer()?;
         let changed = writer
             .execute(
-                "UPDATE sync_item SET path = ?2, path_key = ?3, size = ?4, mtime_ns = ?5
+                "UPDATE sync_item SET path = ?2, path_key = ?3, size = ?4, mtime_ns = ?5,
+                     state = CASE WHEN state = 'missing' THEN 'duplicate' ELSE state END
                  WHERE path_key = ?1
                    AND NOT EXISTS (SELECT 1 FROM sync_item WHERE path_key = ?3)",
                 params![
