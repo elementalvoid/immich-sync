@@ -251,6 +251,8 @@ impl DiagnosticsModel {
         self.info = None;
         self.errors.clear();
         self.problem = None;
+        // A read already in flight must not land over the state this clears.
+        self.read_generation = self.read_generation.wrapping_add(1);
         self.engine.update(cx, |engine, cx| engine.rebuild(cx));
         cx.notify();
     }
@@ -420,6 +422,51 @@ mod tests {
             0.0,
             "a rebuilt engine starts its meter over"
         );
+    }
+
+    /// R10.2: a read a refresh left in flight must not land after a rebuild
+    /// cleared the state; the rebuild supersedes it.
+    #[gpui_kit::test]
+    fn a_rebuild_supersedes_a_read_already_in_flight(cx: &mut gpui_kit::TestAppContext) {
+        use crate::connection::ConnectionModel;
+        use crate::engine::EngineModel;
+        use crate::paths::AppPaths;
+        use crate::store::StoreModel;
+        use gpui_kit::AppContext as _;
+        use std::sync::Arc;
+        use sync_core::connection::ServerProfile;
+        use sync_core::credential::{MemoryCredentialStore, SharedCredentialStore};
+
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let paths = AppPaths {
+            config_file: temp.path().join("config").join("settings.toml"),
+            state_db: temp.path().join("data").join("state.db"),
+            autostart_dir: temp.path().join("config").join("autostart"),
+        };
+        let credentials: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+        let diagnostics = cx.update(|cx| {
+            let connection =
+                cx.new(|_| ConnectionModel::new(ServerProfile::default(), credentials));
+            let store = cx.new(|cx| StoreModel::open(&paths, cx));
+            let engine =
+                cx.new(|cx| EngineModel::new(connection.clone(), store.clone(), &paths, cx));
+            cx.new(|cx| super::DiagnosticsModel::new(store, engine, connection, cx))
+        });
+        // The store opens on the background executor; the initial refresh only
+        // starts a read once it is there.
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            diagnostics.update(cx, |model, cx| {
+                model.refresh(cx);
+                let pending = model.read_generation;
+                model.rebuild(cx);
+                assert_ne!(
+                    model.read_generation, pending,
+                    "the read refresh left in flight must not land over the rebuilt state"
+                );
+            });
+        });
     }
 
     #[test]
