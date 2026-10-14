@@ -1,9 +1,11 @@
 //! The default skip rules (SPEC R2.2).
 //!
 //! Hidden files and folders, symlinks and junctions, temporary and partial
-//! files, and system files never reach the state store or the wire. The
-//! reconciliation scan and the watcher both call [`skip_reason_below`], so the
-//! two discovery paths agree on what a file is.
+//! files, system files, and XMP sidecars never reach the state store or the
+//! wire. The reconciliation scan and the watcher both call
+//! [`skip_reason_below`], so the two discovery paths agree on what a file is.
+//! A sidecar is skipped because it is metadata for its asset rather than an
+//! asset of its own (R3.3); it rides along in the asset's own upload.
 //!
 //! The `ignore` walker also prunes hidden entries while it walks, and this
 //! predicate repeats the check for watcher events, which arrive as bare paths.
@@ -11,6 +13,7 @@
 use std::fs::Metadata;
 use std::path::{Component, Path};
 
+use crate::pairing::is_sidecar_name;
 use crate::paths::{PathCase, key};
 
 /// Why a path is skipped (R2.2).
@@ -26,6 +29,8 @@ pub enum SkipReason {
     Temporary,
     /// An operating-system file, such as `Thumbs.db` or a page file.
     System,
+    /// An XMP sidecar, which travels with its asset (R3.3).
+    Sidecar,
 }
 
 impl SkipReason {
@@ -37,6 +42,7 @@ impl SkipReason {
             Self::Symlink => "symlink",
             Self::Temporary => "temporary",
             Self::System => "system",
+            Self::Sidecar => "sidecar",
         }
     }
 }
@@ -117,7 +123,11 @@ pub fn skip_reason_below(
             return Some(reason);
         }
     }
-    None
+    // R3.3: only the file itself can be a sidecar; a folder named `album.xmp`
+    // is an ordinary folder and its contents are ordinary files.
+    path.file_name()
+        .is_some_and(|name| is_sidecar_name(&name.to_string_lossy()))
+        .then_some(SkipReason::Sidecar)
 }
 
 /// The path below `root` as a forward-slash string, or `None` when `path` is
@@ -260,6 +270,30 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn a_sidecar_is_skipped_because_it_is_not_an_asset_of_its_own() {
+        // R3.3: the sidecar rides along with IMG_0001.jpg, so discovery must
+        // not enqueue it as a second item.
+        let root = Path::new("/photos");
+        assert_eq!(
+            skip_reason_below(root, &PathBuf::from("/photos/IMG_0001.jpg.xmp"), None),
+            Some(SkipReason::Sidecar)
+        );
+        assert_eq!(
+            skip_reason_below(root, &PathBuf::from("/photos/IMG_0001.XMP"), None),
+            Some(SkipReason::Sidecar)
+        );
+        assert_eq!(
+            skip_reason_below(root, &PathBuf::from("/photos/IMG_0001.jpg"), None),
+            None
+        );
+        assert_eq!(
+            skip_reason_below(root, &PathBuf::from("/photos/album.xmp/inside.jpg"), None),
+            None,
+            "a folder that happens to end in .xmp prunes nothing"
+        );
     }
 
     #[test]
