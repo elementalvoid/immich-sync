@@ -353,8 +353,7 @@ async fn a_form_sign_in_resumes_the_engine_a_refused_session_stalled(cx: &mut Te
         });
     });
     for _ in 0..400 {
-        if cx.read(|cx| connection.read(cx).state().is_connected())
-            && server.upload_requests() >= 2
+        if cx.read(|cx| connection.read(cx).state().is_connected()) && server.upload_requests() >= 2
         {
             break;
         }
@@ -366,6 +365,87 @@ async fn a_form_sign_in_resumes_the_engine_a_refused_session_stalled(cx: &mut Te
         2,
         "R1.4: the sign-in that fixes the credential must resume the engine's \
          queue without the user pressing Sync now"
+    );
+}
+
+/// The invariant behind the recovery above: the Settings form and the running
+/// engine observe one session, so a sign-in cannot leave the engine behind on
+/// the state it rejected (R1.4).
+#[gpui_kit::test]
+async fn the_engine_and_the_form_observe_the_same_session(cx: &mut TestAppContext) {
+    let (_runtime, server) = mock_server();
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+
+    let connection = signed_in(cx, &server);
+    let store = cx.update(|cx| cx.new(|cx| StoreModel::open(&paths, cx)));
+    wait_for_inputs(cx, &connection, &store).await;
+    let engine =
+        cx.update(|cx| cx.new(|cx| EngineModel::new(connection.clone(), store, &paths, cx)));
+    cx.update(|cx| engine.update(cx, |model, cx| model.start(cx)));
+    for _ in 0..600 {
+        if cx.read(|cx| engine.read(cx).is_running()) {
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    assert!(
+        cx.read(|cx| engine.read(cx).is_running()),
+        "the engine never started"
+    );
+
+    let form_session = cx
+        .read(|cx| connection.read(cx).session())
+        .expect("a live session");
+    assert!(
+        form_session.shares_state_with(
+            &cx.read(|cx| engine.read(cx).session())
+                .expect("the engine's session")
+        ),
+        "R1.4: the engine must send its requests through the form's session"
+    );
+
+    // The second sign-in is the one that splits them when the form builds a
+    // new session per attempt.
+    let profile = ServerProfile {
+        server_url: server.base_url().to_string(),
+        email: "sync@example.com".to_string(),
+        method: AuthMethod::Password,
+    };
+    cx.update(|cx| {
+        connection.update(cx, |model, cx| {
+            model.sign_in(
+                SignIn {
+                    email: profile.email.clone(),
+                    secret: Secret::new("correct horse"),
+                    method: AuthMethod::Password,
+                },
+                profile,
+                cx,
+            );
+        });
+    });
+    for _ in 0..600 {
+        if cx.read(|cx| connection.read(cx).state().is_connected()) {
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    assert!(
+        cx.read(|cx| connection.read(cx).state().is_connected()),
+        "the form sign-in did not connect"
+    );
+    assert!(
+        cx.read(|cx| connection.read(cx).session())
+            .expect("a live session after the sign-in")
+            .shares_state_with(
+                &cx.read(|cx| engine.read(cx).session())
+                    .expect("the engine's session")
+            ),
+        "R1.4: a form sign-in must land on the session the engine already holds"
     );
 }
 

@@ -511,6 +511,12 @@ impl Engine {
         &self.inner.store
     }
 
+    /// The session this engine sends its requests through (R1.4).
+    #[must_use]
+    pub fn session(&self) -> &SharedSession {
+        &self.inner.session
+    }
+
     /// The items the retry policy gave up on, in path order (R6.5).
     ///
     /// # Errors

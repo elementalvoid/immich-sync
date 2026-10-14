@@ -56,7 +56,9 @@ pub struct ConnectionModel {
     state: ConnectionState,
     form_error: Option<String>,
     /// The live session, shared with the sync engine so a 401 on an upload is
-    /// answered by the same one re-login rule the form uses (R1.4).
+    /// answered by the same one re-login rule the form uses (R1.4). The form
+    /// signs in on this handle rather than building another one, so the engine
+    /// never keeps a session the user has already replaced.
     session: Option<SharedSession>,
     provider: CredentialStoreProvider,
     /// Whether the startup restore already ran. The model outlives every
@@ -154,7 +156,11 @@ impl ConnectionModel {
         if let Some(session) = &self.session {
             let state = session.state();
             if state != self.state {
-                self.set_state(state, cx);
+                // The session's own state, not a new attempt, so the generation
+                // must not move: an attempt still in flight would be dropped as
+                // superseded by the very sign-in it is waiting for (R1.4).
+                self.state = state;
+                cx.notify();
             }
         }
     }
@@ -260,21 +266,35 @@ impl ConnectionModel {
         // Resolving per request makes the recovery step real: starting the OS
         // credential store and signing in again works without a restart.
         let store = self.provider.resolve();
+        // A live session is repointed in place, so the sign-in that lands here
+        // is the one the sync engine and the uploader hold (R1.4).
+        let live = self.session.clone();
         let (results, incoming) = async_channel::bounded(1);
         runtime.spawn(async move {
-            let (state, session) = match Connection::new(&server_url, store) {
-                Ok(connection) => {
-                    let session = connection.shared();
-                    let state = match request {
-                        Some(request) => session.sign_in(request).await,
-                        None => session.restore(&profile).await,
-                    };
-                    (state, Some(session))
-                }
-                Err(error) => (
-                    ConnectionState::NeedsAttention(Attention::from(&error)),
-                    None,
-                ),
+            let (state, session) = match live {
+                Some(session) => match session.repoint(&server_url, store).await {
+                    Ok(()) => {
+                        let state = authenticate(session.clone(), profile, request).await;
+                        (state, Some(session))
+                    }
+                    // The session keeps the handle the engine holds, so it says
+                    // why the attempt failed instead of the model alone.
+                    Err(error) => (
+                        ConnectionState::NeedsAttention(Attention::from(&error)),
+                        Some(session),
+                    ),
+                },
+                None => match Connection::new(&server_url, store) {
+                    Ok(connection) => {
+                        let session = connection.shared();
+                        let state = authenticate(session.clone(), profile, request).await;
+                        (state, Some(session))
+                    }
+                    Err(error) => (
+                        ConnectionState::NeedsAttention(Attention::from(&error)),
+                        None,
+                    ),
+                },
             };
             let _ = results.send((state, session)).await;
         });
@@ -294,6 +314,19 @@ impl ConnectionModel {
             });
         })
         .detach();
+    }
+}
+
+/// Signs in, or restores the saved profile with no user input, on the one
+/// session the app, the engine, and the uploader share (R1.3, R1.4).
+async fn authenticate(
+    session: SharedSession,
+    profile: ServerProfile,
+    request: Option<SignIn>,
+) -> ConnectionState {
+    match request {
+        Some(request) => session.sign_in(request).await,
+        None => session.restore(&profile).await,
     }
 }
 

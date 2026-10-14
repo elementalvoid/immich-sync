@@ -18,6 +18,7 @@ use crate::paths::AppPaths;
 use crate::settings::SettingsStore;
 use crate::status::DashboardModel;
 use crate::store::StoreModel;
+use sync_core::connection::SharedSession;
 
 /// How often the dashboard picks up the engine's live counts.
 const STATUS_POLL: Duration = Duration::from_millis(250);
@@ -243,6 +244,15 @@ impl EngineModel {
     #[must_use]
     pub fn is_running(&self) -> bool {
         self.engine.is_some()
+    }
+
+    /// The session the running engine sends its requests through (R1.4).
+    ///
+    /// It is the one the connection form signs in on, so the two never observe
+    /// two session state machines.
+    #[must_use]
+    pub fn session(&self) -> Option<SharedSession> {
+        self.engine.as_ref().map(|engine| engine.session().clone())
     }
 
     /// Adds a source folder and starts discovering it (R2.1).

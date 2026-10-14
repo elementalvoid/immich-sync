@@ -253,7 +253,23 @@ impl Connection {
     ///
     /// Returns a [`ClientError`] when the server URL cannot be used.
     pub fn new(server_url: &str, store: Arc<dyn CredentialStore>) -> Result<Self, ClientError> {
+        Self::with_budget(server_url, store, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Builds a session that spends a re-login budget a handle already shares,
+    /// so a session replaced inside a live [`SharedSession`] keeps one budget
+    /// with it (R1.4).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ClientError`] when the server URL cannot be used.
+    fn with_budget(
+        server_url: &str,
+        store: Arc<dyn CredentialStore>,
+        relogin_used: Arc<AtomicBool>,
+    ) -> Result<Self, ClientError> {
         let client = ImmichClient::new(server_url)?;
+        relogin_used.store(false, Ordering::SeqCst);
         Ok(Self {
             client,
             store,
@@ -263,7 +279,7 @@ impl Connection {
             },
             state: ConnectionState::NotConfigured,
             credential: None,
-            relogin_used: Arc::new(AtomicBool::new(false)),
+            relogin_used,
         })
     }
 
@@ -397,12 +413,13 @@ impl Connection {
     /// second copy of the rule.
     #[must_use]
     pub fn shared(self) -> SharedSession {
-        SharedSession {
+        let snapshot = SessionSnapshot {
+            state: self.state.clone(),
+            credential: self.credential.clone(),
             client: self.client.clone(),
-            snapshot: Arc::new(std::sync::Mutex::new(SessionSnapshot {
-                state: self.state.clone(),
-                credential: self.credential.clone(),
-            })),
+        };
+        SharedSession {
+            snapshot: Arc::new(std::sync::Mutex::new(snapshot)),
             relogin_used: Arc::clone(&self.relogin_used),
             connection: Arc::new(tokio::sync::Mutex::new(self)),
         }
@@ -459,10 +476,13 @@ impl AttentionSource for CredentialError {
 }
 
 /// The state and credential of a session as of its last change.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct SessionSnapshot {
     state: ConnectionState,
     credential: Option<RequestCredential>,
+    /// The client of the connection the snapshot describes, so a request path
+    /// reaches the server this session points at.
+    client: ImmichClient,
 }
 
 /// One connection session, shared between the app's surfaces and the sync
@@ -474,7 +494,6 @@ struct SessionSnapshot {
 /// the dashboard) see the state without waiting on a request in flight.
 #[derive(Clone)]
 pub struct SharedSession {
-    client: ImmichClient,
     connection: Arc<tokio::sync::Mutex<Connection>>,
     /// The one re-login budget, so a successful request restores it without
     /// taking the lock (R1.4).
@@ -496,7 +515,46 @@ impl SharedSession {
     /// The HTTP client, which is cheap to clone.
     #[must_use]
     pub fn client(&self) -> ImmichClient {
-        self.client.clone()
+        self.snapshot().client
+    }
+
+    /// Whether both handles wrap the same session state, so a form and the
+    /// engine cannot drift into two session state machines (R1.4).
+    #[must_use]
+    pub fn shares_state_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.connection, &other.connection)
+    }
+
+    /// Points this session at another server and credential store, in place.
+    ///
+    /// The handle is never swapped, because the sync engine holds the handle it
+    /// was constructed with: a form sign-in has to land on that session or the
+    /// engine's queue keeps the rejected state and uploads nothing (R1.4).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ClientError`] when the server URL cannot be used. The
+    /// session then reads as needing attention, so the tray cannot keep
+    /// reporting the state this attempt replaced.
+    pub async fn repoint(
+        &self,
+        server_url: &str,
+        store: Arc<dyn CredentialStore>,
+    ) -> Result<(), ClientError> {
+        let mut connection = self.connection.lock().await;
+        let outcome =
+            match Connection::with_budget(server_url, store, Arc::clone(&self.relogin_used)) {
+                Ok(fresh) => {
+                    *connection = fresh;
+                    Ok(())
+                }
+                Err(error) => {
+                    connection.need_attention(&error);
+                    Err(error)
+                }
+            };
+        self.mirror(&connection);
+        outcome
     }
 
     /// The connection state as of the last change (R1.4).
@@ -605,11 +663,11 @@ impl SharedSession {
     /// Returns the transport and protocol variants, and
     /// [`ClientError::InvalidToken`] when no credential is available.
     pub async fn validate(&self) -> Result<(), ClientError> {
-        let probe = match self.credential() {
-            Some(RequestCredential::Session(token)) => self.client.validate_token(&token).await,
-            Some(RequestCredential::ApiKey(key)) => {
-                self.client.validate_api_key(key.expose()).await
-            }
+        let snapshot = self.snapshot();
+        let client = snapshot.client;
+        let probe = match snapshot.credential {
+            Some(RequestCredential::Session(token)) => client.validate_token(&token).await,
+            Some(RequestCredential::ApiKey(key)) => client.validate_api_key(key.expose()).await,
             None => Err(ClientError::InvalidToken),
         };
         // The probe is the one path that learns a refusal without going through
@@ -641,6 +699,7 @@ impl SharedSession {
         let mut snapshot = self.snapshot.lock().expect("the session snapshot lock");
         snapshot.state = connection.state().clone();
         snapshot.credential = connection.credential().cloned();
+        snapshot.client = connection.client().clone();
     }
 }
 
