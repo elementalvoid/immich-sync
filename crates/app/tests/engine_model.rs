@@ -262,6 +262,113 @@ async fn a_superseded_engine_start_leaves_exactly_one_engine_watching(cx: &mut T
     );
 }
 
+/// The documented recovery from a connection that needs the user: re-enter the
+/// credentials in Settings and sign in. The dashboard and the tray recover from
+/// the form's own state, so the engine's queue must recover from the same
+/// sign-in, without waiting for a "Sync now" (R1.4).
+#[gpui_kit::test]
+async fn a_form_sign_in_resumes_the_engine_a_refused_session_stalled(cx: &mut TestAppContext) {
+    let (_runtime, server) = mock_server();
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    // The folder is registered before it exists, so the engine installs no
+    // watcher and only a reconciliation scan finds the files below.
+    let connection = signed_in(cx, &server);
+    let store = cx.update(|cx| cx.new(|cx| StoreModel::open(&paths, cx)));
+    wait_for_inputs(cx, &connection, &store).await;
+    cx.read(|cx| store.read(cx).store().expect("the store is open"))
+        .add_folder(&SourceFolder {
+            path: photos.display().to_string(),
+            recursive: true,
+        })
+        .expect("add the source folder");
+
+    let engine =
+        cx.update(|cx| cx.new(|cx| EngineModel::new(connection.clone(), store, &paths, cx)));
+    cx.update(|cx| engine.update(cx, |model, cx| model.start(cx)));
+    for _ in 0..600 {
+        if cx.read(|cx| engine.read(cx).is_running()) {
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    assert!(
+        cx.read(|cx| engine.read(cx).is_running()),
+        "the engine never started"
+    );
+
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+    for name in ["one.jpg", "two.jpg"] {
+        std::fs::write(photos.join(name), b"stalled bytes").expect("write the file");
+    }
+    // The checksum check is refused twice: the first 401 re-logs in, and the
+    // second leaves the connection needing the user (R1.4).
+    for _ in 0..2 {
+        server.fail(
+            Operation::BulkUploadCheck,
+            Fault::Status {
+                code: 401,
+                retry_after: None,
+            },
+        );
+    }
+    cx.update(|cx| engine.update(cx, |model, cx| model.sync_now(cx)));
+    for _ in 0..400 {
+        if !cx.read(|cx| connection.read(cx).state().is_connected()) {
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(50)).await;
+        cx.run_until_parked();
+    }
+    assert!(
+        !cx.read(|cx| connection.read(cx).state().is_connected()),
+        "R1.4: the refused batch must leave the connection needing the user"
+    );
+    assert_eq!(
+        server.upload_requests(),
+        0,
+        "R1.4: nothing could authenticate, so nothing may be uploaded"
+    );
+
+    // What the user does next: the Settings form, signing in again.
+    let profile = ServerProfile {
+        server_url: server.base_url().to_string(),
+        email: "sync@example.com".to_string(),
+        method: AuthMethod::Password,
+    };
+    cx.update(|cx| {
+        connection.update(cx, |model, cx| {
+            model.sign_in(
+                SignIn {
+                    email: profile.email.clone(),
+                    secret: Secret::new("correct horse"),
+                    method: AuthMethod::Password,
+                },
+                profile,
+                cx,
+            );
+        });
+    });
+    for _ in 0..400 {
+        if cx.read(|cx| connection.read(cx).state().is_connected())
+            && server.upload_requests() >= 2
+        {
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(50)).await;
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        server.upload_requests(),
+        2,
+        "R1.4: the sign-in that fixes the credential must resume the engine's \
+         queue without the user pressing Sync now"
+    );
+}
+
 #[gpui_kit::test]
 async fn a_re_login_resumes_the_batch_a_refused_connection_left_pending(cx: &mut TestAppContext) {
     let (runtime, server) = mock_server();
