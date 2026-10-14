@@ -3522,6 +3522,57 @@ async fn a_trash_without_the_permission_keeps_the_item_in_the_review() {
 }
 
 #[tokio::test]
+async fn a_trash_without_a_server_copy_is_refused_not_silently_kept() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+    add_folder(&store, &photos, true);
+    let path = photos.join("never-uploaded.jpg").display().to_string();
+    store
+        .record(&ItemRecord {
+            path: path.clone(),
+            size: 12,
+            mtime_ns: 1_700_000_000_000_000_000,
+            sha1: Sha1::from_hex("2aae6c35c94fcfb415dbe95f408b9ce91ee846ed").expect("a hex SHA-1"),
+            asset_id: None,
+            state: ItemState::Missing,
+            error_class: None,
+            error_message: None,
+            attempts: 0,
+            sidecar: None,
+        })
+        .expect("write the missing row");
+    let engine = start_engine(&server, &store, EngineConfig::default()).await;
+    wait_for_review(&engine, 1).await;
+
+    let error = engine
+        .trash_review_item(&path)
+        .await
+        .expect_err("a row with no asset cannot be trashed");
+    assert!(
+        matches!(error, ReviewError::NotInReview(_)),
+        "the click must report instead of silently keeping the asset: {error:?}"
+    );
+    assert_eq!(
+        store
+            .item(&path)
+            .expect("read the row")
+            .expect("the row exists")
+            .state,
+        ItemState::Missing,
+        "a refused trash leaves the row in the review"
+    );
+    assert!(
+        server.delete_calls().is_empty(),
+        "no request is sent for a row with no server copy"
+    );
+    assert_eq!(engine.review_items().expect("read the review").len(), 1);
+    engine.stop();
+}
+
+#[tokio::test]
 async fn a_rename_keeps_the_mapping_and_raises_no_review_item() {
     let server = MockImmich::start().await;
     let temp = tempfile::tempdir().expect("create a temp dir");

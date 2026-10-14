@@ -760,9 +760,9 @@ impl Engine {
     /// # Errors
     ///
     /// Returns [`ReviewError::NotInReview`] when the path is not waiting for a
-    /// decision, [`ReviewError::Client`] when the server refuses or cannot be
-    /// reached, and [`ReviewError::Store`] when the decision cannot be
-    /// recorded.
+    /// decision or has no server copy to trash, [`ReviewError::Client`] when
+    /// the server refuses or cannot be reached, and [`ReviewError::Store`]
+    /// when the decision cannot be recorded.
     pub async fn trash_review_item(&self, path: &str) -> Result<(), ReviewError> {
         let row = self
             .inner
@@ -771,12 +771,10 @@ impl Engine {
             .filter(|row| row.state == ItemState::Missing)
             .ok_or_else(|| ReviewError::NotInReview(path.to_string()))?;
         let Some(asset_id) = row.asset_id else {
-            // No server copy, so there is nothing to trash. The item leaves the
-            // review the way Keep leaves it, and no request is sent.
-            if self.inner.store.decide_review(path, ReviewDecision::Keep)? {
-                self.inner.note_review_decided(path);
-            }
-            return Ok(());
+            // No server copy, so there is nothing to trash. A Trash click
+            // must say so instead of recording a Keep the user did not ask
+            // for (R5.5).
+            return Err(ReviewError::NotInReview(path.to_string()));
         };
         let client = self.inner.session.client();
         let asset_ids = vec![asset_id.clone()];
