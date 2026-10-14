@@ -9,6 +9,19 @@
 //! of its own (R3.3): the XMP sidecar rides along in the same request, and a
 //! live photo's motion video uploads first so the photo can link it.
 //!
+//! **A sidecar only reaches an asset that is not on the server yet.** `POST
+//! /assets` is the only Stable operation that carries a `sidecarData` part, and
+//! Immich answers a checksum it already holds as `duplicate` from the
+//! `x-immich-checksum` header, in an interceptor that runs before multer parses
+//! the form. The server also deletes the uploaded file when it answers
+//! `duplicate` from the body checksum. Nothing attaches a sidecar afterwards:
+//! `PUT /assets/:id/original` (`replaceAsset`) is gone in v3.3.1 and
+//! `PUT /assets/copy` only moves the sidecar between two assets the client
+//! already holds. So a sidecar that appears *after* the asset uploaded cannot
+//! be delivered; the client sends it once, parks the item with its asset id,
+//! and reports it on the folder rather than claiming a sidecar that never
+//! arrived.
+//!
 //! The shape is what #6 batches: one [`Uploader`] over the shared state store,
 //! called once per item from a worker.
 
@@ -171,9 +184,7 @@ impl Uploader {
         };
 
         let existing = self.store.item(&path_text).ok().flatten();
-        let (sidecar, live_photo_video) = self
-            .paired_with(path, existing.as_ref().and_then(|row| row.sidecar_sha1))
-            .await;
+        let (sidecar, live_photo_video) = self.paired_with(path, existing.as_ref()).await;
 
         // R4.5: the same SHA-1 with a known asset does not upload again. A row
         // with no asset id is a previous failure, so it is attempted again.
@@ -344,16 +355,17 @@ impl Uploader {
 
     /// The XMP sidecar and the live photo video that belong to `path` (R3.3).
     ///
-    /// `recorded` is the sidecar digest the asset already carries: a sidecar
-    /// with that digest has reached the server and is not sent again (R4.5).
+    /// `row` is what the store recorded for this item: the sidecar digest the
+    /// asset already carries, and the state that says whether another attempt
+    /// is worth sending one.
     async fn paired_with(
         &self,
         path: &Path,
-        recorded: Option<Sha1>,
+        row: Option<&ItemRecord>,
     ) -> (Option<SidecarFile>, Option<PathBuf>) {
         let case = PathCase::for_platform();
         let index = FolderIndex::read(std::slice::from_ref(&path.to_path_buf()));
-        let sidecar = pending_sidecar(path, &index, case, recorded).await;
+        let sidecar = pending_sidecar(path, &index, case, row).await;
         let live_photo_video = index
             .live_photo_video_for(path, case)
             .map(Path::to_path_buf);
@@ -449,11 +461,40 @@ impl Uploader {
             Ok(response) => {
                 let asset_id = response.asset_id;
                 item.asset_id = Some(asset_id.clone());
-                // R4.5: the digest is what says the asset carries this
-                // sidecar, so it is written here and nowhere earlier — only a
-                // request that was accepted may claim one. A `duplicate` answer
-                // that short-circuited the body carries nothing (see
-                // `parked_sidecar`), so it claims nothing either.
+                // R4.5 + the API limitation: only a request the server read
+                // may claim the sidecar it carried. A `duplicate` answer was
+                // made from the `x-immich-checksum` header in an interceptor
+                // that runs before multer parses the form, so the sidecar in
+                // this body was discarded, and `POST /assets` is the only
+                // Stable operation that carries one — there is no attach, and
+                // `PUT /assets/:id/original` (which dropped `sidecarFile`) is
+                // gone in v3.3.1. Another automatic attempt would be answered
+                // the same way, so the item parks with its asset id, the
+                // sidecar stays owed, and the folder says why.
+                if response.duplicate
+                    && let Some(sidecar) = sidecar
+                {
+                    let sidecar_path = sidecar.path.display().to_string();
+                    item.sidecar_sha1 = None;
+                    item.state = ItemState::FailedPermanent;
+                    item.error_class = None;
+                    self.record(item);
+                    tracing::warn!(
+                        path = %item.path,
+                        asset_id = %asset_id,
+                        sidecar = %sidecar_path,
+                        "the server answered duplicate without reading the body, so the sidecar was not sent; Immich cannot attach one to an asset that already exists"
+                    );
+                    return UploadOutcome::Failed(UploadFailure {
+                        class: None,
+                        kind: FailureKind::Permanent,
+                        message: format!(
+                            "{sidecar_path} could not be attached: the server already has \
+                             these bytes and its API has no Stable way to send a sidecar to an \
+                             asset it already holds"
+                        ),
+                    });
+                }
                 item.sidecar_sha1 = sent_sidecar(response.duplicate, sidecar);
                 item.state = if response.duplicate {
                     ItemState::Duplicate
@@ -562,16 +603,21 @@ pub(crate) async fn hash_in_background(path: PathBuf) -> Result<Sha1, HashError>
 
 /// The XMP sidecar for `media` that the asset does not carry yet (R3.3).
 ///
-/// `recorded` is the digest the store last sent with the asset: a sidecar with
-/// that digest has reached the server and must not upload again (R4.5). A
-/// sidecar that cannot be read is left for a later pass rather than failing the
-/// media file with it.
+/// `row` is what the store recorded for this item. A sidecar with the recorded
+/// digest has reached the server and is not sent again (R4.5); an item parked
+/// with an asset gave up on its sidecar, because the only Stable way to carry
+/// one is answered `duplicate` before the server reads the body (see
+/// [`Uploader::send_upload`]). A sidecar that cannot be read is left for a
+/// later pass rather than failing the media file with it.
 pub(crate) async fn pending_sidecar(
     media: &Path,
     index: &FolderIndex,
     case: PathCase,
-    recorded: Option<Sha1>,
+    row: Option<&ItemRecord>,
 ) -> Option<SidecarFile> {
+    if row.is_some_and(parked_with_an_asset) {
+        return None;
+    }
     let found = index.sidecar_for(media, case)?.to_path_buf();
     let sha1 = match hash_in_background(found.clone()).await {
         Ok(sha1) => sha1,
@@ -584,10 +630,19 @@ pub(crate) async fn pending_sidecar(
             return None;
         }
     };
-    if recorded == Some(sha1) {
+    if row.and_then(|row| row.sidecar_sha1) == Some(sha1) {
         return None;
     }
     Some(SidecarFile { path: found, sha1 })
+}
+
+/// Whether the item gave up on its sidecar: it is parked permanently while its
+/// asset is already on the server (R3.3).
+///
+/// shortcut: a sidecar edited after the park is not retried automatically; the
+/// user retries the item by hand, which #7 will drive.
+fn parked_with_an_asset(row: &ItemRecord) -> bool {
+    row.state == ItemState::FailedPermanent && row.asset_id.is_some()
 }
 
 /// The digest to record for the sidecar one request carried (R4.5).

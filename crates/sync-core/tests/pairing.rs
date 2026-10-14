@@ -195,7 +195,13 @@ async fn a_photo_and_its_sidecar_upload_as_one_asset() {
 }
 
 #[tokio::test]
-async fn a_sidecar_that_appears_later_reaches_the_asset_on_the_next_pass() {
+async fn a_late_sidecar_cannot_be_attached_and_the_client_says_so() {
+    // R3.3 deviation, recorded rather than papered over: `POST /assets` is the
+    // only Stable operation that carries a `sidecarData` part, and Immich
+    // answers a checksum it already holds as `duplicate` from the header,
+    // before multer parses the form. There is no attach afterwards. So a
+    // sidecar that appears after the asset uploaded is sent once, is not
+    // recorded as sent, and parks the item where the user can see it.
     let server = MockImmich::start().await;
     let temp = tempfile::tempdir().expect("create a temp dir");
     let store = store_in(&temp);
@@ -222,40 +228,77 @@ async fn a_sidecar_that_appears_later_reaches_the_asset_on_the_next_pass() {
     assert!(
         wait_until(
             || {
-                all_terminal(&store, std::slice::from_ref(&photo))
-                    && store
-                        .item(&photo.display().to_string())
-                        .ok()
-                        .flatten()
-                        .is_some_and(|row| row.sidecar_sha1.is_some())
+                store
+                    .item(&photo.display().to_string())
+                    .ok()
+                    .flatten()
+                    .is_some_and(|row| row.state == ItemState::FailedPermanent)
             },
             Duration::from_secs(15)
         )
         .await,
-        "the sidecar did not reach the asset"
+        "the late sidecar did not park the item"
     );
 
-    // The bytes are already on the server, so the only Stable way to carry a
-    // sidecar is the upload itself; the server answers `duplicate` from the
-    // checksum header before it reads the body, which is why the double cannot
-    // report `has_sidecar` for this second request.
-    assert_eq!(server.upload_requests(), 2, "the asset was sent again");
-    assert_eq!(
-        asset_id(&store, &photo),
-        first_asset,
-        "R3.2: a re-upload must not create a second asset"
-    );
     let row = store
         .item(&photo.display().to_string())
         .expect("read")
         .expect("the photo row");
-    assert_eq!(row.sidecar_sha1, Some(sidecar_fixture_sha1()));
-    assert_eq!(row.state, ItemState::Duplicate);
+    assert_eq!(
+        row.sidecar_sha1, None,
+        "the request was never read, so the asset carries no sidecar"
+    );
+    assert_eq!(
+        row.asset_id.as_deref(),
+        Some(first_asset.as_str()),
+        "R3.2: the media is on the server, and the row says where"
+    );
+    assert!(
+        !server.has_sidecar(&first_asset),
+        "the truth: the sidecar did not reach the asset"
+    );
+    assert_eq!(
+        server.upload_requests(),
+        2,
+        "the sidecar was sent once, in the only request that can carry one"
+    );
+
+    // The folder says why, while the answer is fresh (R8.2).
+    let status = engine.status();
+    assert!(
+        status.folders[0]
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("sidecar")),
+        "the folder says why the sidecar is not on the asset: {:?}",
+        status.folders[0].last_error
+    );
+
+    // A further pass must not keep re-POSTing an answer the server has already
+    // given.
+    engine.sync_now();
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(
+        server.upload_requests(),
+        2,
+        "R6.3: a permanent answer is not retried on every scan"
+    );
     assert_eq!(
         store.item(&sidecar.display().to_string()).expect("read"),
         None,
         "R3.3: the late sidecar is still not an item of its own"
     );
+    engine.stop();
+
+    // The parked item is durable: a restarted client still counts it as
+    // failed, so the condition does not disappear with the process.
+    let engine = start_engine(&server, &store, scan_only()).await;
+    assert_eq!(
+        engine.status().folders[0].counts.failed,
+        1,
+        "the store keeps the item in the failed count the user sees"
+    );
+    assert_eq!(server.upload_requests(), 2, "and it is not sent again");
     engine.stop();
 }
 

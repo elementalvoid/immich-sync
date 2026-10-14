@@ -1004,13 +1004,7 @@ async fn prepare(
     // scan does not re-hash an entire settled library.
     let existing = inner.store.item(&path_text).ok().flatten();
     let case = PathCase::for_platform();
-    let sidecar = pending_sidecar(
-        path,
-        index,
-        case,
-        existing.as_ref().and_then(|row| row.sidecar_sha1),
-    )
-    .await;
+    let sidecar = pending_sidecar(path, index, case, existing.as_ref()).await;
     if let Some(row) = &existing
         && row.size == size
         && row.mtime_ns == mtime_ns

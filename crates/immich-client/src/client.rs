@@ -267,6 +267,13 @@ impl ImmichClient {
     /// answer can be lost in flight, so a transport failure here is resolved by
     /// asking whether the server kept the asset.
     ///
+    /// A `duplicate` answer therefore proves nothing about the `sidecarData`
+    /// part that rode along: the server never read the body. It also deletes
+    /// the file it just buffered when it finds the body checksum known. There
+    /// is no Stable operation that attaches a sidecar to an asset afterwards,
+    /// so the caller must not treat a duplicate as "the sidecar arrived" (see
+    /// `sync-core`'s upload pipeline).
+    ///
     /// # Errors
     ///
     /// Returns [`ClientError::LocalRead`] when the file or its sidecar cannot be
