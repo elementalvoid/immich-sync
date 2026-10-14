@@ -661,8 +661,9 @@ pub(crate) async fn pending_sidecar(
 /// Whether the item gave up on its sidecar: it is parked permanently while its
 /// asset is already on the server (R3.3).
 ///
-/// shortcut: a sidecar edited after the park is not retried automatically; the
-/// user retries the item by hand, which #7 will drive.
+/// shortcut: once parked, the item stops offering its sidecar for good, even
+/// after the sidecar is edited; re-offering it needs the row cleared, which
+/// #7's manual retry will own.
 fn parked_with_an_asset(row: &ItemRecord) -> bool {
     row.state == ItemState::FailedPermanent && row.asset_id.is_some()
 }

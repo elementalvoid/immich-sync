@@ -964,7 +964,9 @@ fn record_terminal(inner: &EngineInner, item: &PreparedItem, asset_id: &str, sta
 /// The folder index resolves what belongs to the asset rather than to a file of
 /// its own (R3.3): the XMP sidecar to send, and the live photo video to upload
 /// first. A sidecar the asset does not carry yet is work even when the media
-/// file itself is settled, so a sidecar that appears later reaches the asset.
+/// file itself is settled, so a sidecar written while the client was stopped
+/// rides along with the next upload — unless the asset is already on the
+/// server, which no Stable operation can change (see `upload::pending_sidecar`).
 async fn prepare(
     inner: &Arc<EngineInner>,
     path: &Path,
