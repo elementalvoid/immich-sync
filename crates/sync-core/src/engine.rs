@@ -679,6 +679,18 @@ impl EngineInner {
         }
     }
 
+    /// Releases an item's in-flight claim without finishing it.
+    ///
+    /// The item is still pending work, so its count stands and its row stays
+    /// `pending`: the next reconciliation scan re-prepares it, and a restart
+    /// re-queues it (R2.3, R6.7).
+    fn release_item(&self, item: &PreparedItem) {
+        self.in_flight
+            .lock()
+            .expect("the in-flight lock")
+            .remove(&path_key(&item.path));
+    }
+
     /// Records a failure that happened before an upload could start.
     fn fail_item(&self, item: &PreparedItem, error: &ClientError) {
         let (class, kind) = classify(error);
@@ -799,11 +811,25 @@ async fn process_batch(inner: &Arc<EngineInner>, batch: Vec<PathBuf>) {
     }
     // R3.3: the photo uploads its motion video first and links it, so a video a
     // photo in this batch claims is not also uploaded as an item of its own.
-    let claimed: HashSet<PathBuf> = prepared
+    // The membership test folds case like the rest of the engine (R2.4): the
+    // walker and the watcher spell the same file differently on Windows.
+    let claimed: HashSet<String> = prepared
         .iter()
-        .filter_map(|item| item.live_photo_video.clone())
+        .filter_map(|item| item.live_photo_video.as_deref())
+        .map(path_key)
         .collect();
-    prepared.retain(|item| !claimed.contains(&item.path));
+    prepared.retain(|item| {
+        if claimed.contains(&path_key(&item.path)) {
+            // A claim is a borrow, not a deletion: the item keeps its pending
+            // count and its `pending` row, and the next scan uploads it as an
+            // ordinary asset — or finds it already sent by the photo that
+            // claimed it. Releasing it is what stops the in-flight claim from
+            // making it un-preparable for the rest of the process.
+            inner.release_item(item);
+            return false;
+        }
+        true
+    });
     if prepared.is_empty() {
         return;
     }

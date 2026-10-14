@@ -334,6 +334,64 @@ async fn the_motion_video_uploads_first_and_the_photo_links_it() {
 }
 
 #[tokio::test]
+async fn a_claimed_video_is_released_and_uploads_on_its_own() {
+    // R3.3: a photo claims its motion video, so the video is not an item of its
+    // own in that batch. The claim is a borrow, not a deletion: when the photo
+    // cannot upload it either, the video still uploads, and the folder's
+    // pending count says what is still in flight.
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let photo = write_file(&photos, "IMG_0006.jpg", b"photo bytes");
+    let video = write_file(&photos, "IMG_0006.mov", b"motion bytes");
+    add_folder(&store, &photos, true);
+    // The photo is refused by the checksum check, so it never uploads and
+    // never claims the video itself.
+    server.reject_format(
+        &sync_core::hash::sha1_file(&photo)
+            .expect("hash the photo fixture")
+            .base64(),
+    );
+
+    let engine = start_engine(&server, &store, scan_only()).await;
+    assert!(
+        wait_until(
+            || !store
+                .item(&photo.display().to_string())
+                .expect("read the photo row")
+                .is_some_and(|row| row.state.is_terminal_success()),
+            Duration::from_secs(15)
+        )
+        .await,
+        "the refused photo was not parked"
+    );
+    assert!(
+        !all_terminal(&store, std::slice::from_ref(&video)),
+        "the video is still pending work: the photo never claimed it for real"
+    );
+
+    // The next scan re-prepares the released item (R2.3).
+    engine.sync_now();
+    assert!(
+        wait_until(
+            || all_terminal(&store, std::slice::from_ref(&video)),
+            Duration::from_secs(15)
+        )
+        .await,
+        "the claimed video was never released"
+    );
+
+    let status = engine.status();
+    assert_eq!(
+        status.folders[0].counts.pending, 0,
+        "R8.1: a released item is not pending once it settled: {:?}",
+        status.folders[0].counts
+    );
+    engine.stop();
+}
+
+#[tokio::test]
 async fn a_video_and_a_photo_without_each_other_upload_as_ordinary_assets() {
     let server = MockImmich::start().await;
     let temp = tempfile::tempdir().expect("create a temp dir");
