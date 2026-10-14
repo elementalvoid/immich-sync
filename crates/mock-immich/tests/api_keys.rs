@@ -40,3 +40,20 @@ async fn api_key_me_refuses_a_session_token() {
     let body: serde_json::Value = response.json().await.unwrap();
     assert_eq!(body["message"], "Not authenticated with an API Key");
 }
+
+#[tokio::test]
+async fn api_key_me_requires_a_credential() {
+    let server = MockImmich::start().await;
+
+    let response = reqwest::Client::new()
+        .get(format!("{}/api-keys/me", server.base_url()))
+        .send()
+        .await
+        .unwrap();
+
+    // The real authentication guard answers a request with no credential
+    // before `getMine` can throw its 403 (v3.3.1).
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["message"], "Authentication required");
+}

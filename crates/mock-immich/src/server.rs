@@ -886,9 +886,10 @@ fn api_key_permission_refusal(
 
 /// `GET /api-keys/me` (Stable, no permission beyond a credential).
 ///
-/// The real server answers a bearer session with 403 `Not authenticated with
-/// an API Key` (api-key.service.ts `getMine`, v3.3.1), which is the refusal
-/// the diagnostics probe must show as a message.
+/// The real authentication guard refuses a request with no credential with
+/// 401, and the real server answers a bearer session with 403 `Not
+/// authenticated with an API Key` (api-key.service.ts `getMine`, v3.3.1),
+/// which is the refusal the diagnostics probe must show as a message.
 async fn api_key_me(AxumState(state): AxumState<Arc<State>>, headers: HeaderMap) -> Response {
     state
         .inner
@@ -897,6 +898,9 @@ async fn api_key_me(AxumState(state): AxumState<Arc<State>>, headers: HeaderMap)
         .api_key_me_requests += 1;
     if let Some(response) = guard(&state, Operation::ApiKeyMe).await {
         return response;
+    }
+    if auth_kind(&headers).is_none() {
+        return message(StatusCode::UNAUTHORIZED, "Authentication required");
     }
     let Some(key) = headers
         .get("x-api-key")
