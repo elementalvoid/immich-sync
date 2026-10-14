@@ -1439,9 +1439,8 @@ mod tests {
     #[tokio::test]
     async fn an_item_the_pool_could_not_spawn_is_claimable_again() {
         let temp = tempfile::tempdir().expect("create a temp dir");
-        let store = Arc::new(
-            StateStore::open(temp.path().join("state.db")).expect("open the state store"),
-        );
+        let store =
+            Arc::new(StateStore::open(temp.path().join("state.db")).expect("open the state store"));
         let file = temp.path().join("queued.jpg");
         std::fs::write(&file, b"queued bytes").expect("write the file");
         // The session is never used: neither path below sends a request.

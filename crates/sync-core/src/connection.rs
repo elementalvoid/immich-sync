@@ -616,7 +616,10 @@ impl SharedSession {
         // `request`, so it records it here: the snapshot the tray reads must
         // not keep saying Connected while nothing can authenticate (R1.4).
         if let Err(error) = &probe
-            && matches!(error, ClientError::InvalidToken | ClientError::InvalidApiKey)
+            && matches!(
+                error,
+                ClientError::InvalidToken | ClientError::InvalidApiKey
+            )
         {
             let mut connection = self.connection.lock().await;
             connection.reject();

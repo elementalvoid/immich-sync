@@ -262,8 +262,6 @@ async fn a_superseded_engine_start_leaves_exactly_one_engine_watching(cx: &mut T
     );
 }
 
-
-
 #[gpui_kit::test]
 async fn a_re_login_resumes_the_batch_a_refused_connection_left_pending(cx: &mut TestAppContext) {
     let (runtime, server) = mock_server();
@@ -285,9 +283,8 @@ async fn a_re_login_resumes_the_batch_a_refused_connection_left_pending(cx: &mut
         })
         .expect("add the source folder");
 
-    let engine = cx.update(|cx| {
-        cx.new(|cx| EngineModel::new(connection.clone(), store, &paths, cx))
-    });
+    let engine =
+        cx.update(|cx| cx.new(|cx| EngineModel::new(connection.clone(), store, &paths, cx)));
     // Both inputs were ready before this model existed, so nothing has
     // notified it yet.
     cx.update(|cx| engine.update(cx, |model, cx| model.start(cx)));
