@@ -42,6 +42,15 @@ const BURST_DIVISOR: u64 = 10;
 /// second is too little to pay for even one read.
 const BUCKET_FLOOR: u64 = 64 * 1024;
 
+/// The slowest rate the limiter will run at; 0 still means unlimited.
+///
+/// The client fails an upload that has moved no byte for 30 s, and the first
+/// read out of an empty bucket costs `read / rate`. One read is at most 4 KiB,
+/// so below about 137 B/s the wait is longer than the guard's budget and a
+/// healthy server looks dead before the body has sent anything. A kilobyte
+/// makes the first read cost 4 s and leaves the steady state far inside it.
+const RATE_FLOOR: u64 = 1_000;
+
 /// A shareable limit on upload bytes per second; 0 means unlimited.
 #[derive(Clone, Debug)]
 pub struct BandwidthLimit {
@@ -72,10 +81,13 @@ impl BandwidthLimit {
             .store(bytes_per_second, Ordering::Release);
     }
 
-    /// The limit right now.
+    /// The rate the limiter runs at right now: what was set, except that a
+    /// rate under [`RATE_FLOOR`] is used at the floor. Zero is left alone; it
+    /// is unlimited, not slow.
     #[must_use]
     pub fn bytes_per_second(&self) -> u64 {
-        self.bytes_per_second.load(Ordering::Acquire)
+        let bytes = self.bytes_per_second.load(Ordering::Acquire);
+        if bytes == 0 { 0 } else { bytes.max(RATE_FLOOR) }
     }
 
     /// How long `bytes` must wait for budget. A zero duration means now.
@@ -306,6 +318,15 @@ mod tests {
             Duration::ZERO,
             "the bucket cannot hold one read at this rate"
         );
+    }
+
+    #[test]
+    fn a_rate_under_the_floor_runs_at_the_floor_and_zero_runs_unlimited() {
+        let limit = BandwidthLimit::new(1);
+        assert_eq!(limit.bytes_per_second(), 1_000);
+        limit.set(0);
+        assert_eq!(limit.bytes_per_second(), 0);
+        assert_eq!(limit.wait_for(1_000_000), Duration::ZERO);
     }
 
     #[test]

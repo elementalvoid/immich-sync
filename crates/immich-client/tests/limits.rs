@@ -75,6 +75,39 @@ async fn zero_is_unlimited() {
 }
 
 #[tokio::test]
+async fn a_rate_too_low_to_pay_out_one_read_still_completes_an_upload() {
+    let server = MockImmich::start().await;
+    let (client, token) = client(&server).await;
+    // One read's worth of body: at the floor it costs 4.1 s of streaming, and
+    // at 100 B/s it would cost 41 s, which is the case under test.
+    let (_directory, path) = fixture(4_096);
+    // 100 B/s is a value the settings field accepts - six decimals of MB/s is
+    // one byte, so it is 0.0001 in the field. The stall guard waits 30 s for
+    // the first byte and the limiter needs `read / rate` for it, so this used
+    // to call a healthy, eager server `Stalled` after 30 s.
+    let limit = BandwidthLimit::new(100);
+
+    let started = Instant::now();
+    let response = client
+        .upload_asset(Auth::Token(&token), &upload_request(&path, &limit))
+        .await
+        .expect("a low rate must not be reported as a dead server");
+    let elapsed = started.elapsed();
+
+    assert!(!response.duplicate);
+    assert_eq!(
+        limit.bytes_per_second(),
+        1_000,
+        "a rate under the floor is used at the floor"
+    );
+    // The upload ran at the floor, not at the 100 B/s that was asked for.
+    assert!(
+        elapsed <= Duration::from_secs(20),
+        "4 KiB at the floor took {elapsed:?}; the rate is lower than the floor"
+    );
+}
+
+#[tokio::test]
 async fn a_server_that_stops_reading_fails_the_upload_within_the_stall_budget() {
     let server = MockImmich::start().await;
     // The double takes the whole body and then holds the answer: a server that

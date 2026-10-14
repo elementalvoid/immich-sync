@@ -79,7 +79,7 @@ impl FieldKey {
     #[must_use]
     pub fn help(self) -> &'static str {
         match self {
-            Self::Bandwidth => "Zero means unlimited.",
+            Self::Bandwidth => "Zero means unlimited; under 0.001 MB/s the client uses 0.001 MB/s.",
             Self::Concurrency => "Uploads that run at the same time.",
             Self::ScanInterval => {
                 "The watcher uploads changes as they happen; this scan finds what the watcher missed."

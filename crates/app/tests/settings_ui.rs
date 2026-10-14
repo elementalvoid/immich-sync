@@ -308,6 +308,13 @@ fn field_keys_map_settings_to_the_displayed_text() {
     assert_eq!(FieldKey::Concurrency.unit(), "uploads");
     assert_eq!(FieldKey::Bandwidth.unit(), "MB/s");
     assert_eq!(FieldKey::ScanInterval.unit(), "minutes");
+    // The client runs a rate under its floor at the floor, so the field says
+    // which one that is instead of silently overriding the value.
+    assert!(
+        FieldKey::Bandwidth.help().contains("0.001 MB/s"),
+        "the bandwidth help does not name the minimum: {}",
+        FieldKey::Bandwidth.help()
+    );
 
     FieldKey::Bandwidth.set(&mut settings, 3.0);
     assert_eq!(
