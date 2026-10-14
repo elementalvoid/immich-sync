@@ -200,7 +200,9 @@ impl Uploader {
             asset_id: None,
             state: ItemState::RetryWait,
             error_class: None,
-            sidecar_sha1: sidecar.as_ref().map(|sidecar| sidecar.sha1),
+            // R4.5: no sidecar has been sent yet. Only the request that
+            // carried it and was accepted may claim one.
+            sidecar_sha1: None,
         };
 
         let checksum = sha1.base64();
@@ -320,7 +322,8 @@ impl Uploader {
             asset_id: None,
             state: ItemState::Uploading,
             error_class: None,
-            sidecar_sha1: prepared.sidecar.as_ref().map(|sidecar| sidecar.sha1),
+            // R4.5: the request carrying the sidecar has not gone out yet.
+            sidecar_sha1: None,
         };
         if gate.is_paused() {
             item.state = ItemState::Pending;
@@ -446,6 +449,12 @@ impl Uploader {
             Ok(response) => {
                 let asset_id = response.asset_id;
                 item.asset_id = Some(asset_id.clone());
+                // R4.5: the digest is what says the asset carries this
+                // sidecar, so it is written here and nowhere earlier — only a
+                // request that was accepted may claim one. A `duplicate` answer
+                // that short-circuited the body carries nothing (see
+                // `parked_sidecar`), so it claims nothing either.
+                item.sidecar_sha1 = sent_sidecar(response.duplicate, sidecar);
                 item.state = if response.duplicate {
                     ItemState::Duplicate
                 } else {
@@ -477,6 +486,8 @@ impl Uploader {
     fn failed(&self, item: &mut ItemRecord, error: &ClientError) -> UploadOutcome {
         let (class, kind) = classify(error);
         item.asset_id = None;
+        // R4.5: the request never landed, so neither did the sidecar.
+        item.sidecar_sha1 = None;
         item.state = match kind {
             FailureKind::Permanent => ItemState::FailedPermanent,
             FailureKind::Transient => ItemState::RetryWait,
@@ -577,6 +588,20 @@ pub(crate) async fn pending_sidecar(
         return None;
     }
     Some(SidecarFile { path: found, sha1 })
+}
+
+/// The digest to record for the sidecar one request carried (R4.5).
+///
+/// Only a `created` answer proves the server read the body: Immich answers a
+/// checksum it already holds as `duplicate` from the `x-immich-checksum`
+/// header, in an interceptor that runs before multer parses the form, so that
+/// answer says nothing about the sidecar it was sent with.
+fn sent_sidecar(duplicate: bool, sidecar: Option<&SidecarFile>) -> Option<Sha1> {
+    if duplicate {
+        None
+    } else {
+        sidecar.map(|sidecar| sidecar.sha1)
+    }
 }
 
 /// A modification time as nanoseconds since the Unix epoch.

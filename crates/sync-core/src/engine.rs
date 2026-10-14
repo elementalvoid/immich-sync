@@ -1042,7 +1042,9 @@ async fn prepare(
         asset_id: None,
         state: ItemState::Pending,
         error_class: None,
-        sidecar_sha1: item.sidecar.as_ref().map(|sidecar| sidecar.sha1),
+        // R4.5: nothing has been sent yet, so the row claims no sidecar. A
+        // crash here re-queues the item and sends it again (R6.7).
+        sidecar_sha1: None,
     };
     if let Err(error) = inner.store.record(&record) {
         tracing::error!(error = %error, "the state database could not record the pending item");
