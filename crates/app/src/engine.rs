@@ -367,7 +367,20 @@ impl EngineModel {
 
     /// Starts the engine when it is not running yet and both inputs exist.
     fn try_start_engine(&mut self, cx: &mut Context<Self>) {
-        if self.engine.is_some() || !self.connection.read(cx).state().is_connected() {
+        let connected = self.connection.read(cx).state().is_connected();
+        if self.engine.is_some() {
+            if connected {
+                // R1.4: a connection that comes back resumes the rows a refused
+                // credential left pending. Without this they wait for the next
+                // reconciliation scan, 30 minutes away by default.
+                if let Some(engine) = &self.engine {
+                    engine.sync_now();
+                }
+            }
+            self.refresh_status(cx);
+            return;
+        }
+        if !connected {
             self.refresh_status(cx);
             return;
         }
