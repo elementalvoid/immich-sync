@@ -726,6 +726,34 @@ impl EngineInner {
         UploadOutcome::DeadLetter(failure)
     }
 
+    /// Records a failure for every item of a batch whose checksum check could
+    /// not be made, and finishes their bookkeeping with it.
+    ///
+    /// A connection that is no longer usable failed as a whole, not once per
+    /// item (R1.4): nothing is written, so the rows stay `pending` and the next
+    /// reconciliation scan queues them again. Parking a batch of them would
+    /// leave every file looking permanently broken to a sign-in that fixes it.
+    fn fail_batch(&self, prepared: &[PreparedItem], error: &ClientError) {
+        if !self.session.state().is_connected() {
+            for item in prepared {
+                self.release_item(item);
+            }
+            return;
+        }
+        for item in prepared {
+            self.fail_item(item, error);
+        }
+    }
+
+    /// Releases an item's in-flight claim without finishing it, so a later scan
+    /// or "Sync now" can queue it again.
+    fn release_item(&self, item: &PreparedItem) {
+        self.in_flight
+            .lock()
+            .expect("the in-flight lock")
+            .remove(&path_key(&item.path));
+    }
+
     /// Records a failure that happened before an upload could start, and
     /// finishes the item's bookkeeping with it.
     fn fail_item(&self, item: &PreparedItem, error: &ClientError) {
@@ -798,9 +826,15 @@ async fn wait_for_the_server(inner: &Arc<EngineInner>) -> Result<(), ClientError
                 tracing::info!("the server answered the credential probe, so the queue resumes");
                 return Ok(());
             }
-            Err(ClientError::InvalidToken) => {
-                tracing::warn!("the credential probe was refused; the connection needs the user");
-                return Err(ClientError::InvalidToken);
+            Err(error) if classify(&error).0 == Some(FailureClass::AuthFailed) => {
+                // Every auth refusal is the user's to fix, not the server's to
+                // wait out: a rejected session token and a revoked API key
+                // both park the item and ask for attention (R1.4).
+                tracing::warn!(
+                    reason = %error.redacted_reason(),
+                    "the credential probe was refused; the connection needs the user"
+                );
+                return Err(error);
             }
             Err(error) => {
                 // A failed probe restarts the cooldown, so this loop is paced.
@@ -855,14 +889,16 @@ async fn process_batch(inner: &Arc<EngineInner>, batch: Vec<PathBuf>) {
         })
         .collect();
     let cap = inner.config.attempt_cap.max(1);
+    // The count is per batch, not per file and not per run: a 429 storm that
+    // spans two batches starts the second one from `ceiling(1)` again. That is
+    // deliberate — the batch spent no upload attempt, so charging it the cap
+    // would park files no request ever failed.
     let mut attempt = 0_u32;
     let results = loop {
         // R6.6: while the breaker is open, the batch waits for the credential
         // probe instead of asking a dead server again.
         if let Err(error) = wait_for_the_server(inner).await {
-            for item in &prepared {
-                inner.fail_item(item, &error);
-            }
+            inner.fail_batch(&prepared, &error);
             return;
         }
         attempt += 1;
@@ -876,15 +912,18 @@ async fn process_batch(inner: &Arc<EngineInner>, batch: Vec<PathBuf>) {
             })
             .await;
         match checked {
-            Ok(results) => break results,
+            Ok(results) => {
+                // R6.6: the server answered, so the run of connection failures
+                // the breaker counts ends here.
+                inner.breaker.record_success();
+                break results;
+            }
             Err(error) => {
                 let (_, kind) = classify(&error);
                 if kind == FailureKind::Permanent || attempt >= cap {
                     // The checksum check could not be made, so no item spent an
                     // upload attempt: they stay for the next scan (R6.1).
-                    for item in &prepared {
-                        inner.fail_item(item, &error);
-                    }
+                    inner.fail_batch(&prepared, &error);
                     return;
                 }
                 if matches!(error, ClientError::Unreachable(_)) {
@@ -1185,6 +1224,9 @@ async fn upload_with_retries(inner: &Arc<EngineInner>, item: &PreparedItem) -> U
         let outcome = inner.uploader.upload_prepared(item, &inner.gate).await;
         let (attempt_outcome, failure) = match &outcome {
             UploadOutcome::Created { .. } | UploadOutcome::Duplicate { .. } => {
+                // R6.6: a request the server answered ends the run of
+                // connection failures, so one unlucky request is not a run.
+                inner.breaker.record_success();
                 (AttemptOutcome::Succeeded, None)
             }
             UploadOutcome::Failed(failure) | UploadOutcome::DeadLetter(failure) => {
