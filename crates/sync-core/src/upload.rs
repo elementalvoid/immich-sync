@@ -248,7 +248,9 @@ impl Uploader {
             }
         }
 
-        self.send_upload(&mut item, &checksum, credential, None)
+        // This path is the caller's own, not the engine's: no limit is in
+        // force, so the body streams at the network's pace.
+        self.send_upload(&mut item, &checksum, credential, &BandwidthLimit::default())
             .await
     }
 
@@ -265,7 +267,7 @@ impl Uploader {
         prepared: &PreparedItem,
         credential: &RequestCredential,
         gate: &UploadGate,
-        bandwidth: Option<&BandwidthLimit>,
+        bandwidth: &BandwidthLimit,
     ) -> UploadOutcome {
         let mut item = ItemRecord {
             path: prepared.path.to_string_lossy().into_owned(),
@@ -293,7 +295,7 @@ impl Uploader {
         item: &mut ItemRecord,
         checksum: &str,
         credential: &RequestCredential,
-        bandwidth: Option<&BandwidthLimit>,
+        bandwidth: &BandwidthLimit,
     ) -> UploadOutcome {
         // Immich requires the file's own dates on the asset (R3.1). The
         // creation time is missing on some platforms and filesystems; the
@@ -316,7 +318,7 @@ impl Uploader {
                     checksum,
                     created_at,
                     modified_at,
-                    bandwidth: bandwidth.cloned(),
+                    bandwidth: bandwidth.clone(),
                 },
             )
             .await

@@ -1,8 +1,8 @@
 //! The upload operations against the offline Immich double (SPEC R3, R6.3).
 
 use immich_client::{
-    AssetUpload, Auth, BulkAction, BulkCheckItem, ClientError, ImmichClient, RejectReason,
-    SessionToken,
+    AssetUpload, Auth, BandwidthLimit, BulkAction, BulkCheckItem, ClientError, ImmichClient,
+    RejectReason, SessionToken,
 };
 use mock_immich::{Fault, MockImmich, Operation};
 
@@ -163,7 +163,7 @@ fn upload_request<'a>(path: &'a std::path::Path, checksum: &'a str) -> AssetUplo
         checksum,
         created_at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
         modified_at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_040),
-        bandwidth: None,
+        bandwidth: BandwidthLimit::default(),
     }
 }
 

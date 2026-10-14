@@ -22,6 +22,11 @@ pub enum ClientError {
     /// The server could not be reached: connection, TLS, timeout, or transport.
     #[error("the server could not be reached: {0}")]
     Unreachable(#[source] reqwest::Error),
+    /// The server stopped taking the body: no upload byte moved for the stall
+    /// budget. The upload is dropped and retried; the limit that was in force
+    /// when the request was built does not enter into it (R7.1).
+    #[error("the server stopped reading the upload")]
+    Stalled,
     /// The server rejected the email and password.
     #[error("the server rejected the password")]
     WrongCredentials,
@@ -76,6 +81,7 @@ impl ClientError {
             Self::InvalidUrl(_) => Cow::Borrowed("the server URL is not valid"),
             Self::HttpClient(_) => Cow::Borrowed("the HTTP client could not be built"),
             Self::Unreachable(_) => Cow::Borrowed("the server could not be reached"),
+            Self::Stalled => Cow::Borrowed("the server stopped reading the upload"),
             Self::WrongCredentials => Cow::Borrowed("the server rejected the password"),
             Self::PasswordLoginDisabled => Cow::Borrowed("password login is disabled"),
             Self::InvalidApiKey => Cow::Borrowed("the server rejected the API key"),

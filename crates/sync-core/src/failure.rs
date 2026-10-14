@@ -78,7 +78,7 @@ pub enum FailureKind {
 #[must_use]
 pub fn classify(error: &ClientError) -> (Option<FailureClass>, FailureKind) {
     match error {
-        ClientError::Unreachable(_) => {
+        ClientError::Unreachable(_) | ClientError::Stalled => {
             (Some(FailureClass::NetworkTransient), FailureKind::Transient)
         }
         ClientError::LocalRead(_) => (Some(FailureClass::LocalReadError), FailureKind::Permanent),

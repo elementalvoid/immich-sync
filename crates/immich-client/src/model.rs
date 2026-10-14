@@ -125,10 +125,11 @@ pub struct AssetUpload<'a> {
     pub created_at: SystemTime,
     /// The local modification time, sent as `fileModifiedAt`.
     pub modified_at: SystemTime,
-    /// The live bandwidth limit the body is metered against (R7.1). `None`
-    /// streams at the network's pace. A limit is shared by every upload that
-    /// clones it, so it caps the total rate and not each upload's.
-    pub bandwidth: Option<BandwidthLimit>,
+    /// The live bandwidth limit the body is metered against (R7.1). The
+    /// default, `BandwidthLimit::default()`, is 0: the network's pace. A limit
+    /// is shared by every upload that clones it, so it caps the total rate and
+    /// not each upload's.
+    pub bandwidth: BandwidthLimit,
 }
 
 /// The result of `POST /assets` (R3.6).

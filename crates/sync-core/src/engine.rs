@@ -997,12 +997,7 @@ async fn spawn_upload(inner: &Arc<EngineInner>, item: PreparedItem) {
     uploads.spawn(async move {
         let outcome = worker
             .uploader
-            .upload_prepared(
-                &item,
-                &worker.credential,
-                &worker.gate,
-                Some(&worker.bandwidth),
-            )
+            .upload_prepared(&item, &worker.credential, &worker.gate, &worker.bandwidth)
             .await;
         worker.finish_item(&item, &outcome);
         match &outcome {

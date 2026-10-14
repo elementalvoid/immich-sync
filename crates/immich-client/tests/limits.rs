@@ -6,8 +6,8 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use immich_client::{AssetUpload, Auth, BandwidthLimit, ImmichClient, SessionToken};
-use mock_immich::MockImmich;
+use immich_client::{AssetUpload, Auth, BandwidthLimit, ClientError, ImmichClient, SessionToken};
+use mock_immich::{Fault, MockImmich, Operation};
 
 /// The acceptance criterion's rate (R7.1): one megabyte per second.
 const ONE_MEGABYTE_PER_SECOND: u64 = 1_000_000;
@@ -47,7 +47,7 @@ fn upload_request<'a>(path: &'a std::path::Path, limit: &BandwidthLimit) -> Asse
         checksum: CHECKSUM,
         created_at: std::time::UNIX_EPOCH,
         modified_at: std::time::UNIX_EPOCH,
-        bandwidth: Some(limit.clone()),
+        bandwidth: limit.clone(),
     }
 }
 
@@ -71,6 +71,105 @@ async fn zero_is_unlimited() {
     assert!(
         elapsed < Duration::from_secs(1),
         "R7.1: 0 means unlimited, but {FILE_BYTES} bytes took {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_server_that_stops_reading_fails_the_upload_within_the_stall_budget() {
+    let server = MockImmich::start().await;
+    // The double takes the whole body and then holds the answer: a server that
+    // accepted the upload and stopped talking is exactly this. Nothing is in
+    // flight on the socket by then, so the only bound left is the client's.
+    server.fail(Operation::Upload, Fault::Slow(Duration::from_secs(300)));
+    let (client, token) = client(&server).await;
+    let (_directory, path) = fixture(FILE_BYTES);
+    // 1.5 MiB at 200 kB/s is 7.9 s of streaming, so the deadline this replaces
+    // - three times the bytes' own time plus the client window - was 53 s, and
+    // nothing on the wire would have ended the upload inside 30 s.
+    let limit = BandwidthLimit::new(200_000);
+
+    let started = Instant::now();
+    let error = client
+        .upload_asset(Auth::Token(&token), &upload_request(&path, &limit))
+        .await
+        .expect_err("a server that never answers cannot finish the upload");
+    let elapsed = started.elapsed();
+
+    assert!(matches!(error, ClientError::Stalled), "{error:?}");
+    assert!(
+        elapsed <= Duration::from_secs(60),
+        "a stalled upload took {elapsed:?}; the bound has to be the stall budget"
+    );
+}
+
+#[tokio::test]
+async fn an_unlimited_upload_still_gives_up_at_the_client_wide_window() {
+    let server = MockImmich::start().await;
+    server.fail(Operation::Upload, Fault::Slow(Duration::from_secs(300)));
+    let (client, token) = client(&server).await;
+    let (_directory, path) = fixture(FILE_BYTES);
+    let limit = BandwidthLimit::new(0);
+
+    let started = Instant::now();
+    let error = client
+        .upload_asset(Auth::Token(&token), &upload_request(&path, &limit))
+        .await
+        .expect_err("a server that never answers cannot finish the upload");
+    let elapsed = started.elapsed();
+
+    assert!(matches!(error, ClientError::Stalled), "{error:?}");
+    // An unlimited upload carries no total deadline any more, but it must not
+    // wait any longer than the 30 s window every request has always had.
+    assert!(
+        elapsed >= Duration::from_secs(29) && elapsed <= Duration::from_secs(45),
+        "an unlimited upload to a stalled server failed after {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn lowering_the_limit_mid_upload_does_not_abort_a_healthy_upload() {
+    let server = MockImmich::start().await;
+    let (client, token) = client(&server).await;
+    let (_directory, path) = fixture(FILE_BYTES);
+    // The engine starts unlimited, so the request is built with no limit in
+    // force and used to carry the client's 30 s total deadline. At 20 kB/s
+    // the rest of the file needs well over a minute of streaming, which that
+    // deadline cut short however well the server was behaving.
+    let limit = BandwidthLimit::new(0);
+
+    let started = Instant::now();
+    let upload = tokio::spawn({
+        let path = path.clone();
+        let limit = limit.clone();
+        async move {
+            let request = upload_request(&path, &limit);
+            client.upload_asset(Auth::Token(&token), &request).await
+        }
+    });
+    // The body is on the wire once the server has the request.
+    while server.upload_requests() == 0 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    limit.set(20_000);
+
+    let response = upload
+        .await
+        .expect("the upload task joins")
+        .expect("a healthy upload survives the limit that was set on it");
+    let elapsed = started.elapsed();
+
+    assert!(!response.duplicate);
+    assert_eq!(
+        server.upload_requests(),
+        1,
+        "the change must not re-issue the request"
+    );
+    // No floor on the elapsed time: how much of the body left the socket before
+    // the limit landed is the machine's business, and the proof is that the
+    // upload finishes at all rather than dying on a deadline nobody re-read.
+    assert!(
+        elapsed <= Duration::from_secs(150),
+        "a slow but progressing upload took {elapsed:?}"
     );
 }
 
