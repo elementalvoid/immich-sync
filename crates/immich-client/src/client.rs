@@ -285,21 +285,28 @@ impl ImmichClient {
             .unwrap_or("asset")
             .to_string();
         let part = file_part(upload.path).await?;
+        // R3.3: the sidecar part goes before every text field. Immich's multer
+        // filter resolves the `sidecarData` part's name from
+        // `body.filename || file.originalName` while it parses the stream, and
+        // `body.filename` is already the media name once the `filename` field
+        // is read — `mimeTypes.isSidecar("IMG_0001.jpg")` is false, so the
+        // filter answers `Unsupported file type` and every sidecar upload is a
+        // permanent 400. Sent first, the part's own `file_name()` is already
+        // `IMG_0001.jpg.xmp`, which is what `originalName` then supplies.
+        let mut form = Form::new().part("assetData", part);
+        if let Some(sidecar) = upload.sidecar {
+            // The sidecar streams from disk as its own part, so an asset with
+            // a sidecar does not hold the sidecar in memory.
+            form = form.part("sidecarData", file_part(sidecar).await?);
+        }
         // Immich requires the file's own dates on the asset. The caller reads
         // them from the local file (R3.1).
-        let mut form = Form::new()
-            .part("assetData", part)
+        form = form
             .text("filename", filename.clone())
             .text("deviceAssetId", upload.path.display().to_string())
             .text("deviceId", "immich-sync")
             .text("fileCreatedAt", iso8601(upload.created_at))
             .text("fileModifiedAt", iso8601(upload.modified_at));
-        // R3.3: one request carries the XMP sidecar and the live photo link.
-        // The sidecar streams from disk as its own part, so an asset with a
-        // sidecar does not hold the sidecar in memory.
-        if let Some(sidecar) = upload.sidecar {
-            form = form.part("sidecarData", file_part(sidecar).await?);
-        }
         if let Some(video_id) = upload.live_photo_video_id {
             form = form.text("livePhotoVideoId", video_id.to_string());
         }

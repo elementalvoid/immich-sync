@@ -122,6 +122,11 @@ pub struct UploadRecord {
     pub has_sidecar: bool,
     /// The `livePhotoVideoId` field, when the request carried one (R3.3).
     pub live_photo_video_id: Option<String>,
+    /// Every part name in the order the body carried them. Immich's multer
+    /// filter resolves a `sidecarData` part from `body.filename ||
+    /// file.originalName` while it parses the stream, so the order is part of
+    /// the request's meaning, not a detail.
+    pub parts: Vec<String>,
 }
 
 impl Inner {
@@ -702,6 +707,7 @@ async fn upload(
     let mut has_sidecar = false;
     let mut live_photo_video_id = None;
     let mut filename = None;
+    let mut parts = Vec::new();
     let mut file_created_at = None;
     let mut file_modified_at = None;
     loop {
@@ -711,6 +717,7 @@ async fn upload(
             Err(error) => return message(StatusCode::BAD_REQUEST, &error.to_string()),
         };
         let name = field.name().map(str::to_string);
+        parts.push(name.clone().unwrap_or_default());
         match name.as_deref() {
             Some("assetData") => match field.bytes().await {
                 Ok(bytes) => asset_data = bytes.to_vec(),
@@ -758,6 +765,7 @@ async fn upload(
         filename: filename.unwrap_or_default(),
         has_sidecar,
         live_photo_video_id: live_photo_video_id.clone(),
+        parts,
     });
     if let Some(asset) = inner.asset_by_checksum(&checksum) {
         return duplicate_response(&asset.id);
