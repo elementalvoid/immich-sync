@@ -29,11 +29,14 @@ use tokio::task::{JoinHandle, JoinSet};
 use crate::connection::RequestCredential;
 use crate::failure::{FailureClass, classify};
 use crate::hash::Sha1;
+use crate::pairing::FolderIndex;
 use crate::paths::{PathCase, is_within, path_key};
 use crate::scan::{ScanError, scan_folder};
 use crate::skip::{has_symlink_ancestor, skip_reason_below};
 use crate::store::{FolderCounts, ItemRecord, ItemState, SourceFolder, StateStore, StoreError};
-use crate::upload::{PreparedItem, UploadGate, UploadOutcome, Uploader, hash_in_background};
+use crate::upload::{
+    PreparedItem, UploadGate, UploadOutcome, Uploader, hash_in_background, pending_sidecar,
+};
 use crate::watch::FolderWatcher;
 
 /// How the engine decides what to do and when (SPEC R2.3, R3.1, R7.2).
@@ -618,6 +621,8 @@ impl EngineInner {
             asset_id: None,
             state,
             error_class: class,
+            // A failure sends nothing, so the sidecar is still owed (R3.3).
+            sidecar_sha1: None,
         };
         if let Err(store_error) = self.store.record(&record) {
             tracing::error!(error = %store_error, "the state database could not record the failure");
@@ -660,12 +665,27 @@ async fn dispatch_loop(inner: Arc<EngineInner>, mut queue_rx: mpsc::UnboundedRec
 
 /// Prepares one batch and checks it with one `bulk-upload-check` (R3.1).
 async fn process_batch(inner: &Arc<EngineInner>, batch: Vec<PathBuf>) {
+    // R3.3: the pairing rules need the folders' other files, so they are read
+    // once per batch on a blocking thread, before any file is hashed.
+    let index = {
+        let batch = batch.clone();
+        tokio::task::spawn_blocking(move || FolderIndex::read(&batch))
+            .await
+            .unwrap_or_default()
+    };
     let mut prepared = Vec::with_capacity(batch.len());
     for path in batch {
-        if let Some(item) = prepare(inner, &path).await {
+        if let Some(item) = prepare(inner, &path, &index).await {
             prepared.push(item);
         }
     }
+    // R3.3: the photo uploads its motion video first and links it, so a video a
+    // photo in this batch claims is not also uploaded as an item of its own.
+    let claimed: HashSet<PathBuf> = prepared
+        .iter()
+        .filter_map(|item| item.live_photo_video.clone())
+        .collect();
+    prepared.retain(|item| !claimed.contains(&item.path));
     if prepared.is_empty() {
         return;
     }
@@ -690,14 +710,23 @@ async fn process_batch(inner: &Arc<EngineInner>, batch: Vec<PathBuf>) {
                     .map(|result| result.action.clone());
                 match action {
                     Some(BulkAction::Accept) => spawn_upload(inner, item).await,
+                    // R3.3: a duplicate the asset already holds still has to
+                    // carry a sidecar the server does not have, so the upload
+                    // runs; the server answers duplicate again and no second
+                    // asset is created.
                     Some(BulkAction::Reject {
                         reason: RejectReason::Duplicate,
                         asset_id: Some(asset_id),
                         ..
-                    }) => {
+                    }) if item.sidecar.is_none() => {
                         record_terminal(inner, &item, &asset_id, ItemState::Duplicate);
                         inner.finish_item(&item, &UploadOutcome::Duplicate { asset_id });
                     }
+                    Some(BulkAction::Reject {
+                        reason: RejectReason::Duplicate,
+                        asset_id: Some(_),
+                        ..
+                    }) => spawn_upload(inner, item).await,
                     Some(BulkAction::Reject {
                         reason: RejectReason::UnsupportedFormat,
                         ..
@@ -768,6 +797,7 @@ fn record_terminal(inner: &EngineInner, item: &PreparedItem, asset_id: &str, sta
         asset_id: Some(asset_id.to_string()),
         state,
         error_class: None,
+        sidecar_sha1: item.sidecar.as_ref().map(|sidecar| sidecar.sha1),
     };
     if let Err(error) = inner.store.record(&record) {
         tracing::error!(error = %error, "the state database could not record the outcome");
@@ -776,7 +806,16 @@ fn record_terminal(inner: &EngineInner, item: &PreparedItem, asset_id: &str, sta
 
 /// Hashes one discovered path, skips what is already known, and records the
 /// pending row the durable queue needs (R6.7).
-async fn prepare(inner: &Arc<EngineInner>, path: &Path) -> Option<PreparedItem> {
+///
+/// The folder index resolves what belongs to the asset rather than to a file of
+/// its own (R3.3): the XMP sidecar to send, and the live photo video to upload
+/// first. A sidecar the asset does not carry yet is work even when the media
+/// file itself is settled, so a sidecar that appears later reaches the asset.
+async fn prepare(
+    inner: &Arc<EngineInner>,
+    path: &Path,
+    index: &FolderIndex,
+) -> Option<PreparedItem> {
     let key = path_key(path);
     {
         let mut in_flight = inner.in_flight.lock().expect("the in-flight lock");
@@ -812,10 +851,19 @@ async fn prepare(inner: &Arc<EngineInner>, path: &Path) -> Option<PreparedItem> 
     // size and mtime are unchanged needs no bytes read, so a reconciliation
     // scan does not re-hash an entire settled library.
     let existing = inner.store.item(&path_text).ok().flatten();
+    let case = PathCase::for_platform();
+    let sidecar = pending_sidecar(
+        path,
+        index,
+        case,
+        existing.as_ref().and_then(|row| row.sidecar_sha1),
+    )
+    .await;
     if let Some(row) = &existing
         && row.size == size
         && row.mtime_ns == mtime_ns
         && is_settled(row.state)
+        && sidecar.is_none()
     {
         inner
             .in_flight
@@ -839,6 +887,7 @@ async fn prepare(inner: &Arc<EngineInner>, path: &Path) -> Option<PreparedItem> 
     if let Some(row) = &existing
         && row.sha1 == sha1
         && is_settled(row.state)
+        && sidecar.is_none()
     {
         // R4.5: the same SHA-1 with a recorded outcome never runs again. A
         // failed row is parked until #7 adds the retry policy.
@@ -854,6 +903,10 @@ async fn prepare(inner: &Arc<EngineInner>, path: &Path) -> Option<PreparedItem> 
         size,
         mtime_ns,
         sha1,
+        live_photo_video: index
+            .live_photo_video_for(path, case)
+            .map(Path::to_path_buf),
+        sidecar,
     };
     let record = ItemRecord {
         path: path_text,
@@ -863,6 +916,7 @@ async fn prepare(inner: &Arc<EngineInner>, path: &Path) -> Option<PreparedItem> 
         asset_id: None,
         state: ItemState::Pending,
         error_class: None,
+        sidecar_sha1: item.sidecar.as_ref().map(|sidecar| sidecar.sha1),
     };
     if let Err(error) = inner.store.record(&record) {
         tracing::error!(error = %error, "the state database could not record the pending item");

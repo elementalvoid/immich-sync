@@ -1,9 +1,13 @@
-//! The one-file upload pipeline (SPEC R3, R3.2, R3.6, R4.5).
+//! The one-file upload pipeline (SPEC R3, R3.2, R3.3, R3.6, R4.5).
 //!
 //! SHA-1 the file, look the checksum up, upload only what the server accepts,
 //! and record the outcome. The pipeline is one file and one attempt: it has no
 //! retry loop, because #7 owns classification-backed retries. It records the
 //! class and the state that the retry work will read.
+//!
+//! The pipeline also carries what belongs to the asset rather than to a file
+//! of its own (R3.3): the XMP sidecar rides along in the same request, and a
+//! live photo's motion video uploads first so the photo can link it.
 //!
 //! The shape is what #6 batches: one [`Uploader`] over the shared state store,
 //! called once per item from a worker.
@@ -20,6 +24,8 @@ use immich_client::{
 use crate::connection::RequestCredential;
 use crate::failure::{FailureClass, FailureKind, classify};
 use crate::hash::{HashError, Sha1};
+use crate::pairing::FolderIndex;
+use crate::paths::PathCase;
 use crate::store::{ItemRecord, ItemState, StateStore};
 
 /// What one pipeline run produced (R3.2, R3.6).
@@ -77,6 +83,16 @@ impl UploadGate {
     }
 }
 
+/// The XMP sidecar that rides along with one upload (R3.3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SidecarFile {
+    /// The sidecar path, sent as the `sidecarData` part.
+    pub path: PathBuf,
+    /// The SHA-1 of the sidecar's content, which the store records as sent, so
+    /// the same sidecar is not uploaded twice (R4.5).
+    pub sha1: Sha1,
+}
+
 /// One file that was hashed and is ready to upload (R3.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedItem {
@@ -88,6 +104,12 @@ pub struct PreparedItem {
     pub mtime_ns: i64,
     /// The SHA-1 of the content.
     pub sha1: Sha1,
+    /// The XMP sidecar the asset does not carry yet (R3.3). `None` when there
+    /// is no sidecar, or when the asset already carries this exact one.
+    pub sidecar: Option<SidecarFile>,
+    /// The live photo video paired with this photo (R3.3). It uploads first,
+    /// and its asset id is the `livePhotoVideoId` link.
+    pub live_photo_video: Option<PathBuf>,
 }
 
 /// Why one pipeline run failed.
@@ -126,6 +148,11 @@ impl Uploader {
     /// Hashes `path`, checks the checksum, uploads it when accepted, and records
     /// the outcome.
     ///
+    /// The XMP sidecar and the live photo video are resolved here from the
+    /// folder the file sits in (R3.3), so a one-file upload — the manual
+    /// upload view, or the live photo's own video — pairs the same way the
+    /// engine does.
+    ///
     /// # Errors
     ///
     /// Every failure is returned as [`UploadOutcome::Failed`]; a local read
@@ -143,11 +170,18 @@ impl Uploader {
             Err(error) => return self.local_hash_failure(&path_text, error),
         };
 
+        let existing = self.store.item(&path_text).ok().flatten();
+        let (sidecar, live_photo_video) = self
+            .paired_with(path, existing.as_ref().and_then(|row| row.sidecar_sha1))
+            .await;
+
         // R4.5: the same SHA-1 with a known asset does not upload again. A row
         // with no asset id is a previous failure, so it is attempted again.
-        if let Ok(Some(item)) = self.store.item(&path_text)
-            && item.sha1 == sha1
-            && let Some(asset_id) = item.asset_id
+        // A sidecar the asset does not carry yet is work even so (R3.3).
+        if let Some(row) = &existing
+            && row.sha1 == sha1
+            && sidecar.is_none()
+            && let Some(asset_id) = row.asset_id.clone()
         {
             tracing::info!(
                 path = %path_text,
@@ -166,6 +200,7 @@ impl Uploader {
             asset_id: None,
             state: ItemState::RetryWait,
             error_class: None,
+            sidecar_sha1: sidecar.as_ref().map(|sidecar| sidecar.sha1),
         };
 
         let checksum = sha1.base64();
@@ -214,16 +249,23 @@ impl Uploader {
                         },
                     );
                 };
-                item.asset_id = Some(asset_id.clone());
-                item.state = ItemState::Duplicate;
-                self.record(&item);
-                tracing::info!(
-                    path = %path_text,
-                    asset_id = %asset_id,
-                    outcome = "duplicate",
-                    "the server already has these bytes"
-                );
-                return UploadOutcome::Duplicate { asset_id };
+                // R3.3: a duplicate the asset already holds still has to carry
+                // a sidecar the server does not have, and POST /assets is the
+                // only Stable way to send one. The server answers duplicate
+                // again, so no second asset is created.
+                if sidecar.is_none() {
+                    item.asset_id = Some(asset_id.clone());
+                    item.state = ItemState::Duplicate;
+                    self.record(&item);
+                    tracing::info!(
+                        path = %path_text,
+                        asset_id = %asset_id,
+                        outcome = "duplicate",
+                        "the server already has these bytes"
+                    );
+                    return UploadOutcome::Duplicate { asset_id };
+                }
+                item.asset_id = Some(asset_id);
             }
             BulkAction::Reject {
                 reason: RejectReason::UnsupportedFormat,
@@ -248,7 +290,14 @@ impl Uploader {
             }
         }
 
-        self.send_upload(&mut item, &checksum, credential).await
+        self.send_upload(
+            &mut item,
+            &checksum,
+            sidecar.as_ref(),
+            live_photo_video.as_deref(),
+            credential,
+        )
+        .await
     }
 
     /// Uploads a file the caller already hashed and the server already
@@ -271,6 +320,7 @@ impl Uploader {
             asset_id: None,
             state: ItemState::Uploading,
             error_class: None,
+            sidecar_sha1: prepared.sidecar.as_ref().map(|sidecar| sidecar.sha1),
         };
         if gate.is_paused() {
             item.state = ItemState::Pending;
@@ -279,8 +329,71 @@ impl Uploader {
             return UploadOutcome::Deferred;
         }
         self.record(&item);
-        self.send_upload(&mut item, &prepared.sha1.base64(), credential)
-            .await
+        self.send_upload(
+            &mut item,
+            &prepared.sha1.base64(),
+            prepared.sidecar.as_ref(),
+            prepared.live_photo_video.as_deref(),
+            credential,
+        )
+        .await
+    }
+
+    /// The XMP sidecar and the live photo video that belong to `path` (R3.3).
+    ///
+    /// `recorded` is the sidecar digest the asset already carries: a sidecar
+    /// with that digest has reached the server and is not sent again (R4.5).
+    async fn paired_with(
+        &self,
+        path: &Path,
+        recorded: Option<Sha1>,
+    ) -> (Option<SidecarFile>, Option<PathBuf>) {
+        let case = PathCase::for_platform();
+        let index = FolderIndex::read(std::slice::from_ref(&path.to_path_buf()));
+        let sidecar = pending_sidecar(path, &index, case, recorded).await;
+        let live_photo_video = index
+            .live_photo_video_for(path, case)
+            .map(Path::to_path_buf);
+        (sidecar, live_photo_video)
+    }
+
+    /// The asset id of the live photo video for `photo`, uploading it when the
+    /// server does not hold it yet (R3.3).
+    ///
+    /// The store is the lookup, so a video uploaded by an earlier pass or an
+    /// earlier run is found without sending it again.
+    async fn live_photo_video_id(
+        &self,
+        photo: &Path,
+        video: &Path,
+        credential: &RequestCredential,
+    ) -> Option<String> {
+        if let Ok(Some(row)) = self.store.item(&video.to_string_lossy())
+            && row.state.is_terminal_success()
+            && let Some(asset_id) = row.asset_id.clone()
+        {
+            tracing::debug!(path = %video.display(), asset_id = %asset_id, "the live photo video is already on the server");
+            return Some(asset_id);
+        }
+        // The video goes through the same pipeline, which resolves its own
+        // pairing; a video has no video sibling, so the recursion stops here.
+        // The indirection is boxed only to break the async type cycle.
+        match Box::pin(self.upload_one(video, credential)).await {
+            UploadOutcome::Created { asset_id } | UploadOutcome::Duplicate { asset_id } => {
+                Some(asset_id)
+            }
+            UploadOutcome::Failed(failure) => {
+                tracing::warn!(
+                    photo = %photo.display(),
+                    video = %video.display(),
+                    permanent = failure.is_permanent(),
+                    class = failure.class.map_or("none", FailureClass::as_str),
+                    "the live photo video did not upload; the photo goes up unlinked"
+                );
+                None
+            }
+            UploadOutcome::Deferred => None,
+        }
     }
 
     /// Sends one accepted file and records the outcome (R3.2, R3.6).
@@ -288,8 +401,21 @@ impl Uploader {
         &self,
         item: &mut ItemRecord,
         checksum: &str,
+        sidecar: Option<&SidecarFile>,
+        live_photo_video: Option<&Path>,
         credential: &RequestCredential,
     ) -> UploadOutcome {
+        // R3.3: the motion video uploads first, so the link never names an
+        // asset the server does not have. A video that fails is parked by its
+        // own upload, and the photo still goes up without the link rather than
+        // being lost with it.
+        let live_photo_video_id = match live_photo_video {
+            Some(video) => {
+                self.live_photo_video_id(Path::new(&item.path), video, credential)
+                    .await
+            }
+            None => None,
+        };
         // Immich requires the file's own dates on the asset (R3.1). The
         // creation time is missing on some platforms and filesystems; the
         // modification time is the honest fallback.
@@ -311,6 +437,8 @@ impl Uploader {
                     checksum,
                     created_at,
                     modified_at,
+                    sidecar: sidecar.map(|sidecar| sidecar.path.as_path()),
+                    live_photo_video_id: live_photo_video_id.as_deref(),
                 },
             )
             .await
@@ -419,6 +547,36 @@ pub(crate) async fn hash_in_background(path: PathBuf) -> Result<Sha1, HashError>
                 source: std::io::Error::other(join.to_string()),
             })
         })
+}
+
+/// The XMP sidecar for `media` that the asset does not carry yet (R3.3).
+///
+/// `recorded` is the digest the store last sent with the asset: a sidecar with
+/// that digest has reached the server and must not upload again (R4.5). A
+/// sidecar that cannot be read is left for a later pass rather than failing the
+/// media file with it.
+pub(crate) async fn pending_sidecar(
+    media: &Path,
+    index: &FolderIndex,
+    case: PathCase,
+    recorded: Option<Sha1>,
+) -> Option<SidecarFile> {
+    let found = index.sidecar_for(media, case)?.to_path_buf();
+    let sha1 = match hash_in_background(found.clone()).await {
+        Ok(sha1) => sha1,
+        Err(error) => {
+            tracing::warn!(
+                path = %found.display(),
+                error = %error,
+                "the XMP sidecar could not be read; the asset goes up without it"
+            );
+            return None;
+        }
+    };
+    if recorded == Some(sha1) {
+        return None;
+    }
+    Some(SidecarFile { path: found, sha1 })
 }
 
 /// A modification time as nanoseconds since the Unix epoch.
