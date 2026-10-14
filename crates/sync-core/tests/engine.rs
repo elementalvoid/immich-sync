@@ -3431,6 +3431,57 @@ async fn trash_moves_the_asset_to_the_trash_and_clears_the_item() {
 }
 
 #[tokio::test]
+async fn a_keep_that_lands_while_the_delete_is_in_flight_still_records_the_trash() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let file = write_file(&photos, "race.jpg", b"race bytes");
+    add_folder(&store, &photos, true);
+    let engine = start_engine(&server, &store, EngineConfig::default()).await;
+    let asset_id = sync_one(&store, &file).await;
+    std::fs::remove_file(&file).expect("delete the fixture");
+    wait_for_review(&engine, 1).await;
+
+    // The DELETE sits on the wire long enough for a Keep to land inside the
+    // same window: Trash already read the row and is awaiting the response.
+    server.fail(
+        Operation::DeleteAssets,
+        Fault::Slow(Duration::from_millis(500)),
+    );
+    let path = file.display().to_string();
+    let trash_engine = Arc::clone(&engine);
+    let trash_path = path.clone();
+    let trash = tokio::spawn(async move { trash_engine.trash_review_item(&trash_path).await });
+    // Yield so the trash task runs up to its awaiting DELETE before Keep.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        engine.keep_review_item(&path).expect("keep the asset"),
+        "the item is still waiting when Keep lands"
+    );
+
+    let outcome = trash.await.expect("the trash task");
+    assert!(outcome.is_ok(), "the DELETE succeeded: {outcome:?}");
+    assert!(server.trashed(&asset_id), "the DELETE reached the server");
+    assert_eq!(
+        store
+            .item(&path)
+            .expect("read the row")
+            .expect("the row exists")
+            .state,
+        ItemState::ReviewTrash,
+        "a successful DELETE is the last word, whatever Keep recorded while it waited"
+    );
+    assert_eq!(engine.review_items().expect("read the review").len(), 0);
+    assert_eq!(
+        engine.status().counts.review,
+        0,
+        "Keep already took the item off the review count"
+    );
+    engine.stop();
+}
+
+#[tokio::test]
 async fn a_trash_without_the_permission_keeps_the_item_in_the_review() {
     let server = MockImmich::start().await;
     let temp = tempfile::tempdir().expect("create a temp dir");

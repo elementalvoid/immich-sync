@@ -1215,6 +1215,30 @@ impl StateStore {
         Ok(changed > 0)
     }
 
+    /// Records that one asset moved to the trash (R5.3), even when a Keep
+    /// decision landed while the DELETE was in flight. Returns whether a row
+    /// changed.
+    ///
+    /// The server's answer is the last word on the asset, so a row that a
+    /// Keep settled during the request must not go on claiming the asset was
+    /// kept. A row already in `review_trash` is left alone, so a second report
+    /// of the same trash changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the write fails or the lock is poisoned.
+    pub fn record_review_trash(&self, path: &str) -> Result<bool, StoreError> {
+        let writer = self.writer()?;
+        let changed = writer
+            .execute(
+                "UPDATE sync_item SET state = 'review_trash'
+                 WHERE path_key = ?1 AND state <> 'review_trash'",
+                [path_key(Path::new(path))],
+            )
+            .map_err(|source| self.query_error(source))?;
+        Ok(changed > 0)
+    }
+
     /// Every missing file the deletion review lists, in path order (R5.3).
     ///
     /// # Errors

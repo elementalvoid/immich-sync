@@ -795,6 +795,15 @@ impl Engine {
         {
             self.inner.note_review_decided(path);
             tracing::info!(path, asset_id, "R5.3: the asset moved to the trash");
+        } else if self.inner.store.record_review_trash(path)? {
+            // A Keep landed while the DELETE was in flight. The asset is gone
+            // all the same, so the row records the trash instead of claiming a
+            // keep; the count was already taken off by that Keep (R5.3).
+            tracing::info!(
+                path,
+                asset_id,
+                "R5.3: the asset moved to the trash while a keep was recorded"
+            );
         }
         Ok(())
     }
