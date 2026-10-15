@@ -790,3 +790,64 @@ async fn the_album_controls_reach_the_store_by_pointer_and_by_keyboard(cx: &mut 
     .await;
     assert!(leaf.album_mapping);
 }
+
+#[gpui_kit::test]
+async fn the_recursive_switch_reaches_the_store_by_pointer_and_by_keyboard(
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the fixture folder");
+    let (window, store) = open_live_dashboard(cx, temp.path());
+    add_folder_through_ui(cx, window, &store, &photos).await;
+
+    // R2.1: the field adds a folder recursively, and the card's switch shows
+    // and changes the flag the store holds.
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find(("folder-recursive", 0_usize)).label(),
+            Some("Sync photos recursively")
+        );
+        assert_eq!(
+            window.find(("folder-recursive", 0_usize)).checked(),
+            Some(true),
+            "a folder added through the field starts recursive"
+        );
+    })
+    .expect("read the recursion switch");
+
+    // Turn album mapping on first: the recursion toggle must not disturb it.
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(("folder-album", 0_usize), cx);
+    })
+    .expect("turn album mapping on");
+    wait_for_folder(cx, &store, |folder| folder.album_mapping).await;
+
+    // The switch is a tab stop that activates with Space (N5).
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        tab_to(window, ("folder-recursive", 0_usize), cx);
+        window.press("space", cx);
+    })
+    .expect("turn recursion off with the keyboard");
+    let flat = wait_for_folder(cx, &store, |folder| !folder.recursive).await;
+    assert!(
+        flat.album_mapping,
+        "R2.1: the recursion toggle keeps the album mapping"
+    );
+
+    // And back on by pointer, still preserving the other per-folder settings.
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(("folder-recursive", 0_usize), cx);
+    })
+    .expect("turn recursion on with the pointer");
+    let recursive = wait_for_folder(cx, &store, |folder| folder.recursive).await;
+    assert!(
+        recursive.album_mapping,
+        "R2.1: the switch back keeps the album mapping"
+    );
+}

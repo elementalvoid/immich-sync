@@ -587,15 +587,28 @@ impl EngineModel {
                     .map(|()| None)
                     .map_err(|error| error.to_string()),
                 None => match store {
-                    Some(store) => match store.add_folder(&SourceFolder {
-                        path: path.clone(),
-                        recursive,
-                        // R3.4: adding a folder never opts it into album
-                        // mapping; the card's switch does that on purpose.
-                        album_mapping: false,
-                        album_scope: AlbumScope::default(),
-                    }) {
-                        Ok(()) => store.folders().map(Some).map_err(|error| error.to_string()),
+                    Some(store) => match store.folders() {
+                        // R3.4: a new folder never opts into album mapping,
+                        // but editing an existing one (the recursion toggle)
+                        // must keep the album settings it already has.
+                        Ok(folders) => {
+                            let existing = folders.into_iter().find(|folder| folder.path == path);
+                            let album_mapping =
+                                existing.as_ref().is_some_and(|folder| folder.album_mapping);
+                            let album_scope = existing
+                                .map_or_else(AlbumScope::default, |folder| folder.album_scope);
+                            match store.add_folder(&SourceFolder {
+                                path: path.clone(),
+                                recursive,
+                                album_mapping,
+                                album_scope,
+                            }) {
+                                Ok(()) => {
+                                    store.folders().map(Some).map_err(|error| error.to_string())
+                                }
+                                Err(error) => Err(error.to_string()),
+                            }
+                        }
                         Err(error) => Err(error.to_string()),
                     },
                     None => Err("The state database is still opening.".to_string()),

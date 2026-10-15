@@ -51,6 +51,9 @@ pub struct StatusCard {
     pub counts: Counts,
     /// The deletion review items that await a decision.
     pub review_count: u32,
+    /// Whether the watcher and the scan descend into subfolders (R2.1);
+    /// only meaningful on a folder card.
+    pub recursive: bool,
     /// Whether this source folder's files join an album (R3.4); always `false`
     /// on the global card, which is not a mapped folder.
     pub album_mapping: bool,
@@ -187,6 +190,7 @@ impl DashboardModel {
             available: true,
             connection,
             last_error: status.last_error.clone(),
+            recursive: false,
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
         };
@@ -213,6 +217,7 @@ impl DashboardModel {
                 available: folder.available,
                 connection: None,
                 last_error: folder.last_error.clone(),
+                recursive: folder.recursive,
                 album_mapping: folder.album_mapping,
                 album_scope: folder.album_scope,
             })
@@ -246,6 +251,7 @@ pub fn sample() -> DashboardModel {
             available: true,
             connection: Some("Connected".to_string()),
             last_error: None,
+            recursive: false,
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
         },
@@ -264,6 +270,7 @@ pub fn sample() -> DashboardModel {
                 available: true,
                 connection: None,
                 last_error: None,
+                recursive: true,
                 album_mapping: true,
                 album_scope: AlbumScope::WholeFolder,
             },
@@ -281,6 +288,7 @@ pub fn sample() -> DashboardModel {
                 available: true,
                 connection: None,
                 last_error: None,
+                recursive: true,
                 album_mapping: true,
                 album_scope: AlbumScope::Leaf,
             },
@@ -300,6 +308,7 @@ pub fn sample() -> DashboardModel {
                 last_error: Some(
                     "permission_denied: the API key cannot write to this album".to_string(),
                 ),
+                recursive: false,
                 album_mapping: true,
                 album_scope: AlbumScope::WholeFolder,
             },
@@ -317,6 +326,7 @@ pub fn sample() -> DashboardModel {
                 available: true,
                 connection: None,
                 last_error: None,
+                recursive: true,
                 album_mapping: false,
                 album_scope: AlbumScope::Leaf,
             },
