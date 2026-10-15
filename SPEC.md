@@ -128,7 +128,7 @@ Acceptance: on Windows, config resolves under `%APPDATA%` and state under `%LOCA
 
 ### R10 — Diagnostics and notifications
 
-- R10.1 The client notifies the user about a permanent error or a lost connection, and about a new deletion review item.
+- R10.1 The client notifies the user about a permanent error or a lost connection, and about a new deletion review item. A permanent error already parked at startup is not re-announced.
 - R10.2 A diagnostics view shows the server version, the granted permissions, the last error per class, and current throughput.
 - R10.3 The client writes a rotating log file. The log contains no password, API key, or session token.
 - R10.4 The diagnostics view offers a state rebuild. The rebuild rescans folders and re-checks the server.
