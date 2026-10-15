@@ -574,10 +574,18 @@ impl EngineModel {
                             // R3.4: a new folder never opts into album mapping,
                             // but editing an existing one (the recursion
                             // toggle) must keep the album settings it already
-                            // has.
+                            // has. The lookup compares path keys (R2.4),
+                            // so a re-add spelled differently still edits the
+                            // row it already has.
                             Ok(folders) => {
-                                let existing =
-                                    folders.into_iter().find(|folder| folder.path == path);
+                                let case = sync_core::paths::PathCase::for_platform();
+                                let existing = folders.into_iter().find(|folder| {
+                                    sync_core::paths::equal(
+                                        Path::new(&folder.path),
+                                        Path::new(&path),
+                                        case,
+                                    )
+                                });
                                 let album_mapping =
                                     existing.as_ref().is_some_and(|folder| folder.album_mapping);
                                 let album_scope = existing

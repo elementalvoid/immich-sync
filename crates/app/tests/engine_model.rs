@@ -927,3 +927,67 @@ async fn a_re_login_resumes_the_batch_a_refused_connection_left_pending(cx: &mut
         "R1.4: the re-login must resume what the refused batch left pending"
     );
 }
+
+/// R3.4: an edit made while signed out goes straight to the store. Re-adding a
+/// folder that is already album-mapped must keep its album settings, even when
+/// the user spells the path differently (R2.4): the store's upsert replaces
+/// the whole row, so the lookup must compare path keys, not raw strings.
+#[gpui_kit::test]
+async fn a_signed_out_re_add_of_a_mapped_folder_keeps_its_album_settings(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    // The connection stays signed out, so the add takes the store-only path.
+    let connection = cx.update(|cx| {
+        let credentials: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+        cx.new(|_| ConnectionModel::new(ServerProfile::default(), credentials))
+    });
+    let store = cx.update(|cx| cx.new(|cx| StoreModel::open(&paths, cx)));
+    for _ in 0..600 {
+        if cx.read(|cx| store.read(cx).store().is_some()) {
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    cx.read(|cx| store.read(cx).store().expect("the store is open"))
+        .add_folder(&SourceFolder {
+            path: photos.display().to_string(),
+            recursive: true,
+            album_mapping: true,
+            album_scope: sync_core::store::AlbumScope::WholeFolder,
+        })
+        .expect("seed the mapped folder");
+
+    let engine =
+        cx.update(|cx| cx.new(|cx| EngineModel::new(connection, store.clone(), &paths, cx)));
+    cx.update(|cx| {
+        engine.update(cx, |model, cx| {
+            model.add_folder(format!("{}/", photos.display()), true, cx);
+        });
+    });
+
+    let mut readded = None;
+    for _ in 0..600 {
+        let folders = cx.read(|cx| store.read(cx).folders().to_vec());
+        if let Some(folder) = folders.first()
+            && folder.path.ends_with('/')
+        {
+            readded = Some(folder.clone());
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    let readded = readded.expect("the signed-out re-add reached the store");
+    assert!(
+        readded.album_mapping,
+        "R3.4: the re-add must keep the mapping on"
+    );
+    assert_eq!(
+        readded.album_scope,
+        sync_core::store::AlbumScope::WholeFolder,
+        "R3.4: the re-add must keep the stored scope"
+    );
+}
