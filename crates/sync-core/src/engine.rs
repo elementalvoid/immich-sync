@@ -200,7 +200,9 @@ pub struct EngineStatus {
     pub activity: Activity,
     /// One entry per source folder, in the stored order.
     pub folders: Vec<FolderStatus>,
-    /// The summed counts across folders.
+    /// The summed counts across folders. The review count is the store's
+    /// global one, because a row under a removed source folder still waits
+    /// for a decision and still shows in [`Engine::review_items`].
     pub counts: FolderCounts,
     /// The last failure the engine recorded, if any.
     pub last_error: Option<String>,
@@ -742,6 +744,14 @@ impl Engine {
             counts.failed += folder.counts.failed;
             counts.review += folder.counts.review;
         }
+        // R5.4: the review is counted from the store, not summed over the
+        // current folders. A row under a removed source folder is still a
+        // decision the user owes, and it still shows in `review_items`, so a
+        // folder sum would let the tray total disagree with the list.
+        counts.review = self.inner.store.review_count().unwrap_or_else(|error| {
+            tracing::warn!(error = %error, "the review count could not be read");
+            counts.review
+        });
         let activity = if self.inner.gate.is_paused() {
             Activity::Paused
         } else if !self.inner.session.state().is_connected()

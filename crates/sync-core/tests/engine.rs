@@ -3780,6 +3780,44 @@ async fn a_deleted_file_becomes_exactly_one_review_item() {
     engine.stop();
 }
 
+/// A review row keeps waiting after its source folder is removed, so the
+/// tray's total must count it too (R5.4): the list shows it, and a total of
+/// zero is a tray that disagrees with what the user can see.
+#[tokio::test]
+async fn a_review_row_under_a_removed_folder_still_counts_once() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let file = write_file(&photos, "gone.jpg", b"gone bytes");
+    add_folder(&store, &photos, true);
+    let engine = start_engine(
+        &server,
+        &store,
+        review_config(Duration::from_secs(1), false),
+    )
+    .await;
+    sync_one(&store, &file).await;
+
+    // The file is deleted while the folder is still a source folder, so the
+    // scan raises the review row; the folder is then removed, and the rows
+    // under it stay in the store for the user to decide on.
+    std::fs::remove_file(&file).expect("delete the fixture");
+    wait_for_review(&engine, 1).await;
+    engine
+        .remove_folder(&photos.display().to_string())
+        .expect("remove the source folder");
+
+    let items = engine.review_items().expect("read the review");
+    assert_eq!(items.len(), 1, "the removed folder's row is still listed");
+    assert_eq!(
+        engine.status().counts.review,
+        1,
+        "R5.4: the tray total must match the list, not only the current folders"
+    );
+    engine.stop();
+}
+
 #[tokio::test]
 async fn keep_leaves_the_server_asset_and_clears_the_item() {
     let server = MockImmich::start().await;
