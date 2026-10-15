@@ -4,6 +4,8 @@
 //! Every test drives the real pipeline: a real directory, the real watcher and
 //! scan, the real state store, and the mock server's request counters.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -22,6 +24,8 @@ use sync_core::store::{
     AlbumScope, AttemptOutcome, AttemptRecord, FolderCounts, ItemRecord, ItemState, SourceFolder,
     StateStore,
 };
+
+use common::wait_until;
 
 /// Starts the mock and signs in, returning the session the engine attaches to
 /// every request (R1.4).
@@ -83,20 +87,6 @@ async fn start_engine(
     let engine = Arc::new(Engine::new(store.clone(), session, config).expect("build the engine"));
     engine.start();
     engine
-}
-
-/// Polls `check` until it returns true, or the timeout elapses.
-async fn wait_until(mut check: impl FnMut() -> bool, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if check() {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
 }
 
 /// Whether every path has a terminal success row.
@@ -779,6 +769,52 @@ async fn a_transient_failure_that_later_succeeds_clears_the_folder_error() {
 }
 
 #[tokio::test]
+async fn a_recovered_folder_clears_the_global_last_error() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    write_file(&photos, "mapped.jpg", b"mapped bytes");
+    add_mapped_folder(&store, &photos, true, AlbumScope::Leaf);
+    // The upload lands, but the album call it maps to fails, which records the
+    // failure on the folder and on the tray's global card (R3.4, R8.2).
+    server.fail(
+        Operation::CreateAlbum,
+        Fault::Status {
+            code: 500,
+            retry_after: None,
+        },
+    );
+    let config = EngineConfig {
+        watch: false,
+        ..EngineConfig::default()
+    };
+    let engine = start_engine(&server, &store, config).await;
+
+    assert!(
+        wait_until(
+            || engine.status().last_error.is_some(),
+            Duration::from_secs(15)
+        )
+        .await,
+        "the album failure was not recorded globally"
+    );
+
+    // A later scan finds the folder available and nothing failing.
+    engine.sync_now();
+    assert!(
+        wait_until(
+            || engine.status().last_error.is_none(),
+            Duration::from_secs(10)
+        )
+        .await,
+        "the global last error stayed sticky after recovery: {:?}",
+        engine.status()
+    );
+    engine.stop();
+}
+
+#[tokio::test]
 async fn a_restart_with_a_pending_row_does_not_double_count_the_pending_item() {
     let server = MockImmich::start().await;
     let temp = tempfile::tempdir().expect("create a temp dir");
@@ -993,6 +1029,68 @@ async fn adding_a_folder_through_the_engine_syncs_its_existing_files() {
         .expect("remove the folder");
     assert!(engine.status().folders.is_empty());
     assert!(store.folders().expect("read the folders").is_empty());
+    engine.stop();
+}
+
+/// Re-adding an existing folder applies the new recursive flag to the store,
+/// the card, and the watch (R2.1).
+///
+/// A recursive watch also watches every subfolder; re-watching the root alone
+/// leaves those behind, so a folder turned non-recursive would keep reporting
+/// nested files. The watcher is real here: only the watcher can find the late
+/// file, because the scan interval is an hour and nothing calls `sync_now`.
+#[tokio::test]
+async fn re_adding_a_folder_applies_the_new_recursive_flag() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    add_folder(&store, &photos, true);
+    let nested = write_file(&photos, "Holiday/beach.jpg", b"nested bytes");
+    let engine = start_engine(
+        &server,
+        &store,
+        EngineConfig {
+            watch: true,
+            watch_debounce: Duration::from_millis(200),
+            scan_interval: Duration::from_secs(3600),
+            ..EngineConfig::default()
+        },
+    )
+    .await;
+    // The folder is recursive, so the nested file uploads.
+    assert!(
+        wait_until(
+            || all_terminal(&store, std::slice::from_ref(&nested)),
+            Duration::from_secs(20)
+        )
+        .await,
+        "the recursive folder did not find the nested file"
+    );
+
+    engine
+        .add_folder(&photos.display().to_string(), false)
+        .expect("re-add the folder");
+    assert!(
+        !engine.status().folders[0].recursive,
+        "the card must show the new flag"
+    );
+    assert!(
+        !store.folders().expect("read the folders")[0].recursive,
+        "the store must hold the new flag"
+    );
+
+    // A file in a subfolder must not reach the queue: the watch moved to
+    // non-recursive.
+    let late = write_file(&photos, "Holiday/late.jpg", b"late nested bytes");
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert!(
+        store
+            .item(&late.display().to_string())
+            .expect("read the row")
+            .is_none(),
+        "R2.1: a nested file must not be discovered after the folder turned non-recursive"
+    );
     engine.stop();
 }
 
@@ -2773,6 +2871,96 @@ async fn a_refused_copy_keeps_the_upload_and_records_no_new_version() {
             .collect::<Vec<_>>(),
         vec![file.display().to_string()],
         "R6.5: the item is in the failed-items view for a manual retry"
+    );
+    engine.stop();
+}
+
+/// A promote failure must keep the sidecar the upload already sent (R3.3,
+/// R4.5).
+///
+/// The upload that creates the new version carries the changed sidecar and
+/// records its digest before the version flow runs. When a promote call then
+/// fails, the row is parked for a retry; if the digest is erased, the retry
+/// offers the sidecar again, and the checksum header answers `duplicate`
+/// before the body is read, so the item parks with a false "could not be
+/// attached" although the asset already carries it.
+#[tokio::test]
+async fn a_promote_failure_keeps_the_sidecar_the_upload_already_sent() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let file = write_file(&photos, "versioned.jpg", b"first bytes");
+    let sidecar = write_file(
+        &photos,
+        "versioned.jpg.xmp",
+        b"<x:xmpmeta>first</x:xmpmeta>",
+    );
+    add_folder(&store, &photos, true);
+    let engine = start_engine(&server, &store, retry_config(4)).await;
+
+    sync_one(&store, &file).await;
+    let first = store
+        .item(&file.display().to_string())
+        .expect("read the row")
+        .expect("the row exists");
+    assert!(
+        first.sidecar.is_some(),
+        "the first upload carried the sidecar"
+    );
+
+    // One promote call fails after the changed upload landed with its new
+    // sidecar; the automatic retry must finish without offering it again.
+    server.fail(
+        Operation::GetAsset,
+        Fault::Status {
+            code: 500,
+            retry_after: None,
+        },
+    );
+    std::fs::write(&file, b"second bytes").expect("edit the media");
+    std::fs::write(&sidecar, b"<x:xmpmeta>second</x:xmpmeta>").expect("edit the sidecar");
+    engine.sync_now();
+
+    let path_text = file.display().to_string();
+    // Waiting on the version chain, not only a terminal row: the first sync
+    // already left a terminal row, and the promote is what the retry has to
+    // finish.
+    assert!(
+        wait_until(
+            || chain_len(&store, &file) == 2
+                && matches!(&store.item(&path_text), Ok(Some(row)) if row.state.is_terminal_success()),
+            Duration::from_secs(20)
+        )
+        .await,
+        "the promote failure left the item parked instead of retrying: {:?}",
+        store.item(&path_text)
+    );
+    let row = store
+        .item(&path_text)
+        .expect("read the row")
+        .expect("the row exists");
+    assert_eq!(
+        row.sidecar.map(|digest| digest.sha1),
+        Some(sha1_file(&sidecar).expect("hash the sidecar")),
+        "the row keeps the sidecar digest the upload recorded"
+    );
+    assert!(
+        engine
+            .failed_items()
+            .expect("read the failed items")
+            .is_empty(),
+        "the false 'could not be attached' must not park the item"
+    );
+
+    // A later pass must not offer the recorded sidecar again.
+    let uploads = server.upload_requests();
+    engine.sync_now();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        server.upload_requests(),
+        uploads,
+        "R4.5: a recorded sidecar is not sent again"
     );
     engine.stop();
 }

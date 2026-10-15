@@ -3,6 +3,8 @@
 //! Real timing against the offline double, because the criteria are a rate and
 //! a number of simultaneous uploads.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -12,6 +14,8 @@ use sync_core::connection::{AuthMethod, Connection, Secret, SharedSession, SignI
 use sync_core::credential::MemoryCredentialStore;
 use sync_core::engine::{Engine, EngineConfig, Limits};
 use sync_core::store::{AlbumScope, SourceFolder, StateStore};
+
+use common::wait_until;
 
 /// The acceptance criterion's rate (R7.1).
 const ONE_MEGABYTE_PER_SECOND: u64 = 1_000_000;
@@ -60,20 +64,6 @@ async fn start_engine(
     let engine = Arc::new(Engine::new(store.clone(), session, config).expect("build the engine"));
     engine.start();
     engine
-}
-
-/// Polls `check` until it returns true, or the timeout elapses.
-async fn wait_until(mut check: impl FnMut() -> bool, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if check() {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
 }
 
 /// Whether every path has a terminal success row.

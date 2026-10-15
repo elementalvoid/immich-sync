@@ -411,8 +411,21 @@ impl Uploader {
         gate: &UploadGate,
         bandwidth: &BandwidthLimit,
     ) -> UploadOutcome {
+        let path = prepared.path.to_string_lossy().into_owned();
+        // R4.5: the digest a previous attempt recorded. The row keeps it while
+        // this attempt runs, and a sidecar with the same digest is not sent
+        // again: a promote failure leaves the item retrying after the server
+        // already read the sidecar, and re-sending it is answered `duplicate`
+        // from the checksum header, which parks the item with a false "could
+        // not be attached".
+        let recorded = self
+            .store
+            .item(&path)
+            .ok()
+            .flatten()
+            .and_then(|row| row.sidecar);
         let mut item = ItemRecord {
-            path: prepared.path.to_string_lossy().into_owned(),
+            path,
             size: prepared.size,
             mtime_ns: prepared.mtime_ns,
             sha1: prepared.sha1,
@@ -421,8 +434,7 @@ impl Uploader {
             error_class: None,
             error_message: None,
             attempts: 0,
-            // R4.5: the request carrying the sidecar has not gone out yet.
-            sidecar: None,
+            sidecar: recorded,
         };
         if gate.is_paused() {
             item.state = ItemState::Pending;
@@ -431,10 +443,14 @@ impl Uploader {
             return UploadOutcome::Deferred;
         }
         self.record(&item);
+        let sidecar = prepared
+            .sidecar
+            .as_ref()
+            .filter(|sidecar| recorded != Some(sidecar.digest));
         self.send_upload(
             &mut item,
             &prepared.sha1.base64(),
-            prepared.sidecar.as_ref(),
+            sidecar,
             prepared.live_photo_video.as_deref(),
             bandwidth,
         )
@@ -514,7 +530,6 @@ impl Uploader {
         }
     }
 
-    /// Sends one accepted file and records the outcome (R3.2, R3.3, R3.6).
     /// Sends one accepted file and records the outcome (R3.2, R3.3, R3.6).
     async fn send_upload(
         &self,
@@ -607,10 +622,14 @@ impl Uploader {
                         connection: false,
                     });
                 }
-                // R4.5: this request was read, so the asset carries the sidecar
-                // it carried. A `duplicate` answer never reaches this line
-                // with one: the branch above parked the item instead.
-                item.sidecar = sidecar.map(|sidecar| sidecar.digest);
+                // R4.5: a request the server read carries the sidecar it
+                // carried. Without one the row keeps the digest it already
+                // recorded: erasing it would make a later pass offer a sidecar
+                // the asset already has. A `duplicate` answer never reaches
+                // this line with a sidecar: the branch above parked the item.
+                if let Some(sidecar) = sidecar {
+                    item.sidecar = Some(sidecar.digest);
+                }
                 item.state = if response.duplicate {
                     ItemState::Duplicate
                 } else {

@@ -4,6 +4,8 @@
 //! reconciliation scan, the real state store, and the mock server's record of
 //! what arrived and in which order.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,6 +16,8 @@ use sync_core::credential::MemoryCredentialStore;
 use sync_core::engine::{Engine, EngineConfig};
 use sync_core::hash::Sha1;
 use sync_core::store::{AlbumScope, ItemState, SourceFolder, StateStore};
+
+use common::wait_until;
 
 /// Starts the mock and signs in, returning the session the engine attaches to
 /// every request (R1.4): #7 owns the one re-login of a 401.
@@ -91,20 +95,6 @@ fn write_file(root: &Path, name: &str, bytes: &[u8]) -> PathBuf {
     }
     std::fs::write(&path, bytes).expect("write the fixture");
     path
-}
-
-/// Polls `check` until it returns true, or the timeout elapses.
-async fn wait_until(mut check: impl FnMut() -> bool, timeout: Duration) -> bool {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        if check() {
-            return true;
-        }
-        if std::time::Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
 }
 
 /// Whether every path reached a terminal success state.

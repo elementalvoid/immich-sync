@@ -17,7 +17,9 @@ use crate::store::SourceFolder;
 pub struct ScanReport {
     /// The files the scan would sync, in walk order.
     pub files: Vec<PathBuf>,
-    /// How many entries the skip rules refused.
+    /// How many entries the skip rules refused. Only the unit tests read it,
+    /// so a production build carries no dead counter.
+    #[cfg(test)]
     pub skipped: usize,
 }
 
@@ -68,18 +70,27 @@ pub fn scan_folder(folder: &SourceFolder) -> Result<ScanReport, ScanError> {
             // finds the folder's real contents.
             Err(error) => {
                 tracing::debug!(folder = %folder.path, error = %error, "a scan entry was unreadable");
-                report.skipped += 1;
+                #[cfg(test)]
+                {
+                    report.skipped += 1;
+                }
                 continue;
             }
         };
         let path = entry.path();
         let Some(file_type) = entry.file_type() else {
-            report.skipped += 1;
+            #[cfg(test)]
+            {
+                report.skipped += 1;
+            }
             continue;
         };
         if file_type.is_symlink() || !file_type.is_file() {
             if file_type.is_symlink() {
-                report.skipped += 1;
+                #[cfg(test)]
+                {
+                    report.skipped += 1;
+                }
             }
             continue;
         }
@@ -93,7 +104,10 @@ pub fn scan_folder(folder: &SourceFolder) -> Result<ScanReport, ScanError> {
                     "an XMP sidecar is not an asset of its own; it rides along with its media file"
                 );
             }
-            report.skipped += 1;
+            #[cfg(test)]
+            {
+                report.skipped += 1;
+            }
             continue;
         }
         report.files.push(path.to_path_buf());

@@ -579,6 +579,13 @@ impl Engine {
         if let Some(watcher) = watcher.as_mut()
             && Path::new(path).is_dir()
         {
+            // Re-adding an existing folder must move the watch to the new
+            // mode. A recursive watch also watches every subfolder, and
+            // re-watching the root alone leaves those behind, so the old
+            // watch is removed first (R2.1). A folder that was never watched
+            // (the folder did not exist, or the watcher is off) makes this a
+            // no-op that is safe to ignore.
+            let _ = watcher.unwatch(Path::new(path));
             let _ = watcher.watch(Path::new(path), recursive);
         }
         drop(watcher);
@@ -999,6 +1006,9 @@ impl EngineInner {
                 // Deferred keeps the item queued and its pending count.
                 UploadOutcome::Deferred => {}
             }
+            // R8.2: the tray card reads the global copy, so a success that
+            // recovers every folder must clear it too.
+            clear_global_error_if_recovered(self, &folders);
         }
         self.in_flight
             .lock()
@@ -1051,10 +1061,12 @@ impl EngineInner {
             error_class,
             error_message,
             attempts: 0,
-            // A parked item owes its sidecar, and the request that would have
-            // carried it never went out. A manual retry starts a fresh budget
-            // (R6.5) and sends it again.
-            sidecar: None,
+            // A parked item owes a sidecar the row does not record, and the
+            // request that would have carried it never went out. A digest the
+            // row already has is kept: a promote failure parked the item
+            // after the upload read the sidecar, and a manual retry (R6.5)
+            // must not offer it again.
+            sidecar: existing.as_ref().and_then(|row| row.sidecar),
         };
         if let Err(error) = self.store.record(&record) {
             tracing::error!(error = %error, "the state database could not record the dead letter");
@@ -1144,8 +1156,20 @@ impl EngineInner {
             crate::failure::FailureKind::Permanent => ItemState::FailedPermanent,
             crate::failure::FailureKind::Transient => ItemState::RetryWait,
         };
+        let path = item.path.to_string_lossy().into_owned();
+        // R3.3, R4.5: a failure sends nothing, so a sidecar that was owed is
+        // still owed; but a promote failure happens after the upload landed
+        // and recorded the sidecar it carried, and erasing that digest makes
+        // the retry re-send the sidecar and park with a false "could not be
+        // attached". The row's last word on what the asset carries is kept.
+        let sidecar = self
+            .store
+            .item(&path)
+            .ok()
+            .flatten()
+            .and_then(|row| row.sidecar);
         let record = ItemRecord {
-            path: item.path.to_string_lossy().into_owned(),
+            path,
             size: item.size,
             mtime_ns: item.mtime_ns,
             sha1: item.sha1,
@@ -1154,8 +1178,7 @@ impl EngineInner {
             error_class: failure.class,
             error_message: Some(failure.message.clone()),
             attempts: 0,
-            // A failure sends nothing, so the sidecar is still owed (R3.3).
-            sidecar: None,
+            sidecar,
         };
         if let Err(store_error) = self.store.record(&record) {
             tracing::error!(error = %store_error, "the state database could not record the failure");
@@ -1252,7 +1275,9 @@ async fn attach_albums(inner: &Arc<EngineInner>, file: &Path, asset_id: &str) {
     match inner.albums.attach(&folder, file, asset_id).await {
         // R3.4: an unmapped folder maps no album, and sends no request.
         Ok(None) => {}
-        Ok(Some(_album)) => {}
+        Ok(Some(album)) => {
+            tracing::debug!(path = %file.display(), album = %album, "the asset joined its album");
+        }
         Err(error) => {
             tracing::warn!(
                 path = %file.display(),
@@ -1498,8 +1523,19 @@ fn missing_result_error() -> ClientError {
 
 /// Writes a terminal row that did not need an upload (R3.2).
 fn record_terminal(inner: &EngineInner, item: &PreparedItem, asset_id: &str, state: ItemState) {
+    let path = item.path.to_string_lossy().into_owned();
+    // R4.5: this branch only runs when no sidecar was owed, but the row may
+    // already record one - a promote failure or a restart can leave a digest
+    // the settled row must not erase, or the next scan offers the sidecar
+    // again and answers `duplicate` for an asset that already carries it.
+    let sidecar = inner
+        .store
+        .item(&path)
+        .ok()
+        .flatten()
+        .and_then(|row| row.sidecar);
     let record = ItemRecord {
-        path: item.path.to_string_lossy().into_owned(),
+        path,
         size: item.size,
         mtime_ns: item.mtime_ns,
         sha1: item.sha1,
@@ -1508,9 +1544,7 @@ fn record_terminal(inner: &EngineInner, item: &PreparedItem, asset_id: &str, sta
         error_class: None,
         error_message: None,
         attempts: 0,
-        // R4.5: this branch only runs when no sidecar was owed, so the asset
-        // carries none.
-        sidecar: None,
+        sidecar,
     };
     if let Err(error) = inner.store.record(&record) {
         tracing::error!(error = %error, "the state database could not record the outcome");
@@ -1627,9 +1661,11 @@ async fn prepare(
         error_class: None,
         error_message: None,
         attempts: 0,
-        // R4.5: nothing has been sent yet, so the row claims no sidecar. A
-        // crash here re-queues the item and sends it again (R6.7).
-        sidecar: None,
+        // R4.5: the digest the row already recorded is what the asset
+        // carries, even though this new attempt has not sent anything yet. A
+        // crash here re-queues the item and sends any newer sidecar again
+        // (R6.7).
+        sidecar: existing.as_ref().and_then(|row| row.sidecar),
     };
     if let Err(error) = inner.store.record(&record) {
         tracing::error!(error = %error, "the state database could not record the pending item");
@@ -2114,6 +2150,17 @@ fn set_folder_available(inner: &EngineInner, path: &str, available: bool) {
         if available {
             entry.last_error = None;
         }
+    }
+    if available {
+        clear_global_error_if_recovered(inner, &folders);
+    }
+}
+
+/// Clears the global last-error once no folder holds one, so the tray card
+/// stops reporting a failure every folder has recovered from (R8.2).
+fn clear_global_error_if_recovered(inner: &EngineInner, folders: &[FolderEntry]) {
+    if folders.iter().all(|entry| entry.last_error.is_none()) {
+        *inner.last_error.lock().expect("the error lock") = None;
     }
 }
 
