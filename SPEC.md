@@ -102,8 +102,9 @@ Acceptance: stopping the server mid-sync produces backoff retries, not a hot loo
 - R7.1 The bandwidth limit is user-settable in bytes per second. 0 means unlimited. Changes apply without a restart.
 - R7.2 The concurrency limit is user-settable. The default is 4. Changes apply without a restart.
 - R7.3 Both limits persist across restarts.
+- R7.4 R7 governs the sync engine. The manual one-file upload in the Upload view is deliberately exempt from both limits: it is an explicit one-off request, not sync work. This is by design, not a defect.
 
-Acceptance: a 1 MB/s limit produces near-limit observed throughput. Raising concurrency during a sync starts new workers without a restart.
+Acceptance: a sync at a 1 MB/s limit produces near-limit observed throughput. Raising concurrency during a sync starts new workers without a restart.
 
 ### R8 — Shell and user experience
 
