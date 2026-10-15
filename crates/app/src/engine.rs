@@ -976,17 +976,15 @@ impl EngineModel {
     /// The user-facing reason the client needs attention, when it is not a
     /// deletion review or a parked failure. `None` lets the generic
     /// notification stay quiet; the specific notification covers those.
+    ///
+    /// A permanent folder error keeps the engine's global error too, so it
+    /// speaks even with no parked item. A transient retry sets only the
+    /// folder's own error, so it stays quiet.
     fn attention_reason(&self, cx: &Context<Self>) -> Option<String> {
         if let ConnectionState::NeedsAttention(attention) = self.connection.read(cx).state() {
             return Some(attention.message());
         }
-        if self.status.counts.failed > 0
-            || self
-                .status
-                .folders
-                .iter()
-                .any(|folder| folder.last_error.is_some())
-        {
+        if self.status.counts.failed > 0 {
             return None;
         }
         if let Some(folder) = self.status.folders.iter().find(|folder| !folder.available) {

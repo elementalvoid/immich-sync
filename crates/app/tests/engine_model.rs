@@ -611,6 +611,92 @@ async fn the_first_attention_transition_raises_one_notification(cx: &mut TestApp
     );
 }
 
+/// R10.1: a folder-level permanent error raises the attention notification
+/// even when no item is parked. An album-mapping failure is the reachable
+/// case: the upload itself succeeded, so the failure count stays zero.
+#[gpui_kit::test]
+async fn a_folder_error_with_zero_parked_items_raises_one_attention_notification(
+    cx: &mut TestAppContext,
+) {
+    let (_runtime, server) = mock_server();
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+    std::fs::write(photos.join("mapped.jpg"), b"mapped bytes").expect("write the file");
+
+    let connection = signed_in(cx, &server);
+    let store = cx.update(|cx| cx.new(|cx| StoreModel::open(&paths, cx)));
+    wait_for_inputs(cx, &connection, &store).await;
+    cx.read(|cx| store.read(cx).store().expect("the store is open"))
+        .add_folder(&SourceFolder {
+            path: photos.display().to_string(),
+            recursive: true,
+            album_mapping: true,
+            album_scope: sync_core::store::AlbumScope::Leaf,
+        })
+        .expect("add the source folder");
+    // The album call is refused, but the upload still lands, so nothing is
+    // parked and the folder error is the only reason to need attention.
+    server.fail(Operation::CreateAlbum, Fault::PermissionDenied);
+
+    let engine = cx.update(|cx| {
+        gpui_kit::init(cx);
+        cx.set_app_identity("com.elementalvoid.immich-sync", "Immich Sync");
+        cx.new(|cx| EngineModel::new(connection, store, &paths, cx))
+    });
+    cx.update(|cx| engine.update(cx, |model, cx| model.start(cx)));
+    for _ in 0..600 {
+        if cx.read(|cx| engine.read(cx).is_running()) {
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    assert!(
+        cx.read(|cx| engine.read(cx).is_running()),
+        "the engine never started"
+    );
+
+    let mut shown = Vec::new();
+    for _ in 0..600 {
+        cx.run_until_parked();
+        shown = cx.shown_system_notifications();
+        if !shown.is_empty() {
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        shown.len(),
+        1,
+        "R10.1: a folder error with no parked item raises one notification"
+    );
+    assert_eq!(shown[0].tag.as_ref(), "needs-attention");
+    assert!(
+        shown[0].body.contains("album mapping failed"),
+        "the notification names the folder error: {}",
+        shown[0].body
+    );
+    assert_eq!(
+        cx.read(|cx| engine.read(cx).status().counts.failed),
+        0,
+        "the upload succeeded, so no item is parked"
+    );
+
+    // The status poll keeps running; the same episode must stay quiet.
+    for _ in 0..20 {
+        cx.executor().timer(Duration::from_millis(100)).await;
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        cx.shown_system_notifications().len(),
+        1,
+        "R10.1: the attention latch holds while the folder error stays"
+    );
+}
+
 /// R10.1: a refused connection raises the attention notification with the
 /// reason the user needs to act on.
 #[gpui_kit::test]
