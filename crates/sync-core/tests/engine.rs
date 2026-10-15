@@ -837,6 +837,62 @@ async fn a_restart_with_a_pending_row_does_not_double_count_the_pending_item() {
     engine.stop();
 }
 
+/// A restart that interrupts a retry must not seed a failed count that no
+/// later success clears (R6.7, R8.1).
+///
+/// `Engine::new` read the folder counts before `requeue_unfinished`, so an
+/// interrupted `retry_wait` row was counted as failed and then became
+/// pending. `prepare` saw it already pending, so it never moved the count
+/// back down, and the item's later success left a phantom failure on the
+/// card.
+#[tokio::test]
+async fn a_restart_that_interrupts_a_retry_does_not_seed_a_failed_count() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let file = write_file(&photos, "interrupted.jpg", b"interrupted bytes");
+    add_folder(&store, &photos, true);
+    let meta = std::fs::metadata(&file).expect("read the fixture metadata");
+    store
+        .record(&ItemRecord {
+            path: file.display().to_string(),
+            size: meta.len(),
+            mtime_ns: mtime_ns_of(&file),
+            sha1: sha1_file(&file).expect("hash the fixture"),
+            asset_id: None,
+            state: ItemState::RetryWait,
+            error_class: Some(FailureClass::ServerTransient),
+            error_message: Some("the server was busy".to_string()),
+            attempts: 1,
+            sidecar: None,
+        })
+        .expect("write the interrupted retry row");
+    let config = EngineConfig {
+        watch: false,
+        ..EngineConfig::default()
+    };
+    let engine = start_engine(&server, &store, config).await;
+
+    assert!(
+        wait_until(
+            || all_terminal(&store, std::slice::from_ref(&file)),
+            Duration::from_secs(15)
+        )
+        .await,
+        "the requeued row was not resumed"
+    );
+    assert_eq!(server.upload_requests(), 1);
+    assert_eq!(
+        engine.status().counts.failed,
+        0,
+        "the interrupted retry left a phantom failure on the card: {:?}",
+        engine.status().counts
+    );
+    assert_eq!(engine.status().counts.uploaded, 1);
+    engine.stop();
+}
+
 #[tokio::test]
 async fn a_re_added_folder_seeds_its_counts_from_the_store() {
     let server = MockImmich::start().await;

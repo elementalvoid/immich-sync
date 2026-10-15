@@ -294,6 +294,14 @@ impl Engine {
         session: SharedSession,
         config: EngineConfig,
     ) -> Result<Self, StoreError> {
+        // Re-queue what a previous run left unfinished before the counts are
+        // read, so a row this run will work on is not seeded as parked (R6.7):
+        // a `retry_wait` row otherwise counts as failed and then becomes
+        // pending, and no later bookkeeping moves the failed count back down.
+        let (queue, queue_rx) = mpsc::unbounded_channel();
+        for path in store.requeue_unfinished()? {
+            let _ = queue.send(PathBuf::from(path));
+        }
         let mut entries = Vec::new();
         for folder in store.folders()? {
             let counts = store.folder_counts(&folder.path).unwrap_or_else(|error| {
@@ -306,12 +314,6 @@ impl Engine {
                 counts,
                 last_error: None,
             });
-        }
-        // Re-queue what a previous run left unfinished before the counts are
-        // read, so a row this run will work on is not seeded as parked (R6.7).
-        let (queue, queue_rx) = mpsc::unbounded_channel();
-        for path in store.requeue_unfinished()? {
-            let _ = queue.send(PathBuf::from(path));
         }
         let uploader = Uploader::new(session.clone(), store.clone());
         // R1.4: the album calls go through the same session, so a 401 on one of
