@@ -756,15 +756,19 @@ async fn a_refused_connection_raises_one_attention_notification(cx: &mut TestApp
     );
 }
 
-/// R10.1: a newly parked item raises its own notification, and a second one
-/// raises another while the first still waits.
+/// R10.1: an item that parks during the session raises its own notification,
+/// and a second one raises another while the first still waits. An item that
+/// was already parked when the process started stays quiet, so a relaunch
+/// does not announce the dead letter again.
 #[gpui_kit::test]
-async fn a_newly_failed_item_raises_a_failure_notification(cx: &mut TestAppContext) {
+async fn only_items_that_park_during_the_session_raise_a_failure_notification(
+    cx: &mut TestAppContext,
+) {
     cx.executor().allow_parking();
     let temp = tempfile::tempdir().expect("create a temp dir");
     let paths = temporary_paths(temp.path());
     let photos = temp.path().join("photos");
-    seed_failed(&paths, &photos, &["one.jpg"]);
+    seed_failed(&paths, &photos, &["old.jpg"]);
 
     let paths_for_model = paths.clone();
     let engine = cx.update(|cx| {
@@ -778,6 +782,25 @@ async fn a_newly_failed_item_raises_a_failure_notification(cx: &mut TestAppConte
         cx.new(|cx| EngineModel::new(connection, store_model, &paths_for_model, cx))
     });
 
+    // The first read of the parked list is the one the process starts with;
+    // wait for it so the assertion is about behaviour, not timing.
+    for _ in 0..600 {
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+        if !cx.read(|cx| engine.read(cx).failed_items().is_empty()) {
+            break;
+        }
+    }
+    assert!(
+        cx.shown_system_notifications().is_empty(),
+        "R10.1: an item parked before startup raises no notification"
+    );
+
+    // A permanent failure appears while the process runs.
+    let store = cx.read(|cx| engine.read(cx).store(cx).expect("the store is open"));
+    store
+        .record(&failed(&photos.join("one.jpg").display().to_string()))
+        .expect("write the new failed row");
     let mut shown = Vec::new();
     for _ in 0..600 {
         cx.executor().timer(Duration::from_millis(10)).await;
@@ -800,7 +823,6 @@ async fn a_newly_failed_item_raises_a_failure_notification(cx: &mut TestAppConte
     );
 
     // A second permanent failure appears while the first still waits.
-    let store = cx.read(|cx| engine.read(cx).store(cx).expect("the store is open"));
     store
         .record(&failed(&photos.join("two.jpg").display().to_string()))
         .expect("write the second failed row");
