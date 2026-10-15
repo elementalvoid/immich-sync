@@ -1148,6 +1148,114 @@ async fn re_adding_a_folder_keeps_its_album_mapping() {
     engine.stop();
 }
 
+/// A re-add takes the album fields from the live entry, not from the stored
+/// row: a near-simultaneous album edit can leave the store holding the row the
+/// re-add read before that edit, and writing it back loses the edit (R3.4).
+#[tokio::test]
+async fn a_re_add_keeps_the_live_album_edit_over_a_stale_stored_row() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the folder");
+    let engine = start_engine(&server, &store, EngineConfig::default()).await;
+    let path = photos.display().to_string();
+
+    engine.add_folder(&path, true).expect("add the folder");
+    engine
+        .set_album_mapping(&path, true)
+        .expect("enable album mapping");
+    // The interleaving the re-add races, made deterministic: the album edit
+    // has landed, and the store still holds the row a racing re-add read
+    // before it.
+    store
+        .add_folder(&SourceFolder {
+            path: path.clone(),
+            recursive: true,
+            album_mapping: false,
+            album_scope: AlbumScope::Leaf,
+        })
+        .expect("write the stale row");
+
+    engine.add_folder(&path, false).expect("re-add the folder");
+
+    let stored = store
+        .folders()
+        .expect("read the folders")
+        .into_iter()
+        .find(|folder| folder.path == path)
+        .expect("the folder is stored");
+    assert!(
+        stored.album_mapping,
+        "the re-add wrote the stale row back over the live album edit"
+    );
+    assert!(
+        !stored.recursive,
+        "the re-add still applies its own recursive flag"
+    );
+    assert!(
+        engine.status().folders[0].album_mapping,
+        "the live card and the store must agree after the re-add"
+    );
+    engine.stop();
+}
+
+/// The two edits can run at the same time: an album toggle (which takes the
+/// folders lock) and a re-add. Neither may lose the other's field (R3.4).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_interleaved_recursive_toggle_and_album_toggle_lose_nothing() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the folder");
+    let engine = start_engine(
+        &server,
+        &store,
+        EngineConfig {
+            watch: false,
+            ..EngineConfig::default()
+        },
+    )
+    .await;
+    let path = photos.display().to_string();
+    engine.add_folder(&path, true).expect("add the folder");
+
+    let barrier = std::sync::Barrier::new(3);
+    std::thread::scope(|scope| {
+        let album = scope.spawn(|| {
+            barrier.wait();
+            for round in 0..300_u32 {
+                engine
+                    .set_album_mapping(&path, round % 2 == 0)
+                    .expect("toggle the album mapping");
+            }
+        });
+        let readd = scope.spawn(|| {
+            barrier.wait();
+            for _ in 0..300 {
+                engine.add_folder(&path, true).expect("re-add the folder");
+                // The live entry is the one the album toggle just wrote, so the
+                // store must still agree with it. A disagreement is a re-add
+                // that wrote back the row it read before the toggle.
+                let live = engine.status().folders[0].album_mapping;
+                let stored = store
+                    .folders()
+                    .expect("read the folders")
+                    .into_iter()
+                    .find(|folder| folder.path == path)
+                    .expect("the folder is stored")
+                    .album_mapping;
+                assert_eq!(live, stored, "a re-add lost an album toggle");
+            }
+        });
+        barrier.wait();
+        album.join().expect("the album thread finished");
+        readd.join().expect("the re-add thread finished");
+    });
+    engine.stop();
+}
+
 /// The asset id the store recorded for one file.
 fn asset_id_of(store: &StateStore, path: &Path) -> String {
     store

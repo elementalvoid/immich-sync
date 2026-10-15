@@ -540,48 +540,68 @@ impl Engine {
         }
         // R3.4: the store's upsert writes every column, so re-adding a folder
         // (the app's recursive toggle does) must carry the album fields the
-        // stored row already holds. A hardcoded `false` silently unmapped a
-        // folder the user had mapped, and the loss only showed after a
-        // restart. A brand-new folder still starts unmapped; the config
-        // window opts it in on purpose.
+        // folder already holds. A hardcoded `false` silently unmapped a folder
+        // the user had mapped, and the loss only showed after a restart. A
+        // brand-new folder still starts unmapped; the config window opts it in
+        // on purpose.
+        //
+        // The lock is held across the lookup and the upsert: a near-simultaneous
+        // album edit would otherwise slip between them and the re-add would
+        // write back the row it read before the edit. For a folder this engine
+        // already holds, that row is taken from the in-memory entry, which the
+        // album edits keep current; a folder new to this engine has no live
+        // entry and starts from the stored row.
         let key = path_key(Path::new(path));
-        let stored = self
-            .inner
-            .store
-            .folders()?
-            .into_iter()
-            .find(|folder| path_key(Path::new(&folder.path)) == key);
+        let mut folders = self.inner.folders.lock().expect("the folder lock");
+        let live = folders
+            .iter()
+            .find(|entry| path_key(Path::new(&entry.folder.path)) == key);
+        let (album_mapping, album_scope) = match live {
+            Some(entry) => (entry.folder.album_mapping, entry.folder.album_scope),
+            None => {
+                let stored = self
+                    .inner
+                    .store
+                    .folders()?
+                    .into_iter()
+                    .find(|folder| path_key(Path::new(&folder.path)) == key);
+                (
+                    stored.as_ref().is_some_and(|folder| folder.album_mapping),
+                    stored.map_or_else(AlbumScope::default, |folder| folder.album_scope),
+                )
+            }
+        };
         let folder = SourceFolder {
             path: path.to_string(),
             recursive,
-            album_mapping: stored.as_ref().is_some_and(|folder| folder.album_mapping),
-            album_scope: stored.map_or_else(AlbumScope::default, |folder| folder.album_scope),
+            album_mapping,
+            album_scope,
         };
         self.inner.store.add_folder(&folder)?;
         // R8.1: a folder new to this engine starts from what the store already
         // holds for it; a zeroed card would never fill, because the rows are
         // settled and `prepare` does not count them again.
-        let counts = self.inner.store.folder_counts(path).unwrap_or_else(|error| {
-            tracing::warn!(folder = path, error = %error, "the folder counts could not be read");
-            FolderCounts::default()
-        });
+        if let Some(entry) = folders
+            .iter_mut()
+            .find(|entry| path_key(Path::new(&entry.folder.path)) == key)
         {
-            let mut folders = self.inner.folders.lock().expect("the folder lock");
-            if let Some(entry) = folders
-                .iter_mut()
-                .find(|entry| path_key(Path::new(&entry.folder.path)) == key)
-            {
-                entry.folder.recursive = recursive;
-                entry.available = Path::new(path).is_dir();
-            } else {
-                folders.push(FolderEntry {
-                    available: Path::new(path).is_dir(),
-                    folder,
-                    counts,
-                    last_error: None,
-                });
-            }
+            // The whole row is taken, so the spelling the store just wrote is
+            // the one the live entry holds, and no field is left stale.
+            entry.folder = folder;
+            entry.available = Path::new(path).is_dir();
+        } else {
+            let counts = self.inner.store.folder_counts(path).unwrap_or_else(|error| {
+                tracing::warn!(folder = path, error = %error, "the folder counts could not be read");
+                FolderCounts::default()
+            });
+            folders.push(FolderEntry {
+                available: Path::new(path).is_dir(),
+                folder,
+                counts,
+                last_error: None,
+            });
         }
+        drop(folders);
         let mut watcher = self.inner.watcher.lock().expect("the watcher lock");
         let mut watch_error = None;
         if let Some(watcher) = watcher.as_mut()
