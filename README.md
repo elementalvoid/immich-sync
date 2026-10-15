@@ -148,8 +148,8 @@ its card instead of producing one error per file.
 ## Using the app
 
 - **Tray.** The tray icon is fixed; its tooltip shows the activity (idle,
-  syncing, or paused), the connection state (including needs attention), the
-  review count, upload progress, and the last error. The tray menu has
+  syncing, paused, or needs attention), the connection state, the review count,
+  upload progress, and the last error. The tray menu has
   **Show**, **Pause**, **Resume**, **Sync now**, and **Quit**.
 - **Window.** Closing the window hides it; the client keeps running in the tray.
   **Quit** exits the client. Starting the app again focuses the running
