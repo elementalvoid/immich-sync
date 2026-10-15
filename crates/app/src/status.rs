@@ -4,6 +4,8 @@
 //! (R8.1). [`sample`] is the layout fixture the view tests render; the shell
 //! never uses it.
 
+use std::path::Path;
+
 use sync_core::engine::{Activity, EngineStatus};
 use sync_core::store::{AlbumScope, FolderCounts};
 
@@ -153,17 +155,14 @@ fn counts_from(counts: FolderCounts) -> Counts {
 
 /// The card title for a folder path: the last component, or the path itself.
 ///
-/// The split accepts both separators, so a Windows path mapped on Linux still
-/// names its folder in a test.
+/// The platform's own separators decide, the same way `sync-core` names an
+/// album from its folder (album names and card titles must agree).
 #[must_use]
 pub fn folder_name(path: &str) -> String {
-    let trimmed = path.trim_end_matches(['/', '\\']);
-    trimmed
-        .rsplit(['/', '\\'])
-        .next()
-        .filter(|name| !name.is_empty())
-        .unwrap_or(trimmed)
-        .to_string()
+    Path::new(path).file_name().map_or_else(
+        || path.to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
 }
 
 /// The upload progress for one folder, 0.0 to 1.0.
