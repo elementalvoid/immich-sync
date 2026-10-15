@@ -502,6 +502,13 @@ impl Engine {
     /// admits its own full size while those attempts are still running, so the
     /// running count can briefly exceed a shrinking limit; no upload is
     /// cancelled or failed.
+    ///
+    /// The overshoot is per swap: the running count can reach the attempts in
+    /// flight at the swap plus the new pool's size. That is not a one-time
+    /// correction, because a later swap does not wait for the attempts the
+    /// previous one admitted: a second resize while those are still running
+    /// lets the count overshoot again by the attempts in flight at that swap
+    /// plus its own new size, so repeated swaps can compound the peak.
     pub async fn set_limits(&self, limits: Limits) {
         self.inner.bandwidth.set(limits.bandwidth_bytes_per_second);
         // One resize at a time, so a second change cannot race the swap.
