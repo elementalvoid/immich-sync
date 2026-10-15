@@ -173,6 +173,16 @@ INSERT INTO version (item_id, asset_id, sha1, created_at_ns, is_current)
 SELECT id, asset_id, sha1, mtime_ns, 1 FROM sync_item WHERE asset_id IS NOT NULL;
 ";
 
+/// The ninth schema (issue #23): an index on the item state.
+///
+/// The tray's status poll asks the store how many files wait in the deletion
+/// review (R5.4), and the app polls that status every 250 ms. Without this
+/// index the count is a full scan of `sync_item` while the writer lock is
+/// held; on a 100k-row library the scan measured about 9 ms per poll. `state`
+/// is the only column the review queries filter on, so one index serves both
+/// the count and the review list.
+const SCHEMA_V9: &str = "CREATE INDEX sync_item_state ON sync_item(state);";
+
 /// How long the one writer waits for a competing lock before failing.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -1925,6 +1935,7 @@ fn migrations() -> Migrations<'static> {
         M::up(SCHEMA_V6),
         M::up(SCHEMA_V7),
         M::up(SCHEMA_V8),
+        M::up(SCHEMA_V9),
     ])
 }
 
@@ -2119,6 +2130,66 @@ mod migration_tests {
             }],
             "R3.4: a folder mapped before album mapping existed reads back off, at the default \
              scope, through the whole composed migration chain"
+        );
+    }
+
+    /// R5.4: the whole chain still applies to a database the first schema
+    /// wrote, and the review count reads through the state index the ninth
+    /// schema adds instead of scanning every item on each status poll.
+    #[test]
+    fn the_review_count_uses_the_state_index_after_migrating() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let path = temp.path().join("state.db");
+        {
+            let mut connection = Connection::open(&path).expect("open the raw database");
+            Migrations::new(vec![M::up(SCHEMA_V1)])
+                .to_latest(&mut connection)
+                .expect("create the first schema");
+            let sha1 =
+                Sha1::from_hex("2aae6c35c94fcfb415dbe95f408b9ce91ee846ed").expect("a hex SHA-1");
+            let transaction = connection.transaction().expect("start one transaction");
+            for index in 0..500 {
+                let state = if index < 3 { "missing" } else { "uploaded" };
+                transaction
+                    .execute(
+                        "INSERT INTO sync_item (path, size, mtime_ns, sha1, asset_id, state, error_class)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        params![
+                            format!("/photos/photo-{index:03}.jpg"),
+                            11_i64,
+                            1_i64,
+                            sha1.as_bytes().as_slice(),
+                            "asset-1",
+                            state,
+                            Option::<String>::None,
+                        ],
+                    )
+                    .expect("insert the old row");
+            }
+            transaction.commit().expect("commit the old rows");
+            drop(connection);
+        }
+
+        let store =
+            StateStore::open(&path).expect("a v1 database must migrate to the latest schema");
+        assert_eq!(
+            store.review_count().expect("count the review"),
+            3,
+            "R5.4: the migrated rows are the ones the review counts"
+        );
+        drop(store);
+
+        let reader = Connection::open(&path).expect("open the migrated database");
+        let plan: Vec<String> = reader
+            .prepare("EXPLAIN QUERY PLAN SELECT COUNT(*) FROM sync_item WHERE state = 'missing'")
+            .expect("prepare the plan")
+            .query_map([], |row| row.get(3))
+            .expect("run the plan")
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .expect("read the plan");
+        assert!(
+            plan.iter().any(|line| line.contains("sync_item_state")),
+            "the review count still scans the table: {plan:?}"
         );
     }
 

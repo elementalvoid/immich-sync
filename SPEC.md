@@ -38,7 +38,7 @@ Acceptance criteria are testable. "Default" values are configurable.
 - R1.1 The config window accepts a server URL, an email address, and a password.
 - R1.2 The client stores the password in the OS credential store. It never writes the password to the config file or the logs.
 - R1.3 The client logs in at startup with `POST /auth/login`. The session token stays in memory.
-- R1.4 After a 401, the client re-logs in once with the stored password. After a second 401, the connection enters a needs-attention state and the tray shows it.
+- R1.4 After a 401, the client re-logs in once with the stored password. Once a run of consecutive failed requests reaches the attention threshold (default 3, reset by a success), the connection enters a needs-attention state and the tray shows it. One refused batch adds at most two failures to the run (the 401 and the retry after the re-login), so a single transient batch stays below the alarm. The run is separate from the circuit breaker's run (R6.6).
 - R1.5 The config window also accepts an API key. The key is validated at startup and stored in the OS credential store, like the password.
 - R1.6 The client shows a clear message when the server disables password login.
 
@@ -92,7 +92,7 @@ Acceptance: deleting a file creates one review item. "Keep" clears the item and 
 - R6.3 The client does not retry HTTP 400, 403, 404, 409, 413, 415, and 422. It marks those permanent.
 - R6.4 The client persists the failure class: auth_failed, permission_denied, quota_exceeded, unsupported_format, network_transient, server_transient, local_read_error, too_large.
 - R6.5 After the attempt cap, the item enters the dead letter state and appears in the failed-items view with a manual retry action.
-- R6.6 A run of connection failures trips a circuit breaker. The client probes with the credential validation endpoint before it resumes.
+- R6.6 A run of connection failures trips a circuit breaker. The client probes with the credential validation endpoint before it resumes. The breaker's run (default 5) is separate from and longer than the connection's attention threshold (R1.4), so the tray changes before the queue does.
 - R6.7 The upload queue survives a restart. No completed item uploads twice.
 
 Acceptance: stopping the server mid-sync produces backoff retries, not a hot loop. A 415 response produces exactly one permanent failure. A restart resumes the queue. A full disk error does not corrupt the database.

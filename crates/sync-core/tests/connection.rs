@@ -239,6 +239,62 @@ async fn a_successful_request_resets_the_re_login_budget() {
     assert_eq!(connection.handle_unauthorized().await, Unauthorized::Retry);
 }
 
+/// R6.6: a failure is only a run when nothing succeeds in between, and a run
+/// only reaches the user at the threshold. The connection keeps its credential
+/// for the probe, so a server that comes back resumes without a sign-in.
+#[tokio::test]
+async fn a_run_of_transport_failures_has_a_threshold_and_a_reset() {
+    let server = MockImmich::start().await;
+    let store = Arc::new(MemoryCredentialStore::new());
+    let mut connection =
+        Connection::new(server.base_url(), store.clone()).expect("a valid server URL");
+    connection
+        .sign_in(SignIn {
+            email: "sync@example.com".to_string(),
+            secret: Secret::new("correct horse"),
+            method: AuthMethod::Password,
+        })
+        .await;
+    let session = connection.shared();
+    session.set_attention_threshold(3);
+
+    session.note_unreachable("the connection was reset").await;
+    session.note_unreachable("the connection was reset").await;
+    assert!(
+        session.state().is_connected(),
+        "two failures are below the threshold: {:?}",
+        session.state()
+    );
+
+    // A success ends the run, so the next failures start from zero again.
+    session.note_reachable().await;
+    session.note_unreachable("the connection was reset").await;
+    session.note_unreachable("the connection was reset").await;
+    assert!(
+        session.state().is_connected(),
+        "the success between the failures reset the run: {:?}",
+        session.state()
+    );
+
+    session.note_unreachable("the connection was reset").await;
+    assert!(
+        matches!(
+            session.state(),
+            ConnectionState::NeedsAttention(Attention::Unreachable(detail))
+                if detail == "the connection was reset"
+        ),
+        "the third failure in the run needs the user: {:?}",
+        session.state()
+    );
+    assert!(
+        session.credential().is_some(),
+        "the transport attention keeps the credential for the probe"
+    );
+
+    // The server answers again: the connection recovers without a sign-in.
+    session.note_reachable().await;
+    assert!(session.state().is_connected(), ":{:?}", session.state());
+}
 #[tokio::test]
 async fn a_restart_relogs_in_without_user_input() {
     let server = MockImmich::start().await;
@@ -304,11 +360,19 @@ async fn an_unconfigured_profile_is_not_signed_in() {
 
 #[tokio::test]
 async fn an_unreachable_server_needs_attention_with_the_reason() {
+    // A listener that accepts and immediately closes every connection is a
+    // server that cannot be reached. Keeping the listener for the whole test
+    // also keeps the port reserved, so the ephemeral-port race (a parallel
+    // mock re-binding a dropped port) cannot make this flaky.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind a port");
     let port = listener.local_addr().expect("the port is known").port();
-    drop(listener);
+    let refusing = tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            drop(socket);
+        }
+    });
 
     let store = Arc::new(MemoryCredentialStore::new());
     store.set(&Secret::new("correct horse")).expect("seed");
@@ -329,6 +393,7 @@ async fn an_unreachable_server_needs_attention_with_the_reason() {
         ),
         "{state:?}"
     );
+    refusing.abort();
 }
 
 #[tokio::test]

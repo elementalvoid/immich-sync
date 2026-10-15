@@ -99,6 +99,54 @@ fn all_terminal(store: &StateStore, paths: &[PathBuf]) -> bool {
     })
 }
 
+/// How many of `paths` have reached a terminal success row, so a wait can
+/// measure the pipeline's progress instead of the clock.
+fn terminal_count(store: &StateStore, paths: &[PathBuf]) -> u64 {
+    let count = paths
+        .iter()
+        .filter(|path| {
+            matches!(
+                store.item(&path.display().to_string()),
+                Ok(Some(row)) if row.state.is_terminal_success()
+            )
+        })
+        .count();
+    u64::try_from(count).unwrap_or(u64::MAX)
+}
+
+/// Polls `check` until it returns true, giving up only after `stall` passes
+/// with `progress` unchanged.
+///
+/// A wall-clock budget starves a real pipeline under load: the work a test
+/// waits for can take longer than any second-based number while still moving.
+/// This waits on the observable progress instead, so the test fails only when
+/// the pipeline stops producing outcomes.
+async fn wait_for_progress(
+    mut progress: impl FnMut() -> u64,
+    mut check: impl FnMut() -> bool,
+    stall: Duration,
+) -> bool {
+    let mut last = progress();
+    let mut deadline = Instant::now() + stall;
+    // A pipeline that keeps trickling out progress would reset the stall
+    // forever, so the wait also has a hard cap: ten stalls without the result.
+    let hard_deadline = Instant::now() + stall.saturating_mul(10);
+    loop {
+        if check() {
+            return true;
+        }
+        let current = progress();
+        if current != last {
+            last = current;
+            deadline = Instant::now() + stall;
+        }
+        if Instant::now() >= deadline || Instant::now() >= hard_deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// The modification time the engine records, in nanoseconds since the epoch.
 fn mtime_ns_of(path: &Path) -> i64 {
     let modified = std::fs::metadata(path)
@@ -144,7 +192,12 @@ async fn a_folder_with_100_files_syncs_without_manual_action() {
     let engine = start_engine(&server, &store, EngineConfig::default()).await;
 
     assert!(
-        wait_until(|| all_terminal(&store, &paths), Duration::from_secs(30)).await,
+        wait_for_progress(
+            || terminal_count(&store, &paths),
+            || all_terminal(&store, &paths),
+            Duration::from_secs(20),
+        )
+        .await,
         "not every file reached a terminal success state"
     );
     assert_eq!(server.upload_requests(), 100, "R3.1: every file uploaded");
@@ -1148,6 +1201,127 @@ async fn re_adding_a_folder_keeps_its_album_mapping() {
     engine.stop();
 }
 
+/// A re-add takes the album fields from the live entry, not from the stored
+/// row: a near-simultaneous album edit can leave the store holding the row the
+/// re-add read before that edit, and writing it back loses the edit (R3.4).
+#[tokio::test]
+async fn a_re_add_keeps_the_live_album_edit_over_a_stale_stored_row() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the folder");
+    let engine = start_engine(&server, &store, EngineConfig::default()).await;
+    let path = photos.display().to_string();
+
+    engine.add_folder(&path, true).expect("add the folder");
+    engine
+        .set_album_mapping(&path, true)
+        .expect("enable album mapping");
+    // The interleaving the re-add races, made deterministic: the album edit
+    // has landed, and the store still holds the row a racing re-add read
+    // before it.
+    store
+        .add_folder(&SourceFolder {
+            path: path.clone(),
+            recursive: true,
+            album_mapping: false,
+            album_scope: AlbumScope::Leaf,
+        })
+        .expect("write the stale row");
+
+    engine.add_folder(&path, false).expect("re-add the folder");
+
+    let stored = store
+        .folders()
+        .expect("read the folders")
+        .into_iter()
+        .find(|folder| folder.path == path)
+        .expect("the folder is stored");
+    assert!(
+        stored.album_mapping,
+        "the re-add wrote the stale row back over the live album edit"
+    );
+    assert!(
+        !stored.recursive,
+        "the re-add still applies its own recursive flag"
+    );
+    assert!(
+        engine.status().folders[0].album_mapping,
+        "the live card and the store must agree after the re-add"
+    );
+    engine.stop();
+}
+
+/// The two edits can run at the same time: album toggles (which take the
+/// folders lock) and re-adds. Neither may lose the other's field (R3.4).
+///
+/// The album thread writes a value it remembers, then checks the store for a
+/// while before its next write; a re-add that read the row before that write
+/// and wrote it after leaves the old value in the store, and the check sees
+/// it. The re-add thread only loops, so the checks cannot race a later album
+/// edit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_interleaved_recursive_toggle_and_album_toggle_lose_nothing() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the folder");
+    let engine = start_engine(
+        &server,
+        &store,
+        EngineConfig {
+            watch: false,
+            ..EngineConfig::default()
+        },
+    )
+    .await;
+    let path = photos.display().to_string();
+    engine.add_folder(&path, true).expect("add the folder");
+
+    let stored_mapping = || {
+        store
+            .folders()
+            .expect("read the folders")
+            .into_iter()
+            .find(|folder| folder.path == path)
+            .expect("the folder is stored")
+            .album_mapping
+    };
+    let barrier = std::sync::Barrier::new(2);
+    let done = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            barrier.wait();
+            let mut expected = false;
+            for _ in 0..40 {
+                expected = !expected;
+                engine
+                    .set_album_mapping(&path, expected)
+                    .expect("toggle the album mapping");
+                // The store must hold this toggle until the next one, unless
+                // a re-add wrote back a row it read before it.
+                for _ in 0..3 {
+                    assert_eq!(
+                        stored_mapping(),
+                        expected,
+                        "a re-add wrote the row it read before the album toggle"
+                    );
+                }
+            }
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        scope.spawn(|| {
+            barrier.wait();
+            while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                engine.add_folder(&path, true).expect("re-add the folder");
+            }
+        });
+    });
+    engine.stop();
+}
+
 /// The asset id the store recorded for one file.
 fn asset_id_of(store: &StateStore, path: &Path) -> String {
     store
@@ -1263,6 +1437,7 @@ fn retry_config(cap: u32) -> EngineConfig {
         attempt_cap: cap,
         retry: test_retry(),
         breaker_threshold: 3,
+        attention_threshold: 3,
         breaker_cooldown: Duration::from_millis(120),
         concurrency: 1,
         watch: false,
@@ -1507,9 +1682,10 @@ async fn a_401_re_logs_in_once_and_the_retried_upload_succeeds() {
     let (engine, session) = start_engine_with_session(&server, &store, retry_config(8)).await;
 
     assert!(
-        wait_until(
+        wait_for_progress(
+            || server.upload_requests() + server.login_requests(),
             || all_terminal(&store, std::slice::from_ref(&file)),
-            Duration::from_secs(10)
+            Duration::from_secs(10),
         )
         .await,
         "R1.4: the upload was not retried after the one re-login"
@@ -1592,14 +1768,24 @@ async fn two_leaf_folders_with_the_same_name_are_two_albums() {
     engine.stop();
 }
 
+/// R1.4's attention run is its own, shorter run, separate from the circuit
+/// breaker's (R6.6): a refused batch is not an alarm by itself, and the
+/// connection needs the user only once the run reaches the engine's attention
+/// threshold.
 #[tokio::test]
-async fn a_second_401_leaves_the_connection_needing_attention() {
+async fn a_run_of_401s_needs_attention_at_the_threshold() {
     let server = MockImmich::start().await;
     let temp = tempfile::tempdir().expect("create a temp dir");
     let store = store_in(&temp);
-    let photos = temp.path().join("photos");
-    let file = write_file(&photos, "photo.jpg", b"photo bytes");
-    add_folder(&store, &photos, true);
+    let first_folder = temp.path().join("first");
+    let second_folder = temp.path().join("second");
+    let first = write_file(&first_folder, "first.jpg", b"first bytes");
+    let second = write_file(&second_folder, "second.jpg", b"second bytes");
+    add_folder(&store, &first_folder, true);
+    // retry_config pins the attention run at three failures. The first item's
+    // upload is refused twice with nothing succeeding in between (the one
+    // re-login and the refusal), and the second item's checksum check is the
+    // third failed request in the run.
     for _ in 0..2 {
         server.fail(
             Operation::Upload,
@@ -1611,37 +1797,151 @@ async fn a_second_401_leaves_the_connection_needing_attention() {
     }
     let (engine, session) = start_engine_with_session(&server, &store, retry_config(8)).await;
 
-    let path_text = file.display().to_string();
+    let first_text = first.display().to_string();
     assert!(
-        wait_until(
-            || matches!(&store.item(&path_text), Ok(Some(row)) if row.state == ItemState::FailedPermanent),
-            Duration::from_secs(10)
+        wait_for_progress(
+            || server.upload_requests() + server.login_requests(),
+            || matches!(&store.item(&first_text), Ok(Some(row)) if row.state == ItemState::FailedPermanent),
+            Duration::from_secs(10),
         )
         .await,
-        "the second 401 did not park the item"
+        "the second 401 did not park the first item"
+    );
+    // Two failed requests in the run: the refusal is real, but the threshold
+    // is not reached, so the connection stays usable and the tray stays quiet.
+    assert!(
+        session.state().is_connected(),
+        "a run below the threshold must not need the user: {:?}",
+        session.state()
     );
     assert_eq!(
         server.upload_requests(),
         2,
-        "R1.4: one retry after the re-login, then no more"
+        "R1.4: the first item is one re-login and one refusal"
     );
     assert_eq!(server.login_requests(), 2);
+
+    // The second item's checksum check is the third failed request in the run,
+    // so the connection needs the user now. Its folder is added after the
+    // first item parked and after the first item's own check, so the refusal
+    // queued here is the next check and no request of it races the assertions
+    // above.
+    server.fail(
+        Operation::BulkUploadCheck,
+        Fault::Status {
+            code: 401,
+            retry_after: None,
+        },
+    );
+    engine
+        .add_folder(&second_folder.display().to_string(), true)
+        .expect("add the second folder");
     assert!(
-        matches!(
-            session.state(),
-            ConnectionState::NeedsAttention(Attention::Rejected)
-        ),
-        "R1.4: a second 401 needs the user: {:?}",
+        wait_for_progress(
+            || server.bulk_check_requests() + server.upload_requests() + server.login_requests(),
+            || matches!(
+                session.state(),
+                ConnectionState::NeedsAttention(Attention::Rejected)
+            ),
+            Duration::from_secs(10),
+        )
+        .await,
+        "R1.4: a run of 401s needs the user: {:?}",
         session.state()
     );
-    let row = store
-        .item(&path_text)
-        .expect("read")
+    assert_eq!(
+        server.upload_requests(),
+        2,
+        "the second item was refused at the check, before any upload"
+    );
+    assert_eq!(server.bulk_check_requests(), 2);
+    let first_row = store
+        .item(&first_text)
+        .expect("read the row")
         .expect("the row exists");
-    assert_eq!(row.state, ItemState::FailedPermanent);
-    assert_eq!(row.error_class, Some(FailureClass::AuthFailed));
+    assert_eq!(first_row.state, ItemState::FailedPermanent);
+    assert_eq!(first_row.error_class, Some(FailureClass::AuthFailed));
+    // R1.4: nothing is wrong with the second file, so its row waits for the
+    // sign-in that fixes the credential instead of being parked.
+    let second_row = store
+        .item(&second.display().to_string())
+        .expect("read the row")
+        .expect("the row exists");
+    assert_eq!(second_row.state, ItemState::Pending);
     // R8.2: the tray reads the same state.
     assert_eq!(engine.status().activity, Activity::NeedsAttention);
+    engine.stop();
+}
+
+/// R1.4: the default attention threshold is its own, shorter run. One refused
+/// batch spends two failures, so it stays below the default of three and the
+/// next scan's refusal is what reaches the user, not the five the circuit
+/// breaker waits for (R6.6).
+#[tokio::test]
+async fn the_default_attention_threshold_is_shorter_than_the_breaker_run() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    write_file(&photos, "photo.jpg", b"photo bytes");
+    add_folder(&store, &photos, true);
+    // Two refusals for the first batch: the 401, the one re-login, and the
+    // retried check's 401.
+    for _ in 0..2 {
+        server.fail(
+            Operation::BulkUploadCheck,
+            Fault::Status {
+                code: 401,
+                retry_after: None,
+            },
+        );
+    }
+    let (engine, session) =
+        start_engine_with_session(&server, &store, EngineConfig::default()).await;
+
+    assert!(
+        wait_for_progress(
+            || server.bulk_check_requests() + server.login_requests(),
+            || server.bulk_check_requests() >= 2,
+            Duration::from_secs(10),
+        )
+        .await,
+        "the first batch was never refused"
+    );
+    assert!(
+        session.state().is_connected(),
+        "one refused batch (two failures) is below the default attention threshold: {:?}",
+        session.state()
+    );
+
+    // The next scan's refusal is the third failure in the run, so it reaches
+    // the user. The breaker's own run is two failures further away.
+    server.fail(
+        Operation::BulkUploadCheck,
+        Fault::Status {
+            code: 401,
+            retry_after: None,
+        },
+    );
+    engine.sync_now();
+    assert!(
+        wait_for_progress(
+            || server.bulk_check_requests() + server.login_requests(),
+            || matches!(
+                session.state(),
+                ConnectionState::NeedsAttention(Attention::Rejected)
+            ),
+            Duration::from_secs(10),
+        )
+        .await,
+        "the third failure in the run must reach the user: {:?}",
+        session.state()
+    );
+    assert_eq!(
+        server.validate_token_requests(),
+        0,
+        "R6.6: the breaker's longer run must not have opened yet"
+    );
     engine.stop();
 }
 
@@ -2059,6 +2359,90 @@ async fn a_duplicate_the_server_already_has_joins_the_album_too() {
     engine.stop();
 }
 
+/// R6.6: one dropped connection is not a run. The retry is held open on the
+/// server, so the run of one failure can be read before anything succeeds.
+#[tokio::test]
+async fn one_transport_failure_does_not_need_attention() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    write_file(&photos, "offline.jpg", b"offline bytes");
+    add_folder(&store, &photos, true);
+    server.fail(Operation::Upload, Fault::Disconnect);
+    // The retry reaches the server and is held there, so the test can read the
+    // connection while the run is one failure long.
+    server.fail(Operation::Upload, Fault::Slow(Duration::from_secs(30)));
+    let (engine, session) = start_engine_with_session(&server, &store, retry_config(8)).await;
+
+    assert!(
+        wait_for_progress(
+            || server.upload_requests(),
+            || server.upload_requests() >= 2,
+            Duration::from_secs(10),
+        )
+        .await,
+        "the retry never reached the server"
+    );
+    assert!(
+        session.state().is_connected(),
+        "one transport failure must not need the user: {:?}",
+        session.state()
+    );
+    engine.stop();
+}
+
+/// R6.6, R8.2: a run of dropped connections reaches the threshold, and the
+/// connection needs the user with the transport reason.
+#[tokio::test]
+async fn a_run_of_transport_failures_needs_attention_with_the_reason() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    write_file(&photos, "offline.jpg", b"offline bytes");
+    add_folder(&store, &photos, true);
+    // Three dropped uploads reach the threshold; every probe after that fails
+    // too, so the connection stays in attention while the test reads it.
+    for _ in 0..3 {
+        server.fail(Operation::Upload, Fault::Disconnect);
+    }
+    for _ in 0..40 {
+        server.fail(
+            Operation::ValidateToken,
+            Fault::Status {
+                code: 503,
+                retry_after: None,
+            },
+        );
+    }
+    let (engine, session) = start_engine_with_session(&server, &store, retry_config(8)).await;
+
+    assert!(
+        wait_for_progress(
+            || server.upload_requests() + server.validate_token_requests(),
+            || matches!(
+                session.state(),
+                ConnectionState::NeedsAttention(Attention::Unreachable(_))
+            ),
+            Duration::from_secs(10),
+        )
+        .await,
+        "the run did not reach attention: {:?}",
+        session.state()
+    );
+    assert_eq!(
+        engine.status().activity,
+        Activity::NeedsAttention,
+        "R8.2: the tray reads the run as needing attention"
+    );
+    let ConnectionState::NeedsAttention(Attention::Unreachable(detail)) = session.state() else {
+        unreachable!("the wait above matched the transport attention")
+    };
+    assert!(!detail.is_empty(), "the reason names the transport failure");
+    engine.stop();
+}
+
 #[tokio::test]
 async fn a_run_of_connection_failures_trips_the_breaker_and_it_probes_before_resuming() {
     let server = MockImmich::start().await;
@@ -2374,9 +2758,11 @@ async fn a_batch_during_a_dead_session_stays_pending_until_the_user_signs_in_aga
         write_file(&photos, "second.jpg", b"second bytes"),
     ];
     add_folder(&store, &photos, true);
-    // The checksum check is refused twice: the first 401 re-logs in, and the
-    // second leaves the connection needing the user (R1.4).
-    for _ in 0..2 {
+    // The checksum check is refused: the first 401 re-logs in, the second is
+    // the first refusal in the run. The attention threshold retry_config pins
+    // is three, so a later scan's refusal is the one that reaches the user
+    // (R1.4, R6.6).
+    for _ in 0..3 {
         server.fail(
             Operation::BulkUploadCheck,
             Fault::Status {
@@ -2387,13 +2773,23 @@ async fn a_batch_during_a_dead_session_stays_pending_until_the_user_signs_in_aga
     }
     let (engine, session) = start_engine_with_session(&server, &store, retry_config(8)).await;
 
+    // The first refused batch leaves its files pending for the next scan.
+    assert!(
+        wait_until(
+            || server.bulk_check_requests() >= 2,
+            Duration::from_secs(20)
+        )
+        .await,
+        "the first batch was never refused"
+    );
+    engine.sync_now();
     assert!(
         wait_until(
             || matches!(session.state(), ConnectionState::NeedsAttention(_)),
             Duration::from_secs(20)
         )
         .await,
-        "R1.4: the second 401 did not leave the connection needing the user"
+        "R1.4: the run of 401s did not leave the connection needing the user"
     );
     tokio::time::sleep(Duration::from_millis(400)).await;
     for file in &files {
@@ -2459,7 +2855,7 @@ async fn a_success_between_two_connection_failures_is_not_a_run() {
     server.fail(Operation::BulkUploadCheck, Fault::Disconnect);
     server.fail(Operation::Upload, Fault::Disconnect);
     server.fail(Operation::BulkUploadCheck, Fault::Disconnect);
-    let engine = start_engine(&server, &store, config).await;
+    let (engine, session) = start_engine_with_session(&server, &store, config).await;
 
     assert!(
         wait_until(|| all_terminal(&store, &files), Duration::from_secs(20)).await,
@@ -2470,6 +2866,16 @@ async fn a_success_between_two_connection_failures_is_not_a_run() {
         server.validate_token_requests(),
         0,
         "R6.6: three failures that were never a run still tripped the breaker"
+    );
+    assert!(
+        session.state().is_connected(),
+        "the successes between the failures ended the run: {:?}",
+        session.state()
+    );
+    assert_ne!(
+        engine.status().activity,
+        Activity::NeedsAttention,
+        "the tray must not need attention for failures no success left in a run"
     );
     engine.stop();
 }
@@ -3669,6 +4075,44 @@ async fn a_deleted_file_becomes_exactly_one_review_item() {
         "R5.1: a later discovery pass must not add a second review item"
     );
     assert_eq!(store.review_count().expect("count the review"), 1);
+    engine.stop();
+}
+
+/// A review row keeps waiting after its source folder is removed, so the
+/// tray's total must count it too (R5.4): the list shows it, and a total of
+/// zero is a tray that disagrees with what the user can see.
+#[tokio::test]
+async fn a_review_row_under_a_removed_folder_still_counts_once() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let file = write_file(&photos, "gone.jpg", b"gone bytes");
+    add_folder(&store, &photos, true);
+    let engine = start_engine(
+        &server,
+        &store,
+        review_config(Duration::from_secs(1), false),
+    )
+    .await;
+    sync_one(&store, &file).await;
+
+    // The file is deleted while the folder is still a source folder, so the
+    // scan raises the review row; the folder is then removed, and the rows
+    // under it stay in the store for the user to decide on.
+    std::fs::remove_file(&file).expect("delete the fixture");
+    wait_for_review(&engine, 1).await;
+    engine
+        .remove_folder(&photos.display().to_string())
+        .expect("remove the source folder");
+
+    let items = engine.review_items().expect("read the review");
+    assert_eq!(items.len(), 1, "the removed folder's row is still listed");
+    assert_eq!(
+        engine.status().counts.review,
+        1,
+        "R5.4: the tray total must match the list, not only the current folders"
+    );
     engine.stop();
 }
 

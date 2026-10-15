@@ -42,8 +42,8 @@ use sync_core::credential::{MemoryCredentialStore, SharedCredentialStore};
 use sync_core::store::{AlbumScope, SourceFolder, StateStore};
 
 const API_KEY: &str = "api-key-abc123";
-/// The schema stands at the eighth migration.
-const DB_MIGRATION_VERSION: i64 = 8;
+/// The schema stands at the ninth migration.
+const DB_MIGRATION_VERSION: i64 = 9;
 
 fn temporary_paths(dir: &Path) -> AppPaths {
     AppPaths {

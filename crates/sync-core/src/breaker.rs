@@ -8,6 +8,12 @@
 //!
 //! The breaker is plain shared state: the engine asks whether it is open, feeds
 //! it connection failures, and reports the probe's outcome.
+//!
+//! The connection counts a run of failed requests as well (R1.4). That run
+//! has its own threshold, `EngineConfig::attention_threshold`, which is
+//! shorter than the breaker's: on the transport path the tray changes before
+//! the breaker opens, and on the auth path a refusal that no re-login answers
+//! moves the tray without the breaker at all. A success resets both notions.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};

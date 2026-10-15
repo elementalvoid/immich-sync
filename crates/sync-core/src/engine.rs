@@ -75,7 +75,18 @@ pub struct EngineConfig {
     /// The wait before a later attempt (R6.1, R6.2).
     pub retry: RetryPolicy,
     /// How many connection failures in a row trip the circuit breaker (R6.6).
+    /// Default 5. The connection's attention run is its own, shorter number
+    /// ([`Self::attention_threshold`]): the breaker gates the queue, not the
+    /// tray.
     pub breaker_threshold: u32,
+    /// How many failed requests in a row the connection waits out before the
+    /// tray needs the user (R1.4). Default 3: one refused batch spends up to
+    /// two refusals (the one re-login and the refusal that starts the run), so
+    /// a single batch never worries the user, while a credential that keeps
+    /// failing reaches the user on the next scan (about 30 minutes by default)
+    /// instead of about an hour a run of five allowed. A success
+    /// resets the run.
+    pub attention_threshold: u32,
     /// How long the queue waits between credential probes while the breaker is
     /// open (R6.6).
     pub breaker_cooldown: Duration,
@@ -93,6 +104,7 @@ impl Default for EngineConfig {
             attempt_cap: 8,
             retry: RetryPolicy::default(),
             breaker_threshold: 5,
+            attention_threshold: 3,
             breaker_cooldown: Duration::from_secs(10),
         }
     }
@@ -200,7 +212,9 @@ pub struct EngineStatus {
     pub activity: Activity,
     /// One entry per source folder, in the stored order.
     pub folders: Vec<FolderStatus>,
-    /// The summed counts across folders.
+    /// The summed counts across folders. The review count is the store's
+    /// global one, because a row under a removed source folder still waits
+    /// for a decision and still shows in [`Engine::review_items`].
     pub counts: FolderCounts,
     /// The last failure the engine recorded, if any.
     pub last_error: Option<String>,
@@ -328,6 +342,10 @@ impl Engine {
         let albums = AlbumMapper::new(session.clone(), store.clone());
         let versions = Versioner::new(session.clone(), store.clone());
         let breaker = CircuitBreaker::new(config.breaker_threshold, config.breaker_cooldown);
+        // R1.4: the attention run is its own, shorter number. A refused batch
+        // spends up to two failures, so the default of three keeps one batch
+        // below the alarm while still reaching the user on the next scan.
+        session.set_attention_threshold(config.attention_threshold);
         let inner = Arc::new(EngineInner {
             store,
             session,
@@ -500,6 +518,13 @@ impl Engine {
     /// admits its own full size while those attempts are still running, so the
     /// running count can briefly exceed a shrinking limit; no upload is
     /// cancelled or failed.
+    ///
+    /// The overshoot is per swap: the running count can reach the attempts in
+    /// flight at the swap plus the new pool's size. That is not a one-time
+    /// correction, because a later swap does not wait for the attempts the
+    /// previous one admitted: a second resize while those are still running
+    /// lets the count overshoot again by the attempts in flight at that swap
+    /// plus its own new size, so repeated swaps can compound the peak.
     pub async fn set_limits(&self, limits: Limits) {
         self.inner.bandwidth.set(limits.bandwidth_bytes_per_second);
         // One resize at a time, so a second change cannot race the swap.
@@ -540,48 +565,68 @@ impl Engine {
         }
         // R3.4: the store's upsert writes every column, so re-adding a folder
         // (the app's recursive toggle does) must carry the album fields the
-        // stored row already holds. A hardcoded `false` silently unmapped a
-        // folder the user had mapped, and the loss only showed after a
-        // restart. A brand-new folder still starts unmapped; the config
-        // window opts it in on purpose.
+        // folder already holds. A hardcoded `false` silently unmapped a folder
+        // the user had mapped, and the loss only showed after a restart. A
+        // brand-new folder still starts unmapped; the config window opts it in
+        // on purpose.
+        //
+        // The lock is held across the lookup and the upsert: a near-simultaneous
+        // album edit would otherwise slip between them and the re-add would
+        // write back the row it read before the edit. For a folder this engine
+        // already holds, that row is taken from the in-memory entry, which the
+        // album edits keep current; a folder new to this engine has no live
+        // entry and starts from the stored row.
         let key = path_key(Path::new(path));
-        let stored = self
-            .inner
-            .store
-            .folders()?
-            .into_iter()
-            .find(|folder| path_key(Path::new(&folder.path)) == key);
+        let mut folders = self.inner.folders.lock().expect("the folder lock");
+        let live = folders
+            .iter()
+            .find(|entry| path_key(Path::new(&entry.folder.path)) == key);
+        let (album_mapping, album_scope) = match live {
+            Some(entry) => (entry.folder.album_mapping, entry.folder.album_scope),
+            None => {
+                let stored = self
+                    .inner
+                    .store
+                    .folders()?
+                    .into_iter()
+                    .find(|folder| path_key(Path::new(&folder.path)) == key);
+                (
+                    stored.as_ref().is_some_and(|folder| folder.album_mapping),
+                    stored.map_or_else(AlbumScope::default, |folder| folder.album_scope),
+                )
+            }
+        };
         let folder = SourceFolder {
             path: path.to_string(),
             recursive,
-            album_mapping: stored.as_ref().is_some_and(|folder| folder.album_mapping),
-            album_scope: stored.map_or_else(AlbumScope::default, |folder| folder.album_scope),
+            album_mapping,
+            album_scope,
         };
         self.inner.store.add_folder(&folder)?;
         // R8.1: a folder new to this engine starts from what the store already
         // holds for it; a zeroed card would never fill, because the rows are
         // settled and `prepare` does not count them again.
-        let counts = self.inner.store.folder_counts(path).unwrap_or_else(|error| {
-            tracing::warn!(folder = path, error = %error, "the folder counts could not be read");
-            FolderCounts::default()
-        });
+        if let Some(entry) = folders
+            .iter_mut()
+            .find(|entry| path_key(Path::new(&entry.folder.path)) == key)
         {
-            let mut folders = self.inner.folders.lock().expect("the folder lock");
-            if let Some(entry) = folders
-                .iter_mut()
-                .find(|entry| path_key(Path::new(&entry.folder.path)) == key)
-            {
-                entry.folder.recursive = recursive;
-                entry.available = Path::new(path).is_dir();
-            } else {
-                folders.push(FolderEntry {
-                    available: Path::new(path).is_dir(),
-                    folder,
-                    counts,
-                    last_error: None,
-                });
-            }
+            // The whole row is taken, so the spelling the store just wrote is
+            // the one the live entry holds, and no field is left stale.
+            entry.folder = folder;
+            entry.available = Path::new(path).is_dir();
+        } else {
+            let counts = self.inner.store.folder_counts(path).unwrap_or_else(|error| {
+                tracing::warn!(folder = path, error = %error, "the folder counts could not be read");
+                FolderCounts::default()
+            });
+            folders.push(FolderEntry {
+                available: Path::new(path).is_dir(),
+                folder,
+                counts,
+                last_error: None,
+            });
         }
+        drop(folders);
         let mut watcher = self.inner.watcher.lock().expect("the watcher lock");
         let mut watch_error = None;
         if let Some(watcher) = watcher.as_mut()
@@ -722,6 +767,14 @@ impl Engine {
             counts.failed += folder.counts.failed;
             counts.review += folder.counts.review;
         }
+        // R5.4: the review is counted from the store, not summed over the
+        // current folders. A row under a removed source folder is still a
+        // decision the user owes, and it still shows in `review_items`, so a
+        // folder sum would let the tray total disagree with the list.
+        counts.review = self.inner.store.review_count().unwrap_or_else(|error| {
+            tracing::warn!(error = %error, "the review count could not be read");
+            counts.review
+        });
         let activity = if self.inner.gate.is_paused() {
             Activity::Paused
         } else if !self.inner.session.state().is_connected()
@@ -894,6 +947,14 @@ impl Drop for Engine {
 impl EngineInner {
     /// The upload pool in force right now (R7.2).
     ///
+    /// Records a request the server answered: the run of failures the breaker
+    /// counts ends, and a connection that only needed attention because the
+    /// server was unreachable leaves that state (R6.6, R8.2).
+    async fn note_reachable(&self) {
+        self.breaker.record_success();
+        self.session.note_reachable().await;
+    }
+
     /// A resize swaps the pool, so an attempt takes its permit from the pool
     /// that was current when the attempt started, and a later attempt takes
     /// one from whatever pool is current then.
@@ -1127,12 +1188,18 @@ impl EngineInner {
 
     /// Records one batch-level failure against every item of the batch.
     ///
-    /// A connection that is no longer usable failed as a whole, not once per
-    /// item (R1.4): nothing is written, so the rows stay `pending` and the next
-    /// reconciliation scan queues them again. Parking a batch of them would
-    /// leave every file looking permanently broken to a sign-in that fixes it.
+    /// A refused credential failed as a whole, not once per item (R1.4):
+    /// nothing is written, so the rows stay `pending` and the next scan or
+    /// sign-in queues them again. The session may still read `Connected` when
+    /// the refusal is below the attention threshold, so the refusal itself is
+    /// the signal. Parking a batch of them would leave every file looking
+    /// permanently broken to a sign-in that fixes it.
     fn fail_batch(&self, prepared: &[PreparedItem], error: &ClientError) {
-        if !self.session.state().is_connected() {
+        // A refusal the session could not answer is the credential's problem,
+        // not the files': the state may still read `Connected` while the
+        // refusal is below the attention threshold (R1.4).
+        let refused = matches!(error, ClientError::InvalidToken);
+        if !self.session.state().is_connected() || refused {
             tracing::warn!(
                 batch = prepared.len(),
                 reason = %error.redacted_reason(),
@@ -1244,7 +1311,7 @@ async fn wait_for_the_server(inner: &Arc<EngineInner>) -> Result<(), ClientError
         }
         match inner.session.validate().await {
             Ok(()) => {
-                inner.breaker.record_success();
+                inner.note_reachable().await;
                 tracing::info!("the server answered the credential probe, so the queue resumes");
                 return Ok(());
             }
@@ -1405,7 +1472,7 @@ async fn process_batch(inner: &Arc<EngineInner>, batch: Vec<PathBuf>) {
             Ok(results) => {
                 // R6.6: the server answered, so the run of connection failures
                 // the breaker counts ends here.
-                inner.breaker.record_success();
+                inner.note_reachable().await;
                 break results;
             }
             Err(error) => {
@@ -1844,7 +1911,7 @@ async fn upload_with_retries(inner: &Arc<EngineInner>, item: &PreparedItem) -> U
             UploadOutcome::Created { .. } | UploadOutcome::Duplicate { .. } => {
                 // R6.6: a request the server answered ends the run of
                 // connection failures, so one unlucky request is not a run.
-                inner.breaker.record_success();
+                inner.note_reachable().await;
                 (AttemptOutcome::Succeeded, None)
             }
             UploadOutcome::Failed(failure) | UploadOutcome::DeadLetter(failure) => {
