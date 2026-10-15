@@ -268,6 +268,11 @@ struct EngineInner {
     /// block, so it only records the path and wakes the scan loop, which asks
     /// the store whether anything tracked really disappeared.
     absences: Mutex<Vec<PathBuf>>,
+    /// The folder listings a scan pass reuses (R3.3). The scan clears it and
+    /// the watcher drops the folder a change touched, so a batch reads only
+    /// what is missing: a 10k-file folder is listed once per scan rather than
+    /// once per batch.
+    index_cache: Mutex<FolderIndex>,
     /// Wakes the scan loop when an absence needs reconciling.
     reconcile: Notify,
 }
@@ -346,6 +351,7 @@ impl Engine {
             uploads: Mutex::new(JoinSet::new()),
             absences: Mutex::new(Vec::new()),
             reconcile: Notify::new(),
+            index_cache: Mutex::new(FolderIndex::default()),
         });
         Ok(Self {
             inner,
@@ -858,6 +864,13 @@ impl EngineInner {
     /// rules (R2.2). A path that disappeared is recorded and reconciled by the
     /// scan loop (R5.1).
     fn enqueue_watch_batch(&self, paths: Vec<PathBuf>) {
+        // A change in a folder makes its cached listing stale, whether or not
+        // the changed path itself is queued (a sidecar is not an item, but it
+        // still pairs with the media file in the same batch). R3.3.
+        self.index_cache
+            .lock()
+            .expect("the index cache lock")
+            .invalidate(&paths);
         for path in paths {
             let Ok(metadata) = std::fs::symlink_metadata(&path) else {
                 // The path is gone. Whether that is a missing file, a rename,
@@ -1265,14 +1278,10 @@ fn folder_entry_for(inner: &EngineInner, path: &Path) -> Option<SourceFolder> {
 
 /// Prepares one batch and checks it with one `bulk-upload-check` (R3.1).
 async fn process_batch(inner: &Arc<EngineInner>, batch: Vec<PathBuf>) {
-    // R3.3: the pairing rules need the folders' other files, so they are read
-    // once per batch on a blocking thread, before any file is hashed.
-    let index = {
-        let batch = batch.clone();
-        tokio::task::spawn_blocking(move || FolderIndex::read(&batch))
-            .await
-            .unwrap_or_default()
-    };
+    // R3.3: the pairing rules need the folders' other files. A scan pass
+    // shares one listing per folder across its batches, so a 10k-file folder
+    // is walked once per scan instead of once per batch.
+    let index = batch_index(inner, &batch).await;
     let mut prepared = Vec::with_capacity(batch.len());
     for path in batch {
         if let Some(item) = prepare(inner, &path, &index).await {
@@ -1455,6 +1464,27 @@ async fn restore_asset(inner: &Arc<EngineInner>, asset_id: &str) -> Result<(), C
             async move { client.restore_assets(credential.auth(), &ids).await }
         })
         .await
+}
+
+/// The folder listings one batch needs, read into the scan's shared cache on
+/// a blocking thread (R3.3).
+async fn batch_index(inner: &Arc<EngineInner>, batch: &[PathBuf]) -> FolderIndex {
+    let missing = {
+        let cache = inner.index_cache.lock().expect("the index cache lock");
+        cache.missing_paths(batch)
+    };
+    if !missing.is_empty() {
+        let read = tokio::task::spawn_blocking(move || FolderIndex::read(&missing))
+            .await
+            .unwrap_or_default();
+        inner
+            .index_cache
+            .lock()
+            .expect("the index cache lock")
+            .merge(read);
+    }
+    let cache = inner.index_cache.lock().expect("the index cache lock");
+    cache.for_paths(batch)
 }
 
 /// One bulk-check answer the server never sent.
@@ -1840,6 +1870,8 @@ async fn scan_loop(inner: Arc<EngineInner>) {
 /// across folders is seen: the reconciliation has the whole picture, not one
 /// folder at a time.
 async fn scan_once(inner: &Arc<EngineInner>) {
+    // R3.3: a new pass pairs against fresh listings, not the previous pass's.
+    *inner.index_cache.lock().expect("the index cache lock") = FolderIndex::default();
     let folders: Vec<SourceFolder> = inner
         .folders
         .lock()
@@ -2211,5 +2243,93 @@ mod tests {
             reclaimed,
             "an item a closed pool could not spawn is stuck claimed forever"
         );
+    }
+
+    /// A scan with more files than one batch must list a folder once, not
+    /// once per batch (R3.3).
+    ///
+    /// `process_batch` used to call `FolderIndex::read` for its own batch, so
+    /// a 10k-file folder re-stated itself once per 100-file batch. The scan's
+    /// cache now serves every batch of the pass.
+    #[tokio::test]
+    async fn a_scan_lists_each_folder_once_for_all_its_batches() {
+        use crate::connection::{AuthMethod, Secret, SignIn};
+
+        let server = mock_immich::MockImmich::start().await;
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let store =
+            Arc::new(StateStore::open(temp.path().join("state.db")).expect("open the state store"));
+        let folder = temp.path().join("photos");
+        std::fs::create_dir_all(&folder).expect("create the folder");
+        for index in 0..130 {
+            std::fs::write(
+                folder.join(format!("file-{index}.jpg")),
+                format!("bytes {index}"),
+            )
+            .expect("write the fixture");
+        }
+        store
+            .add_folder(&SourceFolder {
+                path: folder.display().to_string(),
+                recursive: true,
+                album_mapping: false,
+                album_scope: AlbumScope::default(),
+            })
+            .expect("add the folder");
+        let mut connection = crate::connection::Connection::new(
+            server.base_url(),
+            Arc::new(crate::credential::MemoryCredentialStore::new()),
+        )
+        .expect("a valid URL");
+        connection
+            .sign_in(SignIn {
+                email: "sync@example.com".to_string(),
+                secret: Secret::new("correct horse"),
+                method: AuthMethod::Password,
+            })
+            .await;
+        let engine = Arc::new(
+            Engine::new(
+                store.clone(),
+                connection.shared(),
+                EngineConfig {
+                    scan_interval: Duration::from_secs(3600),
+                    watch: false,
+                    ..EngineConfig::default()
+                },
+            )
+            .expect("build the engine"),
+        );
+        engine.start();
+
+        let paths: Vec<PathBuf> = (0..130)
+            .map(|index| folder.join(format!("file-{index}.jpg")))
+            .collect();
+        let mut finished = false;
+        for _ in 0..1500 {
+            finished = paths.iter().all(|path| {
+                matches!(
+                    store.item(&path.display().to_string()),
+                    Ok(Some(row)) if row.state.is_terminal_success()
+                )
+            });
+            if finished {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(finished, "the 130 files never finished");
+
+        let listings = crate::pairing::LISTED_FOLDERS
+            .lock()
+            .expect("the listing log")
+            .iter()
+            .filter(|path| path.starts_with(&folder))
+            .count();
+        assert_eq!(
+            listings, 1,
+            "R3.3: one scan pass listed the folder {listings} times"
+        );
+        engine.stop();
     }
 }
