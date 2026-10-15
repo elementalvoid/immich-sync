@@ -84,7 +84,7 @@ pub struct EngineConfig {
     /// two refusals (the one re-login and the refusal that starts the run), so
     /// a single batch never worries the user, while a credential that keeps
     /// failing reaches the user on the next scan (about 30 minutes by default)
-    /// instead of the two and a half hours a run of five allowed. A success
+    /// instead of about an hour a run of five allowed. A success
     /// resets the run.
     pub attention_threshold: u32,
     /// How long the queue waits between credential probes while the breaker is
