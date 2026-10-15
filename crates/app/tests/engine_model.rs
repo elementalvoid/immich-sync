@@ -109,15 +109,47 @@ async fn wait_for_inputs(
     panic!("the store and the connection never became ready");
 }
 
+/// The live connection state, read from the session the engine holds rather
+/// than from the model's 250 ms poll of it.
+fn live_state(cx: &TestAppContext, connection: &Entity<ConnectionModel>) -> ConnectionState {
+    cx.read(|cx| {
+        connection
+            .read(cx)
+            .session()
+            .expect("a live session")
+            .state()
+    })
+}
+
+/// Advances the test clock and lets real time pass until `ready` holds.
+///
+/// The engine's HTTP work runs on its own runtime, so a wait must give it real
+/// time; advancing the clock runs the model's own poll without parking the
+/// test thread on a timer future. A parked timer only advances while the test
+/// thread parks, which is what let the old `timer(..).await` loops outlast
+/// every budget.
+fn pump_until(cx: &TestAppContext, mut ready: impl FnMut(&TestAppContext) -> bool) -> bool {
+    // Twenty real seconds in the shape of the timer loops this replaces.
+    const STEPS: usize = 10_000;
+    for _ in 0..STEPS {
+        if ready(cx) {
+            return true;
+        }
+        cx.executor().advance_clock(Duration::from_millis(5));
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    false
+}
+
 /// Drives the engine's checksum check into refusals until the connection's
 /// failure run reaches the attention threshold (R1.4, R6.6).
 ///
-/// The run length is the engine's `EngineConfig::breaker_threshold`, which the
-/// test does not read, so it keeps refusing checks until the connection gives
-/// up. The first round needs two 401s (the one re-login and the refusal that
-/// starts the run); every later round needs one, because the re-login budget
-/// stays spent until a request succeeds.
-async fn refuse_checks_to_attention(
+/// The state is read from the live session, not from the model, whose copy
+/// only moves on its 250 ms poll. The first round needs two 401s (the one
+/// re-login and the refusal that starts the run); every later round needs one,
+/// because the re-login budget stays spent until a request succeeds.
+fn refuse_checks_to_attention(
     cx: &mut TestAppContext,
     engine: &Entity<EngineModel>,
     connection: &Entity<ConnectionModel>,
@@ -125,7 +157,8 @@ async fn refuse_checks_to_attention(
 ) {
     let mut refused = 0_u64;
     for _ in 0..10 {
-        if !cx.read(|cx| connection.read(cx).state().is_connected()) {
+        if !live_state(cx, connection).is_connected() {
+            settle_refused_batch(cx, server);
             return;
         }
         let attempts = if refused == 0 { 2 } else { 1 };
@@ -140,27 +173,35 @@ async fn refuse_checks_to_attention(
         }
         let before = server.bulk_check_requests();
         cx.update(|cx| engine.update(cx, |model, cx| model.sync_now(cx)));
-        for _ in 0..400 {
-            if server.bulk_check_requests() >= before + attempts
-                || !cx.read(|cx| connection.read(cx).state().is_connected())
-            {
-                break;
-            }
-            cx.executor().timer(Duration::from_millis(20)).await;
-            cx.run_until_parked();
-        }
+        let consumed = pump_until(cx, |cx| {
+            server.bulk_check_requests() >= before + attempts
+                || !live_state(cx, connection).is_connected()
+        });
+        assert!(
+            consumed,
+            "the refused check never reached the server: {} of {attempts}",
+            server.bulk_check_requests() - before
+        );
         refused += attempts;
     }
-    // The last refusal's run increment is written by the worker, so give it a
-    // moment before declaring the threshold unreachable.
-    for _ in 0..400 {
-        if !cx.read(|cx| connection.read(cx).state().is_connected()) {
-            return;
-        }
-        cx.executor().timer(Duration::from_millis(20)).await;
-        cx.run_until_parked();
-    }
     panic!("the refusal run never reached the engine's attention threshold");
+}
+
+/// Lets the batch that produced the refusal finish, then clears the faults a
+/// round queued but the refusal stopped before it sent.
+///
+/// The claim on the refused files is released by the batch's own worker after
+/// the session flips; a scan that wins that race would skip them as in flight
+/// and nothing would trigger another scan. The leftover faults would be
+/// bookkeeping, not the state under test: consumed after a sign-in they would
+/// refuse the very batch the test wants to see resume.
+fn settle_refused_batch(cx: &TestAppContext, server: &MockImmich) {
+    for _ in 0..50 {
+        cx.executor().advance_clock(Duration::from_millis(10));
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    server.reset_faults();
 }
 
 #[gpui_kit::test]
@@ -454,7 +495,10 @@ async fn a_form_sign_in_resumes_the_engine_a_refused_session_stalled(cx: &mut Te
     }
     // The checksum check is refused until the connection's run of failures
     // reaches the engine's attention threshold (R1.4, R6.6).
-    refuse_checks_to_attention(cx, &engine, &connection, &server).await;
+    refuse_checks_to_attention(cx, &engine, &connection, &server);
+    // The engine's own poll pulls the session state into the model, and so
+    // into the tray; refresh it here rather than wait out the 250 ms poll.
+    cx.update(|cx| connection.update(cx, |model, cx| model.refresh_state(cx)));
     assert!(
         !cx.read(|cx| connection.read(cx).state().is_connected()),
         "R1.4: the refused batch must leave the connection needing the user"
@@ -484,14 +528,14 @@ async fn a_form_sign_in_resumes_the_engine_a_refused_session_stalled(cx: &mut Te
             );
         });
     });
-    for _ in 0..400 {
-        if cx.read(|cx| connection.read(cx).state().is_connected()) && server.upload_requests() >= 2
-        {
-            break;
-        }
-        cx.executor().timer(Duration::from_millis(50)).await;
-        cx.run_until_parked();
-    }
+    let resumed = pump_until(cx, |cx| {
+        live_state(cx, &connection).is_connected() && server.upload_requests() >= 2
+    });
+    assert!(
+        resumed,
+        "R1.4: the sign-in did not resume the queue: {} uploads",
+        server.upload_requests()
+    );
     assert_eq!(
         server.upload_requests(),
         2,
@@ -910,7 +954,7 @@ async fn a_re_login_resumes_the_batch_a_refused_connection_left_pending(cx: &mut
     // The checksum check is refused until the connection's run of failures
     // reaches the engine's attention threshold (R1.4, R6.6). Nothing but a
     // scan reaches the files, so the refusals also cost a scan each.
-    refuse_checks_to_attention(cx, &engine, &connection, &server).await;
+    refuse_checks_to_attention(cx, &engine, &connection, &server);
     assert_eq!(
         server.upload_requests(),
         0,
@@ -936,13 +980,12 @@ async fn a_re_login_resumes_the_batch_a_refused_connection_left_pending(cx: &mut
     assert!(state.is_connected(), "{state:?}");
     cx.update(|cx| connection.update(cx, |model, cx| model.refresh_state(cx)));
 
-    for _ in 0..200 {
-        if server.upload_requests() >= 2 {
-            break;
-        }
-        cx.executor().timer(Duration::from_millis(50)).await;
-        cx.run_until_parked();
-    }
+    let resumed = pump_until(cx, |_| server.upload_requests() >= 2);
+    assert!(
+        resumed,
+        "R1.4: the re-login did not resume the queue: {} uploads",
+        server.upload_requests()
+    );
     assert_eq!(
         server.upload_requests(),
         2,
