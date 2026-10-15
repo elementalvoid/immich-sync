@@ -216,6 +216,13 @@ struct Field {
     input: Entity<InputState>,
 }
 
+/// What runs on the UI thread when one queued settings write lands (N2).
+///
+/// `Ok` means the file was written and the view's store now holds the new
+/// values; `Err` leaves the previous store in place.
+type SettingsWriteDone =
+    Box<dyn FnOnce(&mut SettingsView, Result<(), anyhow::Error>, &mut Context<SettingsView>)>;
+
 /// The settings view.
 pub struct SettingsView {
     store: SettingsStore,
@@ -237,6 +244,19 @@ pub struct SettingsView {
     /// A failure before the store opened, such as path resolution. It stays
     /// visible until the process restarts, because a later save cannot fix it.
     environment_problem: Option<String>,
+    /// The newest settings edit, so a slow write cannot install older values
+    /// over a newer one (N2).
+    settings_generation: u64,
+    /// The newest settings waiting to be written; a burst of edits coalesces
+    /// into one write.
+    pending_settings: Option<(u64, Settings)>,
+    /// What runs when `pending_settings` lands.
+    pending_finish: Option<SettingsWriteDone>,
+    /// The settings a write is currently writing, so a further edit is based
+    /// on them instead of the older store while the write is in flight. Its
+    /// presence also keeps one atomic save's temporary file from being raced
+    /// (N2).
+    in_flight_settings: Option<(u64, Settings)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -321,6 +341,10 @@ impl SettingsView {
             engine: None,
             action_error: None,
             environment_problem: None,
+            settings_generation: 0,
+            pending_settings: None,
+            pending_finish: None,
+            in_flight_settings: None,
             _subscriptions: subscriptions,
         };
         view.reconcile_autostart(cx);
@@ -401,31 +425,119 @@ impl SettingsView {
         self.engine = Some(engine);
     }
 
+    /// The newest intended settings: what a pending write will hold, or the
+    /// store's values when nothing is queued.
+    fn intended_settings(&self) -> Settings {
+        self.pending_settings
+            .as_ref()
+            .or(self.in_flight_settings.as_ref())
+            .map_or_else(
+                || self.store.settings().clone(),
+                |(_, settings)| settings.clone(),
+            )
+    }
+
+    /// The last save failure, for the Logs view's own notice (R10.3).
+    #[must_use]
+    pub fn save_problem(&self) -> Option<&str> {
+        self.action_error
+            .as_deref()
+            .filter(|error| error.starts_with(SAVE_PROBLEM))
+    }
+
+    /// Applies one settings change and writes it on the background executor
+    /// (N2).
+    ///
+    /// The change is computed against the newest intended state, so a second
+    /// edit before the first write lands is not lost. `finish` runs on the UI
+    /// thread after the write; a superseded failure cannot roll back a newer
+    /// choice, because only the newest edit's finish runs.
+    fn save_settings<F>(
+        &mut self,
+        cx: &mut Context<Self>,
+        change: impl FnOnce(&mut Settings) + Send + 'static,
+        finish: F,
+    ) where
+        F: FnOnce(&mut Self, Result<(), anyhow::Error>, &mut Context<Self>) + 'static,
+    {
+        let current = self.intended_settings();
+        let mut next = current.clone();
+        change(&mut next);
+        self.settings_generation = self.settings_generation.wrapping_add(1);
+        let generation = self.settings_generation;
+        if next == current && self.pending_settings.is_none() && self.in_flight_settings.is_none() {
+            // The file already holds this value and no write can still fail,
+            // so there is nothing to write. While a write is in flight, queue
+            // a redundant write instead: its finish reports the truth about
+            // that write, which a separate no-op success would mask.
+            finish(self, Ok(()), cx);
+            return;
+        }
+        self.pending_settings = Some((generation, next));
+        self.pending_finish = Some(Box::new(finish));
+        self.pump_settings_write(cx);
+    }
+
+    /// Writes the newest pending settings, one write at a time (N2).
+    ///
+    /// A write that is superseded while it runs still installs the store it
+    /// wrote, so the next write starts from what the file holds; only its
+    /// finish is dropped.
+    fn pump_settings_write(&mut self, cx: &mut Context<Self>) {
+        if self.in_flight_settings.is_some() {
+            return;
+        }
+        let Some((generation, settings)) = self.pending_settings.take() else {
+            return;
+        };
+        let Some(finish) = self.pending_finish.take() else {
+            return;
+        };
+        self.in_flight_settings = Some((generation, settings.clone()));
+        let store = self.store.clone();
+        let write = cx.background_executor().spawn(async move {
+            let mut store = store;
+            store.update(|current| *current = settings).map(|()| store)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = write.await;
+            let _ = this.update(cx, |view, cx| {
+                view.in_flight_settings = None;
+                match result {
+                    Ok(store) => {
+                        view.store = store;
+                        if view.settings_generation == generation {
+                            finish(view, Ok(()), cx);
+                        }
+                    }
+                    Err(error) => {
+                        if view.settings_generation == generation {
+                            finish(view, Err(error), cx);
+                        }
+                    }
+                }
+                view.pump_settings_write(cx);
+            });
+        })
+        .detach();
+    }
+
     /// Persists a log level and applies it to the running subscriber.
     ///
     /// The Logs view calls this, so the settings file keeps its one writer.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the settings file cannot be written. The running
-    /// level then keeps its last saved value, so the subscriber, the settings
-    /// file, and the level the view shows never disagree.
-    pub fn set_log_level(&mut self, level: LogLevel, cx: &mut Context<Self>) -> anyhow::Result<()> {
-        let result = self.store.update(|settings| settings.log_level = level);
-        if result.is_ok() {
-            crate::logging::set_level(level);
-        }
-        match result {
-            Ok(()) => {
-                self.record(SAVE_PROBLEM, Ok(()), cx);
-                Ok(())
-            }
-            Err(error) => {
-                let message = format!("{SAVE_PROBLEM}: {error:#}");
-                self.record(SAVE_PROBLEM, Err(error), cx);
-                Err(anyhow::anyhow!(message))
-            }
-        }
+    /// The subscriber keeps its last saved value until the write lands, so the
+    /// level, the settings file, and the subscriber never disagree.
+    pub fn set_log_level(&mut self, level: LogLevel, cx: &mut Context<Self>) {
+        self.save_settings(
+            cx,
+            move |settings| settings.log_level = level,
+            move |view, result, cx| {
+                if result.is_ok() {
+                    crate::logging::set_level(level);
+                }
+                view.record(SAVE_PROBLEM, result, cx);
+            },
+        );
     }
 
     /// Signs in with the form's values. The profile is saved only once the
@@ -458,13 +570,14 @@ impl SettingsView {
             return;
         }
         let profile = self.connection.read(cx).profile().clone();
-        if profile_from_settings(self.store.settings()) == profile {
+        if profile_from_settings(&self.intended_settings()) == profile {
             return;
         }
-        let result = self
-            .store
-            .update(|settings| apply_profile(settings, &profile));
-        self.record(SAVE_PROBLEM, result, cx);
+        self.save_settings(
+            cx,
+            move |settings| apply_profile(settings, &profile),
+            |view, result, cx| view.record(SAVE_PROBLEM, result, cx),
+        );
     }
 
     /// Switches the credential kind the form signs in with.
@@ -491,7 +604,9 @@ impl SettingsView {
     ///
     /// The Run key or `.desktop` entry can change outside the client. The
     /// switch must show what the OS does, or turning it off would be a no-op
-    /// against a file that already said off.
+    /// against a file that already said off. The correction goes through the
+    /// background writer, like every other settings save (N2), so a slow disk
+    /// never blocks the UI thread at startup.
     fn reconcile_autostart(&mut self, cx: &mut Context<Self>) {
         // A corrupt file holds defaults, so its flag is not a stored value. A
         // write here would replace the unparsable bytes and clear the load
@@ -500,12 +615,8 @@ impl SettingsView {
             return;
         }
         let stored = self.store.settings().autostart;
-        let result = match self.autostart.is_enabled() {
-            Ok(actual) if actual != stored => self
-                .store
-                .update(|settings| settings.autostart = actual)
-                .map_err(|error| error.context("record the OS autostart state")),
-            Ok(_) => Ok(()),
+        let actual = match self.autostart.is_enabled() {
+            Ok(actual) => actual,
             Err(error) => {
                 self.record(
                     AUTOSTART_READ_PROBLEM,
@@ -515,23 +626,35 @@ impl SettingsView {
                 return;
             }
         };
-        self.record(AUTOSTART_PROBLEM, result, cx);
+        if actual != stored {
+            self.save_settings(
+                cx,
+                move |settings| settings.autostart = actual,
+                |view, result, cx| view.record(AUTOSTART_PROBLEM, result, cx),
+            );
+        }
     }
 
-    /// Records one settings change and saves it.
+    /// Records one settings change and saves it (N2).
     fn write_field(&mut self, key: FieldKey, value: f64, cx: &mut Context<Self>) {
-        let result = self.store.update(|settings| key.set(settings, value));
-        self.record(SAVE_PROBLEM, result, cx);
-        // The stored value is what the engine gets, so a failed save cannot
-        // move the engine away from the file.
-        if matches!(key, FieldKey::Bandwidth | FieldKey::Concurrency)
-            && let Some(engine) = self.engine.clone()
-        {
-            let settings = self.store.settings();
-            let bandwidth = settings.bandwidth_bytes_per_second;
-            let concurrency = usize::try_from(settings.concurrency.max(1)).unwrap_or(4);
-            engine.update(cx, |model, _| model.set_limits(bandwidth, concurrency));
-        }
+        self.save_settings(
+            cx,
+            move |settings| key.set(settings, value),
+            move |view, result, cx| {
+                // The stored value is what the engine gets, so a failed save
+                // cannot move the engine away from the file.
+                if result.is_ok()
+                    && matches!(key, FieldKey::Bandwidth | FieldKey::Concurrency)
+                    && let Some(engine) = view.engine.clone()
+                {
+                    let settings = view.store.settings();
+                    let bandwidth = settings.bandwidth_bytes_per_second;
+                    let concurrency = usize::try_from(settings.concurrency.max(1)).unwrap_or(4);
+                    engine.update(cx, |model, _| model.set_limits(bandwidth, concurrency));
+                }
+                view.record(SAVE_PROBLEM, result, cx);
+            },
+        );
     }
 
     /// Applies the autostart setting to the OS, then records it.
@@ -545,17 +668,27 @@ impl SettingsView {
             self.record(AUTOSTART_PROBLEM, Err(error), cx);
             return;
         }
-        let result = self.store.update(|settings| settings.autostart = enabled);
-        let result = match result {
-            Ok(()) => Ok(()),
-            Err(error) => match self.autostart.set_enabled(!enabled) {
-                Ok(()) => Err(error),
-                Err(rollback) => Err(error.context(format!(
-                    "and rolling the OS autostart change back failed: {rollback:#}"
-                ))),
+        self.save_settings(
+            cx,
+            move |settings| settings.autostart = enabled,
+            move |view, result, cx| {
+                let result = match result {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        // The file still holds the previous value; bring the
+                        // OS back to it, so the two stores agree.
+                        let stored = view.store.settings().autostart;
+                        match view.autostart.set_enabled(stored) {
+                            Ok(()) => Err(error),
+                            Err(rollback) => Err(error.context(format!(
+                                "and rolling the OS autostart change back failed: {rollback:#}"
+                            ))),
+                        }
+                    }
+                };
+                view.record(AUTOSTART_PROBLEM, result, cx);
             },
-        };
-        self.record(AUTOSTART_PROBLEM, result, cx);
+        );
     }
 
     /// Shows a failure, or clears the previous one after a success.
@@ -831,7 +964,9 @@ impl SettingsView {
     /// The General section: autostart.
     fn general(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let palette = CardPalette::new(cx.theme());
-        let enabled = self.store.settings().autostart;
+        // The switch shows the user's newest intent, so a queued or in-flight
+        // write is reflected before it lands (N2).
+        let enabled = self.intended_settings().autostart;
         section(
             "settings-general",
             "General",

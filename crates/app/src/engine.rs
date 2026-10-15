@@ -5,6 +5,7 @@
 //! persists folder changes while the client is signed out, and republishes the
 //! engine's status to the dashboard on a short poll.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,12 +16,14 @@ use sync_core::store::{
     AlbumScope, FailedItem, FolderCounts, ReviewDecision, ReviewItem, SourceFolder, StateStore,
 };
 
-use crate::connection::{ConnectionModel, worker};
+use crate::connection::{
+    ConnectionModel, STORE_OPENING, WORKER_UNAVAILABLE, run_on_worker, worker,
+};
 use crate::paths::AppPaths;
 use crate::settings::SettingsStore;
 use crate::status::DashboardModel;
 use crate::store::StoreModel;
-use sync_core::connection::SharedSession;
+use sync_core::connection::{ConnectionState, SharedSession};
 
 /// How often the dashboard picks up the engine's live counts.
 const STATUS_POLL: Duration = Duration::from_millis(250);
@@ -55,6 +58,14 @@ pub struct EngineModel {
     /// The review count the last notification was based on, so the 250 ms
     /// status poll cannot post the same notification twice (R5.4).
     notified_review: u32,
+    /// Whether the attention notification already fired for the current
+    /// attention episode (R10.1). It clears when the activity leaves attention,
+    /// so a later episode notifies again.
+    notified_attention: bool,
+    /// The failed items the attention and failure notifications already cover
+    /// (R10.1), so a repeated read of the same parked item stays quiet while a
+    /// newly parked one raises its own notification.
+    notified_failed: HashSet<String>,
     paused: bool,
     problem: Option<String>,
     /// Bumped by every folder edit, so an older edit result cannot overwrite a
@@ -152,6 +163,8 @@ impl EngineModel {
             review: Vec::new(),
             review_problem: None,
             notified_review: 0,
+            notified_attention: false,
+            notified_failed: HashSet::new(),
             paused: false,
             problem: None,
             generation: 0,
@@ -200,31 +213,31 @@ impl EngineModel {
     pub fn keep_review(&mut self, path: String, cx: &mut Context<Self>) {
         let engine = self.engine.clone();
         let store = self.store_model.read(cx).store();
-        let Ok(runtime) = worker() else {
-            self.review_problem = Some("The network runtime could not start.".to_string());
-            cx.notify();
-            return;
-        };
-        let (results, incoming) = async_channel::bounded(1);
         let action_path = path.clone();
-        runtime.spawn(async move {
-            // N2: the store write belongs on the worker, not the UI thread.
-            let result = match engine {
-                Some(engine) => engine
-                    .keep_review_item(&action_path)
-                    .map(|_| ())
-                    .map_err(|error| error.to_string()),
-                None => match store {
-                    Some(store) => store
-                        .decide_review(&action_path, ReviewDecision::Keep)
+        let result = run_on_worker(
+            cx,
+            move || async move {
+                // N2: the store write belongs on the worker, not the UI thread.
+                match engine {
+                    Some(engine) => engine
+                        .keep_review_item(&action_path)
                         .map(|_| ())
                         .map_err(|error| error.to_string()),
-                    None => Err("The state database is still opening.".to_string()),
-                },
-            };
-            let _ = results.send(result).await;
-        });
-        self.finish_review_action(incoming, path, cx);
+                    None => match store {
+                        Some(store) => store
+                            .decide_review(&action_path, ReviewDecision::Keep)
+                            .map(|_| ())
+                            .map_err(|error| error.to_string()),
+                        None => Err(STORE_OPENING.to_string()),
+                    },
+                }
+            },
+            move |model, result, cx| model.finish_review_action(result, &path, cx),
+        );
+        if result.is_err() {
+            self.review_problem = Some(WORKER_UNAVAILABLE.to_string());
+            cx.notify();
+        }
     }
 
     /// Moves one missing file's asset to the trash and clears its row (R5.3).
@@ -237,56 +250,47 @@ impl EngineModel {
             cx.notify();
             return;
         };
-        let Ok(runtime) = worker() else {
-            self.review_problem = Some("The network runtime could not start.".to_string());
-            cx.notify();
-            return;
-        };
-        let (results, incoming) = async_channel::bounded(1);
         let action_path = path.clone();
-        runtime.spawn(async move {
-            let result = engine
-                .trash_review_item(&action_path)
-                .await
-                .map_err(|error| crate::review::trash_problem(&error));
-            let _ = results.send(result).await;
-        });
-        self.finish_review_action(incoming, path, cx);
+        let result = run_on_worker(
+            cx,
+            move || async move {
+                engine
+                    .trash_review_item(&action_path)
+                    .await
+                    .map_err(|error| crate::review::trash_problem(&error))
+            },
+            move |model, result, cx| model.finish_review_action(result, &path, cx),
+        );
+        if result.is_err() {
+            self.review_problem = Some(WORKER_UNAVAILABLE.to_string());
+            cx.notify();
+        }
     }
 
     /// Publishes the outcome of a keep or a trash and refreshes the rows
     /// (R5.3-R5.5).
     fn finish_review_action(
         &mut self,
-        incoming: async_channel::Receiver<Result<(), String>>,
-        path: String,
+        result: Result<(), String>,
+        path: &str,
         cx: &mut Context<Self>,
     ) {
-        cx.spawn(async move |this, cx| {
-            let Ok(result) = incoming.recv().await else {
-                return;
-            };
-            let _ = this.update(cx, |model, cx| {
-                let decided = result.is_ok();
-                match result {
-                    Ok(()) => model.review_problem = None,
-                    Err(problem) => model.review_problem = Some(problem),
-                }
-                model.refresh_review(cx);
-                // R5.4: the tray count follows the decision at once.
-                model.refresh_status(cx);
-                // Without a running engine the status is the store's cached
-                // counts, which do not know about the write that just landed,
-                // so re-read the affected folder's counts instead of patching
-                // the UI model: a later refresh must not resurrect the item.
-                if decided && model.engine.is_none() {
-                    model
-                        .store_model
-                        .update(cx, |store, cx| store.refresh_counts(&path, cx));
-                }
-            });
-        })
-        .detach();
+        let decided = result.is_ok();
+        match result {
+            Ok(()) => self.review_problem = None,
+            Err(problem) => self.review_problem = Some(problem),
+        }
+        self.refresh_review(cx);
+        // R5.4: the tray count follows the decision at once.
+        self.refresh_status(cx);
+        // Without a running engine the status is the store's cached counts,
+        // which do not know about the write that just landed, so re-read the
+        // affected folder's counts instead of patching the UI model: a later
+        // refresh must not resurrect the item.
+        if decided && self.engine.is_none() {
+            self.store_model
+                .update(cx, |store, cx| store.refresh_counts(path, cx));
+        }
     }
 
     /// Re-reads the missing files from the store on the background executor
@@ -319,43 +323,37 @@ impl EngineModel {
     pub fn retry_failed(&mut self, path: String, cx: &mut Context<Self>) {
         let engine = self.engine.clone();
         let store = self.store_model.read(cx).store();
-        let Ok(runtime) = worker() else {
-            self.problem = Some("The network runtime could not start.".to_string());
-            cx.notify();
-            return;
-        };
-        let (results, incoming) = async_channel::bounded(1);
-        runtime.spawn(async move {
-            // The store write runs on the worker runtime, so the UI thread
-            // never waits behind a worker's `BEGIN IMMEDIATE` (N2).
-            let result = match engine {
-                Some(engine) => engine
-                    .retry_failed(&path)
-                    .map(|_| ())
-                    .map_err(|error| error.to_string()),
-                None => match store {
-                    Some(store) => store
-                        .retry_item(&path)
+        let result = run_on_worker(
+            cx,
+            move || async move {
+                // The store write runs on the worker runtime, so the UI thread
+                // never waits behind a worker's `BEGIN IMMEDIATE` (N2).
+                match engine {
+                    Some(engine) => engine
+                        .retry_failed(&path)
                         .map(|_| ())
                         .map_err(|error| error.to_string()),
-                    None => Err("The state database is still opening.".to_string()),
-                },
-            };
-            let _ = results.send(result).await;
-        });
-        cx.spawn(async move |this, cx| {
-            let Ok(result) = incoming.recv().await else {
-                return;
-            };
-            let _ = this.update(cx, |model, cx| {
+                    None => match store {
+                        Some(store) => store
+                            .retry_item(&path)
+                            .map(|_| ())
+                            .map_err(|error| error.to_string()),
+                        None => Err(STORE_OPENING.to_string()),
+                    },
+                }
+            },
+            |model, result, cx| {
                 match result {
                     Ok(()) => model.problem = None,
                     Err(problem) => model.problem = Some(problem),
                 }
                 model.refresh_failed(cx);
-            });
-        })
-        .detach();
+            },
+        );
+        if result.is_err() {
+            self.problem = Some(WORKER_UNAVAILABLE.to_string());
+            cx.notify();
+        }
     }
 
     /// Re-reads the parked items from the store on the background executor
@@ -374,6 +372,26 @@ impl EngineModel {
                     if items != model.failed {
                         model.failed = items;
                         cx.notify();
+                    }
+                    // R10.1: a newly parked item raises a notification of its
+                    // own. An item that left the list forgets it was announced,
+                    // so a later failure notifies again.
+                    model
+                        .notified_failed
+                        .retain(|path| model.failed.iter().any(|item| item.path == *path));
+                    let fresh: Vec<String> = model
+                        .failed
+                        .iter()
+                        .filter(|item| !model.notified_failed.contains(&item.path))
+                        .map(|item| item.path.clone())
+                        .collect();
+                    if !fresh.is_empty() {
+                        tracing::info!(
+                            count = fresh.len(),
+                            "R10.1: a failed item raised a notification"
+                        );
+                        model.notified_failed.extend(fresh.iter().cloned());
+                        cx.show_system_notification(crate::shell::new_failure_notification(&fresh));
                     }
                 }
                 Err(error) => {
@@ -540,43 +558,57 @@ impl EngineModel {
         self.generation = self.generation.wrapping_add(1);
         let engine = self.engine.clone();
         let store = self.store_model.read(cx).store();
-        let Ok(runtime) = worker() else {
-            self.problem = Some("The network runtime could not start.".to_string());
-            cx.notify();
-            return;
-        };
         let generation = self.generation;
-        let (results, incoming) = async_channel::bounded(1);
-        runtime.spawn(async move {
-            // The store write runs on the worker runtime, so the UI thread
-            // never waits behind a worker's `BEGIN IMMEDIATE` (N2).
-            let result = match engine {
-                Some(engine) => engine
-                    .add_folder(&path, recursive)
-                    .map(|()| None)
-                    .map_err(|error| error.to_string()),
-                None => match store {
-                    Some(store) => match store.add_folder(&SourceFolder {
-                        path: path.clone(),
-                        recursive,
-                        // R3.4: adding a folder never opts it into album
-                        // mapping; the card's switch does that on purpose.
-                        album_mapping: false,
-                        album_scope: AlbumScope::default(),
-                    }) {
-                        Ok(()) => store.folders().map(Some).map_err(|error| error.to_string()),
-                        Err(error) => Err(error.to_string()),
+        let result = run_on_worker(
+            cx,
+            move || async move {
+                // The store write runs on the worker runtime, so the UI thread
+                // never waits behind a worker's `BEGIN IMMEDIATE` (N2).
+                match engine {
+                    Some(engine) => engine
+                        .add_folder(&path, recursive)
+                        .map(|()| None)
+                        .map_err(|error| error.to_string()),
+                    None => match store {
+                        Some(store) => match store.folders() {
+                            // R3.4: a new folder never opts into album mapping,
+                            // but editing an existing one (the recursion
+                            // toggle) must keep the album settings it already
+                            // has. The lookup compares path keys (R2.4),
+                            // so a re-add spelled differently still edits the
+                            // row it already has.
+                            Ok(folders) => {
+                                let case = sync_core::paths::PathCase::for_platform();
+                                let existing = folders.into_iter().find(|folder| {
+                                    sync_core::paths::equal(
+                                        Path::new(&folder.path),
+                                        Path::new(&path),
+                                        case,
+                                    )
+                                });
+                                let album_mapping =
+                                    existing.as_ref().is_some_and(|folder| folder.album_mapping);
+                                let album_scope = existing
+                                    .map_or_else(AlbumScope::default, |folder| folder.album_scope);
+                                match store.add_folder(&SourceFolder {
+                                    path: path.clone(),
+                                    recursive,
+                                    album_mapping,
+                                    album_scope,
+                                }) {
+                                    Ok(()) => {
+                                        store.folders().map(Some).map_err(|error| error.to_string())
+                                    }
+                                    Err(error) => Err(error.to_string()),
+                                }
+                            }
+                            Err(error) => Err(error.to_string()),
+                        },
+                        None => Err(STORE_OPENING.to_string()),
                     },
-                    None => Err("The state database is still opening.".to_string()),
-                },
-            };
-            let _ = results.send(result).await;
-        });
-        cx.spawn(async move |this, cx| {
-            let Ok(result) = incoming.recv().await else {
-                return;
-            };
-            let _ = this.update(cx, |model, cx| {
+                }
+            },
+            move |model, result, cx| {
                 if model.generation != generation {
                     return;
                 }
@@ -592,9 +624,12 @@ impl EngineModel {
                     Err(problem) => model.problem = Some(problem),
                 }
                 model.refresh_status(cx);
-            });
-        })
-        .detach();
+            },
+        );
+        if result.is_err() {
+            self.problem = Some(WORKER_UNAVAILABLE.to_string());
+            cx.notify();
+        }
     }
 
     /// Removes a source folder; its items stay in the store (R2.1).
@@ -603,35 +638,26 @@ impl EngineModel {
         self.generation = self.generation.wrapping_add(1);
         let engine = self.engine.clone();
         let store = self.store_model.read(cx).store();
-        let Ok(runtime) = worker() else {
-            self.problem = Some("The network runtime could not start.".to_string());
-            cx.notify();
-            return;
-        };
         let generation = self.generation;
-        let (results, incoming) = async_channel::bounded(1);
-        runtime.spawn(async move {
-            // N2: the store write belongs on the worker, not the UI thread.
-            let result = match engine {
-                Some(engine) => engine
-                    .remove_folder(&path)
-                    .map(|()| None)
-                    .map_err(|error| error.to_string()),
-                None => match store {
-                    Some(store) => match store.remove_folder(&path) {
-                        Ok(_) => store.folders().map(Some).map_err(|error| error.to_string()),
-                        Err(error) => Err(error.to_string()),
+        let result = run_on_worker(
+            cx,
+            move || async move {
+                // N2: the store write belongs on the worker, not the UI thread.
+                match engine {
+                    Some(engine) => engine
+                        .remove_folder(&path)
+                        .map(|()| None)
+                        .map_err(|error| error.to_string()),
+                    None => match store {
+                        Some(store) => match store.remove_folder(&path) {
+                            Ok(_) => store.folders().map(Some).map_err(|error| error.to_string()),
+                            Err(error) => Err(error.to_string()),
+                        },
+                        None => Ok(None),
                     },
-                    None => Ok(None),
-                },
-            };
-            let _ = results.send(result).await;
-        });
-        cx.spawn(async move |this, cx| {
-            let Ok(result) = incoming.recv().await else {
-                return;
-            };
-            let _ = this.update(cx, |model, cx| {
+                }
+            },
+            move |model, result, cx| {
                 if model.generation != generation {
                     return;
                 }
@@ -647,9 +673,12 @@ impl EngineModel {
                     Err(problem) => model.problem = Some(problem),
                 }
                 model.refresh_status(cx);
-            });
-        })
-        .detach();
+            },
+        );
+        if result.is_err() {
+            self.problem = Some(WORKER_UNAVAILABLE.to_string());
+            cx.notify();
+        }
     }
 
     /// Turns album mapping on or off for one source folder (R3.4).
@@ -676,48 +705,40 @@ impl EngineModel {
         self.generation = self.generation.wrapping_add(1);
         let engine = self.engine.clone();
         let store = self.store_model.read(cx).store();
-        let Ok(runtime) = worker() else {
-            self.problem = Some("The network runtime could not start.".to_string());
-            cx.notify();
-            return;
-        };
         let generation = self.generation;
-        let (results, incoming) = async_channel::bounded(1);
-        runtime.spawn(async move {
-            // N2: the store write belongs on the worker, not the UI thread.
-            let result = match engine {
-                Some(engine) => match change {
-                    AlbumChange::Mapping(enabled) => engine.set_album_mapping(&path, enabled),
-                    AlbumChange::Scope(scope) => engine.set_album_scope(&path, scope),
-                }
-                .map(|()| None)
-                .map_err(|error| error.to_string()),
-                None => match store {
-                    Some(store) => match store.folders() {
-                        Ok(folders) => match folders.into_iter().find(|folder| folder.path == path)
-                        {
-                            Some(mut folder) => {
-                                change.apply(&mut folder);
-                                match store.add_folder(&folder) {
-                                    Ok(()) => store.folders().map(Some),
-                                    Err(error) => Err(error),
+        let result = run_on_worker(
+            cx,
+            move || async move {
+                // N2: the store write belongs on the worker, not the UI thread.
+                match engine {
+                    Some(engine) => match change {
+                        AlbumChange::Mapping(enabled) => engine.set_album_mapping(&path, enabled),
+                        AlbumChange::Scope(scope) => engine.set_album_scope(&path, scope),
+                    }
+                    .map(|()| None)
+                    .map_err(|error| error.to_string()),
+                    None => match store {
+                        Some(store) => match store.folders() {
+                            Ok(folders) => {
+                                match folders.into_iter().find(|folder| folder.path == path) {
+                                    Some(mut folder) => {
+                                        change.apply(&mut folder);
+                                        match store.add_folder(&folder) {
+                                            Ok(()) => store.folders().map(Some),
+                                            Err(error) => Err(error),
+                                        }
+                                        .map_err(|error| error.to_string())
+                                    }
+                                    None => Err("That folder is not in the client.".to_string()),
                                 }
-                                .map_err(|error| error.to_string())
                             }
-                            None => Err("That folder is not in the client.".to_string()),
+                            Err(error) => Err(error.to_string()),
                         },
-                        Err(error) => Err(error.to_string()),
+                        None => Err(STORE_OPENING.to_string()),
                     },
-                    None => Err("The state database is still opening.".to_string()),
-                },
-            };
-            let _ = results.send(result).await;
-        });
-        cx.spawn(async move |this, cx| {
-            let Ok(result) = incoming.recv().await else {
-                return;
-            };
-            let _ = this.update(cx, |model, cx| {
+                }
+            },
+            move |model, result, cx| {
                 if model.generation != generation {
                     return;
                 }
@@ -732,9 +753,12 @@ impl EngineModel {
                     Err(problem) => model.problem = Some(problem),
                 }
                 model.refresh_status(cx);
-            });
-        })
-        .detach();
+            },
+        );
+        if result.is_err() {
+            self.problem = Some(WORKER_UNAVAILABLE.to_string());
+            cx.notify();
+        }
     }
 
     /// Starts the engine when it is not running yet and both inputs exist.
@@ -769,49 +793,41 @@ impl EngineModel {
             self.refresh_status(cx);
             return;
         };
-        let Ok(runtime) = worker() else {
-            self.problem = Some("The network runtime could not start.".to_string());
-            cx.notify();
-            return;
-        };
         let config_file = self.paths.config_file.clone();
         let paused = self.paused;
         self.start_generation = self.start_generation.wrapping_add(1);
         let start_generation = self.start_generation;
-        let (results, incoming) = async_channel::bounded(1);
-        runtime.spawn(async move {
-            // The settings file is small; reading it here keeps the UI thread
-            // out of the file system (N2).
-            let settings = SettingsStore::open(config_file).settings().clone();
-            let config = EngineConfig {
-                concurrency: usize::try_from(settings.concurrency.max(1)).unwrap_or(4),
-                bandwidth_bytes_per_second: settings.bandwidth_bytes_per_second,
-                scan_interval: Duration::from_secs(
-                    u64::from(settings.scan_interval_minutes.max(1)) * 60,
-                ),
-                // R6.1: the attempt cap is user-settable, 8 by default.
-                attempt_cap: settings.attempt_cap.max(1),
-                ..EngineConfig::default()
-            };
-            let started = match Engine::new(store, session, config) {
-                Ok(engine) => {
-                    let engine = Arc::new(engine);
-                    // R8.7: a pause set before the engine existed still holds.
-                    if paused {
-                        engine.pause();
+        let result = run_on_worker(
+            cx,
+            move || async move {
+                // The settings file is small; reading it here keeps the UI
+                // thread out of the file system (N2).
+                let settings = SettingsStore::open(config_file).settings().clone();
+                let config = EngineConfig {
+                    concurrency: usize::try_from(settings.concurrency.max(1)).unwrap_or(4),
+                    bandwidth_bytes_per_second: settings.bandwidth_bytes_per_second,
+                    scan_interval: Duration::from_secs(
+                        u64::from(settings.scan_interval_minutes.max(1)) * 60,
+                    ),
+                    // R6.1: the attempt cap is user-settable, 8 by default.
+                    attempt_cap: settings.attempt_cap.max(1),
+                    ..EngineConfig::default()
+                };
+                match Engine::new(store, session, config) {
+                    Ok(engine) => {
+                        let engine = Arc::new(engine);
+                        // R8.7: a pause set before the engine existed still
+                        // holds.
+                        if paused {
+                            engine.pause();
+                        }
+                        engine.start();
+                        Ok(engine)
                     }
-                    engine.start();
-                    Ok(engine)
+                    Err(error) => Err(error.to_string()),
                 }
-                Err(error) => Err(error.to_string()),
-            };
-            let _ = results.send(started).await;
-        });
-        cx.spawn(async move |this, cx| {
-            let Ok(started) = incoming.recv().await else {
-                return;
-            };
-            let _ = this.update(cx, |model, cx| {
+            },
+            move |model, started, cx| {
                 if model.start_generation != start_generation {
                     // A newer start won the race. Stop the engine this attempt
                     // built before discarding it, so its watcher and workers
@@ -858,9 +874,12 @@ impl EngineModel {
                     }
                 }
                 model.refresh_status(cx);
-            });
-        })
-        .detach();
+            },
+        );
+        if result.is_err() {
+            self.problem = Some(WORKER_UNAVAILABLE.to_string());
+            cx.notify();
+        }
     }
 
     /// Republishes the engine's status, or a folder-only status before it runs.
@@ -925,7 +944,61 @@ impl EngineModel {
             cx.show_system_notification(notification);
         }
         self.notified_review = review;
+
+        // R10.1: a lost connection, a refused credential, or a folder that
+        // cannot be read is the other thing the tray cannot show on its own.
+        self.refresh_attention_notification(cx);
         cx.notify();
+    }
+
+    /// Raises the attention notification once per attention episode (R10.1).
+    ///
+    /// A failed item has its own notification, so the generic one stays quiet
+    /// while the only reason is parked failures; the connection state is the
+    /// one reason that must speak even when the engine is not running yet.
+    fn refresh_attention_notification(&mut self, cx: &mut Context<Self>) {
+        let connection_attention = matches!(
+            self.connection.read(cx).state(),
+            ConnectionState::NeedsAttention(_)
+        );
+        let attention = self.status.activity == Activity::NeedsAttention || connection_attention;
+        if !attention {
+            self.notified_attention = false;
+            return;
+        }
+        let Some(reason) = self.attention_reason(cx) else {
+            return;
+        };
+        if let Some(notification) =
+            crate::shell::new_attention_notification(attention, self.notified_attention, &reason)
+        {
+            tracing::info!(
+                reason = %reason,
+                "R10.1: the client entered attention and raised a notification"
+            );
+            cx.show_system_notification(notification);
+        }
+        self.notified_attention = true;
+    }
+
+    /// The user-facing reason the client needs attention, when it is not a
+    /// deletion review or a parked failure. `None` lets the generic
+    /// notification stay quiet; the specific notification covers those.
+    ///
+    /// A permanent folder error keeps the engine's global error too, so it
+    /// speaks even with no parked item. A transient retry sets only the
+    /// folder's own error, so it stays quiet.
+    fn attention_reason(&self, cx: &Context<Self>) -> Option<String> {
+        if let ConnectionState::NeedsAttention(attention) = self.connection.read(cx).state() {
+            return Some(attention.message());
+        }
+        if self.status.counts.failed > 0 {
+            return None;
+        }
+        if let Some(folder) = self.status.folders.iter().find(|folder| !folder.available) {
+            return Some(format!("The source folder {} is unavailable.", folder.path));
+        }
+        self.status.last_error.clone()
     }
 
     /// The shared store, once it has opened.

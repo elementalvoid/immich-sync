@@ -39,15 +39,16 @@ fn socket_name_for(user: &str) -> String {
 
 /// The OS user identity that scopes the socket name.
 ///
-/// The desktop session sets these variables. Ticket #3 brings the
-/// platform-directory abstraction that replaces this environment lookup.
+/// The desktop session sets one of these variables. The platform directory
+/// abstraction names the paths under the user's home, not the user itself, so
+/// this lookup remains.
 fn current_user() -> String {
     ["USERNAME", "USER", "LOGNAME"]
         .into_iter()
         .find_map(|key| std::env::var(key).ok())
         .filter(|user| !user.is_empty())
-        // shortcut: with no user variable every user shares one name; #3
-        // replaces this lookup with the platform directories.
+        // shortcut: with no user variable every user shares one name, and a
+        // second launch by another account would look like the running one.
         .unwrap_or_else(|| "unknown".to_owned())
 }
 

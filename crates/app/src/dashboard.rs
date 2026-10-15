@@ -145,6 +145,16 @@ impl Dashboard {
         }
     }
 
+    /// Turns recursive discovery on or off for one source folder (R2.1).
+    ///
+    /// The engine model treats this as the folder's own edit, updates the
+    /// existing folder, and re-watches and rescans it.
+    fn set_folder_recursive(&mut self, path: String, recursive: bool, cx: &mut Context<Self>) {
+        if let Some(engine) = &self.engine {
+            engine.update(cx, |model, cx| model.add_folder(path, recursive, cx));
+        }
+    }
+
     /// Turns album mapping on or off for one source folder (R3.4).
     fn set_album_mapping(&mut self, path: String, enabled: bool, cx: &mut Context<Self>) {
         if let Some(engine) = &self.engine {
@@ -206,14 +216,14 @@ impl Dashboard {
             })
     }
 
-    /// The album mapping switch and the album scope choice for one folder
-    /// card (R3.4).
+    /// The recursion switch, the album mapping switch, and the album scope
+    /// choice for one folder card (R2.1, R3.4).
     ///
     /// The scope stays choosable while the mapping is off: it is the folder's
     /// stored scope (R3.4) and takes effect as soon as the mapping is on, and
     /// the kit's `Radio` does not announce a disabled state, so a disabled
     /// radio would read as an enabled one (N5).
-    fn album_controls(
+    fn folder_controls(
         &self,
         index: usize,
         card: &StatusCard,
@@ -230,6 +240,18 @@ impl Dashboard {
             .flex_wrap()
             .items_center()
             .gap_2()
+            .child(div().text_xs().text_color(muted).child("Recursive"))
+            .child(
+                Switch::new(("folder-recursive", index))
+                    .checked(card.recursive)
+                    .accessibility_label(format!("Sync {title} recursively"))
+                    .on_click(cx.listener({
+                        let path = path.clone();
+                        move |this, recursive, _, cx| {
+                            this.set_folder_recursive(path.clone(), *recursive, cx);
+                        }
+                    })),
+            )
             .child(div().text_xs().text_color(muted).child("Album mapping"))
             .child(
                 Switch::new(("folder-album", index))
@@ -384,8 +406,9 @@ impl Render for Dashboard {
                                     }))
                                     .into_any_element()
                             });
-                            let album = removed
-                                .then(|| self.album_controls(index, folder, cx).into_any_element());
+                            let album = removed.then(|| {
+                                self.folder_controls(index, folder, cx).into_any_element()
+                            });
                             div().w(rems(17.5)).flex().child(status_card(
                                 ("status-folder", index).into(),
                                 ("status-state-folder", index).into(),

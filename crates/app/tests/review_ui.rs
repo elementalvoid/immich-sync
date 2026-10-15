@@ -60,7 +60,12 @@ fn missing(path: &str) -> ItemRecord {
 }
 
 /// Seeds one source folder and `names` missing files under it.
+///
+/// The folder itself exists: the scenario is a file that disappeared, not a
+/// source folder the client cannot read, and an unavailable folder raises its
+/// own attention notification (R10.1).
 fn seed(paths: &AppPaths, root: &Path, names: &[&str]) {
+    std::fs::create_dir_all(root).expect("create the source folder");
     let store = StateStore::open(&paths.state_db).expect("open the state database");
     store
         .add_folder(&SourceFolder {

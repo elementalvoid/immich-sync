@@ -4,6 +4,8 @@
 //! (R8.1). [`sample`] is the layout fixture the view tests render; the shell
 //! never uses it.
 
+use std::path::Path;
+
 use sync_core::engine::{Activity, EngineStatus};
 use sync_core::store::{AlbumScope, FolderCounts};
 
@@ -51,6 +53,9 @@ pub struct StatusCard {
     pub counts: Counts,
     /// The deletion review items that await a decision.
     pub review_count: u32,
+    /// Whether the watcher and the scan descend into subfolders (R2.1);
+    /// only meaningful on a folder card.
+    pub recursive: bool,
     /// Whether this source folder's files join an album (R3.4); always `false`
     /// on the global card, which is not a mapped folder.
     pub album_mapping: bool,
@@ -150,17 +155,14 @@ fn counts_from(counts: FolderCounts) -> Counts {
 
 /// The card title for a folder path: the last component, or the path itself.
 ///
-/// The split accepts both separators, so a Windows path mapped on Linux still
-/// names its folder in a test.
+/// The platform's own separators decide, the same way `sync-core` names an
+/// album from its folder (album names and card titles must agree).
 #[must_use]
 pub fn folder_name(path: &str) -> String {
-    let trimmed = path.trim_end_matches(['/', '\\']);
-    trimmed
-        .rsplit(['/', '\\'])
-        .next()
-        .filter(|name| !name.is_empty())
-        .unwrap_or(trimmed)
-        .to_string()
+    Path::new(path).file_name().map_or_else(
+        || path.to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
 }
 
 /// The upload progress for one folder, 0.0 to 1.0.
@@ -187,6 +189,7 @@ impl DashboardModel {
             available: true,
             connection,
             last_error: status.last_error.clone(),
+            recursive: false,
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
         };
@@ -213,6 +216,7 @@ impl DashboardModel {
                 available: folder.available,
                 connection: None,
                 last_error: folder.last_error.clone(),
+                recursive: folder.recursive,
                 album_mapping: folder.album_mapping,
                 album_scope: folder.album_scope,
             })
@@ -246,6 +250,7 @@ pub fn sample() -> DashboardModel {
             available: true,
             connection: Some("Connected".to_string()),
             last_error: None,
+            recursive: false,
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
         },
@@ -264,6 +269,7 @@ pub fn sample() -> DashboardModel {
                 available: true,
                 connection: None,
                 last_error: None,
+                recursive: true,
                 album_mapping: true,
                 album_scope: AlbumScope::WholeFolder,
             },
@@ -281,6 +287,7 @@ pub fn sample() -> DashboardModel {
                 available: true,
                 connection: None,
                 last_error: None,
+                recursive: true,
                 album_mapping: true,
                 album_scope: AlbumScope::Leaf,
             },
@@ -300,6 +307,7 @@ pub fn sample() -> DashboardModel {
                 last_error: Some(
                     "permission_denied: the API key cannot write to this album".to_string(),
                 ),
+                recursive: false,
                 album_mapping: true,
                 album_scope: AlbumScope::WholeFolder,
             },
@@ -317,6 +325,7 @@ pub fn sample() -> DashboardModel {
                 available: true,
                 connection: None,
                 last_error: None,
+                recursive: true,
                 album_mapping: false,
                 album_scope: AlbumScope::Leaf,
             },

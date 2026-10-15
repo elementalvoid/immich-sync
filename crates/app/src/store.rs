@@ -295,7 +295,11 @@ fn rebuild_store(
 /// Removes the database file and its WAL sidecars.
 fn remove_state_files(path: &Path) -> anyhow::Result<()> {
     for suffix in ["", "-wal", "-shm"] {
-        let file = PathBuf::from(format!("{}{suffix}", path.display()));
+        // `OsString::push` keeps a non-UTF-8 path intact; `display()` would
+        // replace its bytes and target a different file.
+        let mut name = path.as_os_str().to_os_string();
+        name.push(suffix);
+        let file = PathBuf::from(name);
         match std::fs::remove_file(&file) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -389,6 +393,31 @@ mod tests {
         assert!(
             path.is_dir(),
             "the rebuild must not remove what it cannot open"
+        );
+    }
+
+    /// The WAL sidecars follow the path's own bytes, not a lossy display of
+    /// them, so a non-UTF-8 database name removes the right files (Unix).
+    #[cfg(unix)]
+    #[test]
+    fn sidecars_of_a_non_utf8_database_are_removed() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::path::PathBuf;
+
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let path = temp.path().join(OsStr::from_bytes(b"state-\xff.db"));
+        std::fs::write(&path, b"database").expect("write the database");
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push("-wal");
+        std::fs::write(PathBuf::from(&sidecar), b"wal").expect("write the sidecar");
+
+        super::remove_state_files(&path).expect("remove the database and its sidecars");
+
+        assert!(!path.exists(), "the database is gone");
+        assert!(
+            !PathBuf::from(sidecar).exists(),
+            "the sidecar is gone, at the path its own bytes name"
         );
     }
 }

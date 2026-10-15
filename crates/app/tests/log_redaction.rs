@@ -11,6 +11,10 @@
 //! echoes the submitted password in its error body, so a server-supplied
 //! message cannot slip a secret into the log either.
 
+mod common;
+
+use common::mock_server;
+
 use std::fs;
 use std::path::Path;
 use std::rc::Rc;
@@ -28,7 +32,7 @@ use immich_sync::logging::{LOG_PREFIX, LogLevel, LogPolicy, LogSink};
 use immich_sync::paths::AppPaths;
 use immich_sync::settings::SettingsStore;
 use immich_sync::settings_view::SettingsView;
-use mock_immich::{Fault, MockImmich, Operation};
+use mock_immich::{Fault, Operation};
 use sync_core::connection::{AuthMethod, RequestCredential, Secret, SignIn};
 use sync_core::credential::{MemoryCredentialStore, SharedCredentialStore};
 
@@ -107,18 +111,6 @@ fn fill_and_sign_in(
     })
     .expect("fill in the connection form and sign in");
     window
-}
-
-/// Starts the offline Immich double on its own runtime: a GPUI test runs on the
-/// GPUI executor, which is not a Tokio runtime.
-fn mock_server() -> (tokio::runtime::Runtime, MockImmich) {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
-        .enable_all()
-        .build()
-        .expect("start the mock runtime");
-    let server = runtime.block_on(MockImmich::start());
-    (runtime, server)
 }
 
 /// Moves focus to the next tab stop, as the Root's Tab binding does.

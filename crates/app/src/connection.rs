@@ -34,6 +34,51 @@ pub fn apply_profile(settings: &mut Settings, profile: &ServerProfile) {
     settings.auth_method = profile.method;
 }
 
+/// The runtime failure every worker-backed edit reports to its model.
+pub(crate) const WORKER_UNAVAILABLE: &str = "The network runtime could not start.";
+
+/// The reason a store-backed edit cannot run yet.
+pub(crate) const STORE_OPENING: &str = "The state database is still opening.";
+
+/// Runs `work` on the shared HTTP runtime and applies its result on the UI
+/// thread (N2).
+///
+/// This is the one shape behind every worker-backed edit: the bounded result
+/// channel, `runtime.spawn` for the work, and `cx.spawn` for the result. `apply`
+/// keeps its caller's generation check; the caller reports a runtime that could
+/// not start, because each model names that failure in its own place.
+///
+/// # Errors
+///
+/// Returns the reason [`worker`] gave when the runtime could not start.
+pub(crate) fn run_on_worker<T, R, Fut, Work, Apply>(
+    cx: &mut Context<T>,
+    work: Work,
+    apply: Apply,
+) -> Result<(), String>
+where
+    T: 'static,
+    R: Send + 'static,
+    Fut: std::future::Future<Output = R> + Send + 'static,
+    Work: FnOnce() -> Fut + Send + 'static,
+    Apply: FnOnce(&mut T, R, &mut Context<T>) + 'static,
+{
+    let runtime = worker()?;
+    let (results, incoming) = async_channel::bounded(1);
+    runtime.spawn(async move {
+        let result = work().await;
+        let _ = results.send(result).await;
+    });
+    cx.spawn(async move |this, cx| {
+        let Ok(result) = incoming.recv().await else {
+            return;
+        };
+        let _ = this.update(cx, |model, cx| apply(model, result, cx));
+    })
+    .detach();
+    Ok(())
+}
+
 /// The Tokio runtime that carries HTTP work, or the reason it could not start.
 pub(crate) fn worker() -> Result<&'static tokio::runtime::Runtime, String> {
     static WORKER: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
@@ -166,8 +211,8 @@ impl ConnectionModel {
     }
 
     /// A test seam onto the session's own 401 handling, so the upload tests can
-    /// exhaust the re-login budget and then observe it restored. No request
-    /// path calls it yet; the retried request belongs to #7.
+    /// exhaust the re-login budget and then observe it restored. Real requests
+    /// answer their own 401s through the session (R1.4).
     #[cfg(test)]
     pub(crate) fn handle_unauthorized_for_test(&mut self, cx: &mut Context<Self>) -> Unauthorized {
         let session = self.session.clone().expect("a live session before the 401");
@@ -248,17 +293,6 @@ impl ConnectionModel {
     /// Runs the sign-in or the restore on the worker runtime and applies the
     /// result back on the UI thread.
     fn begin(&mut self, profile: ServerProfile, request: Option<SignIn>, cx: &mut Context<Self>) {
-        let runtime = match worker() {
-            Ok(runtime) => runtime,
-            Err(message) => {
-                self.form_error = Some(message.clone());
-                self.set_state(
-                    ConnectionState::NeedsAttention(Attention::Server(message)),
-                    cx,
-                );
-                return;
-            }
-        };
         let server_url = profile.server_url.clone();
         // The attempt belongs to the state the caller just set. A later state
         // change supersedes it, so its result must not overwrite that state.
@@ -269,51 +303,54 @@ impl ConnectionModel {
         // A live session is repointed in place, so the sign-in that lands here
         // is the one the sync engine and the uploader hold (R1.4).
         let live = self.session.clone();
-        let (results, incoming) = async_channel::bounded(1);
-        runtime.spawn(async move {
-            let (state, session) = match live {
-                Some(session) => match session.repoint(&server_url, store).await {
-                    Ok(()) => {
-                        let state = authenticate(session.clone(), profile, request).await;
-                        (state, Some(session))
-                    }
-                    // The session keeps the handle the engine holds, so it says
-                    // why the attempt failed instead of the model alone.
-                    Err(error) => (
-                        ConnectionState::NeedsAttention(Attention::from(&error)),
-                        Some(session),
-                    ),
-                },
-                None => match Connection::new(&server_url, store) {
-                    Ok(connection) => {
-                        let session = connection.shared();
-                        let state = authenticate(session.clone(), profile, request).await;
-                        (state, Some(session))
-                    }
-                    Err(error) => (
-                        ConnectionState::NeedsAttention(Attention::from(&error)),
-                        None,
-                    ),
-                },
-            };
-            let _ = results.send((state, session)).await;
-        });
-        cx.spawn(async move |this, cx| {
-            let Ok((state, session)) = incoming.recv().await else {
-                return;
-            };
-            // The model can be gone while the request runs; the result is then
-            // simply dropped.
-            let _ = this.update(cx, |model, cx| {
+        let result = run_on_worker(
+            cx,
+            move || async move {
+                match live {
+                    Some(session) => match session.repoint(&server_url, store).await {
+                        Ok(()) => {
+                            let state = authenticate(session.clone(), profile, request).await;
+                            (state, Some(session))
+                        }
+                        // The session keeps the handle the engine holds, so it
+                        // says why the attempt failed instead of the model
+                        // alone.
+                        Err(error) => (
+                            ConnectionState::NeedsAttention(Attention::from(&error)),
+                            Some(session),
+                        ),
+                    },
+                    None => match Connection::new(&server_url, store) {
+                        Ok(connection) => {
+                            let session = connection.shared();
+                            let state = authenticate(session.clone(), profile, request).await;
+                            (state, Some(session))
+                        }
+                        Err(error) => (
+                            ConnectionState::NeedsAttention(Attention::from(&error)),
+                            None,
+                        ),
+                    },
+                }
+            },
+            // The model can be gone while the request runs; the result is
+            // then simply dropped.
+            move |model, (state, session), cx| {
                 if model.generation != generation {
                     return;
                 }
                 model.session = session;
                 log_outcome(&state);
                 model.set_state(state, cx);
-            });
-        })
-        .detach();
+            },
+        );
+        if let Err(message) = result {
+            self.form_error = Some(message.clone());
+            self.set_state(
+                ConnectionState::NeedsAttention(Attention::Server(message)),
+                cx,
+            );
+        }
     }
 }
 

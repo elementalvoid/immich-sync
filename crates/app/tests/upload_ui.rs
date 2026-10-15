@@ -3,6 +3,10 @@
 //! The view is driven through its real controls: the path field, the button,
 //! and the result notice the window renders.
 
+mod common;
+
+use common::mock_server;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,17 +44,6 @@ fn window_options() -> WindowOptions {
         })),
         ..Default::default()
     }
-}
-
-/// Starts the offline Immich double on its own runtime.
-fn mock_server() -> (tokio::runtime::Runtime, MockImmich) {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
-        .enable_all()
-        .build()
-        .expect("start the mock runtime");
-    let server = runtime.block_on(MockImmich::start());
-    (runtime, server)
 }
 
 /// A connection model signed in to `server`, with an in-memory credential

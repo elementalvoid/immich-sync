@@ -30,19 +30,28 @@ pub struct LogsView {
     read_problem: Option<String>,
     /// Why the level could not be saved, when it could not.
     save_problem: Option<String>,
+    /// Keeps the level notice in step with the settings surface's save
+    /// failures, which now land after the worker write (N2).
+    _subscriptions: Vec<Subscription>,
 }
 
 impl LogsView {
     /// A view over the log directory the settings paths resolved.
     pub fn new(settings: Entity<SettingsView>, cx: &mut Context<Self>) -> Self {
         let directory = settings.read(cx).paths().log_directory();
+        let save_problem = settings.read(cx).save_problem().map(str::to_string);
+        let subscription = cx.observe(&settings, |this, settings, cx| {
+            this.save_problem = settings.read(cx).save_problem().map(str::to_string);
+            cx.notify();
+        });
         let mut view = Self {
             settings,
             directory,
             lines: Vec::new(),
             current_file: None,
             read_problem: None,
-            save_problem: None,
+            save_problem,
+            _subscriptions: vec![subscription],
         };
         view.refresh(cx);
         view
@@ -77,13 +86,11 @@ impl LogsView {
         self.settings.read(cx).log_level()
     }
 
-    /// Persists the level and applies it to the running subscriber.
+    /// Persists the level and applies it to the running subscriber. The
+    /// settings surface reports the outcome through its own subscription.
     fn set_level(&mut self, level: LogLevel, cx: &mut Context<Self>) {
-        let saved = self
-            .settings
+        self.settings
             .update(cx, |settings, cx| settings.set_log_level(level, cx));
-        self.save_problem = saved.err().map(|error| error.to_string());
-        cx.notify();
     }
 
     /// The page header.
