@@ -211,8 +211,8 @@ impl ConnectionModel {
     }
 
     /// A test seam onto the session's own 401 handling, so the upload tests can
-    /// exhaust the re-login budget and then observe it restored. No request
-    /// path calls it yet; the retried request belongs to #7.
+    /// exhaust the re-login budget and then observe it restored. Real requests
+    /// answer their own 401s through the session (R1.4).
     #[cfg(test)]
     pub(crate) fn handle_unauthorized_for_test(&mut self, cx: &mut Context<Self>) -> Unauthorized {
         let session = self.session.clone().expect("a live session before the 401");
