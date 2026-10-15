@@ -66,6 +66,11 @@ pub struct EngineModel {
     /// (R10.1), so a repeated read of the same parked item stays quiet while a
     /// newly parked one raises its own notification.
     notified_failed: HashSet<String>,
+    /// Whether the first read of the parked list has seeded `notified_failed`
+    /// (R10.1). The items the first read holds are the ones the process
+    /// started with, so they stay quiet; only a failure that parks later
+    /// notifies.
+    failed_latch_seeded: bool,
     paused: bool,
     problem: Option<String>,
     /// Bumped by every folder edit, so an older edit result cannot overwrite a
@@ -112,9 +117,11 @@ impl EngineModel {
         cx: &mut Context<Self>,
     ) -> Self {
         let subscriptions = vec![
-            // The status and the review list are refreshed when the store opens,
-            // so a review that already waits in the database raises its
-            // notification and fills the view at start (R5.3, R5.4).
+            // The status, the review list and the parked list are refreshed
+            // when the store opens, so a review that already waits in the
+            // database raises its notification and fills the view at start
+            // (R5.3, R5.4), and the parked list seeds its notification latch
+            // before the engine's first scan can park a new failure (R10.1).
             cx.observe(&store_model, |this, store, cx| {
                 let generation = store.read(cx).generation();
                 this.store_changed(generation, cx);
@@ -123,6 +130,7 @@ impl EngineModel {
                 // store notification (R5.4).
                 this.refresh_status(cx);
                 this.refresh_review(cx);
+                this.refresh_failed(cx);
             }),
             cx.observe(&connection, |this, _, cx| this.try_start_engine(cx)),
         ];
@@ -165,6 +173,7 @@ impl EngineModel {
             notified_review: 0,
             notified_attention: false,
             notified_failed: HashSet::new(),
+            failed_latch_seeded: false,
             paused: false,
             problem: None,
             generation: 0,
@@ -373,12 +382,22 @@ impl EngineModel {
                         model.failed = items;
                         cx.notify();
                     }
-                    // R10.1: a newly parked item raises a notification of its
-                    // own. An item that left the list forgets it was announced,
-                    // so a later failure notifies again.
+                    // R10.1: the first read is the parked list the process
+                    // started with, so it seeds the latch instead of notifying:
+                    // a relaunch must not announce the dead letter again. After
+                    // that, a newly parked item raises a notification of its
+                    // own, and an item that left the list forgets it was
+                    // announced, so a later failure notifies again.
                     model
                         .notified_failed
                         .retain(|path| model.failed.iter().any(|item| item.path == *path));
+                    if !model.failed_latch_seeded {
+                        model.failed_latch_seeded = true;
+                        model
+                            .notified_failed
+                            .extend(model.failed.iter().map(|item| item.path.clone()));
+                        return;
+                    }
                     let fresh: Vec<String> = model
                         .failed
                         .iter()
