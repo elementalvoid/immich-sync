@@ -604,7 +604,9 @@ impl SettingsView {
     ///
     /// The Run key or `.desktop` entry can change outside the client. The
     /// switch must show what the OS does, or turning it off would be a no-op
-    /// against a file that already said off.
+    /// against a file that already said off. The correction goes through the
+    /// background writer, like every other settings save (N2), so a slow disk
+    /// never blocks the UI thread at startup.
     fn reconcile_autostart(&mut self, cx: &mut Context<Self>) {
         // A corrupt file holds defaults, so its flag is not a stored value. A
         // write here would replace the unparsable bytes and clear the load
@@ -613,12 +615,8 @@ impl SettingsView {
             return;
         }
         let stored = self.store.settings().autostart;
-        let result = match self.autostart.is_enabled() {
-            Ok(actual) if actual != stored => self
-                .store
-                .update(|settings| settings.autostart = actual)
-                .map_err(|error| error.context("record the OS autostart state")),
-            Ok(_) => Ok(()),
+        let actual = match self.autostart.is_enabled() {
+            Ok(actual) => actual,
             Err(error) => {
                 self.record(
                     AUTOSTART_READ_PROBLEM,
@@ -628,7 +626,13 @@ impl SettingsView {
                 return;
             }
         };
-        self.record(AUTOSTART_PROBLEM, result, cx);
+        if actual != stored {
+            self.save_settings(
+                cx,
+                move |settings| settings.autostart = actual,
+                |view, result, cx| view.record(AUTOSTART_PROBLEM, result, cx),
+            );
+        }
     }
 
     /// Records one settings change and saves it (N2).

@@ -677,7 +677,7 @@ fn a_failed_path_resolution_is_shown_through_the_problem_notice(cx: &mut TestApp
 }
 
 #[gpui_kit::test]
-fn the_view_reconciles_the_autostart_setting_with_the_os(cx: &mut TestAppContext) {
+async fn the_view_reconciles_the_autostart_setting_with_the_os(cx: &mut TestAppContext) {
     // The file says the client starts at login, but the OS has no entry, as if
     // the user removed it outside the client. The file is corrected to off.
     let temp = tempfile::tempdir().expect("create a temp dir");
@@ -697,10 +697,10 @@ fn the_view_reconciles_the_autostart_setting_with_the_os(cx: &mut TestAppContext
         );
     })
     .expect("update the settings window");
-    assert!(
-        !SettingsStore::open(paths.config_file).settings().autostart,
-        "the file was corrected to match the OS"
-    );
+    // N2: the correction is written on the background executor, so the file
+    // is only in step after the write lands.
+    let saved = wait_for_settings(cx, &paths, |settings| !settings.autostart).await;
+    assert!(!saved.autostart, "the file was corrected to match the OS");
 
     // The reverse mismatch: a real OS entry with the file saying off. The
     // switch shows on and the file is corrected, so toggling it off is real.
@@ -720,10 +720,8 @@ fn the_view_reconciles_the_autostart_setting_with_the_os(cx: &mut TestAppContext
         );
     })
     .expect("update the settings window");
-    assert!(
-        SettingsStore::open(paths.config_file).settings().autostart,
-        "the file was corrected to match the OS"
-    );
+    let saved = wait_for_settings(cx, &paths, |settings| settings.autostart).await;
+    assert!(saved.autostart, "the file was corrected to match the OS");
     assert!(backend.enabled.get(), "the OS entry was left alone");
 }
 
