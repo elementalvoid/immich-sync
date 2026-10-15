@@ -1094,6 +1094,60 @@ async fn re_adding_a_folder_applies_the_new_recursive_flag() {
     engine.stop();
 }
 
+/// Re-adding an existing folder must not turn its album mapping off (R3.4).
+///
+/// The app's per-folder recursive toggle re-adds the folder through
+/// `Engine::add_folder`. The store's upsert writes every tracked column, so a
+/// folder constructed with `album_mapping: false` silently unmapped a folder
+/// the user had mapped, and the loss only showed after a restart.
+#[tokio::test]
+async fn re_adding_a_folder_keeps_its_album_mapping() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the folder");
+    let engine = start_engine(&server, &store, EngineConfig::default()).await;
+
+    engine
+        .add_folder(&photos.display().to_string(), true)
+        .expect("add the folder");
+    engine
+        .set_album_mapping(&photos.display().to_string(), true)
+        .expect("enable album mapping");
+    engine
+        .set_album_scope(&photos.display().to_string(), AlbumScope::WholeFolder)
+        .expect("set the album scope");
+
+    engine
+        .add_folder(&photos.display().to_string(), false)
+        .expect("re-add the folder");
+
+    let stored = store
+        .folders()
+        .expect("read the folders")
+        .into_iter()
+        .find(|folder| folder.path == photos.display().to_string())
+        .expect("the folder is stored");
+    assert!(
+        stored.album_mapping,
+        "re-adding the folder turned album mapping off"
+    );
+    assert_eq!(
+        stored.album_scope,
+        AlbumScope::WholeFolder,
+        "re-adding the folder reset the album scope"
+    );
+    let card = engine.status().folders[0].clone();
+    assert!(card.album_mapping, "the card lost the album mapping");
+    assert_eq!(
+        card.album_scope,
+        AlbumScope::WholeFolder,
+        "the card lost the album scope"
+    );
+    engine.stop();
+}
+
 /// The asset id the store recorded for one file.
 fn asset_id_of(store: &StateStore, path: &Path) -> String {
     store

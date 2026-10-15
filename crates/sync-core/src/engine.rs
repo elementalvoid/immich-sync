@@ -541,13 +541,24 @@ impl Engine {
         if path.is_empty() {
             return Err(EngineError::EmptyFolder);
         }
+        // R3.4: the store's upsert writes every column, so re-adding a folder
+        // (the app's recursive toggle does) must carry the album fields the
+        // stored row already holds. A hardcoded `false` silently unmapped a
+        // folder the user had mapped, and the loss only showed after a
+        // restart. A brand-new folder still starts unmapped; the config
+        // window opts it in on purpose.
+        let key = path_key(Path::new(path));
+        let stored = self
+            .inner
+            .store
+            .folders()?
+            .into_iter()
+            .find(|folder| path_key(Path::new(&folder.path)) == key);
         let folder = SourceFolder {
             path: path.to_string(),
             recursive,
-            // R3.4: adding a folder never opts it into album mapping; the
-            // config window does that on purpose.
-            album_mapping: false,
-            album_scope: AlbumScope::default(),
+            album_mapping: stored.as_ref().is_some_and(|folder| folder.album_mapping),
+            album_scope: stored.map_or_else(AlbumScope::default, |folder| folder.album_scope),
         };
         self.inner.store.add_folder(&folder)?;
         // R8.1: a folder new to this engine starts from what the store already
@@ -559,7 +570,6 @@ impl Engine {
         });
         {
             let mut folders = self.inner.folders.lock().expect("the folder lock");
-            let key = path_key(Path::new(path));
             if let Some(entry) = folders
                 .iter_mut()
                 .find(|entry| path_key(Path::new(&entry.folder.path)) == key)
