@@ -68,26 +68,16 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: windows
-          # The linker is part of cargo's fingerprints, so the lld experiment
-          # gets its own cache lineage via the prefix; a linker change must not
-          # restore artifacts built with another linker and recompile forever.
-          prefix-key: v0-rust-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'Cargo.toml', 'crates/*/Cargo.toml') }}-lld
+          # Same scheme as Linux: the hash has to go in the prefix because
+          # `key:` is ignored with `shared-key:`. lld-link was tried here and
+          # reverted: the linker is a global fingerprint input, so switching it
+          # rebuilt all 526 crates every run and never warmed the cache.
+          prefix-key: v0-rust-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'Cargo.toml', 'crates/*/Cargo.toml') }}
           add-rust-environment-hash-key: "false"
           cache-on-failure: "true"
       # fmt is platform-independent and already checked on Linux; running it
       # here only paid for a toolchain component and a fresh checkout.
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
-      # lld links the 44 test binaries faster than link.exe. rust-lld is a
-      # multicall binary and picks the MSVC driver from its own file name, so
-      # copy it as lld-link.exe instead of teaching rustc the flavor.
-      - name: Use lld-link for linking
-        shell: pwsh
-        run: |
-          $rustLld = Join-Path (rustc --print sysroot) 'lib\rustlib\x86_64-pc-windows-msvc\bin\rust-lld.exe'
-          if (-not (Test-Path $rustLld)) { throw "rust-lld not found at $rustLld" }
-          $linker = Join-Path $env:RUNNER_TEMP 'lld-link.exe'
-          Copy-Item $rustLld $linker
-          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$linker" | Out-File -FilePath $env:GITHUB_ENV -Append
       - run: cargo test --locked --workspace
 
   linux-gui-smoke:
