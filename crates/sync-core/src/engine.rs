@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use immich_client::{BandwidthLimit, BulkAction, BulkCheckItem, ClientError, RejectReason};
+use immich_client::{BandwidthLimit, BulkCheckItem, ClientError};
 use tokio::sync::{Mutex as AsyncMutex, Notify, Semaphore, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
 
@@ -45,8 +45,8 @@ use crate::store::{
     ReviewDecision, ReviewItem, SourceFolder, StateStore, StoreError,
 };
 use crate::upload::{
-    PreparedItem, UploadFailure, UploadGate, UploadOutcome, Uploader, hash_in_background,
-    pending_sidecar,
+    CheckOutcome, PreparedItem, UploadFailure, UploadGate, UploadOutcome, Uploader, check_outcome,
+    hash_in_background, pending_sidecar,
 };
 use crate::versions::Versioner;
 use crate::watch::FolderWatcher;
@@ -101,8 +101,8 @@ impl Default for EngineConfig {
 /// The user-set limits the running engine can be moved to (SPEC R7).
 ///
 /// [`Engine::set_limits`] applies both without a restart: the bandwidth limit
-/// is read by an upload already on the wire, and the concurrency limit admits
-/// or retires workers as the pool drains.
+/// is read by an upload already on the wire, and a concurrency change moves
+/// the next attempt to a freshly sized pool.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     /// Upload bytes per second; 0 means unlimited (R7.1).
@@ -248,14 +248,16 @@ struct EngineInner {
     last_error: Mutex<Option<String>>,
     resume: Notify,
     sync_now: Notify,
-    upload_slots: Arc<Semaphore>,
+    /// The upload pool in force right now. A resize replaces the whole
+    /// `Arc<Semaphore>` instead of moving permits in and out of one pool.
+    upload_slots: Mutex<Arc<Semaphore>>,
     /// The upload bandwidth limit, shared with every upload so a change
     /// reaches one already on the wire (R7.1).
     bandwidth: BandwidthLimit,
     /// The concurrency the pool is sized to right now (R7.2).
     concurrency: AtomicUsize,
-    /// Serializes a pool resize, so two quick settings changes cannot leave
-    /// the permits and this count disagreeing.
+    /// Serializes a pool resize, so two quick settings changes cannot race
+    /// the swap and this count.
     limits_lock: AsyncMutex<()>,
     watcher: Mutex<Option<FolderWatcher>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
@@ -268,6 +270,11 @@ struct EngineInner {
     /// block, so it only records the path and wakes the scan loop, which asks
     /// the store whether anything tracked really disappeared.
     absences: Mutex<Vec<PathBuf>>,
+    /// The folder listings a scan pass reuses (R3.3). The scan clears it and
+    /// the watcher drops the folder a change touched, so a batch reads only
+    /// what is missing: a 10k-file folder is listed once per scan rather than
+    /// once per batch.
+    index_cache: Mutex<FolderIndex>,
     /// Wakes the scan loop when an absence needs reconciling.
     reconcile: Notify,
 }
@@ -294,6 +301,14 @@ impl Engine {
         session: SharedSession,
         config: EngineConfig,
     ) -> Result<Self, StoreError> {
+        // Re-queue what a previous run left unfinished before the counts are
+        // read, so a row this run will work on is not seeded as parked (R6.7):
+        // a `retry_wait` row otherwise counts as failed and then becomes
+        // pending, and no later bookkeeping moves the failed count back down.
+        let (queue, queue_rx) = mpsc::unbounded_channel();
+        for path in store.requeue_unfinished()? {
+            let _ = queue.send(PathBuf::from(path));
+        }
         let mut entries = Vec::new();
         for folder in store.folders()? {
             let counts = store.folder_counts(&folder.path).unwrap_or_else(|error| {
@@ -306,12 +321,6 @@ impl Engine {
                 counts,
                 last_error: None,
             });
-        }
-        // Re-queue what a previous run left unfinished before the counts are
-        // read, so a row this run will work on is not seeded as parked (R6.7).
-        let (queue, queue_rx) = mpsc::unbounded_channel();
-        for path in store.requeue_unfinished()? {
-            let _ = queue.send(PathBuf::from(path));
         }
         let uploader = Uploader::new(session.clone(), store.clone());
         // R1.4: the album calls go through the same session, so a 401 on one of
@@ -326,7 +335,7 @@ impl Engine {
             albums,
             versions,
             breaker,
-            upload_slots: Arc::new(Semaphore::new(config.concurrency.max(1))),
+            upload_slots: Mutex::new(Arc::new(Semaphore::new(config.concurrency.max(1)))),
             bandwidth: BandwidthLimit::new(config.bandwidth_bytes_per_second),
             concurrency: AtomicUsize::new(config.concurrency.max(1)),
             limits_lock: AsyncMutex::new(()),
@@ -344,6 +353,7 @@ impl Engine {
             uploads: Mutex::new(JoinSet::new()),
             absences: Mutex::new(Vec::new()),
             reconcile: Notify::new(),
+            index_cache: Mutex::new(FolderIndex::default()),
         });
         Ok(Self {
             inner,
@@ -482,39 +492,34 @@ impl Engine {
     ///
     /// The bandwidth limit is read by every upload on its next poll, so a
     /// change reaches an upload already on the wire without a restart and
-    /// without re-sending a request. A raised concurrency admits new workers
-    /// at once. A lowered concurrency lets the in-flight uploads finish: the
-    /// pool takes no new work until it has drained to the new number, and no
-    /// upload is cancelled or failed.
+    /// without re-sending a request. A resize swaps in a freshly sized pool:
+    /// the attempts in flight finish on the pool they took their permit from,
+    /// and every worker waiting on the old pool fails out at once and re-queues
+    /// its item for the new pool, so the new limit is in force for the next
+    /// attempt instead of after the whole waiting list has run. The new pool
+    /// admits its own full size while those attempts are still running, so the
+    /// running count can briefly exceed a shrinking limit; no upload is
+    /// cancelled or failed.
     pub async fn set_limits(&self, limits: Limits) {
         self.inner.bandwidth.set(limits.bandwidth_bytes_per_second);
-        // One resize at a time, so a second change cannot race the permits.
+        // One resize at a time, so a second change cannot race the swap.
         let _resize = self.inner.limits_lock.lock().await;
         let target = limits.concurrency.max(1);
         let current = self.inner.concurrency.load(Ordering::Acquire);
-        if target > current {
-            self.inner.upload_slots.add_permits(target - current);
+        if target != current {
+            let fresh = Arc::new(Semaphore::new(target));
+            let old = std::mem::replace(
+                &mut *self.inner.upload_slots.lock().expect("the upload slots"),
+                fresh,
+            );
+            // Closing the old pool releases its waiters now instead of leaving
+            // them queued behind permits nothing new will release into; their
+            // deferred items go back to the queue and take a permit from the
+            // new pool. The in-flight attempts keep the permits they hold.
+            old.close();
+            // Published only once the swap is done, so the reported limit and
+            // the pool it stands for cannot disagree.
             self.inner.concurrency.store(target, Ordering::Release);
-        } else if target < current {
-            // Take the whole pool first, so nothing new starts while it
-            // drains; then forget the difference, so the pool stays smaller
-            // from then on.
-            let slots = Arc::clone(&self.inner.upload_slots);
-            let remove = current - target;
-            let permits = u32::try_from(current).unwrap_or(u32::MAX);
-            // Only a closed semaphore fails this, and a closed pool is an
-            // engine on its way down: then the published limit stays the one
-            // the pool really has.
-            if let Ok(mut held) = slots.acquire_many_owned(permits).await {
-                // `remove` is below the permits just taken, so the split is
-                // never `None`.
-                if let Some(removed) = held.split(remove) {
-                    removed.forget();
-                }
-                // Published only once the permits are really gone, so the
-                // reported limit and the pool it stands for cannot disagree.
-                self.inner.concurrency.store(target, Ordering::Release);
-            }
         }
         tracing::info!(
             bandwidth = limits.bandwidth_bytes_per_second,
@@ -533,13 +538,24 @@ impl Engine {
         if path.is_empty() {
             return Err(EngineError::EmptyFolder);
         }
+        // R3.4: the store's upsert writes every column, so re-adding a folder
+        // (the app's recursive toggle does) must carry the album fields the
+        // stored row already holds. A hardcoded `false` silently unmapped a
+        // folder the user had mapped, and the loss only showed after a
+        // restart. A brand-new folder still starts unmapped; the config
+        // window opts it in on purpose.
+        let key = path_key(Path::new(path));
+        let stored = self
+            .inner
+            .store
+            .folders()?
+            .into_iter()
+            .find(|folder| path_key(Path::new(&folder.path)) == key);
         let folder = SourceFolder {
             path: path.to_string(),
             recursive,
-            // R3.4: adding a folder never opts it into album mapping; the
-            // config window does that on purpose.
-            album_mapping: false,
-            album_scope: AlbumScope::default(),
+            album_mapping: stored.as_ref().is_some_and(|folder| folder.album_mapping),
+            album_scope: stored.map_or_else(AlbumScope::default, |folder| folder.album_scope),
         };
         self.inner.store.add_folder(&folder)?;
         // R8.1: a folder new to this engine starts from what the store already
@@ -551,7 +567,6 @@ impl Engine {
         });
         {
             let mut folders = self.inner.folders.lock().expect("the folder lock");
-            let key = path_key(Path::new(path));
             if let Some(entry) = folders
                 .iter_mut()
                 .find(|entry| path_key(Path::new(&entry.folder.path)) == key)
@@ -568,12 +583,37 @@ impl Engine {
             }
         }
         let mut watcher = self.inner.watcher.lock().expect("the watcher lock");
+        let mut watch_error = None;
         if let Some(watcher) = watcher.as_mut()
             && Path::new(path).is_dir()
         {
-            let _ = watcher.watch(Path::new(path), recursive);
+            // Re-adding an existing folder must move the watch to the new
+            // mode. A recursive watch also watches every subfolder, and
+            // re-watching the root alone leaves those behind, so the old
+            // watch is removed first (R2.1). A folder that was never watched
+            // (the folder did not exist, or the watcher is off) makes the
+            // unwatch a no-op, and a failed unwatch may leave the old watch
+            // running.
+            let unwatched = match watcher.unwatch(Path::new(path)) {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!(folder = path, error = %error, "the old folder watch could not be removed");
+                    false
+                }
+            };
+            if let Err(error) = watcher.watch(Path::new(path), recursive) {
+                tracing::warn!(folder = path, error = %error, "the folder could not be watched");
+                // Only a removed old watch leaves the folder unwatched, so
+                // only then does the failure belong on the card (R2.1).
+                if unwatched {
+                    watch_error = Some(format!("the folder could not be watched: {error}"));
+                }
+            }
         }
         drop(watcher);
+        if let Some(error) = watch_error {
+            set_folder_error(&self.inner, path, error);
+        }
         tracing::info!(folder = path, recursive, "a source folder was added");
         // Existing files in the new folder need discovery, not only future
         // watch events.
@@ -852,10 +892,26 @@ impl Drop for Engine {
 }
 
 impl EngineInner {
+    /// The upload pool in force right now (R7.2).
+    ///
+    /// A resize swaps the pool, so an attempt takes its permit from the pool
+    /// that was current when the attempt started, and a later attempt takes
+    /// one from whatever pool is current then.
+    fn upload_pool(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.upload_slots.lock().expect("the upload slots"))
+    }
+
     /// Queues the settled paths the watcher reported, after the shared skip
     /// rules (R2.2). A path that disappeared is recorded and reconciled by the
     /// scan loop (R5.1).
     fn enqueue_watch_batch(&self, paths: Vec<PathBuf>) {
+        // A change in a folder makes its cached listing stale, whether or not
+        // the changed path itself is queued (a sidecar is not an item, but it
+        // still pairs with the media file in the same batch). R3.3.
+        self.index_cache
+            .lock()
+            .expect("the index cache lock")
+            .invalidate(&paths);
         for path in paths {
             let Ok(metadata) = std::fs::symlink_metadata(&path) else {
                 // The path is gone. Whether that is a missing file, a rename,
@@ -984,6 +1040,9 @@ impl EngineInner {
                 // Deferred keeps the item queued and its pending count.
                 UploadOutcome::Deferred => {}
             }
+            // R8.2: the tray card reads the global copy, so a success that
+            // recovers every folder must clear it too.
+            clear_global_error_if_recovered(self, &folders);
         }
         self.in_flight
             .lock()
@@ -1036,10 +1095,12 @@ impl EngineInner {
             error_class,
             error_message,
             attempts: 0,
-            // A parked item owes its sidecar, and the request that would have
-            // carried it never went out. A manual retry starts a fresh budget
-            // (R6.5) and sends it again.
-            sidecar: None,
+            // A parked item owes a sidecar the row does not record, and the
+            // request that would have carried it never went out. A digest the
+            // row already has is kept: a promote failure parked the item
+            // after the upload read the sidecar, and a manual retry (R6.5)
+            // must not offer it again.
+            sidecar: existing.as_ref().and_then(|row| row.sidecar),
         };
         if let Err(error) = self.store.record(&record) {
             tracing::error!(error = %error, "the state database could not record the dead letter");
@@ -1129,8 +1190,20 @@ impl EngineInner {
             crate::failure::FailureKind::Permanent => ItemState::FailedPermanent,
             crate::failure::FailureKind::Transient => ItemState::RetryWait,
         };
+        let path = item.path.to_string_lossy().into_owned();
+        // R3.3, R4.5: a failure sends nothing, so a sidecar that was owed is
+        // still owed; but a promote failure happens after the upload landed
+        // and recorded the sidecar it carried, and erasing that digest makes
+        // the retry re-send the sidecar and park with a false "could not be
+        // attached". The row's last word on what the asset carries is kept.
+        let sidecar = self
+            .store
+            .item(&path)
+            .ok()
+            .flatten()
+            .and_then(|row| row.sidecar);
         let record = ItemRecord {
-            path: item.path.to_string_lossy().into_owned(),
+            path,
             size: item.size,
             mtime_ns: item.mtime_ns,
             sha1: item.sha1,
@@ -1139,8 +1212,7 @@ impl EngineInner {
             error_class: failure.class,
             error_message: Some(failure.message.clone()),
             attempts: 0,
-            // A failure sends nothing, so the sidecar is still owed (R3.3).
-            sidecar: None,
+            sidecar,
         };
         if let Err(store_error) = self.store.record(&record) {
             tracing::error!(error = %store_error, "the state database could not record the failure");
@@ -1237,7 +1309,9 @@ async fn attach_albums(inner: &Arc<EngineInner>, file: &Path, asset_id: &str) {
     match inner.albums.attach(&folder, file, asset_id).await {
         // R3.4: an unmapped folder maps no album, and sends no request.
         Ok(None) => {}
-        Ok(Some(_album)) => {}
+        Ok(Some(album)) => {
+            tracing::debug!(path = %file.display(), album = %album, "the asset joined its album");
+        }
         Err(error) => {
             tracing::warn!(
                 path = %file.display(),
@@ -1263,14 +1337,10 @@ fn folder_entry_for(inner: &EngineInner, path: &Path) -> Option<SourceFolder> {
 
 /// Prepares one batch and checks it with one `bulk-upload-check` (R3.1).
 async fn process_batch(inner: &Arc<EngineInner>, batch: Vec<PathBuf>) {
-    // R3.3: the pairing rules need the folders' other files, so they are read
-    // once per batch on a blocking thread, before any file is hashed.
-    let index = {
-        let batch = batch.clone();
-        tokio::task::spawn_blocking(move || FolderIndex::read(&batch))
-            .await
-            .unwrap_or_default()
-    };
+    // R3.3: the pairing rules need the folders' other files. A scan pass
+    // shares one listing per folder across its batches, so a 10k-file folder
+    // is walked once per scan instead of once per batch.
+    let index = batch_index(inner, &batch).await;
     let mut prepared = Vec::with_capacity(batch.len());
     for path in batch {
         if let Some(item) = prepare(inner, &path, &index).await {
@@ -1368,73 +1438,43 @@ async fn process_batch(inner: &Arc<EngineInner>, batch: Vec<PathBuf>) {
             .find(|result| result.id == id)
             .map(|result| result.action.clone());
         match action {
-            Some(BulkAction::Accept) => spawn_upload(inner, item).await,
-            // R3.3: a duplicate the asset already holds still has to carry a
-            // sidecar the server does not have, so the upload runs; the server
-            // answers duplicate again and no second asset is created.
-            Some(BulkAction::Reject {
-                reason: RejectReason::Duplicate,
-                asset_id: Some(asset_id),
-                ..
-            }) if item.sidecar.is_none() => {
-                // R4.2: bytes the server already holds are still a new version
-                // of a tracked file, so the version flow runs before the row is
-                // settled. A failure here parks the row with its asset id, and
-                // the next scan or "Sync now" finishes the chain (R6.7).
-                if let Err(error) = inner.versions.promote(&id, &asset_id, item.sha1).await {
-                    inner.fail_item(&item, &error.failure(), Some(&asset_id));
-                    continue;
+            Some(action) => match check_outcome(&action) {
+                // R3.3: a duplicate whose asset is live still has to carry a
+                // sidecar the server does not have, so the upload runs; the
+                // server answers duplicate again and no second asset is
+                // created. Without one, the row settles through the version
+                // flow.
+                CheckOutcome::Duplicate { asset_id } if item.sidecar.is_none() => {
+                    settle_duplicate(inner, &item, &asset_id).await;
                 }
-                record_terminal(inner, &item, &asset_id, ItemState::Duplicate);
-                inner.finish_item(
-                    &item,
-                    &UploadOutcome::Duplicate {
-                        asset_id: asset_id.clone(),
-                    },
-                );
-                // R3.4: a duplicate is a success (R3.2), and it still maps to
-                // its folder's album.
-                attach_albums(inner, &item.path, &asset_id).await;
-            }
-            // R3.3: a sidecar is still owed, so the upload runs and parks the
-            // item when the server answers duplicate again (see
-            // `upload::Uploader::send_upload`).
-            Some(BulkAction::Reject {
-                reason: RejectReason::Duplicate,
-                asset_id: Some(_),
-                ..
-            }) => spawn_upload(inner, item).await,
-            Some(BulkAction::Reject {
-                reason: RejectReason::UnsupportedFormat,
-                ..
-            }) => {
-                let error = ClientError::UnsupportedFormat(
-                    "the checksum check refused the format".to_string(),
-                );
-                inner.fail_item(&item, &UploadFailure::from_client_error(&error), None);
-            }
-            Some(BulkAction::Reject {
-                reason: RejectReason::Duplicate,
-                asset_id: None,
-                ..
-            }) => {
-                inner.fail_item(
-                    &item,
-                    &UploadFailure::from_client_error(&missing_asset_error()),
-                    None,
-                );
-            }
-            Some(BulkAction::Reject {
-                reason: RejectReason::Other(reason),
-                ..
-            }) => {
-                let error = ClientError::Protocol {
-                    status: 200,
-                    message: format!("the checksum check refused it: {reason}"),
-                    retry_after: None,
-                };
-                inner.fail_item(&item, &UploadFailure::from_client_error(&error), None);
-            }
+                CheckOutcome::Duplicate { .. } | CheckOutcome::Upload => {
+                    spawn_upload(inner, item).await;
+                }
+                CheckOutcome::Restore { asset_id } => {
+                    // R5.3: the bytes are in the trash. Nothing can upload
+                    // them back - the checksum header answers duplicate even
+                    // then - so the asset is restored. A sidecar still cannot
+                    // attach to an asset that already exists, so it follows
+                    // the ordinary duplicate upload path and parks with its
+                    // reason.
+                    match restore_asset(inner, &asset_id).await {
+                        Ok(()) if item.sidecar.is_none() => {
+                            settle_duplicate(inner, &item, &asset_id).await;
+                        }
+                        Ok(()) => spawn_upload(inner, item).await,
+                        Err(error) => {
+                            inner.fail_item(
+                                &item,
+                                &UploadFailure::from_client_error(&error),
+                                Some(&asset_id),
+                            );
+                        }
+                    }
+                }
+                CheckOutcome::Refused(error) => {
+                    inner.fail_item(&item, &UploadFailure::from_client_error(&error), None);
+                }
+            },
             None => {
                 inner.fail_item(
                     &item,
@@ -1446,13 +1486,64 @@ async fn process_batch(inner: &Arc<EngineInner>, batch: Vec<PathBuf>) {
     }
 }
 
-/// One bulk-check answer that named no asset id.
-fn missing_asset_error() -> ClientError {
-    ClientError::Protocol {
-        status: 200,
-        message: "the server reported a duplicate without an asset id".to_string(),
-        retry_after: None,
+/// Settles an item whose bytes the server already holds under `asset_id`
+/// (R3.2, R4.2).
+///
+/// The version flow runs first: bytes the server holds are still a new
+/// version of a tracked file. A promote failure parks the row with its asset
+/// id, and the next scan or "Sync now" finishes the chain (R6.7). Then the
+/// row is terminal and the asset joins its folder's album.
+async fn settle_duplicate(inner: &Arc<EngineInner>, item: &PreparedItem, asset_id: &str) {
+    let id = item.path.to_string_lossy().into_owned();
+    if let Err(error) = inner.versions.promote(&id, asset_id, item.sha1).await {
+        inner.fail_item(item, &error.failure(), Some(asset_id));
+        return;
     }
+    record_terminal(inner, item, asset_id, ItemState::Duplicate);
+    inner.finish_item(
+        item,
+        &UploadOutcome::Duplicate {
+            asset_id: asset_id.to_string(),
+        },
+    );
+    // R3.4: a duplicate is a success (R3.2), and it still maps to its
+    // folder's album.
+    attach_albums(inner, &item.path, asset_id).await;
+}
+
+/// Restores one trashed asset through the shared session (R5.3).
+async fn restore_asset(inner: &Arc<EngineInner>, asset_id: &str) -> Result<(), ClientError> {
+    let client = inner.session.client();
+    let ids = vec![asset_id.to_string()];
+    inner
+        .session
+        .request(move |credential| {
+            let client = client.clone();
+            let ids = ids.clone();
+            async move { client.restore_assets(credential.auth(), &ids).await }
+        })
+        .await
+}
+
+/// The folder listings one batch needs, read into the scan's shared cache on
+/// a blocking thread (R3.3).
+async fn batch_index(inner: &Arc<EngineInner>, batch: &[PathBuf]) -> FolderIndex {
+    let missing = {
+        let cache = inner.index_cache.lock().expect("the index cache lock");
+        cache.missing_paths(batch)
+    };
+    if !missing.is_empty() {
+        let read = tokio::task::spawn_blocking(move || FolderIndex::read(&missing))
+            .await
+            .unwrap_or_default();
+        inner
+            .index_cache
+            .lock()
+            .expect("the index cache lock")
+            .merge(read);
+    }
+    let cache = inner.index_cache.lock().expect("the index cache lock");
+    cache.for_paths(batch)
 }
 
 /// One bulk-check answer the server never sent.
@@ -1466,8 +1557,19 @@ fn missing_result_error() -> ClientError {
 
 /// Writes a terminal row that did not need an upload (R3.2).
 fn record_terminal(inner: &EngineInner, item: &PreparedItem, asset_id: &str, state: ItemState) {
+    let path = item.path.to_string_lossy().into_owned();
+    // R4.5: this branch only runs when no sidecar was owed, but the row may
+    // already record one - a promote failure or a restart can leave a digest
+    // the settled row must not erase, or the next scan offers the sidecar
+    // again and answers `duplicate` for an asset that already carries it.
+    let sidecar = inner
+        .store
+        .item(&path)
+        .ok()
+        .flatten()
+        .and_then(|row| row.sidecar);
     let record = ItemRecord {
-        path: item.path.to_string_lossy().into_owned(),
+        path,
         size: item.size,
         mtime_ns: item.mtime_ns,
         sha1: item.sha1,
@@ -1476,9 +1578,7 @@ fn record_terminal(inner: &EngineInner, item: &PreparedItem, asset_id: &str, sta
         error_class: None,
         error_message: None,
         attempts: 0,
-        // R4.5: this branch only runs when no sidecar was owed, so the asset
-        // carries none.
-        sidecar: None,
+        sidecar,
     };
     if let Err(error) = inner.store.record(&record) {
         tracing::error!(error = %error, "the state database could not record the outcome");
@@ -1595,9 +1695,11 @@ async fn prepare(
         error_class: None,
         error_message: None,
         attempts: 0,
-        // R4.5: nothing has been sent yet, so the row claims no sidecar. A
-        // crash here re-queues the item and sends it again (R6.7).
-        sidecar: None,
+        // R4.5: the digest the row already recorded is what the asset
+        // carries, even though this new attempt has not sent anything yet. A
+        // crash here re-queues the item and sends any newer sidecar again
+        // (R6.7).
+        sidecar: existing.as_ref().and_then(|row| row.sidecar),
     };
     if let Err(error) = inner.store.record(&record) {
         tracing::error!(error = %error, "the state database could not record the pending item");
@@ -1615,8 +1717,12 @@ async fn prepare(
 
 /// Whether a recorded row is finished on its own: a terminal success, a
 /// failure no automatic retry can fix, or a decision the user already made.
-/// A pending, uploading, `retry_wait`, or `missing` row is still work the
-/// pipeline owns, so a scan may pick it up again.
+/// A pending, uploading, `retry_wait`, `missing`, or `review_trash` row is
+/// still work the pipeline owns, so a scan may pick it up again.
+///
+/// A `review_trash` row is deliberately not settled: the local file can come
+/// back, and the asset it maps to can be restored, so the path must be
+/// re-discovered rather than skipped (R5.3).
 fn is_settled(state: ItemState) -> bool {
     matches!(
         state,
@@ -1625,24 +1731,16 @@ fn is_settled(state: ItemState) -> bool {
             | ItemState::FailedPermanent
             | ItemState::DeadLetter
             | ItemState::ReviewKeep
-            | ItemState::ReviewTrash
     )
 }
 
-/// Hands one accepted file to the upload pool, holding a semaphore permit for
-/// the whole request (R7.2).
+/// Hands one accepted file to the upload pool (R7.2).
+///
+/// The pool's permit is taken inside [`upload_with_retries`], around one
+/// attempt, so a worker sleeping its backoff holds no slot: lowering the
+/// concurrency limit drains the pool instead of waiting out the sleep.
 async fn spawn_upload(inner: &Arc<EngineInner>, item: PreparedItem) {
-    let permit = match Arc::clone(&inner.upload_slots).acquire_owned().await {
-        Ok(permit) => permit,
-        // No worker can take the item, so the claim goes back: `prepare` skips
-        // a claimed path, and nothing else would ever queue it again (R6.7).
-        Err(_) => {
-            inner.release_item(&item);
-            return;
-        }
-    };
     if inner.gate.is_paused() {
-        drop(permit);
         inner.finish_item(&item, &UploadOutcome::Deferred);
         return;
     }
@@ -1650,7 +1748,6 @@ async fn spawn_upload(inner: &Arc<EngineInner>, item: PreparedItem) {
     let mut uploads = inner.uploads.lock().expect("the upload list");
     if inner.stopped.load(Ordering::SeqCst) {
         // `stop` ran first: the item stays pending for the next engine (R6.7).
-        drop(permit);
         inner.release_item(&item);
         return;
     }
@@ -1678,7 +1775,6 @@ async fn spawn_upload(inner: &Arc<EngineInner>, item: PreparedItem) {
             }
             UploadOutcome::Deferred => {}
         }
-        drop(permit);
     });
 }
 
@@ -1709,6 +1805,17 @@ async fn upload_with_retries(inner: &Arc<EngineInner>, item: &PreparedItem) -> U
             // without a request (R6.5, R6.7).
             return inner.park_dead_letter(item, None);
         }
+        // R7.2: one permit per attempt, released before the backoff sleep so
+        // a lowered limit can drain the pool without waiting it out. A closed
+        // pool has no worker to take the item, so it stays queued for the
+        // next engine (R6.7).
+        let permit = match inner.upload_pool().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                inner.release_item(item);
+                return UploadOutcome::Deferred;
+            }
+        };
         let started_ns = now_ns();
         attempts += 1;
         let mut outcome = inner
@@ -1731,6 +1838,8 @@ async fn upload_with_retries(inner: &Arc<EngineInner>, item: &PreparedItem) -> U
             inner.park_row(item, &failure, Some(asset_id));
             outcome = UploadOutcome::Failed(failure);
         }
+        // The attempt is over; a later one takes its own permit.
+        drop(permit);
         let (attempt_outcome, failure) = match &outcome {
             UploadOutcome::Created { .. } | UploadOutcome::Duplicate { .. } => {
                 // R6.6: a request the server answered ends the run of
@@ -1831,6 +1940,8 @@ async fn scan_loop(inner: Arc<EngineInner>) {
 /// across folders is seen: the reconciliation has the whole picture, not one
 /// folder at a time.
 async fn scan_once(inner: &Arc<EngineInner>) {
+    // R3.3: a new pass pairs against fresh listings, not the previous pass's.
+    *inner.index_cache.lock().expect("the index cache lock") = FolderIndex::default();
     let folders: Vec<SourceFolder> = inner
         .folders
         .lock()
@@ -2074,6 +2185,17 @@ fn set_folder_available(inner: &EngineInner, path: &str, available: bool) {
             entry.last_error = None;
         }
     }
+    if available {
+        clear_global_error_if_recovered(inner, &folders);
+    }
+}
+
+/// Clears the global last-error once no folder holds one, so the tray card
+/// stops reporting a failure every folder has recovered from (R8.2).
+fn clear_global_error_if_recovered(inner: &EngineInner, folders: &[FolderEntry]) {
+    if folders.iter().all(|entry| entry.last_error.is_none()) {
+        *inner.last_error.lock().expect("the error lock") = None;
+    }
 }
 
 /// Records a folder-level problem; it is not an error per file (R2.5).
@@ -2185,12 +2307,184 @@ mod tests {
             panic!("an item a stopped engine could not spawn is stuck claimed forever");
         };
 
-        // The pool is closed, so no permit is left to take.
-        inner.upload_slots.close();
+        // The pool is closed, so no permit is left to take. The worker takes
+        // its permit asynchronously now, so give it the chance to fail and
+        // release the claim before asking whether the file is claimable.
+        inner.upload_pool().close();
         spawn_upload(&inner, reclaimed).await;
+        let mut reclaimed = false;
+        for _ in 0..100 {
+            if prepare(&inner, &file, &index).await.is_some() {
+                reclaimed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert!(
-            prepare(&inner, &file, &index).await.is_some(),
+            reclaimed,
             "an item a closed pool could not spawn is stuck claimed forever"
         );
+    }
+
+    /// A pool shrink must not queue behind every worker already waiting
+    /// (R7.2).
+    ///
+    /// Taking the permits back one by one queues the shrink behind the whole
+    /// waiting list, and each waiter runs its attempt before releasing
+    /// anything, so the resize cost grows with the number of queued files (a
+    /// probe measured 310 ms for 4 permits behind 120 waiters of 10 ms). The
+    /// resize swaps the pool instead: attempts in flight finish on the pool
+    /// they hold a permit from, and the waiters fail out at once and go back
+    /// to the queue for the new pool.
+    #[tokio::test]
+    async fn shrinking_the_pool_does_not_wait_behind_the_queued_workers() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let store =
+            Arc::new(StateStore::open(temp.path().join("state.db")).expect("open the state store"));
+        // The session is never used: no request is sent.
+        let session = crate::connection::Connection::new(
+            "http://127.0.0.1:1",
+            Arc::new(crate::credential::MemoryCredentialStore::new()),
+        )
+        .expect("a valid URL")
+        .shared();
+        let engine = Arc::new(
+            Engine::new(
+                store,
+                session,
+                EngineConfig {
+                    concurrency: 4,
+                    ..EngineConfig::default()
+                },
+            )
+            .expect("build the engine"),
+        );
+        let inner = Arc::clone(&engine.inner);
+        let mut workers = Vec::new();
+        // Four attempts hold the whole pool; 120 more wait behind them.
+        for _ in 0..4 {
+            let pool = inner.upload_pool();
+            workers.push(tokio::spawn(async move {
+                let _permit = pool.acquire_owned().await.expect("the pool is open");
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }));
+        }
+        for _ in 0..120 {
+            let pool = inner.upload_pool();
+            workers.push(tokio::spawn(async move {
+                let _permit = pool.acquire_owned().await;
+            }));
+        }
+        // Let the holders take their permits and the rest settle in the queue.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let changed = tokio::time::timeout(
+            Duration::from_secs(2),
+            engine.set_limits(Limits {
+                bandwidth_bytes_per_second: 0,
+                concurrency: 1,
+            }),
+        )
+        .await;
+        assert!(
+            changed.is_ok(),
+            "R7.2: the shrink waited behind the queued workers"
+        );
+        assert_eq!(
+            engine.limits().concurrency,
+            1,
+            "the published limit must be the pool the waiters now queue on"
+        );
+        for worker in workers {
+            worker.abort();
+        }
+    }
+
+    /// A scan with more files than one batch must list a folder once, not
+    /// once per batch (R3.3).
+    ///
+    /// `process_batch` used to call `FolderIndex::read` for its own batch, so
+    /// a 10k-file folder re-stated itself once per 100-file batch. The scan's
+    /// cache now serves every batch of the pass.
+    #[tokio::test]
+    async fn a_scan_lists_each_folder_once_for_all_its_batches() {
+        use crate::connection::{AuthMethod, Secret, SignIn};
+
+        let server = mock_immich::MockImmich::start().await;
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let store =
+            Arc::new(StateStore::open(temp.path().join("state.db")).expect("open the state store"));
+        let folder = temp.path().join("photos");
+        std::fs::create_dir_all(&folder).expect("create the folder");
+        for index in 0..130 {
+            std::fs::write(
+                folder.join(format!("file-{index}.jpg")),
+                format!("bytes {index}"),
+            )
+            .expect("write the fixture");
+        }
+        store
+            .add_folder(&SourceFolder {
+                path: folder.display().to_string(),
+                recursive: true,
+                album_mapping: false,
+                album_scope: AlbumScope::default(),
+            })
+            .expect("add the folder");
+        let mut connection = crate::connection::Connection::new(
+            server.base_url(),
+            Arc::new(crate::credential::MemoryCredentialStore::new()),
+        )
+        .expect("a valid URL");
+        connection
+            .sign_in(SignIn {
+                email: "sync@example.com".to_string(),
+                secret: Secret::new("correct horse"),
+                method: AuthMethod::Password,
+            })
+            .await;
+        let engine = Arc::new(
+            Engine::new(
+                store.clone(),
+                connection.shared(),
+                EngineConfig {
+                    scan_interval: Duration::from_secs(3600),
+                    watch: false,
+                    ..EngineConfig::default()
+                },
+            )
+            .expect("build the engine"),
+        );
+        engine.start();
+
+        let paths: Vec<PathBuf> = (0..130)
+            .map(|index| folder.join(format!("file-{index}.jpg")))
+            .collect();
+        let mut finished = false;
+        for _ in 0..1500 {
+            finished = paths.iter().all(|path| {
+                matches!(
+                    store.item(&path.display().to_string()),
+                    Ok(Some(row)) if row.state.is_terminal_success()
+                )
+            });
+            if finished {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(finished, "the 130 files never finished");
+
+        let listings = crate::pairing::LISTED_FOLDERS
+            .lock()
+            .expect("the listing log")
+            .iter()
+            .filter(|path| path.starts_with(&folder))
+            .count();
+        assert_eq!(
+            listings, 1,
+            "R3.3: one scan pass listed the folder {listings} times"
+        );
+        engine.stop();
     }
 }

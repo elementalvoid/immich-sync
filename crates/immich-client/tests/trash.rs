@@ -92,6 +92,56 @@ async fn a_trash_without_the_permission_is_permission_denied() {
 }
 
 #[tokio::test]
+async fn restoring_an_asset_brings_it_back_from_the_trash() {
+    let server = MockImmich::start().await;
+    let client = client(&server);
+    let token = token(&client).await;
+    let asset_id = uploaded_asset(&client, &token).await;
+    client
+        .trash_assets(Auth::Token(&token), std::slice::from_ref(&asset_id))
+        .await
+        .expect("the mock trashes the asset");
+    assert!(server.trashed(&asset_id));
+
+    client
+        .restore_assets(Auth::Token(&token), std::slice::from_ref(&asset_id))
+        .await
+        .expect("the mock restores the asset");
+
+    assert!(
+        !server.trashed(&asset_id),
+        "R5.3: a restore is the way back for a trashed checksum"
+    );
+}
+
+#[tokio::test]
+async fn a_restore_without_the_permission_is_permission_denied() {
+    let server = MockImmich::start().await;
+    let client = client(&server);
+    let token = token(&client).await;
+    let asset_id = uploaded_asset(&client, &token).await;
+    client
+        .trash_assets(Auth::Token(&token), std::slice::from_ref(&asset_id))
+        .await
+        .expect("the mock trashes the asset");
+    server.fail(Operation::RestoreAssets, Fault::PermissionDenied);
+
+    let error = client
+        .restore_assets(Auth::Token(&token), std::slice::from_ref(&asset_id))
+        .await
+        .expect_err("the missing permission is refused");
+
+    assert!(
+        matches!(error, ClientError::PermissionDenied(_)),
+        "R5.5: a missing permission is its own class, got {error:?}"
+    );
+    assert!(
+        server.trashed(&asset_id),
+        "R5.5: a refused restore leaves the asset in the trash"
+    );
+}
+
+#[tokio::test]
 async fn an_api_key_trashes_too() {
     let server = MockImmich::start().await;
     let client = client(&server);

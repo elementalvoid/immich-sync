@@ -15,8 +15,9 @@ use crate::error::ClientError;
 use crate::model::{
     Album, AlbumAssetsRequest, AlbumBody, ApiKeyInfo, AssetBulkDeleteRequest, AssetCopyRequest,
     AssetInfo, AssetInfoBody, AssetUpload, Auth, AuthStatus, BulkAction, BulkCheckBody,
-    BulkCheckItem, BulkCheckResult, BulkTagRequest, CreateAlbumRequest, CreateStackRequest,
-    LoginResponse, RejectReason, ServerAbout, SessionToken, StackBody, UploadBody, UploadResponse,
+    BulkCheckItem, BulkCheckResult, BulkIdsRequest, BulkTagRequest, CreateAlbumRequest,
+    CreateStackRequest, LoginResponse, RejectReason, ServerAbout, SessionToken, StackBody,
+    UploadBody, UploadResponse,
 };
 
 /// The longest error message body kept from the server. A reverse proxy can
@@ -25,6 +26,25 @@ const MESSAGE_LIMIT: usize = 200;
 
 /// A request that has not finished within this window is unreachable.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The window [`send`] enforces. Production always gets [`REQUEST_TIMEOUT`];
+/// only a unit test can shrink it, so the stalled-server test does not spend
+/// half a minute on the wall clock.
+fn request_timeout() -> Duration {
+    #[cfg(test)]
+    {
+        let millis = TEST_TIMEOUT_MILLIS.load(std::sync::atomic::Ordering::Relaxed);
+        if millis > 0 {
+            return Duration::from_millis(millis);
+        }
+    }
+    REQUEST_TIMEOUT
+}
+
+/// The test seam [`request_timeout`] reads. It exists only in the unit-test
+/// build and defaults to zero, which means [`REQUEST_TIMEOUT`].
+#[cfg(test)]
+static TEST_TIMEOUT_MILLIS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// How long an upload may hand the server no byte before it is called stalled.
 ///
@@ -46,7 +66,7 @@ const STALL_BUDGET: Duration = REQUEST_TIMEOUT;
 /// the request was built aborts a healthy upload the moment the limit changes.
 async fn send(request: RequestBuilder) -> Result<Response, ClientError> {
     request
-        .timeout(REQUEST_TIMEOUT)
+        .timeout(request_timeout())
         .send()
         .await
         .map_err(ClientError::Unreachable)
@@ -454,11 +474,13 @@ impl ImmichClient {
         result
     }
 
-    /// The id of the asset the server already holds for `checksum`, if any.
+    /// The id of the live asset the server already holds for `checksum`, if
+    /// any.
     ///
     /// Only an answer carrying the `id` sent here is about this file; an entry
     /// for another id is some other asset, and a row that carries one is never
-    /// uploaded again (#19).
+    /// uploaded again (#19). A trashed asset is not a held asset: the bytes
+    /// are not usable until a restore, so it is not returned here.
     async fn asset_for_checksum(&self, auth: Auth<'_>, id: &str, checksum: &str) -> Option<String> {
         let item = BulkCheckItem {
             id: id.to_string(),
@@ -476,7 +498,7 @@ impl ImmichClient {
             BulkAction::Reject {
                 reason: RejectReason::Duplicate,
                 asset_id: Some(asset_id),
-                ..
+                is_trashed: false,
             } => Some(asset_id),
             _ => None,
         }
@@ -497,15 +519,14 @@ impl ImmichClient {
         name: &str,
         asset_ids: &[String],
     ) -> Result<Album, ClientError> {
-        let response = self
-            .authorize(self.http.post(self.endpoint("albums")), auth)
-            .json(&CreateAlbumRequest {
-                album_name: name,
-                asset_ids,
-            })
-            .send()
-            .await
-            .map_err(ClientError::Unreachable)?;
+        let response = send(
+            self.authorize(self.http.post(self.endpoint("albums")), auth)
+                .json(&CreateAlbumRequest {
+                    album_name: name,
+                    asset_ids,
+                }),
+        )
+        .await?;
         let result = self.read_album(response).await;
         log_outcome("create-album", &result);
         result
@@ -530,16 +551,15 @@ impl ImmichClient {
         album_id: &str,
         asset_ids: &[String],
     ) -> Result<(), ClientError> {
-        let response = self
-            .authorize(
+        let response = send(
+            self.authorize(
                 self.http
                     .put(self.endpoint(&format!("albums/{album_id}/assets"))),
                 auth,
             )
-            .json(&AlbumAssetsRequest { ids: asset_ids })
-            .send()
-            .await
-            .map_err(ClientError::Unreachable)?;
+            .json(&AlbumAssetsRequest { ids: asset_ids }),
+        )
+        .await?;
         let result = self.read_accepted(response).await;
         log_outcome("add-album-assets", &result);
         result
@@ -560,14 +580,11 @@ impl ImmichClient {
         auth: Auth<'_>,
         asset_id: &str,
     ) -> Result<AssetInfo, ClientError> {
-        let response = self
-            .authorize(
-                self.http.get(self.endpoint(&format!("assets/{asset_id}"))),
-                auth,
-            )
-            .send()
-            .await
-            .map_err(ClientError::Unreachable)?;
+        let response = send(self.authorize(
+            self.http.get(self.endpoint(&format!("assets/{asset_id}"))),
+            auth,
+        ))
+        .await?;
         let result = self.read_asset_info(response).await;
         log_outcome("asset-info", &result);
         result
@@ -594,20 +611,19 @@ impl ImmichClient {
         target_id: &str,
         stack: bool,
     ) -> Result<(), ClientError> {
-        let response = self
-            .authorize(self.http.put(self.endpoint("assets/copy")), auth)
-            .json(&AssetCopyRequest {
-                source_id,
-                target_id,
-                albums: true,
-                shared_links: true,
-                favorite: true,
-                sidecar: true,
-                stack,
-            })
-            .send()
-            .await
-            .map_err(ClientError::Unreachable)?;
+        let response = send(
+            self.authorize(self.http.put(self.endpoint("assets/copy")), auth)
+                .json(&AssetCopyRequest {
+                    source_id,
+                    target_id,
+                    albums: true,
+                    shared_links: true,
+                    favorite: true,
+                    sidecar: true,
+                    stack,
+                }),
+        )
+        .await?;
         let result = self.read_accepted(response).await;
         log_outcome("copy-asset", &result);
         result
@@ -629,12 +645,11 @@ impl ImmichClient {
         auth: Auth<'_>,
         asset_ids: &[String],
     ) -> Result<String, ClientError> {
-        let response = self
-            .authorize(self.http.post(self.endpoint("stacks")), auth)
-            .json(&CreateStackRequest { asset_ids })
-            .send()
-            .await
-            .map_err(ClientError::Unreachable)?;
+        let response = send(
+            self.authorize(self.http.post(self.endpoint("stacks")), auth)
+                .json(&CreateStackRequest { asset_ids }),
+        )
+        .await?;
         let result = self.read_stack(response).await;
         log_outcome("create-stack", &result);
         result
@@ -654,12 +669,11 @@ impl ImmichClient {
         tag_ids: &[String],
         asset_ids: &[String],
     ) -> Result<(), ClientError> {
-        let response = self
-            .authorize(self.http.put(self.endpoint("tags/assets")), auth)
-            .json(&BulkTagRequest { tag_ids, asset_ids })
-            .send()
-            .await
-            .map_err(ClientError::Unreachable)?;
+        let response = send(
+            self.authorize(self.http.put(self.endpoint("tags/assets")), auth)
+                .json(&BulkTagRequest { tag_ids, asset_ids }),
+        )
+        .await?;
         let result = self.read_accepted(response).await;
         log_outcome("bulk-tag-assets", &result);
         result
@@ -682,17 +696,45 @@ impl ImmichClient {
         auth: Auth<'_>,
         asset_ids: &[String],
     ) -> Result<(), ClientError> {
-        let response = self
-            .authorize(self.http.delete(self.endpoint("assets")), auth)
-            .json(&AssetBulkDeleteRequest {
-                ids: asset_ids,
-                force: false,
-            })
-            .send()
-            .await
-            .map_err(ClientError::Unreachable)?;
+        let response = send(
+            self.authorize(self.http.delete(self.endpoint("assets")), auth)
+                .json(&AssetBulkDeleteRequest {
+                    ids: asset_ids,
+                    force: false,
+                }),
+        )
+        .await?;
         let result = self.read_accepted(response).await;
         log_outcome("trash-assets", &result);
+        result
+    }
+
+    /// Brings trashed assets back (R5.3).
+    ///
+    /// `POST /trash/restore/assets` is `x-immich-state: Stable` in the v3.3.1
+    /// spec and asks for the same `asset.delete` permission the trash call
+    /// does. This is the way back for a checksum the server holds in the
+    /// trash: a re-POST is answered `duplicate` from the `x-immich-checksum`
+    /// header before the body is read, and the unique checksum index does not
+    /// exclude `deletedAt`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::PermissionDenied`] when the credential lacks
+    /// Immich's `asset.delete` permission (R5.5), the other typed refusal
+    /// classes (R6.3), and the transport and protocol variants.
+    pub async fn restore_assets(
+        &self,
+        auth: Auth<'_>,
+        asset_ids: &[String],
+    ) -> Result<(), ClientError> {
+        let response = send(
+            self.authorize(self.http.post(self.endpoint("trash/restore/assets")), auth)
+                .json(&BulkIdsRequest { ids: asset_ids }),
+        )
+        .await?;
+        let result = self.read_accepted(response).await;
+        log_outcome("restore-assets", &result);
         result
     }
 
@@ -976,6 +1018,28 @@ mod tests {
     fn only_immichs_quota_message_is_a_quota_refusal() {
         assert!(quota_exceeded("Quota has been exceeded!"));
         assert!(!quota_exceeded("Invalid asset data"));
+    }
+
+    #[tokio::test]
+    async fn a_request_the_server_never_answers_hits_the_deadline() {
+        let server = mock_immich::MockImmich::start().await;
+        server.fail(
+            mock_immich::Operation::CreateAlbum,
+            mock_immich::Fault::Slow(Duration::from_secs(30)),
+        );
+        TEST_TIMEOUT_MILLIS.store(200, std::sync::atomic::Ordering::Relaxed);
+        let client = ImmichClient::new(server.base_url()).expect("a valid URL");
+
+        let error = client
+            .create_album(Auth::ApiKey("test-key"), "album", &[])
+            .await
+            .expect_err("a server that accepts and never answers must fail the call");
+
+        TEST_TIMEOUT_MILLIS.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            matches!(&error, ClientError::Unreachable(inner) if inner.is_timeout()),
+            "the ordinary request window must end the call, got {error:?}"
+        );
     }
 
     #[test]

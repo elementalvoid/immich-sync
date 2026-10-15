@@ -226,6 +226,55 @@ async fn delete_moves_an_asset_to_the_trash() {
 }
 
 #[tokio::test]
+async fn restore_brings_a_trashed_asset_back() {
+    let server = MockImmich::start().await;
+    let client = reqwest::Client::new();
+    let id = upload(&client, &server, 1).await;
+    client
+        .delete(format!("{}/assets", server.base_url()))
+        .json(&serde_json::json!({ "ids": [id.clone()], "force": false }))
+        .send()
+        .await
+        .unwrap();
+    assert!(server.trashed(&id));
+
+    let response = client
+        .post(format!("{}/trash/restore/assets", server.base_url()))
+        .json(&serde_json::json!({ "ids": [id.clone()] }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["count"], 1, "one trashed asset came back");
+    assert!(!server.trashed(&id), "R5.3: the asset is live again");
+    let result = bulk_action(&client, &server, &checksum_for(1)).await;
+    assert_eq!(result["isTrashed"], false, "bulk-check sees a live asset");
+}
+
+#[tokio::test]
+async fn restore_counts_the_ids_the_request_named() {
+    // Immich's TrashService.restoreAssets answers with the number of ids the
+    // request named, not the number it moved out of the trash, so the double
+    // must count an id that was already live too.
+    let server = MockImmich::start().await;
+    let client = reqwest::Client::new();
+    let id = upload(&client, &server, 1).await;
+
+    let response = client
+        .post(format!("{}/trash/restore/assets", server.base_url()))
+        .json(&serde_json::json!({ "ids": [id] }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["count"], 1, "the id was named, so it is counted");
+}
+
+#[tokio::test]
 async fn force_delete_removes_an_asset() {
     let server = MockImmich::start().await;
     let client = reqwest::Client::new();

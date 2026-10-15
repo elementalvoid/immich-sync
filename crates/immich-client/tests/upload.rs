@@ -369,6 +369,10 @@ const SERVER_HOLDS_IT: &str = r#"{"results":[{"id":"hello.txt","action":"reject"
 const SERVER_HOLDS_ANOTHER_FILE: &str = r#"{"results":[{"id":"other.txt","action":"reject",
     "reason":"duplicate","assetId":"someone-elses","isTrashed":false}]}"#;
 
+/// The same answer, about an asset in the trash: the bytes are not held.
+const SERVER_HOLDS_IT_TRAHSED: &str = r#"{"results":[{"id":"hello.txt","action":"reject",
+    "reason":"duplicate","assetId":"trashed","isTrashed":true}]}"#;
+
 #[tokio::test]
 async fn a_cut_off_upload_is_resolved_by_asking_whether_the_server_kept_it() {
     let base_url = server_that_never_reads_a_body(&[None, Some(SERVER_HOLDS_IT)]).await;
@@ -410,6 +414,28 @@ async fn an_answer_about_another_file_does_not_resolve_the_upload() {
     assert!(
         matches!(error, ClientError::Unreachable(_)),
         "an answer for another id leaves the upload unanswered (#19): {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_trashed_duplicate_does_not_resolve_the_upload() {
+    let base_url = server_that_never_reads_a_body(&[None, Some(SERVER_HOLDS_IT_TRAHSED)]).await;
+    let client = ImmichClient::new(&base_url).expect("a loopback URL is valid");
+    let (_directory, path) = hello_world_file();
+
+    let error = client
+        .upload_asset(
+            Auth::ApiKey("api-key-1234"),
+            &upload_request(&path, HELLO_WORLD_SHA1_BASE64),
+        )
+        .await
+        .expect_err("an asset in the trash does not hold the bytes");
+
+    // A row that treats the trashed asset as held would never re-send the
+    // file, and the local copy would stay out of the library (R5.3).
+    assert!(
+        matches!(error, ClientError::Unreachable(_)),
+        "a trashed duplicate leaves the upload unanswered: {error:?}"
     );
 }
 

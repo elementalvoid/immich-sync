@@ -279,6 +279,12 @@ pub(crate) struct AssetBulkDeleteRequest<'a> {
     pub(crate) force: bool,
 }
 
+/// The `POST /trash/restore/assets` request body (R5.3).
+#[derive(Serialize)]
+pub(crate) struct BulkIdsRequest<'a> {
+    pub(crate) ids: &'a [String],
+}
+
 /// The `POST /assets/bulk-upload-check` response body.
 #[derive(Deserialize)]
 pub(crate) struct BulkCheckBody {

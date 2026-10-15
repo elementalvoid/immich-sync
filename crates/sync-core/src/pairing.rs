@@ -25,9 +25,10 @@
 //! Both rules compare names under [`PathCase`], so a case-only spelling
 //! difference is one file on Windows (R2.4).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::paths::{PathCase, equal, key};
 
@@ -116,13 +117,19 @@ pub fn same_stem(left: &Path, right: &Path, case: PathCase) -> bool {
 /// The files of the folders one batch discovered, read once per folder.
 ///
 /// Pairing needs the folder's other files, so the engine reads each folder
-/// once per batch and asks this index, instead of asking the filesystem once
-/// per candidate name. A folder that cannot be read yields no candidates,
-/// which leaves the media file an ordinary asset rather than losing it.
+/// once and asks this index, instead of asking the filesystem once per
+/// candidate name. A folder that cannot be read yields no candidates, which
+/// leaves the media file an ordinary asset rather than losing it.
 #[derive(Debug, Default)]
 pub struct FolderIndex {
-    folders: HashMap<String, Vec<PathBuf>>,
+    folders: HashMap<String, Arc<Vec<PathBuf>>>,
 }
+
+/// Every folder `read_files` has listed in this (unit-test) build, so a test
+/// can prove one scan pass lists a folder once. Production records nothing.
+#[cfg(test)]
+pub(crate) static LISTED_FOLDERS: std::sync::Mutex<Vec<PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
 
 impl FolderIndex {
     /// Reads the files of every folder `paths` sit in.
@@ -142,6 +149,68 @@ impl FolderIndex {
         index
     }
 
+    /// The paths whose folder this index does not hold, at most one per
+    /// folder and in first-seen order. A caller reads exactly these (and no
+    /// more) with [`Self::read`], so a repeated batch in the same folder owes
+    /// no second listing.
+    #[must_use]
+    pub fn missing_paths(&self, paths: &[PathBuf]) -> Vec<PathBuf> {
+        let mut missing = Vec::new();
+        let mut seen = HashSet::new();
+        let case = PathCase::for_platform();
+        for path in paths {
+            let Some(folder) = path.parent() else {
+                continue;
+            };
+            let folder_key = key(folder, case);
+            if self.folders.contains_key(&folder_key) || !seen.insert(folder_key) {
+                continue;
+            }
+            missing.push(path.clone());
+        }
+        missing
+    }
+
+    /// The listings of the folders `paths` sit in, as an index of its own, so
+    /// a batch can pair without holding the shared cache.
+    #[must_use]
+    pub fn for_paths(&self, paths: &[PathBuf]) -> Self {
+        let mut out = Self::default();
+        let case = PathCase::for_platform();
+        for path in paths {
+            let Some(folder) = path.parent() else {
+                continue;
+            };
+            let folder_key = key(folder, case);
+            if let Some(files) = self.folders.get(&folder_key) {
+                out.folders
+                    .entry(folder_key)
+                    .or_insert_with(|| Arc::clone(files));
+            }
+        }
+        out
+    }
+
+    /// Adds the listings another read holds. Already-known folders are kept:
+    /// an unreadable read yields no candidates, and it must not erase a
+    /// listing that is still good.
+    pub fn merge(&mut self, other: Self) {
+        for (folder, files) in other.folders {
+            self.folders.entry(folder).or_insert(files);
+        }
+    }
+
+    /// Drops the listings of the folders `paths` sit in, so the next batch
+    /// reads them again. The watcher calls this for every path it reports.
+    pub fn invalidate(&mut self, paths: &[PathBuf]) {
+        let case = PathCase::for_platform();
+        for path in paths {
+            if let Some(folder) = path.parent() {
+                self.folders.remove(&key(folder, case));
+            }
+        }
+    }
+
     /// Builds an index of folders whose files are already known, so the rules
     /// can be tested without a filesystem.
     #[must_use]
@@ -150,7 +219,7 @@ impl FolderIndex {
         for (folder, files) in folders {
             index
                 .folders
-                .insert(key(&folder, PathCase::for_platform()), files);
+                .insert(key(&folder, PathCase::for_platform()), Arc::new(files));
         }
         index
     }
@@ -205,7 +274,7 @@ impl FolderIndex {
         let folder = path.parent()?;
         self.folders
             .get(&key(folder, PathCase::for_platform()))
-            .map(Vec::as_slice)
+            .map(|files| files.as_slice())
     }
 }
 
@@ -214,19 +283,26 @@ impl FolderIndex {
 /// `symlink_metadata` is what decides: `Path::is_file` follows a link, and a
 /// symlinked `.mov` or `.xmp` next to a photo would then pair and be uploaded,
 /// which is what R2.2 refuses everywhere else.
-fn read_files(folder: &Path) -> Vec<PathBuf> {
+fn read_files(folder: &Path) -> Arc<Vec<PathBuf>> {
+    #[cfg(test)]
+    LISTED_FOLDERS
+        .lock()
+        .expect("the listing log")
+        .push(folder.to_path_buf());
     let Ok(entries) = std::fs::read_dir(folder) else {
-        return Vec::new();
+        return Arc::new(Vec::new());
     };
-    entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| {
-            std::fs::symlink_metadata(path)
-                .map(|metadata| metadata.is_file())
-                .unwrap_or(false)
-        })
-        .collect()
+    Arc::new(
+        entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                std::fs::symlink_metadata(path)
+                    .map(|metadata| metadata.is_file())
+                    .unwrap_or(false)
+            })
+            .collect(),
+    )
 }
 
 #[cfg(test)]

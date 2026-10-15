@@ -34,6 +34,7 @@ pub enum Operation {
     CreateStack,
     TagAssets,
     DeleteAssets,
+    RestoreAssets,
     CreateAlbum,
     AddAssetsToAlbum,
 }
@@ -766,6 +767,7 @@ impl MockImmich {
             .route("/auth/validateToken", post(validate_token))
             .route("/assets/bulk-upload-check", post(bulk_upload_check))
             .route("/assets", post(upload).delete(delete_assets))
+            .route("/trash/restore/assets", post(restore_assets))
             .route("/assets/copy", put(copy_asset))
             .route("/assets/{id}", get(get_asset))
             .route("/stacks", post(create_stack))
@@ -1489,6 +1491,28 @@ async fn tag_assets(
         .expect("mock state poisoned")
         .tag(&asset_ids, &tag_ids);
     Json(json!({ "count": count })).into_response()
+}
+
+async fn restore_assets(
+    AxumState(state): AxumState<Arc<State>>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if let Some(response) = guard(&state, Operation::RestoreAssets).await {
+        return response;
+    }
+    let ids = id_list(body.get("ids"));
+    let mut inner = state.inner.lock().expect("mock state poisoned");
+    for id in &ids {
+        if let Some(asset) = inner.assets.get_mut(id)
+            && asset.trashed
+        {
+            asset.trashed = false;
+        }
+    }
+    // Immich's TrashService.restoreAssets answers with the number of ids the
+    // request named, not the number whose deletedAt it cleared, so a double
+    // must not answer a smaller count for an id that was not trashed.
+    Json(json!({ "count": ids.len() })).into_response()
 }
 
 async fn delete_assets(

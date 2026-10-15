@@ -4,6 +4,8 @@
 //! Every test drives the real pipeline: a real directory, the real watcher and
 //! scan, the real state store, and the mock server's request counters.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -22,6 +24,8 @@ use sync_core::store::{
     AlbumScope, AttemptOutcome, AttemptRecord, FolderCounts, ItemRecord, ItemState, SourceFolder,
     StateStore,
 };
+
+use common::wait_until;
 
 /// Starts the mock and signs in, returning the session the engine attaches to
 /// every request (R1.4).
@@ -83,20 +87,6 @@ async fn start_engine(
     let engine = Arc::new(Engine::new(store.clone(), session, config).expect("build the engine"));
     engine.start();
     engine
-}
-
-/// Polls `check` until it returns true, or the timeout elapses.
-async fn wait_until(mut check: impl FnMut() -> bool, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if check() {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
 }
 
 /// Whether every path has a terminal success row.
@@ -779,6 +769,52 @@ async fn a_transient_failure_that_later_succeeds_clears_the_folder_error() {
 }
 
 #[tokio::test]
+async fn a_recovered_folder_clears_the_global_last_error() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    write_file(&photos, "mapped.jpg", b"mapped bytes");
+    add_mapped_folder(&store, &photos, true, AlbumScope::Leaf);
+    // The upload lands, but the album call it maps to fails, which records the
+    // failure on the folder and on the tray's global card (R3.4, R8.2).
+    server.fail(
+        Operation::CreateAlbum,
+        Fault::Status {
+            code: 500,
+            retry_after: None,
+        },
+    );
+    let config = EngineConfig {
+        watch: false,
+        ..EngineConfig::default()
+    };
+    let engine = start_engine(&server, &store, config).await;
+
+    assert!(
+        wait_until(
+            || engine.status().last_error.is_some(),
+            Duration::from_secs(15)
+        )
+        .await,
+        "the album failure was not recorded globally"
+    );
+
+    // A later scan finds the folder available and nothing failing.
+    engine.sync_now();
+    assert!(
+        wait_until(
+            || engine.status().last_error.is_none(),
+            Duration::from_secs(10)
+        )
+        .await,
+        "the global last error stayed sticky after recovery: {:?}",
+        engine.status()
+    );
+    engine.stop();
+}
+
+#[tokio::test]
 async fn a_restart_with_a_pending_row_does_not_double_count_the_pending_item() {
     let server = MockImmich::start().await;
     let temp = tempfile::tempdir().expect("create a temp dir");
@@ -834,6 +870,62 @@ async fn a_restart_with_a_pending_row_does_not_double_count_the_pending_item() {
         1.0,
         "the drained queue must read as complete"
     );
+    engine.stop();
+}
+
+/// A restart that interrupts a retry must not seed a failed count that no
+/// later success clears (R6.7, R8.1).
+///
+/// `Engine::new` read the folder counts before `requeue_unfinished`, so an
+/// interrupted `retry_wait` row was counted as failed and then became
+/// pending. `prepare` saw it already pending, so it never moved the count
+/// back down, and the item's later success left a phantom failure on the
+/// card.
+#[tokio::test]
+async fn a_restart_that_interrupts_a_retry_does_not_seed_a_failed_count() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let file = write_file(&photos, "interrupted.jpg", b"interrupted bytes");
+    add_folder(&store, &photos, true);
+    let meta = std::fs::metadata(&file).expect("read the fixture metadata");
+    store
+        .record(&ItemRecord {
+            path: file.display().to_string(),
+            size: meta.len(),
+            mtime_ns: mtime_ns_of(&file),
+            sha1: sha1_file(&file).expect("hash the fixture"),
+            asset_id: None,
+            state: ItemState::RetryWait,
+            error_class: Some(FailureClass::ServerTransient),
+            error_message: Some("the server was busy".to_string()),
+            attempts: 1,
+            sidecar: None,
+        })
+        .expect("write the interrupted retry row");
+    let config = EngineConfig {
+        watch: false,
+        ..EngineConfig::default()
+    };
+    let engine = start_engine(&server, &store, config).await;
+
+    assert!(
+        wait_until(
+            || all_terminal(&store, std::slice::from_ref(&file)),
+            Duration::from_secs(15)
+        )
+        .await,
+        "the requeued row was not resumed"
+    );
+    assert_eq!(server.upload_requests(), 1);
+    assert_eq!(
+        engine.status().counts.failed,
+        0,
+        "the interrupted retry left a phantom failure on the card: {:?}",
+        engine.status().counts
+    );
+    assert_eq!(engine.status().counts.uploaded, 1);
     engine.stop();
 }
 
@@ -937,6 +1029,122 @@ async fn adding_a_folder_through_the_engine_syncs_its_existing_files() {
         .expect("remove the folder");
     assert!(engine.status().folders.is_empty());
     assert!(store.folders().expect("read the folders").is_empty());
+    engine.stop();
+}
+
+/// Re-adding an existing folder applies the new recursive flag to the store,
+/// the card, and the watch (R2.1).
+///
+/// A recursive watch also watches every subfolder; re-watching the root alone
+/// leaves those behind, so a folder turned non-recursive would keep reporting
+/// nested files. The watcher is real here: only the watcher can find the late
+/// file, because the scan interval is an hour and nothing calls `sync_now`.
+#[tokio::test]
+async fn re_adding_a_folder_applies_the_new_recursive_flag() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    add_folder(&store, &photos, true);
+    let nested = write_file(&photos, "Holiday/beach.jpg", b"nested bytes");
+    let engine = start_engine(
+        &server,
+        &store,
+        EngineConfig {
+            watch: true,
+            watch_debounce: Duration::from_millis(200),
+            scan_interval: Duration::from_secs(3600),
+            ..EngineConfig::default()
+        },
+    )
+    .await;
+    // The folder is recursive, so the nested file uploads.
+    assert!(
+        wait_until(
+            || all_terminal(&store, std::slice::from_ref(&nested)),
+            Duration::from_secs(20)
+        )
+        .await,
+        "the recursive folder did not find the nested file"
+    );
+
+    engine
+        .add_folder(&photos.display().to_string(), false)
+        .expect("re-add the folder");
+    assert!(
+        !engine.status().folders[0].recursive,
+        "the card must show the new flag"
+    );
+    assert!(
+        !store.folders().expect("read the folders")[0].recursive,
+        "the store must hold the new flag"
+    );
+
+    // A file in a subfolder must not reach the queue: the watch moved to
+    // non-recursive.
+    let late = write_file(&photos, "Holiday/late.jpg", b"late nested bytes");
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert!(
+        store
+            .item(&late.display().to_string())
+            .expect("read the row")
+            .is_none(),
+        "R2.1: a nested file must not be discovered after the folder turned non-recursive"
+    );
+    engine.stop();
+}
+
+/// Re-adding an existing folder must not turn its album mapping off (R3.4).
+///
+/// The app's per-folder recursive toggle re-adds the folder through
+/// `Engine::add_folder`. The store's upsert writes every tracked column, so a
+/// folder constructed with `album_mapping: false` silently unmapped a folder
+/// the user had mapped, and the loss only showed after a restart.
+#[tokio::test]
+async fn re_adding_a_folder_keeps_its_album_mapping() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the folder");
+    let engine = start_engine(&server, &store, EngineConfig::default()).await;
+
+    engine
+        .add_folder(&photos.display().to_string(), true)
+        .expect("add the folder");
+    engine
+        .set_album_mapping(&photos.display().to_string(), true)
+        .expect("enable album mapping");
+    engine
+        .set_album_scope(&photos.display().to_string(), AlbumScope::WholeFolder)
+        .expect("set the album scope");
+
+    engine
+        .add_folder(&photos.display().to_string(), false)
+        .expect("re-add the folder");
+
+    let stored = store
+        .folders()
+        .expect("read the folders")
+        .into_iter()
+        .find(|folder| folder.path == photos.display().to_string())
+        .expect("the folder is stored");
+    assert!(
+        stored.album_mapping,
+        "re-adding the folder turned album mapping off"
+    );
+    assert_eq!(
+        stored.album_scope,
+        AlbumScope::WholeFolder,
+        "re-adding the folder reset the album scope"
+    );
+    let card = engine.status().folders[0].clone();
+    assert!(card.album_mapping, "the card lost the album mapping");
+    assert_eq!(
+        card.album_scope,
+        AlbumScope::WholeFolder,
+        "the card lost the album scope"
+    );
     engine.stop();
 }
 
@@ -2721,6 +2929,96 @@ async fn a_refused_copy_keeps_the_upload_and_records_no_new_version() {
     engine.stop();
 }
 
+/// A promote failure must keep the sidecar the upload already sent (R3.3,
+/// R4.5).
+///
+/// The upload that creates the new version carries the changed sidecar and
+/// records its digest before the version flow runs. When a promote call then
+/// fails, the row is parked for a retry; if the digest is erased, the retry
+/// offers the sidecar again, and the checksum header answers `duplicate`
+/// before the body is read, so the item parks with a false "could not be
+/// attached" although the asset already carries it.
+#[tokio::test]
+async fn a_promote_failure_keeps_the_sidecar_the_upload_already_sent() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let file = write_file(&photos, "versioned.jpg", b"first bytes");
+    let sidecar = write_file(
+        &photos,
+        "versioned.jpg.xmp",
+        b"<x:xmpmeta>first</x:xmpmeta>",
+    );
+    add_folder(&store, &photos, true);
+    let engine = start_engine(&server, &store, retry_config(4)).await;
+
+    sync_one(&store, &file).await;
+    let first = store
+        .item(&file.display().to_string())
+        .expect("read the row")
+        .expect("the row exists");
+    assert!(
+        first.sidecar.is_some(),
+        "the first upload carried the sidecar"
+    );
+
+    // One promote call fails after the changed upload landed with its new
+    // sidecar; the automatic retry must finish without offering it again.
+    server.fail(
+        Operation::GetAsset,
+        Fault::Status {
+            code: 500,
+            retry_after: None,
+        },
+    );
+    std::fs::write(&file, b"second bytes").expect("edit the media");
+    std::fs::write(&sidecar, b"<x:xmpmeta>second</x:xmpmeta>").expect("edit the sidecar");
+    engine.sync_now();
+
+    let path_text = file.display().to_string();
+    // Waiting on the version chain, not only a terminal row: the first sync
+    // already left a terminal row, and the promote is what the retry has to
+    // finish.
+    assert!(
+        wait_until(
+            || chain_len(&store, &file) == 2
+                && matches!(&store.item(&path_text), Ok(Some(row)) if row.state.is_terminal_success()),
+            Duration::from_secs(20)
+        )
+        .await,
+        "the promote failure left the item parked instead of retrying: {:?}",
+        store.item(&path_text)
+    );
+    let row = store
+        .item(&path_text)
+        .expect("read the row")
+        .expect("the row exists");
+    assert_eq!(
+        row.sidecar.map(|digest| digest.sha1),
+        Some(sha1_file(&sidecar).expect("hash the sidecar")),
+        "the row keeps the sidecar digest the upload recorded"
+    );
+    assert!(
+        engine
+            .failed_items()
+            .expect("read the failed items")
+            .is_empty(),
+        "the false 'could not be attached' must not park the item"
+    );
+
+    // A later pass must not offer the recorded sidecar again.
+    let uploads = server.upload_requests();
+    engine.sync_now();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        server.upload_requests(),
+        uploads,
+        "R4.5: a recorded sidecar is not sent again"
+    );
+    engine.stop();
+}
+
 /// R6.5 and R4.4: the dead letter keeps the asset the server already holds,
 /// the same rule `park_row` follows when a promote fails — the upload made the
 /// mapping, and dropping it claims the server holds nothing.
@@ -3792,6 +4090,69 @@ async fn a_file_that_comes_back_leaves_the_review() {
         row.asset_id.as_deref(),
         Some(asset_id.as_str()),
         "the restored file keeps pointing at the asset the server holds"
+    );
+    engine.stop();
+}
+
+#[tokio::test]
+async fn a_file_that_comes_back_after_a_trash_decision_restores_the_asset() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let file = write_file(&photos, "trashed-then-back.jpg", b"trashed then back");
+    add_folder(&store, &photos, true);
+    let engine = start_engine(
+        &server,
+        &store,
+        review_config(Duration::from_secs(1), false),
+    )
+    .await;
+    let asset_id = sync_one(&store, &file).await;
+    std::fs::remove_file(&file).expect("delete the fixture");
+    wait_for_review(&engine, 1).await;
+    engine
+        .trash_review_item(&file.display().to_string())
+        .await
+        .expect("R5.3: the asset moves to the trash");
+    assert!(server.trashed(&asset_id), "the asset is in the trash");
+
+    // The same bytes come back. `review_trash` must not be a settled state,
+    // and a trashed checksum must not read as held: the engine restores the
+    // asset instead of uploading bytes the server answers `duplicate`.
+    write_file(&photos, "trashed-then-back.jpg", b"trashed then back");
+    engine.sync_now();
+    assert!(
+        wait_until(|| !server.trashed(&asset_id), Duration::from_secs(15)).await,
+        "R5.3: the trashed asset was not restored"
+    );
+    assert!(
+        wait_until(
+            || store
+                .item(&file.display().to_string())
+                .ok()
+                .flatten()
+                .is_some_and(|row| row.state.is_terminal_success()),
+            Duration::from_secs(15)
+        )
+        .await,
+        "the restored file never settled: {:?}",
+        store.item(&file.display().to_string())
+    );
+    assert_eq!(
+        server.upload_requests(),
+        1,
+        "a restore is not an upload: the checksum is already known"
+    );
+    assert_eq!(
+        store
+            .item(&file.display().to_string())
+            .expect("read the row")
+            .expect("the row exists")
+            .asset_id
+            .as_deref(),
+        Some(asset_id.as_str()),
+        "the restored file keeps its asset mapping"
     );
     engine.stop();
 }
