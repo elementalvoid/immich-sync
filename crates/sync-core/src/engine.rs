@@ -581,6 +581,7 @@ impl Engine {
             }
         }
         let mut watcher = self.inner.watcher.lock().expect("the watcher lock");
+        let mut watch_error = None;
         if let Some(watcher) = watcher.as_mut()
             && Path::new(path).is_dir()
         {
@@ -588,12 +589,29 @@ impl Engine {
             // mode. A recursive watch also watches every subfolder, and
             // re-watching the root alone leaves those behind, so the old
             // watch is removed first (R2.1). A folder that was never watched
-            // (the folder did not exist, or the watcher is off) makes this a
-            // no-op that is safe to ignore.
-            let _ = watcher.unwatch(Path::new(path));
-            let _ = watcher.watch(Path::new(path), recursive);
+            // (the folder did not exist, or the watcher is off) makes the
+            // unwatch a no-op, and a failed unwatch may leave the old watch
+            // running.
+            let unwatched = match watcher.unwatch(Path::new(path)) {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!(folder = path, error = %error, "the old folder watch could not be removed");
+                    false
+                }
+            };
+            if let Err(error) = watcher.watch(Path::new(path), recursive) {
+                tracing::warn!(folder = path, error = %error, "the folder could not be watched");
+                // Only a removed old watch leaves the folder unwatched, so
+                // only then does the failure belong on the card (R2.1).
+                if unwatched {
+                    watch_error = Some(format!("the folder could not be watched: {error}"));
+                }
+            }
         }
         drop(watcher);
+        if let Some(error) = watch_error {
+            set_folder_error(&self.inner, path, error);
+        }
         tracing::info!(folder = path, recursive, "a source folder was added");
         // Existing files in the new folder need discovery, not only future
         // watch events.
