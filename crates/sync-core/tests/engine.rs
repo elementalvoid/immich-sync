@@ -1200,8 +1200,14 @@ async fn a_re_add_keeps_the_live_album_edit_over_a_stale_stored_row() {
     engine.stop();
 }
 
-/// The two edits can run at the same time: an album toggle (which takes the
-/// folders lock) and a re-add. Neither may lose the other's field (R3.4).
+/// The two edits can run at the same time: album toggles (which take the
+/// folders lock) and re-adds. Neither may lose the other's field (R3.4).
+///
+/// The album thread writes a value it remembers, then checks the store for a
+/// while before its next write; a re-add that read the row before that write
+/// and wrote it after leaves the old value in the store, and the check sees
+/// it. The re-add thread only loops, so the checks cannot race a later album
+/// edit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_interleaved_recursive_toggle_and_album_toggle_lose_nothing() {
     let server = MockImmich::start().await;
@@ -1221,37 +1227,44 @@ async fn an_interleaved_recursive_toggle_and_album_toggle_lose_nothing() {
     let path = photos.display().to_string();
     engine.add_folder(&path, true).expect("add the folder");
 
-    let barrier = std::sync::Barrier::new(3);
+    let stored_mapping = || {
+        store
+            .folders()
+            .expect("read the folders")
+            .into_iter()
+            .find(|folder| folder.path == path)
+            .expect("the folder is stored")
+            .album_mapping
+    };
+    let barrier = std::sync::Barrier::new(2);
+    let done = std::sync::atomic::AtomicBool::new(false);
     std::thread::scope(|scope| {
-        let album = scope.spawn(|| {
+        scope.spawn(|| {
             barrier.wait();
-            for round in 0..300_u32 {
+            let mut expected = false;
+            for _ in 0..40 {
+                expected = !expected;
                 engine
-                    .set_album_mapping(&path, round % 2 == 0)
+                    .set_album_mapping(&path, expected)
                     .expect("toggle the album mapping");
+                // The store must hold this toggle until the next one, unless
+                // a re-add wrote back a row it read before it.
+                for _ in 0..3 {
+                    assert_eq!(
+                        stored_mapping(),
+                        expected,
+                        "a re-add wrote the row it read before the album toggle"
+                    );
+                }
             }
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
         });
-        let readd = scope.spawn(|| {
+        scope.spawn(|| {
             barrier.wait();
-            for _ in 0..300 {
+            while !done.load(std::sync::atomic::Ordering::SeqCst) {
                 engine.add_folder(&path, true).expect("re-add the folder");
-                // The live entry is the one the album toggle just wrote, so the
-                // store must still agree with it. A disagreement is a re-add
-                // that wrote back the row it read before the toggle.
-                let live = engine.status().folders[0].album_mapping;
-                let stored = store
-                    .folders()
-                    .expect("read the folders")
-                    .into_iter()
-                    .find(|folder| folder.path == path)
-                    .expect("the folder is stored")
-                    .album_mapping;
-                assert_eq!(live, stored, "a re-add lost an album toggle");
             }
         });
-        barrier.wait();
-        album.join().expect("the album thread finished");
-        readd.join().expect("the re-add thread finished");
     });
     engine.stop();
 }
