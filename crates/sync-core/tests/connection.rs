@@ -304,11 +304,19 @@ async fn an_unconfigured_profile_is_not_signed_in() {
 
 #[tokio::test]
 async fn an_unreachable_server_needs_attention_with_the_reason() {
+    // A listener that accepts and immediately closes every connection is a
+    // server that cannot be reached. Keeping the listener for the whole test
+    // also keeps the port reserved, so the ephemeral-port race (a parallel
+    // mock re-binding a dropped port) cannot make this flaky.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind a port");
     let port = listener.local_addr().expect("the port is known").port();
-    drop(listener);
+    let refusing = tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            drop(socket);
+        }
+    });
 
     let store = Arc::new(MemoryCredentialStore::new());
     store.set(&Secret::new("correct horse")).expect("seed");
@@ -329,6 +337,7 @@ async fn an_unreachable_server_needs_attention_with_the_reason() {
         ),
         "{state:?}"
     );
+    refusing.abort();
 }
 
 #[tokio::test]

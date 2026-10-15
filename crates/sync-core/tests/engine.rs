@@ -99,6 +99,51 @@ fn all_terminal(store: &StateStore, paths: &[PathBuf]) -> bool {
     })
 }
 
+/// How many of `paths` have reached a terminal success row, so a wait can
+/// measure the pipeline's progress instead of the clock.
+fn terminal_count(store: &StateStore, paths: &[PathBuf]) -> u64 {
+    let count = paths
+        .iter()
+        .filter(|path| {
+            matches!(
+                store.item(&path.display().to_string()),
+                Ok(Some(row)) if row.state.is_terminal_success()
+            )
+        })
+        .count();
+    u64::try_from(count).unwrap_or(u64::MAX)
+}
+
+/// Polls `check` until it returns true, giving up only after `stall` passes
+/// with `progress` unchanged.
+///
+/// A wall-clock budget starves a real pipeline under load: the work a test
+/// waits for can take longer than any second-based number while still moving.
+/// This waits on the observable progress instead, so the test fails only when
+/// the pipeline stops producing outcomes.
+async fn wait_for_progress(
+    mut progress: impl FnMut() -> u64,
+    mut check: impl FnMut() -> bool,
+    stall: Duration,
+) -> bool {
+    let mut last = progress();
+    let mut deadline = Instant::now() + stall;
+    loop {
+        if check() {
+            return true;
+        }
+        let current = progress();
+        if current != last {
+            last = current;
+            deadline = Instant::now() + stall;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// The modification time the engine records, in nanoseconds since the epoch.
 fn mtime_ns_of(path: &Path) -> i64 {
     let modified = std::fs::metadata(path)
@@ -144,7 +189,12 @@ async fn a_folder_with_100_files_syncs_without_manual_action() {
     let engine = start_engine(&server, &store, EngineConfig::default()).await;
 
     assert!(
-        wait_until(|| all_terminal(&store, &paths), Duration::from_secs(30)).await,
+        wait_for_progress(
+            || terminal_count(&store, &paths),
+            || all_terminal(&store, &paths),
+            Duration::from_secs(20),
+        )
+        .await,
         "not every file reached a terminal success state"
     );
     assert_eq!(server.upload_requests(), 100, "R3.1: every file uploaded");
@@ -1628,9 +1678,10 @@ async fn a_401_re_logs_in_once_and_the_retried_upload_succeeds() {
     let (engine, session) = start_engine_with_session(&server, &store, retry_config(8)).await;
 
     assert!(
-        wait_until(
+        wait_for_progress(
+            || server.upload_requests() + server.login_requests(),
             || all_terminal(&store, std::slice::from_ref(&file)),
-            Duration::from_secs(10)
+            Duration::from_secs(10),
         )
         .await,
         "R1.4: the upload was not retried after the one re-login"
