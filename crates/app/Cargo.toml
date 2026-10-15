@@ -61,8 +61,10 @@ licenseFile = "../../LICENSE-MIT"
 installerIcon = "icons/icon.ico"
 
 # Runtime libraries for the deb, read off the release binary (readelf NEEDED
-# plus the dlopen names): the linked ones, the Vulkan loader, and the Wayland
-# client. A desktop distro already has them, but dpkg must know.
+# plus the dlopen names): the linked ones, the Vulkan loader, the Wayland
+# client, and the EGL/Wayland-EGL surfaces the GPU stack opens (a missing
+# libwayland-egl.so.1 panics wayland-sys). A desktop distro already has them,
+# but dpkg must know.
 [package.metadata.packager.deb]
 depends = [
     "libc6",
@@ -73,6 +75,8 @@ depends = [
     "libxkbcommon-x11-0",
     "libvulkan1",
     "libwayland-client0",
+    "libwayland-egl1",
+    "libegl1",
 ]
 
 [target."cfg(target_os = \"linux\")".dependencies]
