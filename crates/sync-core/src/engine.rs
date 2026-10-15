@@ -101,8 +101,8 @@ impl Default for EngineConfig {
 /// The user-set limits the running engine can be moved to (SPEC R7).
 ///
 /// [`Engine::set_limits`] applies both without a restart: the bandwidth limit
-/// is read by an upload already on the wire, and the concurrency limit admits
-/// or retires workers as the pool drains.
+/// is read by an upload already on the wire, and a concurrency change moves
+/// the next attempt to a freshly sized pool.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     /// Upload bytes per second; 0 means unlimited (R7.1).
@@ -248,14 +248,16 @@ struct EngineInner {
     last_error: Mutex<Option<String>>,
     resume: Notify,
     sync_now: Notify,
-    upload_slots: Arc<Semaphore>,
+    /// The upload pool in force right now. A resize replaces the whole
+    /// `Arc<Semaphore>` instead of moving permits in and out of one pool.
+    upload_slots: Mutex<Arc<Semaphore>>,
     /// The upload bandwidth limit, shared with every upload so a change
     /// reaches one already on the wire (R7.1).
     bandwidth: BandwidthLimit,
     /// The concurrency the pool is sized to right now (R7.2).
     concurrency: AtomicUsize,
-    /// Serializes a pool resize, so two quick settings changes cannot leave
-    /// the permits and this count disagreeing.
+    /// Serializes a pool resize, so two quick settings changes cannot race
+    /// the swap and this count.
     limits_lock: AsyncMutex<()>,
     watcher: Mutex<Option<FolderWatcher>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
@@ -333,7 +335,7 @@ impl Engine {
             albums,
             versions,
             breaker,
-            upload_slots: Arc::new(Semaphore::new(config.concurrency.max(1))),
+            upload_slots: Mutex::new(Arc::new(Semaphore::new(config.concurrency.max(1)))),
             bandwidth: BandwidthLimit::new(config.bandwidth_bytes_per_second),
             concurrency: AtomicUsize::new(config.concurrency.max(1)),
             limits_lock: AsyncMutex::new(()),
@@ -490,39 +492,32 @@ impl Engine {
     ///
     /// The bandwidth limit is read by every upload on its next poll, so a
     /// change reaches an upload already on the wire without a restart and
-    /// without re-sending a request. A raised concurrency admits new workers
-    /// at once. A lowered concurrency lets the in-flight uploads finish: the
-    /// pool takes no new work until it has drained to the new number, and no
-    /// upload is cancelled or failed.
+    /// without re-sending a request. A resize swaps in a freshly sized pool:
+    /// the attempts in flight finish on the pool they took their permit from,
+    /// and every worker waiting on the old pool fails out at once and re-queues
+    /// its item for the new pool, so the new limit is in force for the next
+    /// attempt instead of after the whole waiting list has run. No upload is
+    /// cancelled or failed.
     pub async fn set_limits(&self, limits: Limits) {
         self.inner.bandwidth.set(limits.bandwidth_bytes_per_second);
-        // One resize at a time, so a second change cannot race the permits.
+        // One resize at a time, so a second change cannot race the swap.
         let _resize = self.inner.limits_lock.lock().await;
         let target = limits.concurrency.max(1);
         let current = self.inner.concurrency.load(Ordering::Acquire);
-        if target > current {
-            self.inner.upload_slots.add_permits(target - current);
+        if target != current {
+            let fresh = Arc::new(Semaphore::new(target));
+            let old = std::mem::replace(
+                &mut *self.inner.upload_slots.lock().expect("the upload slots"),
+                fresh,
+            );
+            // Closing the old pool releases its waiters now instead of leaving
+            // them queued behind permits nothing new will release into; their
+            // deferred items go back to the queue and take a permit from the
+            // new pool. The in-flight attempts keep the permits they hold.
+            old.close();
+            // Published only once the swap is done, so the reported limit and
+            // the pool it stands for cannot disagree.
             self.inner.concurrency.store(target, Ordering::Release);
-        } else if target < current {
-            // Take the whole pool first, so nothing new starts while it
-            // drains; then forget the difference, so the pool stays smaller
-            // from then on.
-            let slots = Arc::clone(&self.inner.upload_slots);
-            let remove = current - target;
-            let permits = u32::try_from(current).unwrap_or(u32::MAX);
-            // Only a closed semaphore fails this, and a closed pool is an
-            // engine on its way down: then the published limit stays the one
-            // the pool really has.
-            if let Ok(mut held) = slots.acquire_many_owned(permits).await {
-                // `remove` is below the permits just taken, so the split is
-                // never `None`.
-                if let Some(removed) = held.split(remove) {
-                    removed.forget();
-                }
-                // Published only once the permits are really gone, so the
-                // reported limit and the pool it stands for cannot disagree.
-                self.inner.concurrency.store(target, Ordering::Release);
-            }
         }
         tracing::info!(
             bandwidth = limits.bandwidth_bytes_per_second,
@@ -877,6 +872,15 @@ impl Drop for Engine {
 }
 
 impl EngineInner {
+    /// The upload pool in force right now (R7.2).
+    ///
+    /// A resize swaps the pool, so an attempt takes its permit from the pool
+    /// that was current when the attempt started, and a later attempt takes
+    /// one from whatever pool is current then.
+    fn upload_pool(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.upload_slots.lock().expect("the upload slots"))
+    }
+
     /// Queues the settled paths the watcher reported, after the shared skip
     /// rules (R2.2). A path that disappeared is recorded and reconciled by the
     /// scan loop (R5.1).
@@ -1785,7 +1789,7 @@ async fn upload_with_retries(inner: &Arc<EngineInner>, item: &PreparedItem) -> U
         // a lowered limit can drain the pool without waiting it out. A closed
         // pool has no worker to take the item, so it stays queued for the
         // next engine (R6.7).
-        let permit = match Arc::clone(&inner.upload_slots).acquire_owned().await {
+        let permit = match inner.upload_pool().acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => {
                 inner.release_item(item);
@@ -2286,7 +2290,7 @@ mod tests {
         // The pool is closed, so no permit is left to take. The worker takes
         // its permit asynchronously now, so give it the chance to fail and
         // release the claim before asking whether the file is claimable.
-        inner.upload_slots.close();
+        inner.upload_pool().close();
         spawn_upload(&inner, reclaimed).await;
         let mut reclaimed = false;
         for _ in 0..100 {
@@ -2300,6 +2304,80 @@ mod tests {
             reclaimed,
             "an item a closed pool could not spawn is stuck claimed forever"
         );
+    }
+
+    /// A pool shrink must not queue behind every worker already waiting
+    /// (R7.2).
+    ///
+    /// Taking the permits back one by one queues the shrink behind the whole
+    /// waiting list, and each waiter runs its attempt before releasing
+    /// anything, so the resize cost grows with the number of queued files (a
+    /// probe measured 310 ms for 4 permits behind 120 waiters of 10 ms). The
+    /// resize swaps the pool instead: attempts in flight finish on the pool
+    /// they hold a permit from, and the waiters fail out at once and go back
+    /// to the queue for the new pool.
+    #[tokio::test]
+    async fn shrinking_the_pool_does_not_wait_behind_the_queued_workers() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let store =
+            Arc::new(StateStore::open(temp.path().join("state.db")).expect("open the state store"));
+        // The session is never used: no request is sent.
+        let session = crate::connection::Connection::new(
+            "http://127.0.0.1:1",
+            Arc::new(crate::credential::MemoryCredentialStore::new()),
+        )
+        .expect("a valid URL")
+        .shared();
+        let engine = Arc::new(
+            Engine::new(
+                store,
+                session,
+                EngineConfig {
+                    concurrency: 4,
+                    ..EngineConfig::default()
+                },
+            )
+            .expect("build the engine"),
+        );
+        let inner = Arc::clone(&engine.inner);
+        let mut workers = Vec::new();
+        // Four attempts hold the whole pool; 120 more wait behind them.
+        for _ in 0..4 {
+            let pool = inner.upload_pool();
+            workers.push(tokio::spawn(async move {
+                let _permit = pool.acquire_owned().await.expect("the pool is open");
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }));
+        }
+        for _ in 0..120 {
+            let pool = inner.upload_pool();
+            workers.push(tokio::spawn(async move {
+                let _permit = pool.acquire_owned().await;
+            }));
+        }
+        // Let the holders take their permits and the rest settle in the queue.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let changed = tokio::time::timeout(
+            Duration::from_secs(2),
+            engine.set_limits(Limits {
+                bandwidth_bytes_per_second: 0,
+                concurrency: 1,
+            }),
+        )
+        .await;
+        assert!(
+            changed.is_ok(),
+            "R7.2: the shrink waited behind the queued workers"
+        );
+        assert_eq!(
+            engine.limits().concurrency,
+            1,
+            "the published limit must be the pool the waiters now queue on"
+        );
+        for worker in workers {
+            worker.abort();
+        }
     }
 
     /// A scan with more files than one batch must list a folder once, not
