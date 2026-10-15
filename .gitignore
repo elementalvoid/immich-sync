@@ -1,5 +1,7 @@
 target/
 .scratch/
+# cargo-packager output (the release workflow's out-dir).
+/dist/
 *.db
 *.db-wal
 *.db-shm

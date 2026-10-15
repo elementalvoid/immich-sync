@@ -31,6 +31,64 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
+# Packaging (SPEC R11.1). Run the packager from this directory:
+#   cargo packager --release --formats deb,appimage --out-dir ../../dist
+# Every path in this table is resolved against the working directory, so the
+# release workflow changes into this crate first. The version is not set here:
+# it comes from this manifest, and the workflow fails when the git tag and the
+# manifest version disagree.
+[package.metadata.packager]
+identifier = "com.elementalvoid.immich-sync"
+productName = "Immich Sync"
+description = "Uploads photos and videos from local folders to one Immich server."
+# The deb Description body. Windows formats can read the whole README; this is
+# what `apt show` and `dpkg -s` print, so it stays short.
+longDescription = """\
+Keeps the server in step as files change, with deletion review, bandwidth
+limits, and a tray that shows progress and the last error.
+"""
+category = "Photography"
+publisher = "elementalvoid"
+authors = ["Matt Klich <elementalvoid@users.noreply.github.com>"]
+homepage = "https://github.com/elementalvoid/immich-sync"
+icons = ["icons/icon.png", "icons/icon.ico"]
+licenseFile = "../../LICENSE-MIT"
+
+# The installer icon; the installed executable carries the toolchain default
+# because the app has no Windows resource script.
+[package.metadata.packager.nsis]
+installerIcon = "icons/icon.ico"
+
+# Runtime libraries for the deb, read off the release binary (readelf NEEDED
+# plus the dlopen names): the linked ones, the Vulkan loader, the Wayland
+# client, and the EGL/Wayland-EGL surfaces the GPU stack opens (a missing
+# libwayland-egl.so.1 panics wayland-sys). A desktop distro already has them,
+# but dpkg must know.
+[package.metadata.packager.deb]
+depends = [
+    "libc6",
+    "libgcc-s1",
+    "libdbus-1-3",
+    "libxcb1",
+    "libxkbcommon0",
+    "libxkbcommon-x11-0",
+    "libvulkan1",
+    "libwayland-client0",
+    "libwayland-egl1",
+    "libegl1",
+]
+# `licenseFile` only reaches NSIS/WiX/DMG, so the deb ships both licence texts
+# itself. Sources are relative to the working directory, which the release
+# workflow sets to this crate. See `Config::resources` in cargo-packager.
+[package.metadata.packager.deb.files]
+"../../LICENSE-MIT" = "usr/share/doc/immich-sync/LICENSE-MIT"
+"../../LICENSE-APACHE" = "usr/share/doc/immich-sync/LICENSE-APACHE"
+
+# The AppImage has no licence page either; ship the same texts in the AppDir.
+[package.metadata.packager.appimage.files]
+"../../LICENSE-MIT" = "usr/share/doc/immich-sync/LICENSE-MIT"
+"../../LICENSE-APACHE" = "usr/share/doc/immich-sync/LICENSE-APACHE"
+
 [target."cfg(target_os = \"linux\")".dependencies]
 # The Secret Service store, pinned: the keyring ecosystem restructured in 2026
 # (ADR 0006 research §3.2). `crypto-rust` keeps the D-Bus transport encryption
