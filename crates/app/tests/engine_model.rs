@@ -10,10 +10,13 @@ use immich_sync::engine::EngineModel;
 use immich_sync::paths::AppPaths;
 use immich_sync::store::StoreModel;
 use mock_immich::{Fault, MockImmich, Operation};
-use sync_core::connection::{AuthMethod, Secret, ServerProfile, SignIn};
+use sync_core::connection::{
+    Attention, AuthMethod, ConnectionState, Secret, ServerProfile, SignIn,
+};
 use sync_core::credential::{MemoryCredentialStore, SharedCredentialStore};
 use sync_core::engine::Activity;
-use sync_core::store::SourceFolder;
+use sync_core::hash::Sha1;
+use sync_core::store::{ItemRecord, ItemState, SourceFolder, StateStore};
 
 /// The path layout the other app tests use, so the engine gets a temp
 /// database and settings file.
@@ -22,6 +25,40 @@ fn temporary_paths(dir: &Path) -> AppPaths {
         config_file: dir.join("config").join("settings.toml"),
         state_db: dir.join("data").join("state.db"),
         autostart_dir: dir.join("config").join("autostart"),
+    }
+}
+
+/// A permanently failed row, written straight to the store.
+fn failed(path: &str) -> ItemRecord {
+    ItemRecord {
+        path: path.to_string(),
+        size: 1024,
+        mtime_ns: 1_700_000_000_000_000_000,
+        sha1: Sha1::from_hex("2aae6c35c94fcfb415dbe95f408b9ce91ee846ed").expect("a hex SHA-1"),
+        asset_id: None,
+        state: ItemState::FailedPermanent,
+        error_class: None,
+        error_message: Some("the server refused the upload".to_string()),
+        attempts: 1,
+        sidecar: None,
+    }
+}
+
+/// Seeds one source folder and `names` permanent failures under it.
+fn seed_failed(paths: &AppPaths, root: &Path, names: &[&str]) {
+    let store = StateStore::open(&paths.state_db).expect("open the state database");
+    store
+        .add_folder(&SourceFolder {
+            path: root.display().to_string(),
+            recursive: true,
+            album_mapping: false,
+            album_scope: sync_core::store::AlbumScope::Leaf,
+        })
+        .expect("add the source folder");
+    for name in names {
+        store
+            .record(&failed(&root.join(name).display().to_string()))
+            .expect("write the failed row");
     }
 }
 
@@ -511,6 +548,202 @@ async fn the_engine_and_the_form_observe_the_same_session(cx: &mut TestAppContex
                     .expect("the engine's session")
             ),
         "R1.4: a form sign-in must land on the session the engine already holds"
+    );
+}
+
+/// R10.1: the first transition into attention raises one notification, and
+/// the status poll does not repeat it while the episode lasts.
+#[gpui_kit::test]
+async fn the_first_attention_transition_raises_one_notification(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    // The folder is stored but does not exist, so the client starts needing
+    // attention with a reason other than the deletion review.
+    let unavailable = temp.path().join("gone");
+    let store = StateStore::open(&paths.state_db).expect("open the state database");
+    store
+        .add_folder(&SourceFolder {
+            path: unavailable.display().to_string(),
+            recursive: true,
+            album_mapping: false,
+            album_scope: sync_core::store::AlbumScope::Leaf,
+        })
+        .expect("add the source folder");
+    drop(store);
+
+    let paths_for_model = paths.clone();
+    let _engine = cx.update(|cx| {
+        gpui_kit::init(cx);
+        // The platform records a notification only with an identity set.
+        cx.set_app_identity("com.elementalvoid.immich-sync", "Immich Sync");
+        let connection = cx.new(|_| {
+            let store: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+            ConnectionModel::new(ServerProfile::default(), store)
+        });
+        let store_model = cx.new(|cx| StoreModel::open(&paths_for_model, cx));
+        cx.new(|cx| EngineModel::new(connection, store_model, &paths_for_model, cx))
+    });
+
+    let mut shown = Vec::new();
+    for _ in 0..600 {
+        cx.run_until_parked();
+        shown = cx.shown_system_notifications();
+        if !shown.is_empty() {
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        shown.len(),
+        1,
+        "R10.1: an unavailable folder raises one notification"
+    );
+    assert_eq!(shown[0].tag.as_ref(), "needs-attention");
+    assert_eq!(shown[0].title.as_ref(), "Immich Sync");
+    assert!(
+        shown[0].body.contains("unavailable"),
+        "the notification names the reason: {}",
+        shown[0].body
+    );
+
+    // The status poll keeps running; the same episode must stay quiet.
+    for _ in 0..20 {
+        cx.executor().timer(Duration::from_millis(100)).await;
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        cx.shown_system_notifications().len(),
+        1,
+        "R10.1: the attention latch holds while the state does not change"
+    );
+}
+
+/// R10.1: a refused connection raises the attention notification with the
+/// reason the user needs to act on.
+#[gpui_kit::test]
+async fn a_refused_connection_raises_one_attention_notification(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let paths_for_model = paths.clone();
+    let (connection, _engine) = cx.update(|cx| {
+        gpui_kit::init(cx);
+        cx.set_app_identity("com.elementalvoid.immich-sync", "Immich Sync");
+        let connection = cx.new(|_| {
+            let store: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+            ConnectionModel::new(ServerProfile::default(), store)
+        });
+        let store_model = cx.new(|cx| StoreModel::open(&paths_for_model, cx));
+        let engine =
+            cx.new(|cx| EngineModel::new(connection.clone(), store_model, &paths_for_model, cx));
+        (connection, engine)
+    });
+
+    cx.update(|cx| {
+        connection.update(cx, |model, cx| {
+            model.set_state(ConnectionState::NeedsAttention(Attention::Rejected), cx);
+        });
+    });
+
+    let mut shown = Vec::new();
+    for _ in 0..600 {
+        cx.run_until_parked();
+        shown = cx.shown_system_notifications();
+        if !shown.is_empty() {
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        shown.len(),
+        1,
+        "R10.1: a refused connection raises one notification"
+    );
+    assert_eq!(shown[0].tag.as_ref(), "needs-attention");
+    assert!(
+        shown[0].body.contains("refused the session"),
+        "the notification carries the reason: {}",
+        shown[0].body
+    );
+
+    for _ in 0..20 {
+        cx.executor().timer(Duration::from_millis(100)).await;
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        cx.shown_system_notifications().len(),
+        1,
+        "R10.1: the latch holds while the connection stays refused"
+    );
+}
+
+/// R10.1: a newly parked item raises its own notification, and a second one
+/// raises another while the first still waits.
+#[gpui_kit::test]
+async fn a_newly_failed_item_raises_a_failure_notification(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    seed_failed(&paths, &photos, &["one.jpg"]);
+
+    let paths_for_model = paths.clone();
+    let engine = cx.update(|cx| {
+        gpui_kit::init(cx);
+        cx.set_app_identity("com.elementalvoid.immich-sync", "Immich Sync");
+        let connection = cx.new(|_| {
+            let store: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+            ConnectionModel::new(ServerProfile::default(), store)
+        });
+        let store_model = cx.new(|cx| StoreModel::open(&paths_for_model, cx));
+        cx.new(|cx| EngineModel::new(connection, store_model, &paths_for_model, cx))
+    });
+
+    let mut shown = Vec::new();
+    for _ in 0..600 {
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+        shown = cx.shown_system_notifications();
+        if !shown.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(
+        shown.len(),
+        1,
+        "R10.1: one newly failed item raises one notification"
+    );
+    assert_eq!(shown[0].tag.as_ref(), "failed-item");
+    assert!(
+        shown[0].body.contains("one.jpg"),
+        "the notification names the file: {}",
+        shown[0].body
+    );
+
+    // A second permanent failure appears while the first still waits.
+    let store = cx.read(|cx| engine.read(cx).store(cx).expect("the store is open"));
+    store
+        .record(&failed(&photos.join("two.jpg").display().to_string()))
+        .expect("write the second failed row");
+    for _ in 0..600 {
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+        shown = cx.shown_system_notifications();
+        if shown.len() >= 2 {
+            break;
+        }
+    }
+    assert_eq!(
+        shown.len(),
+        2,
+        "R10.1: a second failure raises a second notification"
+    );
+    assert_eq!(shown[1].tag.as_ref(), "failed-item");
+    assert!(
+        shown[1].body.contains("two.jpg"),
+        "the second notification names the new file: {}",
+        shown[1].body
     );
 }
 

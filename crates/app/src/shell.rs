@@ -606,6 +606,51 @@ pub fn new_review_notification(count: u32, previous: u32) -> Option<SystemNotifi
     })
 }
 
+/// The system notification the first transition into attention raises
+/// (R10.1).
+///
+/// `None` when the client is not in attention, the episode was already
+/// announced, or there is no user-facing reason; the stable tag replaces a
+/// previous episode's notification where the platform supports it.
+#[must_use]
+pub fn new_attention_notification(
+    attention: bool,
+    announced: bool,
+    reason: &str,
+) -> Option<SystemNotification> {
+    if !attention || announced || reason.is_empty() {
+        return None;
+    }
+    Some(SystemNotification {
+        tag: "needs-attention".into(),
+        title: "Immich Sync".into(),
+        body: format!("Needs attention: {reason}").into(),
+        actions: Vec::new(),
+    })
+}
+
+/// The system notification a newly failed item raises (R10.1).
+///
+/// The paths are the failures this notification is the first to cover; one
+/// path is named in full and several are counted, so a burst does not produce
+/// a wall of file names.
+#[must_use]
+pub fn new_failure_notification(paths: &[String]) -> SystemNotification {
+    let body = match paths {
+        [path] => format!("{path} could not be uploaded and needs attention."),
+        paths => format!(
+            "{} files could not be uploaded and need attention.",
+            paths.len()
+        ),
+    };
+    SystemNotification {
+        tag: "failed-item".into(),
+        title: "Immich Sync".into(),
+        body: body.into(),
+        actions: Vec::new(),
+    }
+}
+
 /// Shows a connection state on the tray tooltip, when a tray is installed.
 ///
 /// The tray can be absent (a desktop without one, or a failed install), so a

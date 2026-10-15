@@ -5,6 +5,7 @@
 //! persists folder changes while the client is signed out, and republishes the
 //! engine's status to the dashboard on a short poll.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,7 +21,7 @@ use crate::paths::AppPaths;
 use crate::settings::SettingsStore;
 use crate::status::DashboardModel;
 use crate::store::StoreModel;
-use sync_core::connection::SharedSession;
+use sync_core::connection::{ConnectionState, SharedSession};
 
 /// How often the dashboard picks up the engine's live counts.
 const STATUS_POLL: Duration = Duration::from_millis(250);
@@ -55,6 +56,14 @@ pub struct EngineModel {
     /// The review count the last notification was based on, so the 250 ms
     /// status poll cannot post the same notification twice (R5.4).
     notified_review: u32,
+    /// Whether the attention notification already fired for the current
+    /// attention episode (R10.1). It clears when the activity leaves attention,
+    /// so a later episode notifies again.
+    notified_attention: bool,
+    /// The failed items the attention and failure notifications already cover
+    /// (R10.1), so a repeated read of the same parked item stays quiet while a
+    /// newly parked one raises its own notification.
+    notified_failed: HashSet<String>,
     paused: bool,
     problem: Option<String>,
     /// Bumped by every folder edit, so an older edit result cannot overwrite a
@@ -152,6 +161,8 @@ impl EngineModel {
             review: Vec::new(),
             review_problem: None,
             notified_review: 0,
+            notified_attention: false,
+            notified_failed: HashSet::new(),
             paused: false,
             problem: None,
             generation: 0,
@@ -374,6 +385,26 @@ impl EngineModel {
                     if items != model.failed {
                         model.failed = items;
                         cx.notify();
+                    }
+                    // R10.1: a newly parked item raises a notification of its
+                    // own. An item that left the list forgets it was announced,
+                    // so a later failure notifies again.
+                    model
+                        .notified_failed
+                        .retain(|path| model.failed.iter().any(|item| item.path == *path));
+                    let fresh: Vec<String> = model
+                        .failed
+                        .iter()
+                        .filter(|item| !model.notified_failed.contains(&item.path))
+                        .map(|item| item.path.clone())
+                        .collect();
+                    if !fresh.is_empty() {
+                        tracing::info!(
+                            count = fresh.len(),
+                            "R10.1: a failed item raised a notification"
+                        );
+                        model.notified_failed.extend(fresh.iter().cloned());
+                        cx.show_system_notification(crate::shell::new_failure_notification(&fresh));
                     }
                 }
                 Err(error) => {
@@ -925,7 +956,63 @@ impl EngineModel {
             cx.show_system_notification(notification);
         }
         self.notified_review = review;
+
+        // R10.1: a lost connection, a refused credential, or a folder that
+        // cannot be read is the other thing the tray cannot show on its own.
+        self.refresh_attention_notification(cx);
         cx.notify();
+    }
+
+    /// Raises the attention notification once per attention episode (R10.1).
+    ///
+    /// A failed item has its own notification, so the generic one stays quiet
+    /// while the only reason is parked failures; the connection state is the
+    /// one reason that must speak even when the engine is not running yet.
+    fn refresh_attention_notification(&mut self, cx: &mut Context<Self>) {
+        let connection_attention = matches!(
+            self.connection.read(cx).state(),
+            ConnectionState::NeedsAttention(_)
+        );
+        let attention = self.status.activity == Activity::NeedsAttention || connection_attention;
+        if !attention {
+            self.notified_attention = false;
+            return;
+        }
+        let Some(reason) = self.attention_reason(cx) else {
+            return;
+        };
+        if let Some(notification) =
+            crate::shell::new_attention_notification(attention, self.notified_attention, &reason)
+        {
+            tracing::info!(
+                reason = %reason,
+                "R10.1: the client entered attention and raised a notification"
+            );
+            cx.show_system_notification(notification);
+        }
+        self.notified_attention = true;
+    }
+
+    /// The user-facing reason the client needs attention, when it is not a
+    /// deletion review or a parked failure. `None` lets the generic
+    /// notification stay quiet; the specific notification covers those.
+    fn attention_reason(&self, cx: &Context<Self>) -> Option<String> {
+        if let ConnectionState::NeedsAttention(attention) = self.connection.read(cx).state() {
+            return Some(attention.message());
+        }
+        if self.status.counts.failed > 0
+            || self
+                .status
+                .folders
+                .iter()
+                .any(|folder| folder.last_error.is_some())
+        {
+            return None;
+        }
+        if let Some(folder) = self.status.folders.iter().find(|folder| !folder.available) {
+            return Some(format!("The source folder {} is unavailable.", folder.path));
+        }
+        self.status.last_error.clone()
     }
 
     /// The shared store, once it has opened.
