@@ -411,6 +411,70 @@ async fn a_failed_upload_leaves_the_sidecar_owed_and_a_later_pass_sends_it() {
 }
 
 #[tokio::test]
+async fn a_failed_attempt_that_carried_no_sidecar_keeps_the_recorded_digest() {
+    // R4.5: an attempt that carried no sidecar must not erase the digest the
+    // row recorded. After the first attempt sent the sidecar, a later attempt
+    // for changed media filters it out, because the digest matches what the
+    // row already holds; if that attempt fails and wipes the digest, a later
+    // pass offers the sidecar again, and the checksum header answers
+    // `duplicate` before the body is read, parking the item with the false
+    // "could not be attached" this pipeline exists to avoid.
+    let server = MockImmich::start().await;
+    let (uploader, _session, store, temp) = uploader(&server).await;
+    let path = hello_world_file(temp.path(), "hello.txt");
+    let sidecar = sidecar_of(&path);
+    let first = uploader.upload_one(&path).await;
+    let asset_id = success_asset_id(&first).to_string();
+    assert!(
+        server.has_sidecar(&asset_id),
+        "R3.3: the first attempt carried the sidecar"
+    );
+    let recorded = store
+        .item(&path.display().to_string())
+        .expect("read the row")
+        .expect("the row exists")
+        .sidecar
+        .expect("the digest was recorded");
+
+    // Changed media, unchanged sidecar: the recorded digest filters the
+    // sidecar out, so this attempt carries none.
+    std::fs::write(&path, b"hello there").expect("edit the media");
+    server.fail(Operation::Upload, Fault::UnsupportedFormat);
+    let prepared = PreparedItem {
+        path: path.clone(),
+        size: 11,
+        mtime_ns: expected_mtime_ns(&path),
+        sha1: Sha1::from_hex("6e71b3cac15d32fe2d36c270887df9479c25c640").expect("a hex SHA-1"),
+        sidecar: Some(sync_core::upload::SidecarFile {
+            path: sidecar,
+            digest: recorded,
+        }),
+        live_photo_video: None,
+    };
+    let outcome = uploader
+        .upload_prepared(&prepared, &UploadGate::new(), &BandwidthLimit::default())
+        .await;
+    let UploadOutcome::Failed(failure) = &outcome else {
+        panic!("expected the faulted attempt to fail, got {outcome:?}");
+    };
+    assert_eq!(
+        failure.class,
+        Some(FailureClass::UnsupportedFormat),
+        "a 415 is not transport noise: {outcome:?}"
+    );
+
+    assert_eq!(
+        store
+            .item(&path.display().to_string())
+            .expect("read the row")
+            .expect("the failure was recorded")
+            .sidecar,
+        Some(recorded),
+        "an attempt with no sidecar erased the digest the row recorded"
+    );
+}
+
+#[tokio::test]
 async fn a_paused_upload_leaves_the_sidecar_owed() {
     // R8.7: a paused upload sends nothing at all, so it can claim no sidecar.
     let server = MockImmich::start().await;

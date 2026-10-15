@@ -332,11 +332,12 @@ impl Uploader {
                             message: "the checksum check answered for a different id".to_string(),
                             retry_after: None,
                         },
+                        false,
                     );
                 }
             },
             Err(error) => {
-                return self.failed(&mut item, &error);
+                return self.failed(&mut item, &error, false);
             }
         };
 
@@ -366,7 +367,7 @@ impl Uploader {
                 // back, so restore first; a sidecar then follows the ordinary
                 // duplicate path, which parks it with its reason (R3.3).
                 if let Err(error) = self.restore_asset(&asset_id).await {
-                    return self.failed(&mut item, &error);
+                    return self.failed(&mut item, &error, false);
                 }
                 if sidecar.is_none() {
                     item.asset_id = Some(asset_id.clone());
@@ -382,7 +383,7 @@ impl Uploader {
                 }
                 item.asset_id = Some(asset_id);
             }
-            CheckOutcome::Refused(error) => return self.failed(&mut item, &error),
+            CheckOutcome::Refused(error) => return self.failed(&mut item, &error, false),
         }
 
         // This path is the caller's own, not the engine's: no limit is in
@@ -653,15 +654,21 @@ impl Uploader {
                     UploadOutcome::Created { asset_id }
                 }
             }
-            Err(error) => self.failed(item, &error),
+            Err(error) => self.failed(item, &error, sidecar.is_some()),
         }
     }
 
     /// Records a client failure with its class and state, and returns it.
-    fn failed(&self, item: &mut ItemRecord, error: &ClientError) -> UploadOutcome {
+    ///
+    /// `carried` says whether the failed attempt sent a sidecar. Only then may
+    /// the recorded digest be dropped: an attempt that carried none (the row
+    /// already recorded this sidecar's digest, so it was filtered out) leaves
+    /// the digest in place, and a later pass does not offer the sidecar the
+    /// asset already carries (R4.5).
+    fn failed(&self, item: &mut ItemRecord, error: &ClientError, carried: bool) -> UploadOutcome {
         let failure = UploadFailure::from_client_error(error);
         item.asset_id = None;
-        item.sidecar = None;
+        item.sidecar = if carried { None } else { item.sidecar };
         item.state = match failure.kind {
             FailureKind::Permanent => ItemState::FailedPermanent,
             FailureKind::Transient => ItemState::RetryWait,
