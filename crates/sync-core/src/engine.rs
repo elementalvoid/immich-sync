@@ -496,7 +496,9 @@ impl Engine {
     /// the attempts in flight finish on the pool they took their permit from,
     /// and every worker waiting on the old pool fails out at once and re-queues
     /// its item for the new pool, so the new limit is in force for the next
-    /// attempt instead of after the whole waiting list has run. No upload is
+    /// attempt instead of after the whole waiting list has run. The new pool
+    /// admits its own full size while those attempts are still running, so the
+    /// running count can briefly exceed a shrinking limit; no upload is
     /// cancelled or failed.
     pub async fn set_limits(&self, limits: Limits) {
         self.inner.bandwidth.set(limits.bandwidth_bytes_per_second);
