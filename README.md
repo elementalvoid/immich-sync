@@ -123,8 +123,8 @@ The credential is stored in the operating system's credential store — Windows
 Credential Manager, or the Secret Service (GNOME Keyring or KWallet) on Linux.
 It is never written to the settings file or to the log. Later launches sign in
 again from that stored credential, without asking. A wrong password shows an
-error in the window and does not crash the client; after repeated failures the
-connection shows as "Needs attention" in the window and the tray tooltip.
+error in the window and does not crash the client; the connection shows as
+"Needs attention" in the window and the tray tooltip.
 
 If the server has password login disabled, choose **API key** instead and paste
 a key from Immich's account settings.
@@ -147,9 +147,10 @@ its card instead of producing one error per file.
 
 ## Using the app
 
-- **Tray.** The tray icon shows idle, syncing, paused, or needs-attention; its
-  tooltip adds the review count, upload progress, and the last error. The tray
-  menu has **Show**, **Pause**, **Resume**, **Sync now**, and **Quit**.
+- **Tray.** The tray icon is fixed; its tooltip shows the activity (idle,
+  syncing, or paused), the connection state (including needs attention), the
+  review count, upload progress, and the last error. The tray menu has
+  **Show**, **Pause**, **Resume**, **Sync now**, and **Quit**.
 - **Window.** Closing the window hides it; the client keeps running in the tray.
   **Quit** exits the client. Starting the app again focuses the running
   instance instead of starting a second one.
