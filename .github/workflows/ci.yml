@@ -36,10 +36,12 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: linux
-          # Key on the files that decide the build. The automatic environment
-          # hash varies across runner images (Windows attempt to attempt), which
-          # made the cache miss; our lockfile/toolchain hash is stable.
-          key: ${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'Cargo.toml', 'crates/*/Cargo.toml') }}
+          # `key:` is ignored once `shared-key:` is set (rust-cache composes
+          # only prefix-key + shared-key + OS + arch), and the automatic
+          # environment hash varies across runner images. Put the lockfile
+          # hash in the prefix: it rotates when dependencies change and stays
+          # stable across runners.
+          prefix-key: v0-rust-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'Cargo.toml', 'crates/*/Cargo.toml') }}
           add-rust-environment-hash-key: "false"
           cache-on-failure: "true"
       - name: Install system dependencies
@@ -66,10 +68,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: windows
-          # The linker is part of cargo's fingerprints but not of this explicit
-          # key, so its name is: otherwise a linker change would reuse the old
-          # cache and recompile the tree on every run.
-          key: ${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'Cargo.toml', 'crates/*/Cargo.toml') }}-lld-link
+          # The linker is part of cargo's fingerprints, so the lld experiment
+          # gets its own cache lineage via the prefix; a linker change must not
+          # restore artifacts built with another linker and recompile forever.
+          prefix-key: v0-rust-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'Cargo.toml', 'crates/*/Cargo.toml') }}-lld
           add-rust-environment-hash-key: "false"
           cache-on-failure: "true"
       # fmt is platform-independent and already checked on Linux; running it
@@ -104,8 +106,9 @@ jobs:
           # compiling them a third time. It never saves: the Linux job owns the
           # key and its cache covers the test targets too, while a bin-only save
           # here finished first and starved the Linux job of dev-dependencies.
+          # The prefix must match the Linux job's exactly to share the cache.
           shared-key: linux
-          key: ${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'Cargo.toml', 'crates/*/Cargo.toml') }}
+          prefix-key: v0-rust-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'Cargo.toml', 'crates/*/Cargo.toml') }}
           add-rust-environment-hash-key: "false"
           save-if: "false"
           cache-on-failure: "true"
