@@ -465,8 +465,11 @@ impl SettingsView {
         change(&mut next);
         self.settings_generation = self.settings_generation.wrapping_add(1);
         let generation = self.settings_generation;
-        if next == current && self.pending_settings.is_none() {
-            // The file already holds this value; nothing to write.
+        if next == current && self.pending_settings.is_none() && self.in_flight_settings.is_none() {
+            // The file already holds this value and no write can still fail,
+            // so there is nothing to write. While a write is in flight, queue
+            // a redundant write instead: its finish reports the truth about
+            // that write, which a separate no-op success would mask.
             finish(self, Ok(()), cx);
             return;
         }

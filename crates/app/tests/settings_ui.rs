@@ -834,6 +834,41 @@ async fn a_failed_save_says_the_settings_could_not_be_saved(cx: &mut TestAppCont
     );
 }
 
+/// N2: a no-op edit while a failing write is in flight must not report
+/// success on its behalf; the queued write reports the truth.
+#[gpui_kit::test]
+async fn a_noop_edit_while_a_write_is_in_flight_still_reports_its_failure(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let store = SettingsStore::open(paths.config_file.clone());
+    fs::create_dir_all(paths.config_file.parent().expect("a config directory"))
+        .expect("create the config directory");
+    fs::create_dir(paths.config_file.with_extension("toml.tmp")).expect("block the temporary file");
+    let window = open_settings(cx, store, paths, FakeAutostart::new());
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        tab_to(window, FieldKey::Bandwidth.id(), cx);
+        // The first edit starts a write for 2 MB/s that will fail.
+        retype(window, "2", cx);
+        assert!(
+            window.try_find("settings-action-error").is_none(),
+            "the failing write did not run on the UI thread"
+        );
+        // The second edit stores the same 2_000_000 bytes per second from a
+        // different text, so it queues a redundant write instead of claiming
+        // success while the first still runs.
+        retype(window, "2.0000001", cx);
+    })
+    .expect("update the settings window");
+
+    let message = wait_for_label(cx, window, "settings-action-error").await;
+    assert!(
+        message.starts_with("Could not save the settings"),
+        "a no-op edit must not hide the failing write: {message}"
+    );
+}
+
 #[gpui_kit::test]
 fn a_refused_autostart_change_is_reported_and_not_recorded(cx: &mut TestAppContext) {
     let temp = tempfile::tempdir().expect("create a temp dir");
