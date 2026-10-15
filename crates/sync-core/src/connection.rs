@@ -11,7 +11,7 @@
 //! file and never handed to the credential store.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use immich_client::{Auth, ClientError, ImmichClient, SessionToken};
 use serde::{Deserialize, Serialize};
@@ -226,12 +226,27 @@ pub struct SignIn {
 pub enum Unauthorized {
     /// The session re-authenticated; retry the request once.
     Retry,
-    /// The connection needs attention; do not retry.
+    /// The session cannot answer the refusal; do not retry. The connection
+    /// shows the needs-attention state once the run of failed requests reaches
+    /// the attention threshold (R1.4, R6.6).
     Stop,
 }
 
+/// How many failed requests in a row a connection waits out before it needs
+/// the user (R1.4, R6.6).
+///
+/// The run is the same notion the
+/// [`CircuitBreaker`](crate::breaker::CircuitBreaker) counts: a failure
+/// extends it, a success resets it to zero. A session no engine owns keeps
+/// this value of one: a sign-in form has no queue to protect and must report
+/// the refusal it is waiting on. The engine raises the length to its
+/// `EngineConfig::breaker_threshold`, so the connection and the breaker agree
+/// on what a run is.
+const DEFAULT_ATTENTION_THRESHOLD: u32 = 1;
+
 /// The connection session: login at startup, one re-login after a 401, and the
-/// needs-attention state after a second 401 (R1.3, R1.4).
+/// needs-attention state once a run of failed requests reaches the attention
+/// threshold (R1.3, R1.4, R6.6).
 pub struct Connection {
     client: ImmichClient,
     store: Arc<dyn CredentialStore>,
@@ -243,6 +258,12 @@ pub struct Connection {
     /// It is shared with [`SharedSession`], so a successful request can restore
     /// the budget without waiting for a request that is in flight (R1.4).
     relogin_used: Arc<AtomicBool>,
+    /// The failed requests no success has reset, shared with [`SharedSession`]
+    /// so the run can be read and reset without the lock (R1.4, R6.6).
+    failure_run: Arc<AtomicU32>,
+    /// How many failures in a row reach the user; see
+    /// [`SharedSession::set_attention_threshold`].
+    attention_threshold: Arc<AtomicU32>,
 }
 
 impl Connection {
@@ -253,7 +274,13 @@ impl Connection {
     ///
     /// Returns a [`ClientError`] when the server URL cannot be used.
     pub fn new(server_url: &str, store: Arc<dyn CredentialStore>) -> Result<Self, ClientError> {
-        Self::with_budget(server_url, store, Arc::new(AtomicBool::new(false)))
+        Self::with_budget(
+            server_url,
+            store,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(AtomicU32::new(DEFAULT_ATTENTION_THRESHOLD)),
+        )
     }
 
     /// Builds a session that spends a re-login budget a handle already shares,
@@ -267,9 +294,12 @@ impl Connection {
         server_url: &str,
         store: Arc<dyn CredentialStore>,
         relogin_used: Arc<AtomicBool>,
+        failure_run: Arc<AtomicU32>,
+        attention_threshold: Arc<AtomicU32>,
     ) -> Result<Self, ClientError> {
         let client = ImmichClient::new(server_url)?;
         relogin_used.store(false, Ordering::SeqCst);
+        failure_run.store(0, Ordering::SeqCst);
         Ok(Self {
             client,
             store,
@@ -280,6 +310,8 @@ impl Connection {
             state: ConnectionState::NotConfigured,
             credential: None,
             relogin_used,
+            failure_run,
+            attention_threshold,
         })
     }
 
@@ -322,6 +354,7 @@ impl Connection {
         self.profile = profile.clone();
         self.credential = None;
         self.relogin_used.store(false, Ordering::SeqCst);
+        self.failure_run.store(0, Ordering::SeqCst);
         if !profile.is_configured() {
             self.state = ConnectionState::NotConfigured;
             return self.state.clone();
@@ -346,6 +379,7 @@ impl Connection {
         self.profile.method = sign_in.method;
         self.credential = None;
         self.relogin_used.store(false, Ordering::SeqCst);
+        self.failure_run.store(0, Ordering::SeqCst);
         self.state = ConnectionState::Connecting;
         self.authenticate(sign_in.method, &sign_in.secret).await;
         if self.state.is_connected()
@@ -362,26 +396,30 @@ impl Connection {
     /// Answers a 401 from a request the session authenticated (R1.4).
     ///
     /// The first 401 re-logs in once and returns [`Unauthorized::Retry`]; a
-    /// second 401 before any request succeeded returns [`Unauthorized::Stop`]
-    /// and leaves the session in the needs-attention state.
+    /// later 401 before any request succeeded returns [`Unauthorized::Stop`].
+    /// The refusal reaches the needs-attention state only once the run of
+    /// failed requests reaches the attention threshold, so one unlucky refusal
+    /// does not worry the user (R6.6).
     pub async fn handle_unauthorized(&mut self) -> Unauthorized {
+        // Every 401 is one failed request in the run; the first success
+        // resets it. The run is only read when the client must give up, so a
+        // 401 the re-login can answer is not by itself an alarm.
+        let run = self.record_failure();
         if self.relogin_used.load(Ordering::SeqCst) || self.credential.is_none() {
-            self.reject();
+            self.refuse(run);
             return Unauthorized::Stop;
         }
         match self.profile.method {
             AuthMethod::Password => match self.store.get() {
                 Ok(Some(secret)) => self.authenticate(AuthMethod::Password, &secret).await,
-                Ok(None) => self.state = ConnectionState::NeedsAttention(Attention::Rejected),
+                Ok(None) => self.refuse(run),
                 Err(error) => self.need_attention(&error),
             },
             AuthMethod::ApiKey => match self.credential.clone() {
                 Some(RequestCredential::ApiKey(key)) => {
                     self.authenticate(AuthMethod::ApiKey, &key).await;
                 }
-                _ => {
-                    self.state = ConnectionState::NeedsAttention(Attention::InvalidApiKey);
-                }
+                _ => self.refuse(run),
             },
         }
         if self.state.is_connected() {
@@ -393,16 +431,66 @@ impl Connection {
     }
 
     /// Records that a request with the current credential succeeded, which
-    /// restores the one re-login budget (R1.4).
+    /// restores the one re-login budget and ends the failure run (R1.4, R6.6).
     pub fn note_authenticated(&self) {
         self.relogin_used.store(false, Ordering::SeqCst);
+        self.failure_run.store(0, Ordering::SeqCst);
+    }
+
+    /// Extends the run of failed requests and returns its new length (R1.4,
+    /// R6.6).
+    fn record_failure(&self) -> u32 {
+        self.failure_run
+            .fetch_add(1, Ordering::SeqCst)
+            .saturating_add(1)
+    }
+
+    /// Enters the needs-attention state once the run of failed requests reaches
+    /// the threshold (R1.4, R6.6).
+    ///
+    /// Below the threshold the credential is kept and the connection stays
+    /// usable: the refusal has not become a run yet.
+    fn refuse(&mut self, run: u32) {
+        if run >= self.attention_threshold.load(Ordering::SeqCst) {
+            self.credential = None;
+            self.state = ConnectionState::NeedsAttention(Attention::Rejected);
+        }
+    }
+
+    /// Enters the needs-attention state with the transport reason (R6.6,
+    /// R8.2).
+    ///
+    /// The credential is kept: the server may come back, and the probe needs
+    /// it. A refusal or a sign-in failure is the stronger reason and is not
+    /// overwritten.
+    fn need_unreachable(&mut self, detail: &str) {
+        if matches!(
+            self.state,
+            ConnectionState::Connected | ConnectionState::NeedsAttention(Attention::Unreachable(_))
+        ) {
+            self.state =
+                ConnectionState::NeedsAttention(Attention::Unreachable(detail.to_string()));
+        }
+    }
+
+    /// Records a request the server answered: the run resets, and a connection
+    /// that only needed attention because the server was unreachable recovers
+    /// (R1.4, R6.6).
+    pub fn note_reachable(&mut self) {
+        self.note_authenticated();
+        if matches!(
+            self.state,
+            ConnectionState::NeedsAttention(Attention::Unreachable(_))
+        ) {
+            self.state = ConnectionState::Connected;
+        }
     }
 
     /// Records that the credential was refused again after the one re-login
     /// (R1.4).
     pub(crate) fn reject(&mut self) {
-        self.credential = None;
-        self.state = ConnectionState::NeedsAttention(Attention::Rejected);
+        let run = self.record_failure();
+        self.refuse(run);
     }
 
     /// The same session, shared between the app's surfaces and the sync engine
@@ -421,6 +509,8 @@ impl Connection {
         SharedSession {
             snapshot: Arc::new(std::sync::Mutex::new(snapshot)),
             relogin_used: Arc::clone(&self.relogin_used),
+            failure_run: Arc::clone(&self.failure_run),
+            attention_threshold: Arc::clone(&self.attention_threshold),
             connection: Arc::new(tokio::sync::Mutex::new(self)),
         }
     }
@@ -498,6 +588,11 @@ pub struct SharedSession {
     /// The one re-login budget, so a successful request restores it without
     /// taking the lock (R1.4).
     relogin_used: Arc<AtomicBool>,
+    /// The failed requests no success has reset (R1.4, R6.6).
+    failure_run: Arc<AtomicU32>,
+    /// How many failures in a row reach the user; see
+    /// [`Self::set_attention_threshold`].
+    attention_threshold: Arc<AtomicU32>,
     snapshot: Arc<std::sync::Mutex<SessionSnapshot>>,
 }
 
@@ -542,17 +637,22 @@ impl SharedSession {
         store: Arc<dyn CredentialStore>,
     ) -> Result<(), ClientError> {
         let mut connection = self.connection.lock().await;
-        let outcome =
-            match Connection::with_budget(server_url, store, Arc::clone(&self.relogin_used)) {
-                Ok(fresh) => {
-                    *connection = fresh;
-                    Ok(())
-                }
-                Err(error) => {
-                    connection.need_attention(&error);
-                    Err(error)
-                }
-            };
+        let outcome = match Connection::with_budget(
+            server_url,
+            store,
+            Arc::clone(&self.relogin_used),
+            Arc::clone(&self.failure_run),
+            Arc::clone(&self.attention_threshold),
+        ) {
+            Ok(fresh) => {
+                *connection = fresh;
+                Ok(())
+            }
+            Err(error) => {
+                connection.need_attention(&error);
+                Err(error)
+            }
+        };
         self.mirror(&connection);
         outcome
     }
@@ -594,9 +694,52 @@ impl SharedSession {
     }
 
     /// Records that a request with the current credential succeeded, which
-    /// restores the one re-login budget (R1.4).
+    /// restores the one re-login budget and ends the failure run (R1.4, R6.6).
     pub fn note_authenticated(&self) {
         self.relogin_used.store(false, Ordering::SeqCst);
+        self.failure_run.store(0, Ordering::SeqCst);
+    }
+
+    /// Sets how many failed requests in a row the connection waits out before
+    /// it needs the user (R1.4, R6.6).
+    ///
+    /// The engine sets its `EngineConfig::breaker_threshold` here, so the
+    /// connection and the circuit breaker agree on the length of a run. A
+    /// session no engine owns keeps `DEFAULT_ATTENTION_THRESHOLD`.
+    pub fn set_attention_threshold(&self, threshold: u32) {
+        self.attention_threshold
+            .store(threshold.max(1), Ordering::SeqCst);
+    }
+
+    /// Records one request the server could not answer (R6.6).
+    ///
+    /// The run ends at the next success; when it reaches the threshold the
+    /// connection needs the user, with `detail` as the transport reason. The
+    /// credential is kept, so a server that comes back can be probed and
+    /// resume without a sign-in.
+    pub async fn note_unreachable(&self, detail: &str) {
+        let mut connection = self.connection.lock().await;
+        if connection.record_failure() >= self.attention_threshold.load(Ordering::SeqCst) {
+            connection.need_unreachable(detail);
+        }
+        self.mirror(&connection);
+    }
+
+    /// Records a request the server answered: the run resets, and a connection
+    /// that only needed attention because the server was unreachable recovers
+    /// (R1.4, R6.6). A refused credential is not cleared: only a sign-in fixes
+    /// that.
+    pub async fn note_reachable(&self) {
+        self.failure_run.store(0, Ordering::SeqCst);
+        if !matches!(
+            self.state(),
+            ConnectionState::NeedsAttention(Attention::Unreachable(_))
+        ) {
+            return;
+        }
+        let mut connection = self.connection.lock().await;
+        connection.note_reachable();
+        self.mirror(&connection);
     }
 
     /// Runs one authenticated request, answering a 401 with the session's one
@@ -644,10 +787,29 @@ impl SharedSession {
                         let _ = self.handle_unauthorized().await;
                         Err(ClientError::InvalidToken)
                     }
-                    Err(error) => Err(error),
+                    Err(error) => {
+                        self.note_request_error(&error).await;
+                        Err(error)
+                    }
                 }
             }
-            Err(error) => Err(error),
+            Err(error) => {
+                self.note_request_error(&error).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Records a request the server could not answer, before the caller sees
+    /// the error (R6.6).
+    ///
+    /// Every request path funnels through [`Self::request`], so this is the one
+    /// place a connection failure extends the run of failures that reaches the
+    /// attention threshold. A refusal is not a connection failure: the 401
+    /// path feeds the run through [`Connection::handle_unauthorized`].
+    async fn note_request_error(&self, error: &ClientError) {
+        if let ClientError::Unreachable(detail) = error {
+            self.note_unreachable(&detail.to_string()).await;
         }
     }
 

@@ -8,6 +8,11 @@
 //!
 //! The breaker is plain shared state: the engine asks whether it is open, feeds
 //! it connection failures, and reports the probe's outcome.
+//!
+//! The connection counts the same run: `EngineConfig::breaker_threshold` is
+//! also the number of consecutive failed requests after which the connection
+//! needs the user, so the breaker opens at the point the tray changes and a
+//! success resets both notions.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};

@@ -74,7 +74,11 @@ pub struct EngineConfig {
     pub attempt_cap: u32,
     /// The wait before a later attempt (R6.1, R6.2).
     pub retry: RetryPolicy,
-    /// How many connection failures in a row trip the circuit breaker (R6.6).
+    /// How many connection failures in a row trip the circuit breaker (R6.6),
+    /// and how many failed requests in a row the connection waits out before it
+    /// needs the user (R1.4). One run length keeps the two notions in step:
+    /// the breaker opens at the same point the tray changes, and a success
+    /// resets both.
     pub breaker_threshold: u32,
     /// How long the queue waits between credential probes while the breaker is
     /// open (R6.6).
@@ -330,6 +334,10 @@ impl Engine {
         let albums = AlbumMapper::new(session.clone(), store.clone());
         let versions = Versioner::new(session.clone(), store.clone());
         let breaker = CircuitBreaker::new(config.breaker_threshold, config.breaker_cooldown);
+        // R1.4, R6.6: the same run length the breaker uses, so a single
+        // failure does not worry the user on either the transport or the auth
+        // path.
+        session.set_attention_threshold(config.breaker_threshold);
         let inner = Arc::new(EngineInner {
             store,
             session,
@@ -931,6 +939,14 @@ impl Drop for Engine {
 impl EngineInner {
     /// The upload pool in force right now (R7.2).
     ///
+    /// Records a request the server answered: the run of failures the breaker
+    /// counts ends, and a connection that only needed attention because the
+    /// server was unreachable leaves that state (R6.6, R8.2).
+    async fn note_reachable(&self) {
+        self.breaker.record_success();
+        self.session.note_reachable().await;
+    }
+
     /// A resize swaps the pool, so an attempt takes its permit from the pool
     /// that was current when the attempt started, and a later attempt takes
     /// one from whatever pool is current then.
@@ -1164,12 +1180,18 @@ impl EngineInner {
 
     /// Records one batch-level failure against every item of the batch.
     ///
-    /// A connection that is no longer usable failed as a whole, not once per
-    /// item (R1.4): nothing is written, so the rows stay `pending` and the next
-    /// reconciliation scan queues them again. Parking a batch of them would
-    /// leave every file looking permanently broken to a sign-in that fixes it.
+    /// A refused credential failed as a whole, not once per item (R1.4):
+    /// nothing is written, so the rows stay `pending` and the next scan or
+    /// sign-in queues them again. The session may still read `Connected` when
+    /// the refusal is below the attention threshold, so the refusal itself is
+    /// the signal. Parking a batch of them would leave every file looking
+    /// permanently broken to a sign-in that fixes it.
     fn fail_batch(&self, prepared: &[PreparedItem], error: &ClientError) {
-        if !self.session.state().is_connected() {
+        // A refusal the session could not answer is the credential's problem,
+        // not the files': the state may still read `Connected` while the
+        // refusal is below the attention threshold (R1.4).
+        let refused = matches!(error, ClientError::InvalidToken);
+        if !self.session.state().is_connected() || refused {
             tracing::warn!(
                 batch = prepared.len(),
                 reason = %error.redacted_reason(),
@@ -1281,7 +1303,7 @@ async fn wait_for_the_server(inner: &Arc<EngineInner>) -> Result<(), ClientError
         }
         match inner.session.validate().await {
             Ok(()) => {
-                inner.breaker.record_success();
+                inner.note_reachable().await;
                 tracing::info!("the server answered the credential probe, so the queue resumes");
                 return Ok(());
             }
@@ -1442,7 +1464,7 @@ async fn process_batch(inner: &Arc<EngineInner>, batch: Vec<PathBuf>) {
             Ok(results) => {
                 // R6.6: the server answered, so the run of connection failures
                 // the breaker counts ends here.
-                inner.breaker.record_success();
+                inner.note_reachable().await;
                 break results;
             }
             Err(error) => {
@@ -1881,7 +1903,7 @@ async fn upload_with_retries(inner: &Arc<EngineInner>, item: &PreparedItem) -> U
             UploadOutcome::Created { .. } | UploadOutcome::Duplicate { .. } => {
                 // R6.6: a request the server answered ends the run of
                 // connection failures, so one unlucky request is not a run.
-                inner.breaker.record_success();
+                inner.note_reachable().await;
                 (AttemptOutcome::Succeeded, None)
             }
             UploadOutcome::Failed(failure) | UploadOutcome::DeadLetter(failure) => {

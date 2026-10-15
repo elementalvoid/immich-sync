@@ -109,6 +109,60 @@ async fn wait_for_inputs(
     panic!("the store and the connection never became ready");
 }
 
+/// Drives the engine's checksum check into refusals until the connection's
+/// failure run reaches the attention threshold (R1.4, R6.6).
+///
+/// The run length is the engine's `EngineConfig::breaker_threshold`, which the
+/// test does not read, so it keeps refusing checks until the connection gives
+/// up. The first round needs two 401s (the one re-login and the refusal that
+/// starts the run); every later round needs one, because the re-login budget
+/// stays spent until a request succeeds.
+async fn refuse_checks_to_attention(
+    cx: &mut TestAppContext,
+    engine: &Entity<EngineModel>,
+    connection: &Entity<ConnectionModel>,
+    server: &MockImmich,
+) {
+    let mut refused = 0_u64;
+    for _ in 0..10 {
+        if !cx.read(|cx| connection.read(cx).state().is_connected()) {
+            return;
+        }
+        let attempts = if refused == 0 { 2 } else { 1 };
+        for _ in 0..attempts {
+            server.fail(
+                Operation::BulkUploadCheck,
+                Fault::Status {
+                    code: 401,
+                    retry_after: None,
+                },
+            );
+        }
+        let before = server.bulk_check_requests();
+        cx.update(|cx| engine.update(cx, |model, cx| model.sync_now(cx)));
+        for _ in 0..400 {
+            if server.bulk_check_requests() >= before + attempts
+                || !cx.read(|cx| connection.read(cx).state().is_connected())
+            {
+                break;
+            }
+            cx.executor().timer(Duration::from_millis(20)).await;
+            cx.run_until_parked();
+        }
+        refused += attempts;
+    }
+    // The last refusal's run increment is written by the worker, so give it a
+    // moment before declaring the threshold unreachable.
+    for _ in 0..400 {
+        if !cx.read(|cx| connection.read(cx).state().is_connected()) {
+            return;
+        }
+        cx.executor().timer(Duration::from_millis(20)).await;
+        cx.run_until_parked();
+    }
+    panic!("the refusal run never reached the engine's attention threshold");
+}
+
 #[gpui_kit::test]
 async fn a_pause_during_engine_startup_still_holds(cx: &mut TestAppContext) {
     let (_runtime, server) = mock_server();
@@ -398,25 +452,9 @@ async fn a_form_sign_in_resumes_the_engine_a_refused_session_stalled(cx: &mut Te
     for name in ["one.jpg", "two.jpg"] {
         std::fs::write(photos.join(name), b"stalled bytes").expect("write the file");
     }
-    // The checksum check is refused twice: the first 401 re-logs in, and the
-    // second leaves the connection needing the user (R1.4).
-    for _ in 0..2 {
-        server.fail(
-            Operation::BulkUploadCheck,
-            Fault::Status {
-                code: 401,
-                retry_after: None,
-            },
-        );
-    }
-    cx.update(|cx| engine.update(cx, |model, cx| model.sync_now(cx)));
-    for _ in 0..400 {
-        if !cx.read(|cx| connection.read(cx).state().is_connected()) {
-            break;
-        }
-        cx.executor().timer(Duration::from_millis(50)).await;
-        cx.run_until_parked();
-    }
+    // The checksum check is refused until the connection's run of failures
+    // reaches the engine's attention threshold (R1.4, R6.6).
+    refuse_checks_to_attention(cx, &engine, &connection, &server).await;
     assert!(
         !cx.read(|cx| connection.read(cx).state().is_connected()),
         "R1.4: the refused batch must leave the connection needing the user"
@@ -869,26 +907,10 @@ async fn a_re_login_resumes_the_batch_a_refused_connection_left_pending(cx: &mut
     for name in ["one.jpg", "two.jpg"] {
         std::fs::write(photos.join(name), b"pending bytes").expect("write the file");
     }
-    // The checksum check is refused twice: the first 401 re-logs in, and the
-    // second leaves the connection needing the user (R1.4).
-    for _ in 0..2 {
-        server.fail(
-            Operation::BulkUploadCheck,
-            Fault::Status {
-                code: 401,
-                retry_after: None,
-            },
-        );
-    }
-    // The dashboard's "Sync now": the one scan this test asks for by hand.
-    cx.update(|cx| engine.update(cx, |model, cx| model.sync_now(cx)));
-    for _ in 0..200 {
-        if server.bulk_check_requests() >= 2 {
-            break;
-        }
-        cx.executor().timer(Duration::from_millis(50)).await;
-        cx.run_until_parked();
-    }
+    // The checksum check is refused until the connection's run of failures
+    // reaches the engine's attention threshold (R1.4, R6.6). Nothing but a
+    // scan reaches the files, so the refusals also cost a scan each.
+    refuse_checks_to_attention(cx, &engine, &connection, &server).await;
     assert_eq!(
         server.upload_requests(),
         0,

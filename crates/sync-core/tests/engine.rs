@@ -1764,14 +1764,23 @@ async fn two_leaf_folders_with_the_same_name_are_two_albums() {
     engine.stop();
 }
 
+/// R1.4's second 401 is one failed request in a run, not an alarm by itself:
+/// the connection needs the user only once the run reaches the threshold the
+/// engine shares with its circuit breaker (R6.6).
 #[tokio::test]
-async fn a_second_401_leaves_the_connection_needing_attention() {
+async fn a_run_of_401s_needs_attention_at_the_threshold() {
     let server = MockImmich::start().await;
     let temp = tempfile::tempdir().expect("create a temp dir");
     let store = store_in(&temp);
-    let photos = temp.path().join("photos");
-    let file = write_file(&photos, "photo.jpg", b"photo bytes");
-    add_folder(&store, &photos, true);
+    let first_folder = temp.path().join("first");
+    let second_folder = temp.path().join("second");
+    let first = write_file(&first_folder, "first.jpg", b"first bytes");
+    let second = write_file(&second_folder, "second.jpg", b"second bytes");
+    add_folder(&store, &first_folder, true);
+    // retry_config pins the run at three failures. The first item's upload is
+    // refused twice with nothing succeeding in between (the one re-login and
+    // the refusal), and the second item's checksum check is the third failed
+    // request in the run.
     for _ in 0..2 {
         server.fail(
             Operation::Upload,
@@ -1783,35 +1792,77 @@ async fn a_second_401_leaves_the_connection_needing_attention() {
     }
     let (engine, session) = start_engine_with_session(&server, &store, retry_config(8)).await;
 
-    let path_text = file.display().to_string();
+    let first_text = first.display().to_string();
     assert!(
-        wait_until(
-            || matches!(&store.item(&path_text), Ok(Some(row)) if row.state == ItemState::FailedPermanent),
-            Duration::from_secs(10)
+        wait_for_progress(
+            || server.upload_requests() + server.login_requests(),
+            || matches!(&store.item(&first_text), Ok(Some(row)) if row.state == ItemState::FailedPermanent),
+            Duration::from_secs(10),
         )
         .await,
-        "the second 401 did not park the item"
+        "the second 401 did not park the first item"
+    );
+    // Two failed requests in the run: the refusal is real, but the threshold
+    // is not reached, so the connection stays usable and the tray stays quiet.
+    assert!(
+        session.state().is_connected(),
+        "a run below the threshold must not need the user: {:?}",
+        session.state()
     );
     assert_eq!(
         server.upload_requests(),
         2,
-        "R1.4: one retry after the re-login, then no more"
+        "R1.4: the first item is one re-login and one refusal"
     );
     assert_eq!(server.login_requests(), 2);
+
+    // The second item's checksum check is the third failed request in the run,
+    // so the connection needs the user now. Its folder is added after the
+    // first item parked and after the first item's own check, so the refusal
+    // queued here is the next check and no request of it races the assertions
+    // above.
+    server.fail(
+        Operation::BulkUploadCheck,
+        Fault::Status {
+            code: 401,
+            retry_after: None,
+        },
+    );
+    engine
+        .add_folder(&second_folder.display().to_string(), true)
+        .expect("add the second folder");
     assert!(
-        matches!(
-            session.state(),
-            ConnectionState::NeedsAttention(Attention::Rejected)
-        ),
-        "R1.4: a second 401 needs the user: {:?}",
+        wait_for_progress(
+            || server.bulk_check_requests() + server.upload_requests() + server.login_requests(),
+            || matches!(
+                session.state(),
+                ConnectionState::NeedsAttention(Attention::Rejected)
+            ),
+            Duration::from_secs(10),
+        )
+        .await,
+        "R1.4: a run of 401s needs the user: {:?}",
         session.state()
     );
-    let row = store
-        .item(&path_text)
-        .expect("read")
+    assert_eq!(
+        server.upload_requests(),
+        2,
+        "the second item was refused at the check, before any upload"
+    );
+    assert_eq!(server.bulk_check_requests(), 2);
+    let first_row = store
+        .item(&first_text)
+        .expect("read the row")
         .expect("the row exists");
-    assert_eq!(row.state, ItemState::FailedPermanent);
-    assert_eq!(row.error_class, Some(FailureClass::AuthFailed));
+    assert_eq!(first_row.state, ItemState::FailedPermanent);
+    assert_eq!(first_row.error_class, Some(FailureClass::AuthFailed));
+    // R1.4: nothing is wrong with the second file, so its row waits for the
+    // sign-in that fixes the credential instead of being parked.
+    let second_row = store
+        .item(&second.display().to_string())
+        .expect("read the row")
+        .expect("the row exists");
+    assert_eq!(second_row.state, ItemState::Pending);
     // R8.2: the tray reads the same state.
     assert_eq!(engine.status().activity, Activity::NeedsAttention);
     engine.stop();
@@ -2231,6 +2282,84 @@ async fn a_duplicate_the_server_already_has_joins_the_album_too() {
     engine.stop();
 }
 
+/// R6.6: one dropped connection is not a run. The retry is held open on the
+/// server, so the run of one failure can be read before anything succeeds.
+#[tokio::test]
+async fn one_transport_failure_does_not_need_attention() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    write_file(&photos, "offline.jpg", b"offline bytes");
+    add_folder(&store, &photos, true);
+    server.fail(Operation::Upload, Fault::Disconnect);
+    // The retry reaches the server and is held there, so the test can read the
+    // connection while the run is one failure long.
+    server.fail(Operation::Upload, Fault::Slow(Duration::from_secs(30)));
+    let (engine, session) = start_engine_with_session(&server, &store, retry_config(8)).await;
+
+    assert!(
+        wait_until(|| server.upload_requests() >= 2, Duration::from_secs(20)).await,
+        "the retry never reached the server"
+    );
+    assert!(
+        session.state().is_connected(),
+        "one transport failure must not need the user: {:?}",
+        session.state()
+    );
+    engine.stop();
+}
+
+/// R6.6, R8.2: a run of dropped connections reaches the threshold, and the
+/// connection needs the user with the transport reason.
+#[tokio::test]
+async fn a_run_of_transport_failures_needs_attention_with_the_reason() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    write_file(&photos, "offline.jpg", b"offline bytes");
+    add_folder(&store, &photos, true);
+    // Three dropped uploads reach the threshold; every probe after that fails
+    // too, so the connection stays in attention while the test reads it.
+    for _ in 0..3 {
+        server.fail(Operation::Upload, Fault::Disconnect);
+    }
+    for _ in 0..40 {
+        server.fail(
+            Operation::ValidateToken,
+            Fault::Status {
+                code: 503,
+                retry_after: None,
+            },
+        );
+    }
+    let (engine, session) = start_engine_with_session(&server, &store, retry_config(8)).await;
+
+    assert!(
+        wait_until(
+            || matches!(
+                session.state(),
+                ConnectionState::NeedsAttention(Attention::Unreachable(_))
+            ),
+            Duration::from_secs(20)
+        )
+        .await,
+        "the run did not reach attention: {:?}",
+        session.state()
+    );
+    assert_eq!(
+        engine.status().activity,
+        Activity::NeedsAttention,
+        "R8.2: the tray reads the run as needing attention"
+    );
+    let ConnectionState::NeedsAttention(Attention::Unreachable(detail)) = session.state() else {
+        unreachable!("the wait above matched the transport attention")
+    };
+    assert!(!detail.is_empty(), "the reason names the transport failure");
+    engine.stop();
+}
+
 #[tokio::test]
 async fn a_run_of_connection_failures_trips_the_breaker_and_it_probes_before_resuming() {
     let server = MockImmich::start().await;
@@ -2546,9 +2675,11 @@ async fn a_batch_during_a_dead_session_stays_pending_until_the_user_signs_in_aga
         write_file(&photos, "second.jpg", b"second bytes"),
     ];
     add_folder(&store, &photos, true);
-    // The checksum check is refused twice: the first 401 re-logs in, and the
-    // second leaves the connection needing the user (R1.4).
-    for _ in 0..2 {
+    // The checksum check is refused: the first 401 re-logs in, the second is
+    // the first refusal in the run. The threshold retry_config pins is three,
+    // so a later scan's refusal is the one that reaches the user (R1.4,
+    // R6.6).
+    for _ in 0..3 {
         server.fail(
             Operation::BulkUploadCheck,
             Fault::Status {
@@ -2559,13 +2690,23 @@ async fn a_batch_during_a_dead_session_stays_pending_until_the_user_signs_in_aga
     }
     let (engine, session) = start_engine_with_session(&server, &store, retry_config(8)).await;
 
+    // The first refused batch leaves its files pending for the next scan.
+    assert!(
+        wait_until(
+            || server.bulk_check_requests() >= 2,
+            Duration::from_secs(20)
+        )
+        .await,
+        "the first batch was never refused"
+    );
+    engine.sync_now();
     assert!(
         wait_until(
             || matches!(session.state(), ConnectionState::NeedsAttention(_)),
             Duration::from_secs(20)
         )
         .await,
-        "R1.4: the second 401 did not leave the connection needing the user"
+        "R1.4: the run of 401s did not leave the connection needing the user"
     );
     tokio::time::sleep(Duration::from_millis(400)).await;
     for file in &files {
@@ -2631,7 +2772,7 @@ async fn a_success_between_two_connection_failures_is_not_a_run() {
     server.fail(Operation::BulkUploadCheck, Fault::Disconnect);
     server.fail(Operation::Upload, Fault::Disconnect);
     server.fail(Operation::BulkUploadCheck, Fault::Disconnect);
-    let engine = start_engine(&server, &store, config).await;
+    let (engine, session) = start_engine_with_session(&server, &store, config).await;
 
     assert!(
         wait_until(|| all_terminal(&store, &files), Duration::from_secs(20)).await,
@@ -2642,6 +2783,16 @@ async fn a_success_between_two_connection_failures_is_not_a_run() {
         server.validate_token_requests(),
         0,
         "R6.6: three failures that were never a run still tripped the breaker"
+    );
+    assert!(
+        session.state().is_connected(),
+        "the successes between the failures ended the run: {:?}",
+        session.state()
+    );
+    assert_ne!(
+        engine.status().activity,
+        Activity::NeedsAttention,
+        "the tray must not need attention for failures no success left in a run"
     );
     engine.stop();
 }
