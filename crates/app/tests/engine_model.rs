@@ -1,5 +1,9 @@
 //! The app-scoped engine model's start handoff (SPEC R8.7).
 
+mod common;
+
+use common::mock_server;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -60,18 +64,6 @@ fn seed_failed(paths: &AppPaths, root: &Path, names: &[&str]) {
             .record(&failed(&root.join(name).display().to_string()))
             .expect("write the failed row");
     }
-}
-
-/// Starts the offline Immich double on its own runtime: a GPUI test runs on
-/// the GPUI executor, which is not a Tokio runtime.
-fn mock_server() -> (tokio::runtime::Runtime, MockImmich) {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
-        .enable_all()
-        .build()
-        .expect("start the mock runtime");
-    let server = runtime.block_on(MockImmich::start());
-    (runtime, server)
 }
 
 /// Signs in against `server` and returns the connection model.

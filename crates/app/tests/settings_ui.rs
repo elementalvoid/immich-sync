@@ -3,6 +3,10 @@
 //! The harness can drive keyboard focus and native accessibility properties; it
 //! cannot read pixels, so the focus *ring* itself is not asserted here.
 
+mod common;
+
+use common::mock_server;
+
 use std::cell::Cell;
 use std::fs;
 use std::path::Path;
@@ -30,7 +34,6 @@ use immich_sync::status;
 use immich_sync::store::StoreModel;
 use immich_sync::upload::UploadModel;
 use immich_sync::upload_view::UploadView;
-use mock_immich::MockImmich;
 use sync_core::connection::{
     Attention, AuthMethod, ConnectionState, Secret, ServerProfile, SignIn,
 };
@@ -183,18 +186,6 @@ fn open_settings_over_connection(
         })
         .expect("open the settings window")
     })
-}
-
-/// Starts the offline Immich double on its own runtime: a GPUI test runs on
-/// the GPUI executor, which is not a Tokio runtime.
-fn mock_server() -> (tokio::runtime::Runtime, MockImmich) {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
-        .enable_all()
-        .build()
-        .expect("start the mock runtime");
-    let server = runtime.block_on(MockImmich::start());
-    (runtime, server)
 }
 
 /// Replaces the text in the focused field with `value`.

@@ -6,6 +6,10 @@
 //! cannot read pixels, so "readable in both themes" is checked by rendering
 //! under both and reading the same accessibility properties.
 
+mod common;
+
+use common::mock_server;
+
 use std::fs;
 use std::path::Path;
 use std::rc::Rc;
@@ -63,18 +67,6 @@ fn autostart() -> Rc<dyn Autostart> {
     Rc::new(UnavailableAutostart::new(
         "the test run has no OS autostart mechanism".to_string(),
     ))
-}
-
-/// Starts the offline Immich double on its own runtime: a GPUI test runs on
-/// the GPUI executor, which is not a Tokio runtime.
-fn mock_server() -> (tokio::runtime::Runtime, MockImmich) {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
-        .enable_all()
-        .build()
-        .expect("start the mock runtime");
-    let server = runtime.block_on(MockImmich::start());
-    (runtime, server)
 }
 
 fn profile_for(server: &MockImmich, method: AuthMethod) -> ServerProfile {
