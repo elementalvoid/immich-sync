@@ -10,6 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
@@ -269,7 +270,7 @@ fn every_logs_control_is_named_and_keyboard_reachable(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn choosing_a_level_persists_it_in_the_settings_file(cx: &mut TestAppContext) {
+async fn choosing_a_level_persists_it_in_the_settings_file(cx: &mut TestAppContext) {
     let temp = tempfile::tempdir().expect("create a temp dir");
     let paths = temporary_paths(temp.path());
     let store = SettingsStore::open(paths.config_file.clone());
@@ -282,9 +283,21 @@ fn choosing_a_level_persists_it_in_the_settings_file(cx: &mut TestAppContext) {
     })
     .expect("update the shell window");
 
-    let reloaded = SettingsStore::open(paths.config_file);
+    // The level write runs on the background executor (N2), so the test waits
+    // for it to land instead of reading the file in the same tick.
+    let mut observed = LogLevel::Info;
+    for _ in 0..600 {
+        observed = SettingsStore::open(paths.config_file.clone())
+            .settings()
+            .log_level;
+        if observed == LogLevel::Debug {
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
     assert_eq!(
-        reloaded.settings().log_level,
+        observed,
         LogLevel::Debug,
         "the chosen level is stored in the settings file"
     );

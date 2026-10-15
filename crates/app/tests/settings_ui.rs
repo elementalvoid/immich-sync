@@ -203,6 +203,54 @@ fn retype(window: &mut Window, value: &str, cx: &mut App) {
     window.input(value, cx);
 }
 
+/// Pumps the executor until the settings file holds a value `check` accepts.
+///
+/// The settings write now runs on the background executor (N2), so a test
+/// that reads the file right after a UI action has to wait for it.
+async fn wait_for_settings(
+    cx: &mut TestAppContext,
+    paths: &AppPaths,
+    check: impl Fn(&Settings) -> bool,
+) -> Settings {
+    for _ in 0..600 {
+        let settings = SettingsStore::open(paths.config_file.clone())
+            .settings()
+            .clone();
+        if check(&settings) {
+            return settings;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    panic!("the settings file never reached the wanted state");
+}
+
+/// Pumps the executor until the settings window shows `id`, then returns its
+/// label. A save outcome now lands on a later tick (N2).
+async fn wait_for_label(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    id: &'static str,
+) -> String {
+    for _ in 0..600 {
+        cx.run_until_parked();
+        let label = cx
+            .update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                window
+                    .try_find(id)
+                    .and_then(|found| found.label().map(str::to_string))
+            })
+            .ok()
+            .flatten();
+        if let Some(label) = label {
+            return label;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+    }
+    panic!("the settings window never showed {id}");
+}
+
 /// Opens the settings over an explicit path-resolution result.
 fn open_settings_over_resolution(
     cx: &mut TestAppContext,
@@ -497,7 +545,7 @@ fn opening_the_view_leaves_a_fractional_bandwidth_alone(cx: &mut TestAppContext)
 }
 
 #[gpui_kit::test]
-fn stepping_the_bandwidth_keeps_the_fraction(cx: &mut TestAppContext) {
+async fn stepping_the_bandwidth_keeps_the_fraction(cx: &mut TestAppContext) {
     let temp = tempfile::tempdir().expect("create a temp dir");
     let paths = temporary_paths(temp.path());
     let mut store = SettingsStore::open(paths.config_file.clone());
@@ -518,17 +566,18 @@ fn stepping_the_bandwidth_keeps_the_fraction(cx: &mut TestAppContext) {
     })
     .expect("update the settings window");
 
+    let saved = wait_for_settings(cx, &paths, |settings| {
+        settings.bandwidth_bytes_per_second == 2_500_000
+    })
+    .await;
     assert_eq!(
-        SettingsStore::open(paths.config_file)
-            .settings()
-            .bandwidth_bytes_per_second,
-        2_500_000,
+        saved.bandwidth_bytes_per_second, 2_500_000,
         "the stepped value was saved in bytes per second"
     );
 }
 
 #[gpui_kit::test]
-fn keyboard_reaches_every_control_and_steps_the_concurrency(cx: &mut TestAppContext) {
+async fn keyboard_reaches_every_control_and_steps_the_concurrency(cx: &mut TestAppContext) {
     let temp = tempfile::tempdir().expect("create a temp dir");
     let paths = temporary_paths(temp.path());
     let store = SettingsStore::open(paths.config_file.clone());
@@ -568,16 +617,16 @@ fn keyboard_reaches_every_control_and_steps_the_concurrency(cx: &mut TestAppCont
     })
     .expect("update the settings window");
 
-    let reloaded = SettingsStore::open(paths.config_file);
+    // The three steps queue and coalesce; the last one is what reaches disk.
+    let reloaded = wait_for_settings(cx, &paths, |settings| settings.concurrency == 5).await;
     assert_eq!(
-        reloaded.settings().concurrency,
-        5,
+        reloaded.concurrency, 5,
         "arrow steps changed the setting and wrote it to disk"
     );
 }
 
 #[gpui_kit::test]
-fn the_autostart_toggle_applies_to_the_os_and_persists(cx: &mut TestAppContext) {
+async fn the_autostart_toggle_applies_to_the_os_and_persists(cx: &mut TestAppContext) {
     let temp = tempfile::tempdir().expect("create a temp dir");
     let paths = temporary_paths(temp.path());
     let store = SettingsStore::open(paths.config_file.clone());
@@ -598,12 +647,8 @@ fn the_autostart_toggle_applies_to_the_os_and_persists(cx: &mut TestAppContext) 
     .expect("update the settings window");
 
     assert!(backend.enabled.get(), "the OS mechanism was switched on");
-    assert!(
-        SettingsStore::open(paths.config_file.clone())
-            .settings()
-            .autostart,
-        "the setting persisted"
-    );
+    let saved = wait_for_settings(cx, &paths, |settings| settings.autostart).await;
+    assert!(saved.autostart, "the setting persisted");
 
     cx.update_window(window, |_, window, cx| {
         tab_to(window, "settings-autostart", cx);
@@ -612,10 +657,8 @@ fn the_autostart_toggle_applies_to_the_os_and_persists(cx: &mut TestAppContext) 
     .expect("update the settings window");
 
     assert!(!backend.enabled.get(), "the OS mechanism was switched off");
-    assert!(
-        !SettingsStore::open(paths.config_file).settings().autostart,
-        "turning it off persisted too"
-    );
+    let saved = wait_for_settings(cx, &paths, |settings| !settings.autostart).await;
+    assert!(!saved.autostart, "turning it off persisted too");
 }
 
 #[gpui_kit::test]
@@ -714,7 +757,7 @@ fn an_unreadable_os_autostart_state_is_reported_as_a_read_failure(cx: &mut TestA
 }
 
 #[gpui_kit::test]
-fn a_failed_settings_write_rolls_the_autostart_change_back(cx: &mut TestAppContext) {
+async fn a_failed_settings_write_rolls_the_autostart_change_back(cx: &mut TestAppContext) {
     let temp = tempfile::tempdir().expect("create a temp dir");
     let paths = temporary_paths(temp.path());
     let store = SettingsStore::open(paths.config_file.clone());
@@ -732,25 +775,38 @@ fn a_failed_settings_write_rolls_the_autostart_change_back(cx: &mut TestAppConte
         tab_to(window, "settings-autostart", cx);
         window.press("space", cx);
 
+        // N2: the save runs off the UI thread, so its outcome is not here yet.
         assert!(
-            !backend.enabled.get(),
-            "the OS change is rolled back when the file cannot be saved"
+            window.try_find("settings-action-error").is_none(),
+            "the failing write did not run on the UI thread"
         );
-        assert_eq!(
-            window.find("settings-autostart").checked(),
-            Some(false),
-            "the switch keeps the value both stores agree on"
-        );
-        let notice = window.find("settings-action-error");
-        assert!(notice.visible(), "the failure is visible");
-        let message = notice.label().unwrap_or_default();
         assert!(
-            message.starts_with("Could not update the autostart setting"),
-            "the notice names the failed action: {message}"
+            backend.enabled.get(),
+            "the OS change is applied before the file write"
         );
     })
     .expect("update the settings window");
 
+    let message = wait_for_label(cx, window, "settings-action-error").await;
+    assert!(
+        message.starts_with("Could not update the autostart setting"),
+        "the notice names the failed action: {message}"
+    );
+    assert!(
+        !backend.enabled.get(),
+        "the OS change is rolled back when the file cannot be saved"
+    );
+    let checked = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.find("settings-autostart").checked()
+        })
+        .expect("read the switch");
+    assert_eq!(
+        checked,
+        Some(false),
+        "the switch keeps the value both stores agree on"
+    );
     assert!(
         !SettingsStore::open(paths.config_file).settings().autostart,
         "the failed save recorded nothing"
@@ -758,7 +814,7 @@ fn a_failed_settings_write_rolls_the_autostart_change_back(cx: &mut TestAppConte
 }
 
 #[gpui_kit::test]
-fn a_failed_save_says_the_settings_could_not_be_saved(cx: &mut TestAppContext) {
+async fn a_failed_save_says_the_settings_could_not_be_saved(cx: &mut TestAppContext) {
     let temp = tempfile::tempdir().expect("create a temp dir");
     let paths = temporary_paths(temp.path());
     let store = SettingsStore::open(paths.config_file.clone());
@@ -771,19 +827,20 @@ fn a_failed_save_says_the_settings_could_not_be_saved(cx: &mut TestAppContext) {
         window.render_frame(cx);
         tab_to(window, FieldKey::Concurrency.id(), cx);
         window.press("up", cx);
-    })
-    .expect("update the settings window");
-
-    cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
-        let notice = window.find("settings-action-error");
-        let message = notice.label().unwrap_or_default();
+        // N2: the write runs off the UI thread, so its failure is not here
+        // yet. Seeing it in this same tick would mean the UI waited on it.
         assert!(
-            message.starts_with("Could not save the settings"),
-            "a number change reports a save failure: {message}"
+            window.try_find("settings-action-error").is_none(),
+            "the failing write did not run on the UI thread"
         );
     })
     .expect("update the settings window");
+
+    let message = wait_for_label(cx, window, "settings-action-error").await;
+    assert!(
+        message.starts_with("Could not save the settings"),
+        "a number change reports a save failure: {message}"
+    );
 }
 
 #[gpui_kit::test]
@@ -820,7 +877,7 @@ fn a_refused_autostart_change_is_reported_and_not_recorded(cx: &mut TestAppConte
 }
 
 #[gpui_kit::test]
-fn corrupt_settings_load_defaults_and_show_a_problem_that_clears_after_a_save(
+async fn corrupt_settings_load_defaults_and_show_a_problem_that_clears_after_a_save(
     cx: &mut TestAppContext,
 ) {
     let temp = tempfile::tempdir().expect("create a temp dir");
@@ -847,12 +904,20 @@ fn corrupt_settings_load_defaults_and_show_a_problem_that_clears_after_a_save(
         );
 
         // Acting on the defaults repairs the file. The input change is
-        // delivered as an entity effect, so the notice is checked after this
-        // window update returns and the effect has run.
+        // delivered as an entity effect, and the save runs on the background
+        // executor (N2), so the file is waited for below.
         tab_to(window, FieldKey::Concurrency.id(), cx);
         window.press("up", cx);
     })
     .expect("update the settings window");
+
+    wait_for_settings(cx, &paths, |settings| settings.concurrency == 5).await;
+    let reloaded = SettingsStore::open(paths.config_file.clone());
+    assert_eq!(reloaded.settings().concurrency, 5);
+    assert!(
+        reloaded.problem().is_none(),
+        "the repaired file loads cleanly"
+    );
 
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
@@ -862,10 +927,6 @@ fn corrupt_settings_load_defaults_and_show_a_problem_that_clears_after_a_save(
         );
     })
     .expect("update the settings window");
-
-    let reloaded = SettingsStore::open(paths.config_file);
-    assert_eq!(reloaded.settings().concurrency, 5);
-    assert!(reloaded.problem().is_none());
 }
 
 #[gpui_kit::test]
