@@ -13,6 +13,14 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
 
+# No dependency cache here on purpose: a poisoned Actions cache could change
+# the published binaries while the provenance attestation still names this
+# workflow. Releases are rare; a cold build is the price. The per-push ci
+# workflow keeps its caches.
+
+permissions:
+  contents: read
+
 jobs:
   # Fails a tag that does not name the version in the manifest, before two
   # release builds are paid for. A dispatch has no tag, so the step is skipped
@@ -22,6 +30,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Nothing here pushes over git; the token must not land in .git.
+          persist-credentials: false
       - name: Compare the tag with the package version
         if: github.ref_type == 'tag'
         run: |
@@ -42,18 +53,12 @@ jobs:
       attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install Rust 1.99.0
         run: |
           rustup toolchain install 1.99.0 --profile minimal
           rustup default 1.99.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          # A release profile and this workflow's own key: the ci workflow's
-          # dev-profile artifacts are not what this build restores.
-          shared-key: release-linux
-          key: ${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'Cargo.toml', 'crates/*/Cargo.toml') }}
-          add-rust-environment-hash-key: "false"
-          cache-on-failure: "true"
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -109,16 +114,12 @@ jobs:
       attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install Rust 1.99.0
         run: |
           rustup toolchain install 1.99.0 --profile minimal
           rustup default 1.99.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: release-windows
-          key: ${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'Cargo.toml', 'crates/*/Cargo.toml') }}
-          add-rust-environment-hash-key: "false"
-          cache-on-failure: "true"
       - name: Install cargo-packager
         run: cargo install --locked cargo-packager --version 0.11.8
       - name: Build the client (release)
