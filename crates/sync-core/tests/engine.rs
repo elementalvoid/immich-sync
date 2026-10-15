@@ -128,6 +128,9 @@ async fn wait_for_progress(
 ) -> bool {
     let mut last = progress();
     let mut deadline = Instant::now() + stall;
+    // A pipeline that keeps trickling out progress would reset the stall
+    // forever, so the wait also has a hard cap: ten stalls without the result.
+    let hard_deadline = Instant::now() + stall.saturating_mul(10);
     loop {
         if check() {
             return true;
@@ -137,7 +140,7 @@ async fn wait_for_progress(
             last = current;
             deadline = Instant::now() + stall;
         }
-        if Instant::now() >= deadline {
+        if Instant::now() >= deadline || Instant::now() >= hard_deadline {
             return false;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -2373,7 +2376,12 @@ async fn one_transport_failure_does_not_need_attention() {
     let (engine, session) = start_engine_with_session(&server, &store, retry_config(8)).await;
 
     assert!(
-        wait_until(|| server.upload_requests() >= 2, Duration::from_secs(20)).await,
+        wait_for_progress(
+            || server.upload_requests(),
+            || server.upload_requests() >= 2,
+            Duration::from_secs(10),
+        )
+        .await,
         "the retry never reached the server"
     );
     assert!(
@@ -2411,12 +2419,13 @@ async fn a_run_of_transport_failures_needs_attention_with_the_reason() {
     let (engine, session) = start_engine_with_session(&server, &store, retry_config(8)).await;
 
     assert!(
-        wait_until(
+        wait_for_progress(
+            || server.upload_requests() + server.validate_token_requests(),
             || matches!(
                 session.state(),
                 ConnectionState::NeedsAttention(Attention::Unreachable(_))
             ),
-            Duration::from_secs(20)
+            Duration::from_secs(10),
         )
         .await,
         "the run did not reach attention: {:?}",
