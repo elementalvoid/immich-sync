@@ -325,7 +325,7 @@ async fn a_new_review_item_raises_one_notification(cx: &mut TestAppContext) {
         gpui_kit::init(cx);
         // The platform records a notification only with an identity set, as
         // the Windows backend needs one (R5.4, R10.1).
-        cx.set_app_identity("com.immichsync.desktop", "Immich Sync");
+        cx.set_app_identity("com.elementalvoid.immich-sync", "Immich Sync");
         let connection = cx.new(|_| {
             let store: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
             ConnectionModel::new(ServerProfile::default(), store)

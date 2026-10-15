@@ -42,8 +42,10 @@ pub fn init(cx: &mut App) {
     cx.set_quit_mode(QuitMode::Explicit);
     // A system notification needs an identity on Windows (the AppUserModelID)
     // and on the test platform, so it is set before any can be posted (R5.4,
-    // R10.1).
-    cx.set_app_identity("com.immichsync.desktop", "Immich Sync");
+    // R10.1). It must match the packager identifier: the NSIS installer stamps
+    // shortcuts with that identifier, and a pin or toast only resolves to them
+    // when the two agree.
+    cx.set_app_identity("com.elementalvoid.immich-sync", "Immich Sync");
     cx.on_action(show)
         .on_action(hide)
         .on_action(quit)
