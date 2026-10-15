@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use immich_client::{BandwidthLimit, BulkAction, BulkCheckItem, ClientError, RejectReason};
+use immich_client::{BandwidthLimit, BulkCheckItem, ClientError};
 use tokio::sync::{Mutex as AsyncMutex, Notify, Semaphore, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
 
@@ -45,8 +45,8 @@ use crate::store::{
     ReviewDecision, ReviewItem, SourceFolder, StateStore, StoreError,
 };
 use crate::upload::{
-    PreparedItem, UploadFailure, UploadGate, UploadOutcome, Uploader, hash_in_background,
-    pending_sidecar,
+    CheckOutcome, PreparedItem, UploadFailure, UploadGate, UploadOutcome, Uploader, check_outcome,
+    hash_in_background, pending_sidecar,
 };
 use crate::versions::Versioner;
 use crate::watch::FolderWatcher;
@@ -1370,73 +1370,43 @@ async fn process_batch(inner: &Arc<EngineInner>, batch: Vec<PathBuf>) {
             .find(|result| result.id == id)
             .map(|result| result.action.clone());
         match action {
-            Some(BulkAction::Accept) => spawn_upload(inner, item).await,
-            // R3.3: a duplicate the asset already holds still has to carry a
-            // sidecar the server does not have, so the upload runs; the server
-            // answers duplicate again and no second asset is created.
-            Some(BulkAction::Reject {
-                reason: RejectReason::Duplicate,
-                asset_id: Some(asset_id),
-                ..
-            }) if item.sidecar.is_none() => {
-                // R4.2: bytes the server already holds are still a new version
-                // of a tracked file, so the version flow runs before the row is
-                // settled. A failure here parks the row with its asset id, and
-                // the next scan or "Sync now" finishes the chain (R6.7).
-                if let Err(error) = inner.versions.promote(&id, &asset_id, item.sha1).await {
-                    inner.fail_item(&item, &error.failure(), Some(&asset_id));
-                    continue;
+            Some(action) => match check_outcome(&action) {
+                // R3.3: a duplicate whose asset is live still has to carry a
+                // sidecar the server does not have, so the upload runs; the
+                // server answers duplicate again and no second asset is
+                // created. Without one, the row settles through the version
+                // flow.
+                CheckOutcome::Duplicate { asset_id } if item.sidecar.is_none() => {
+                    settle_duplicate(inner, &item, &asset_id).await;
                 }
-                record_terminal(inner, &item, &asset_id, ItemState::Duplicate);
-                inner.finish_item(
-                    &item,
-                    &UploadOutcome::Duplicate {
-                        asset_id: asset_id.clone(),
-                    },
-                );
-                // R3.4: a duplicate is a success (R3.2), and it still maps to
-                // its folder's album.
-                attach_albums(inner, &item.path, &asset_id).await;
-            }
-            // R3.3: a sidecar is still owed, so the upload runs and parks the
-            // item when the server answers duplicate again (see
-            // `upload::Uploader::send_upload`).
-            Some(BulkAction::Reject {
-                reason: RejectReason::Duplicate,
-                asset_id: Some(_),
-                ..
-            }) => spawn_upload(inner, item).await,
-            Some(BulkAction::Reject {
-                reason: RejectReason::UnsupportedFormat,
-                ..
-            }) => {
-                let error = ClientError::UnsupportedFormat(
-                    "the checksum check refused the format".to_string(),
-                );
-                inner.fail_item(&item, &UploadFailure::from_client_error(&error), None);
-            }
-            Some(BulkAction::Reject {
-                reason: RejectReason::Duplicate,
-                asset_id: None,
-                ..
-            }) => {
-                inner.fail_item(
-                    &item,
-                    &UploadFailure::from_client_error(&missing_asset_error()),
-                    None,
-                );
-            }
-            Some(BulkAction::Reject {
-                reason: RejectReason::Other(reason),
-                ..
-            }) => {
-                let error = ClientError::Protocol {
-                    status: 200,
-                    message: format!("the checksum check refused it: {reason}"),
-                    retry_after: None,
-                };
-                inner.fail_item(&item, &UploadFailure::from_client_error(&error), None);
-            }
+                CheckOutcome::Duplicate { .. } | CheckOutcome::Upload => {
+                    spawn_upload(inner, item).await;
+                }
+                CheckOutcome::Restore { asset_id } => {
+                    // R5.3: the bytes are in the trash. Nothing can upload
+                    // them back - the checksum header answers duplicate even
+                    // then - so the asset is restored. A sidecar still cannot
+                    // attach to an asset that already exists, so it follows
+                    // the ordinary duplicate upload path and parks with its
+                    // reason.
+                    match restore_asset(inner, &asset_id).await {
+                        Ok(()) if item.sidecar.is_none() => {
+                            settle_duplicate(inner, &item, &asset_id).await;
+                        }
+                        Ok(()) => spawn_upload(inner, item).await,
+                        Err(error) => {
+                            inner.fail_item(
+                                &item,
+                                &UploadFailure::from_client_error(&error),
+                                Some(&asset_id),
+                            );
+                        }
+                    }
+                }
+                CheckOutcome::Refused(error) => {
+                    inner.fail_item(&item, &UploadFailure::from_client_error(&error), None);
+                }
+            },
             None => {
                 inner.fail_item(
                     &item,
@@ -1448,13 +1418,43 @@ async fn process_batch(inner: &Arc<EngineInner>, batch: Vec<PathBuf>) {
     }
 }
 
-/// One bulk-check answer that named no asset id.
-fn missing_asset_error() -> ClientError {
-    ClientError::Protocol {
-        status: 200,
-        message: "the server reported a duplicate without an asset id".to_string(),
-        retry_after: None,
+/// Settles an item whose bytes the server already holds under `asset_id`
+/// (R3.2, R4.2).
+///
+/// The version flow runs first: bytes the server holds are still a new
+/// version of a tracked file. A promote failure parks the row with its asset
+/// id, and the next scan or "Sync now" finishes the chain (R6.7). Then the
+/// row is terminal and the asset joins its folder's album.
+async fn settle_duplicate(inner: &Arc<EngineInner>, item: &PreparedItem, asset_id: &str) {
+    let id = item.path.to_string_lossy().into_owned();
+    if let Err(error) = inner.versions.promote(&id, asset_id, item.sha1).await {
+        inner.fail_item(item, &error.failure(), Some(asset_id));
+        return;
     }
+    record_terminal(inner, item, asset_id, ItemState::Duplicate);
+    inner.finish_item(
+        item,
+        &UploadOutcome::Duplicate {
+            asset_id: asset_id.to_string(),
+        },
+    );
+    // R3.4: a duplicate is a success (R3.2), and it still maps to its
+    // folder's album.
+    attach_albums(inner, &item.path, asset_id).await;
+}
+
+/// Restores one trashed asset through the shared session (R5.3).
+async fn restore_asset(inner: &Arc<EngineInner>, asset_id: &str) -> Result<(), ClientError> {
+    let client = inner.session.client();
+    let ids = vec![asset_id.to_string()];
+    inner
+        .session
+        .request(move |credential| {
+            let client = client.clone();
+            let ids = ids.clone();
+            async move { client.restore_assets(credential.auth(), &ids).await }
+        })
+        .await
 }
 
 /// One bulk-check answer the server never sent.
@@ -1617,8 +1617,12 @@ async fn prepare(
 
 /// Whether a recorded row is finished on its own: a terminal success, a
 /// failure no automatic retry can fix, or a decision the user already made.
-/// A pending, uploading, `retry_wait`, or `missing` row is still work the
-/// pipeline owns, so a scan may pick it up again.
+/// A pending, uploading, `retry_wait`, `missing`, or `review_trash` row is
+/// still work the pipeline owns, so a scan may pick it up again.
+///
+/// A `review_trash` row is deliberately not settled: the local file can come
+/// back, and the asset it maps to can be restored, so the path must be
+/// re-discovered rather than skipped (R5.3).
 fn is_settled(state: ItemState) -> bool {
     matches!(
         state,
@@ -1627,7 +1631,6 @@ fn is_settled(state: ItemState) -> bool {
             | ItemState::FailedPermanent
             | ItemState::DeadLetter
             | ItemState::ReviewKeep
-            | ItemState::ReviewTrash
     )
 }
 

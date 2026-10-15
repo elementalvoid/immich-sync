@@ -15,8 +15,9 @@ use crate::error::ClientError;
 use crate::model::{
     Album, AlbumAssetsRequest, AlbumBody, ApiKeyInfo, AssetBulkDeleteRequest, AssetCopyRequest,
     AssetInfo, AssetInfoBody, AssetUpload, Auth, AuthStatus, BulkAction, BulkCheckBody,
-    BulkCheckItem, BulkCheckResult, BulkTagRequest, CreateAlbumRequest, CreateStackRequest,
-    LoginResponse, RejectReason, ServerAbout, SessionToken, StackBody, UploadBody, UploadResponse,
+    BulkCheckItem, BulkCheckResult, BulkIdsRequest, BulkTagRequest, CreateAlbumRequest,
+    CreateStackRequest, LoginResponse, RejectReason, ServerAbout, SessionToken, StackBody,
+    UploadBody, UploadResponse,
 };
 
 /// The longest error message body kept from the server. A reverse proxy can
@@ -473,11 +474,13 @@ impl ImmichClient {
         result
     }
 
-    /// The id of the asset the server already holds for `checksum`, if any.
+    /// The id of the live asset the server already holds for `checksum`, if
+    /// any.
     ///
     /// Only an answer carrying the `id` sent here is about this file; an entry
     /// for another id is some other asset, and a row that carries one is never
-    /// uploaded again (#19).
+    /// uploaded again (#19). A trashed asset is not a held asset: the bytes
+    /// are not usable until a restore, so it is not returned here.
     async fn asset_for_checksum(&self, auth: Auth<'_>, id: &str, checksum: &str) -> Option<String> {
         let item = BulkCheckItem {
             id: id.to_string(),
@@ -495,7 +498,7 @@ impl ImmichClient {
             BulkAction::Reject {
                 reason: RejectReason::Duplicate,
                 asset_id: Some(asset_id),
-                ..
+                is_trashed: false,
             } => Some(asset_id),
             _ => None,
         }
@@ -703,6 +706,35 @@ impl ImmichClient {
         .await?;
         let result = self.read_accepted(response).await;
         log_outcome("trash-assets", &result);
+        result
+    }
+
+    /// Brings trashed assets back (R5.3).
+    ///
+    /// `POST /trash/restore/assets` is `x-immich-state: Stable` in the v3.3.1
+    /// spec and asks for the same `asset.delete` permission the trash call
+    /// does. This is the way back for a checksum the server holds in the
+    /// trash: a re-POST is answered `duplicate` from the `x-immich-checksum`
+    /// header before the body is read, and the unique checksum index does not
+    /// exclude `deletedAt`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::PermissionDenied`] when the credential lacks
+    /// Immich's `asset.delete` permission (R5.5), the other typed refusal
+    /// classes (R6.3), and the transport and protocol variants.
+    pub async fn restore_assets(
+        &self,
+        auth: Auth<'_>,
+        asset_ids: &[String],
+    ) -> Result<(), ClientError> {
+        let response = send(
+            self.authorize(self.http.post(self.endpoint("trash/restore/assets")), auth)
+                .json(&BulkIdsRequest { ids: asset_ids }),
+        )
+        .await?;
+        let result = self.read_accepted(response).await;
+        log_outcome("restore-assets", &result);
         result
     }
 

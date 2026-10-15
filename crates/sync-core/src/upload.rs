@@ -169,6 +169,71 @@ impl UploadFailure {
     }
 }
 
+/// What one bulk-check answer means for the item (R3.1, R3.2, R6.3).
+#[derive(Debug)]
+pub(crate) enum CheckOutcome {
+    /// The server does not hold these bytes; upload them.
+    Upload,
+    /// The server holds them under `asset_id`, and the asset is live.
+    Duplicate { asset_id: String },
+    /// The server holds them, but the asset is in the trash. The bytes are
+    /// not usable until the asset is restored (R5.3).
+    Restore { asset_id: String },
+    /// The server refused; the failure is already classified.
+    Refused(ClientError),
+}
+
+/// Maps one bulk-check answer onto the decision both callers act on.
+///
+/// One place owns the protocol strings and the `is_trashed` rule, so the
+/// engine's batch path and the single-file pipeline cannot disagree about
+/// what the server meant.
+pub(crate) fn check_outcome(action: &BulkAction) -> CheckOutcome {
+    match action {
+        BulkAction::Accept => CheckOutcome::Upload,
+        // A trashed duplicate is not a held asset: re-POSTing the bytes
+        // answers `duplicate` from the checksum header before the body is
+        // read, so the only way back to a live asset is a restore (R5.3).
+        BulkAction::Reject {
+            reason: RejectReason::Duplicate,
+            asset_id: Some(asset_id),
+            is_trashed: true,
+        } => CheckOutcome::Restore {
+            asset_id: asset_id.clone(),
+        },
+        BulkAction::Reject {
+            reason: RejectReason::Duplicate,
+            asset_id: Some(asset_id),
+            is_trashed: false,
+        } => CheckOutcome::Duplicate {
+            asset_id: asset_id.clone(),
+        },
+        BulkAction::Reject {
+            reason: RejectReason::Duplicate,
+            asset_id: None,
+            ..
+        } => CheckOutcome::Refused(ClientError::Protocol {
+            status: 200,
+            message: "the server reported a duplicate without an asset id".to_string(),
+            retry_after: None,
+        }),
+        BulkAction::Reject {
+            reason: RejectReason::UnsupportedFormat,
+            ..
+        } => CheckOutcome::Refused(ClientError::UnsupportedFormat(
+            "the checksum check refused the format".to_string(),
+        )),
+        BulkAction::Reject {
+            reason: RejectReason::Other(reason),
+            ..
+        } => CheckOutcome::Refused(ClientError::Protocol {
+            status: 200,
+            message: format!("the checksum check refused it: {reason}"),
+            retry_after: None,
+        }),
+    }
+}
+
 /// Runs the pipeline for one file over one shared state store.
 #[derive(Debug)]
 pub struct Uploader {
@@ -275,26 +340,11 @@ impl Uploader {
             }
         };
 
-        match action {
-            BulkAction::Accept => {}
-            BulkAction::Reject {
-                reason: RejectReason::Duplicate,
-                asset_id,
-                ..
-            } => {
-                let Some(asset_id) = asset_id else {
-                    return self.failed(
-                        &mut item,
-                        &ClientError::Protocol {
-                            status: 200,
-                            message: "the server reported a duplicate without an asset id"
-                                .to_string(),
-                            retry_after: None,
-                        },
-                    );
-                };
-                // R3.3: a duplicate the asset already holds still has to carry
-                // a sidecar the server does not have, and POST /assets is the
+        match check_outcome(&action) {
+            CheckOutcome::Upload => {}
+            CheckOutcome::Duplicate { asset_id } => {
+                // R3.3: a duplicate whose asset is live still has to carry a
+                // sidecar the server does not have, and POST /assets is the
                 // only Stable way to send one. The server answers duplicate
                 // again, so no second asset is created.
                 if sidecar.is_none() {
@@ -311,28 +361,28 @@ impl Uploader {
                 }
                 item.asset_id = Some(asset_id);
             }
-            BulkAction::Reject {
-                reason: RejectReason::UnsupportedFormat,
-                ..
-            } => {
-                return self.failed(
-                    &mut item,
-                    &ClientError::UnsupportedFormat("the checksum check refused the format".into()),
-                );
+            CheckOutcome::Restore { asset_id } => {
+                // The bytes are in the trash. A re-POST cannot bring them
+                // back, so restore first; a sidecar then follows the ordinary
+                // duplicate path, which parks it with its reason (R3.3).
+                if let Err(error) = self.restore_asset(&asset_id).await {
+                    return self.failed(&mut item, &error);
+                }
+                if sidecar.is_none() {
+                    item.asset_id = Some(asset_id.clone());
+                    item.state = ItemState::Duplicate;
+                    self.record(&item);
+                    tracing::info!(
+                        path = %path_text,
+                        asset_id = %asset_id,
+                        outcome = "restored",
+                        "the trashed asset is live again"
+                    );
+                    return UploadOutcome::Duplicate { asset_id };
+                }
+                item.asset_id = Some(asset_id);
             }
-            BulkAction::Reject {
-                reason: RejectReason::Other(reason),
-                ..
-            } => {
-                return self.failed(
-                    &mut item,
-                    &ClientError::Protocol {
-                        status: 200,
-                        message: format!("the checksum check refused it: {reason}"),
-                        retry_after: None,
-                    },
-                );
-            }
+            CheckOutcome::Refused(error) => return self.failed(&mut item, &error),
         }
 
         // This path is the caller's own, not the engine's: no limit is in
@@ -389,6 +439,24 @@ impl Uploader {
             bandwidth,
         )
         .await
+    }
+
+    /// Brings one trashed asset back from the trash (R5.3).
+    ///
+    /// `POST /trash/restore/assets` is the Stable operation that clears
+    /// `deletedAt`. A checksum the server already knows cannot be uploaded
+    /// into a live asset: the upload interceptor answers `duplicate` even when
+    /// the asset is trashed, and the unique index ignores `deletedAt`.
+    async fn restore_asset(&self, asset_id: &str) -> Result<(), ClientError> {
+        let client = self.session.client();
+        let ids = vec![asset_id.to_string()];
+        self.session
+            .request(move |credential| {
+                let client = client.clone();
+                let ids = ids.clone();
+                async move { client.restore_assets(credential.auth(), &ids).await }
+            })
+            .await
     }
 
     /// The XMP sidecar and the live photo video that belong to `path` (R3.3).

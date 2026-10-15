@@ -3853,6 +3853,69 @@ async fn a_file_that_comes_back_leaves_the_review() {
 }
 
 #[tokio::test]
+async fn a_file_that_comes_back_after_a_trash_decision_restores_the_asset() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let file = write_file(&photos, "trashed-then-back.jpg", b"trashed then back");
+    add_folder(&store, &photos, true);
+    let engine = start_engine(
+        &server,
+        &store,
+        review_config(Duration::from_secs(1), false),
+    )
+    .await;
+    let asset_id = sync_one(&store, &file).await;
+    std::fs::remove_file(&file).expect("delete the fixture");
+    wait_for_review(&engine, 1).await;
+    engine
+        .trash_review_item(&file.display().to_string())
+        .await
+        .expect("R5.3: the asset moves to the trash");
+    assert!(server.trashed(&asset_id), "the asset is in the trash");
+
+    // The same bytes come back. `review_trash` must not be a settled state,
+    // and a trashed checksum must not read as held: the engine restores the
+    // asset instead of uploading bytes the server answers `duplicate`.
+    write_file(&photos, "trashed-then-back.jpg", b"trashed then back");
+    engine.sync_now();
+    assert!(
+        wait_until(|| !server.trashed(&asset_id), Duration::from_secs(15)).await,
+        "R5.3: the trashed asset was not restored"
+    );
+    assert!(
+        wait_until(
+            || store
+                .item(&file.display().to_string())
+                .ok()
+                .flatten()
+                .is_some_and(|row| row.state.is_terminal_success()),
+            Duration::from_secs(15)
+        )
+        .await,
+        "the restored file never settled: {:?}",
+        store.item(&file.display().to_string())
+    );
+    assert_eq!(
+        server.upload_requests(),
+        1,
+        "a restore is not an upload: the checksum is already known"
+    );
+    assert_eq!(
+        store
+            .item(&file.display().to_string())
+            .expect("read the row")
+            .expect("the row exists")
+            .asset_id
+            .as_deref(),
+        Some(asset_id.as_str()),
+        "the restored file keeps its asset mapping"
+    );
+    engine.stop();
+}
+
+#[tokio::test]
 async fn a_review_item_whose_content_reappears_elsewhere_leaves_the_review() {
     let server = MockImmich::start().await;
     let temp = tempfile::tempdir().expect("create a temp dir");

@@ -34,6 +34,7 @@ pub enum Operation {
     CreateStack,
     TagAssets,
     DeleteAssets,
+    RestoreAssets,
     CreateAlbum,
     AddAssetsToAlbum,
 }
@@ -766,6 +767,7 @@ impl MockImmich {
             .route("/auth/validateToken", post(validate_token))
             .route("/assets/bulk-upload-check", post(bulk_upload_check))
             .route("/assets", post(upload).delete(delete_assets))
+            .route("/trash/restore/assets", post(restore_assets))
             .route("/assets/copy", put(copy_asset))
             .route("/assets/{id}", get(get_asset))
             .route("/stacks", post(create_stack))
@@ -1488,6 +1490,27 @@ async fn tag_assets(
         .lock()
         .expect("mock state poisoned")
         .tag(&asset_ids, &tag_ids);
+    Json(json!({ "count": count })).into_response()
+}
+
+async fn restore_assets(
+    AxumState(state): AxumState<Arc<State>>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if let Some(response) = guard(&state, Operation::RestoreAssets).await {
+        return response;
+    }
+    let ids = id_list(body.get("ids"));
+    let mut inner = state.inner.lock().expect("mock state poisoned");
+    let mut count = 0;
+    for id in &ids {
+        if let Some(asset) = inner.assets.get_mut(id)
+            && asset.trashed
+        {
+            asset.trashed = false;
+            count += 1;
+        }
+    }
     Json(json!({ "count": count })).into_response()
 }
 
