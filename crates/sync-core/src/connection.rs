@@ -240,8 +240,9 @@ pub enum Unauthorized {
 /// extends it, a success resets it to zero. A session no engine owns keeps
 /// this value of one: a sign-in form has no queue to protect and must report
 /// the refusal it is waiting on. The engine raises the length to its
-/// `EngineConfig::breaker_threshold`, so the connection and the breaker agree
-/// on what a run is.
+/// `EngineConfig::attention_threshold`, the tray's own run; that is separate
+/// from the breaker's longer `breaker_threshold`, because the breaker gates
+/// the queue, not the tray.
 const DEFAULT_ATTENTION_THRESHOLD: u32 = 1;
 
 /// The connection session: login at startup, one re-login after a 401, and the
@@ -445,13 +446,19 @@ impl Connection {
             .saturating_add(1)
     }
 
+    /// Whether a run of failed requests has reached the point the user must be
+    /// told (R1.4, R6.6).
+    fn threshold_reached(&self, run: u32) -> bool {
+        run >= self.attention_threshold.load(Ordering::SeqCst)
+    }
+
     /// Enters the needs-attention state once the run of failed requests reaches
     /// the threshold (R1.4, R6.6).
     ///
     /// Below the threshold the credential is kept and the connection stays
     /// usable: the refusal has not become a run yet.
     fn refuse(&mut self, run: u32) {
-        if run >= self.attention_threshold.load(Ordering::SeqCst) {
+        if self.threshold_reached(run) {
             self.credential = None;
             self.state = ConnectionState::NeedsAttention(Attention::Rejected);
         }
@@ -486,8 +493,8 @@ impl Connection {
         }
     }
 
-    /// Records that the credential was refused again after the one re-login
-    /// (R1.4).
+    /// Records one more refusal against the run (R1.4, R6.6), for a probe
+    /// that learns the refusal outside [`Connection::handle_unauthorized`].
     pub(crate) fn reject(&mut self) {
         let run = self.record_failure();
         self.refuse(run);
@@ -703,9 +710,11 @@ impl SharedSession {
     /// Sets how many failed requests in a row the connection waits out before
     /// it needs the user (R1.4, R6.6).
     ///
-    /// The engine sets its `EngineConfig::breaker_threshold` here, so the
-    /// connection and the circuit breaker agree on the length of a run. A
-    /// session no engine owns keeps `DEFAULT_ATTENTION_THRESHOLD`.
+    /// The engine sets its `EngineConfig::attention_threshold` here, its own
+    /// run for the tray. The circuit breaker keeps its separate
+    /// `EngineConfig::breaker_threshold`: the two decide different things, so
+    /// they no longer share a length. A session no engine owns keeps
+    /// `DEFAULT_ATTENTION_THRESHOLD`.
     pub fn set_attention_threshold(&self, threshold: u32) {
         self.attention_threshold
             .store(threshold.max(1), Ordering::SeqCst);
@@ -719,7 +728,8 @@ impl SharedSession {
     /// resume without a sign-in.
     pub async fn note_unreachable(&self, detail: &str) {
         let mut connection = self.connection.lock().await;
-        if connection.record_failure() >= self.attention_threshold.load(Ordering::SeqCst) {
+        let run = connection.record_failure();
+        if connection.threshold_reached(run) {
             connection.need_unreachable(detail);
         }
         self.mirror(&connection);
@@ -745,9 +755,11 @@ impl SharedSession {
     /// Runs one authenticated request, answering a 401 with the session's one
     /// re-login and retrying it once (R1.4).
     ///
-    /// A second 401 leaves the connection in the needs-attention state and
-    /// returns the refusal. A request that succeeds restores the re-login
-    /// budget.
+    /// A second 401 returns the refusal, one more failure in the run (R1.4).
+    /// The connection enters the needs-attention state only once the run
+    /// reaches the attention threshold, so one refusal below it leaves the
+    /// credential in place. A request that succeeds restores the re-login
+    /// budget and resets the run.
     ///
     /// # Errors
     ///
@@ -783,7 +795,9 @@ impl SharedSession {
                     }
                     Err(ClientError::InvalidToken) => {
                         // The second 401 of R1.4: the one re-login is spent, so
-                        // the connection needs the user.
+                        // the refusal is recorded against the run. The
+                        // connection needs the user only once that run reaches
+                        // the attention threshold.
                         let _ = self.handle_unauthorized().await;
                         Err(ClientError::InvalidToken)
                     }

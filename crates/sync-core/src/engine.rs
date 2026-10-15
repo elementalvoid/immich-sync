@@ -74,12 +74,19 @@ pub struct EngineConfig {
     pub attempt_cap: u32,
     /// The wait before a later attempt (R6.1, R6.2).
     pub retry: RetryPolicy,
-    /// How many connection failures in a row trip the circuit breaker (R6.6),
-    /// and how many failed requests in a row the connection waits out before it
-    /// needs the user (R1.4). One run length keeps the two notions in step:
-    /// the breaker opens at the same point the tray changes, and a success
-    /// resets both.
+    /// How many connection failures in a row trip the circuit breaker (R6.6).
+    /// Default 5. The connection's attention run is its own, shorter number
+    /// ([`Self::attention_threshold`]): the breaker gates the queue, not the
+    /// tray.
     pub breaker_threshold: u32,
+    /// How many failed requests in a row the connection waits out before the
+    /// tray needs the user (R1.4). Default 3: one refused batch spends up to
+    /// two refusals (the one re-login and the refusal that starts the run), so
+    /// a single batch never worries the user, while a credential that keeps
+    /// failing reaches the user on the next scan (about 30 minutes by default)
+    /// instead of the two and a half hours a run of five allowed. A success
+    /// resets the run.
+    pub attention_threshold: u32,
     /// How long the queue waits between credential probes while the breaker is
     /// open (R6.6).
     pub breaker_cooldown: Duration,
@@ -97,6 +104,7 @@ impl Default for EngineConfig {
             attempt_cap: 8,
             retry: RetryPolicy::default(),
             breaker_threshold: 5,
+            attention_threshold: 3,
             breaker_cooldown: Duration::from_secs(10),
         }
     }
@@ -334,10 +342,10 @@ impl Engine {
         let albums = AlbumMapper::new(session.clone(), store.clone());
         let versions = Versioner::new(session.clone(), store.clone());
         let breaker = CircuitBreaker::new(config.breaker_threshold, config.breaker_cooldown);
-        // R1.4, R6.6: the same run length the breaker uses, so a single
-        // failure does not worry the user on either the transport or the auth
-        // path.
-        session.set_attention_threshold(config.breaker_threshold);
+        // R1.4: the attention run is its own, shorter number. A refused batch
+        // spends up to two failures, so the default of three keeps one batch
+        // below the alarm while still reaching the user on the next scan.
+        session.set_attention_threshold(config.attention_threshold);
         let inner = Arc::new(EngineInner {
             store,
             session,

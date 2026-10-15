@@ -1434,6 +1434,7 @@ fn retry_config(cap: u32) -> EngineConfig {
         attempt_cap: cap,
         retry: test_retry(),
         breaker_threshold: 3,
+        attention_threshold: 3,
         breaker_cooldown: Duration::from_millis(120),
         concurrency: 1,
         watch: false,
@@ -1764,9 +1765,10 @@ async fn two_leaf_folders_with_the_same_name_are_two_albums() {
     engine.stop();
 }
 
-/// R1.4's second 401 is one failed request in a run, not an alarm by itself:
-/// the connection needs the user only once the run reaches the threshold the
-/// engine shares with its circuit breaker (R6.6).
+/// R1.4's attention run is its own, shorter run, separate from the circuit
+/// breaker's (R6.6): a refused batch is not an alarm by itself, and the
+/// connection needs the user only once the run reaches the engine's attention
+/// threshold.
 #[tokio::test]
 async fn a_run_of_401s_needs_attention_at_the_threshold() {
     let server = MockImmich::start().await;
@@ -1777,10 +1779,10 @@ async fn a_run_of_401s_needs_attention_at_the_threshold() {
     let first = write_file(&first_folder, "first.jpg", b"first bytes");
     let second = write_file(&second_folder, "second.jpg", b"second bytes");
     add_folder(&store, &first_folder, true);
-    // retry_config pins the run at three failures. The first item's upload is
-    // refused twice with nothing succeeding in between (the one re-login and
-    // the refusal), and the second item's checksum check is the third failed
-    // request in the run.
+    // retry_config pins the attention run at three failures. The first item's
+    // upload is refused twice with nothing succeeding in between (the one
+    // re-login and the refusal), and the second item's checksum check is the
+    // third failed request in the run.
     for _ in 0..2 {
         server.fail(
             Operation::Upload,
@@ -1865,6 +1867,78 @@ async fn a_run_of_401s_needs_attention_at_the_threshold() {
     assert_eq!(second_row.state, ItemState::Pending);
     // R8.2: the tray reads the same state.
     assert_eq!(engine.status().activity, Activity::NeedsAttention);
+    engine.stop();
+}
+
+/// R1.4: the default attention threshold is its own, shorter run. One refused
+/// batch spends two failures, so it stays below the default of three and the
+/// next scan's refusal is what reaches the user, not the five the circuit
+/// breaker waits for (R6.6).
+#[tokio::test]
+async fn the_default_attention_threshold_is_shorter_than_the_breaker_run() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    write_file(&photos, "photo.jpg", b"photo bytes");
+    add_folder(&store, &photos, true);
+    // Two refusals for the first batch: the 401, the one re-login, and the
+    // retried check's 401.
+    for _ in 0..2 {
+        server.fail(
+            Operation::BulkUploadCheck,
+            Fault::Status {
+                code: 401,
+                retry_after: None,
+            },
+        );
+    }
+    let (engine, session) =
+        start_engine_with_session(&server, &store, EngineConfig::default()).await;
+
+    assert!(
+        wait_for_progress(
+            || server.bulk_check_requests() + server.login_requests(),
+            || server.bulk_check_requests() >= 2,
+            Duration::from_secs(10),
+        )
+        .await,
+        "the first batch was never refused"
+    );
+    assert!(
+        session.state().is_connected(),
+        "one refused batch (two failures) is below the default attention threshold: {:?}",
+        session.state()
+    );
+
+    // The next scan's refusal is the third failure in the run, so it reaches
+    // the user. The breaker's own run is two failures further away.
+    server.fail(
+        Operation::BulkUploadCheck,
+        Fault::Status {
+            code: 401,
+            retry_after: None,
+        },
+    );
+    engine.sync_now();
+    assert!(
+        wait_for_progress(
+            || server.bulk_check_requests() + server.login_requests(),
+            || matches!(
+                session.state(),
+                ConnectionState::NeedsAttention(Attention::Rejected)
+            ),
+            Duration::from_secs(10),
+        )
+        .await,
+        "the third failure in the run must reach the user: {:?}",
+        session.state()
+    );
+    assert_eq!(
+        server.validate_token_requests(),
+        0,
+        "R6.6: the breaker's longer run must not have opened yet"
+    );
     engine.stop();
 }
 
@@ -2676,9 +2750,9 @@ async fn a_batch_during_a_dead_session_stays_pending_until_the_user_signs_in_aga
     ];
     add_folder(&store, &photos, true);
     // The checksum check is refused: the first 401 re-logs in, the second is
-    // the first refusal in the run. The threshold retry_config pins is three,
-    // so a later scan's refusal is the one that reaches the user (R1.4,
-    // R6.6).
+    // the first refusal in the run. The attention threshold retry_config pins
+    // is three, so a later scan's refusal is the one that reaches the user
+    // (R1.4, R6.6).
     for _ in 0..3 {
         server.fail(
             Operation::BulkUploadCheck,
