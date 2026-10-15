@@ -15,7 +15,7 @@ use sync_core::connection::{RequestCredential, SharedSession};
 use sync_core::engine::EngineStatus;
 use sync_core::store::{ClassError, SqliteInfo};
 
-use crate::connection::{ConnectionModel, worker};
+use crate::connection::{ConnectionModel, WORKER_UNAVAILABLE, run_on_worker};
 use crate::engine::EngineModel;
 use crate::store::StoreModel;
 
@@ -223,25 +223,18 @@ impl DiagnosticsModel {
         if !connected {
             return;
         }
-        let Ok(runtime) = worker() else {
-            self.server.problem = Some("The network runtime could not start.".to_string());
-            cx.notify();
-            return;
-        };
-        let (results, incoming) = async_channel::bounded(1);
-        runtime.spawn(async move {
-            let _ = results.send(probe_server(session).await).await;
-        });
-        cx.spawn(async move |this, cx| {
-            let Ok(info) = incoming.recv().await else {
-                return;
-            };
-            let _ = this.update(cx, |model, cx| {
+        let result = run_on_worker(
+            cx,
+            move || async move { probe_server(session).await },
+            |model, info, cx| {
                 model.server = info;
                 cx.notify();
-            });
-        })
-        .detach();
+            },
+        );
+        if result.is_err() {
+            self.server.problem = Some(WORKER_UNAVAILABLE.to_string());
+            cx.notify();
+        }
     }
 
     /// Rebuilds the state database and rescans the folders (R10.4). The engine

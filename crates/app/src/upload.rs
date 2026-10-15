@@ -12,7 +12,7 @@ use gpui_kit::*;
 use sync_core::failure::FailureClass;
 use sync_core::upload::{UploadOutcome, Uploader};
 
-use crate::connection::{ConnectionModel, worker};
+use crate::connection::{ConnectionModel, STORE_OPENING, WORKER_UNAVAILABLE, run_on_worker};
 use crate::store::StoreModel;
 
 /// What the window shows for the last manual upload.
@@ -188,7 +188,7 @@ impl UploadModel {
                     Some(problem) => {
                         format!("The state database could not be opened: {problem}")
                     }
-                    None => "The state database is still opening.".to_string(),
+                    None => STORE_OPENING.to_string(),
                 };
                 self.set(UploadReport::CannotRun { message }, cx);
                 return;
@@ -204,36 +204,23 @@ impl UploadModel {
             );
             return;
         };
-        let Ok(runtime) = worker() else {
-            self.set(
-                UploadReport::CannotRun {
-                    message: "The network runtime could not start.".to_string(),
-                },
-                cx,
-            );
-            return;
-        };
-
         self.set(UploadReport::Running, cx);
         // The attempt belongs to the report the caller just set; a newer report
         // supersedes it.
         let generation = self.generation;
-        let (results, incoming) = async_channel::bounded(1);
-        // Exempt from the engine's pause gate by design (R8.7); see the method
-        // doc comment.
-        runtime.spawn(async move {
-            // R1.4: the session answers a 401 with its one re-login and retries
-            // the request, so the manual path uses the same rule as the engine.
-            let outcome = Uploader::new(session, store)
-                .upload_one(Path::new(&path))
-                .await;
-            let _ = results.send(outcome).await;
-        });
-        cx.spawn(async move |this, cx| {
-            let Ok(outcome) = incoming.recv().await else {
-                return;
-            };
-            let _ = this.update(cx, |model, cx| {
+        let result = run_on_worker(
+            cx,
+            // Exempt from the engine's pause gate by design (R8.7); see the
+            // method doc comment.
+            move || async move {
+                // R1.4: the session answers a 401 with its one re-login and
+                // retries the request, so the manual path uses the same rule as
+                // the engine.
+                Uploader::new(session, store)
+                    .upload_one(Path::new(&path))
+                    .await
+            },
+            move |model, outcome, cx| {
                 if model.generation != generation {
                     return;
                 }
@@ -244,9 +231,16 @@ impl UploadModel {
                     .connection
                     .update(cx, |connection, cx| connection.refresh_state(cx));
                 model.set(report_from_outcome(outcome), cx);
-            });
-        })
-        .detach();
+            },
+        );
+        if result.is_err() {
+            self.set(
+                UploadReport::CannotRun {
+                    message: WORKER_UNAVAILABLE.to_string(),
+                },
+                cx,
+            );
+        }
     }
 
     /// Replaces the report and notifies the views.
