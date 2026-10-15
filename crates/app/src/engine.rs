@@ -117,9 +117,11 @@ impl EngineModel {
         cx: &mut Context<Self>,
     ) -> Self {
         let subscriptions = vec![
-            // The status and the review list are refreshed when the store opens,
-            // so a review that already waits in the database raises its
-            // notification and fills the view at start (R5.3, R5.4).
+            // The status, the review list and the parked list are refreshed
+            // when the store opens, so a review that already waits in the
+            // database raises its notification and fills the view at start
+            // (R5.3, R5.4), and the parked list seeds its notification latch
+            // before the engine's first scan can park a new failure (R10.1).
             cx.observe(&store_model, |this, store, cx| {
                 let generation = store.read(cx).generation();
                 this.store_changed(generation, cx);
@@ -128,6 +130,7 @@ impl EngineModel {
                 // store notification (R5.4).
                 this.refresh_status(cx);
                 this.refresh_review(cx);
+                this.refresh_failed(cx);
             }),
             cx.observe(&connection, |this, _, cx| this.try_start_engine(cx)),
         ];
