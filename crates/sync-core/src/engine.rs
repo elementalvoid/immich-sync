@@ -1634,20 +1634,13 @@ fn is_settled(state: ItemState) -> bool {
     )
 }
 
-/// Hands one accepted file to the upload pool, holding a semaphore permit for
-/// the whole request (R7.2).
+/// Hands one accepted file to the upload pool (R7.2).
+///
+/// The pool's permit is taken inside [`upload_with_retries`], around one
+/// attempt, so a worker sleeping its backoff holds no slot: lowering the
+/// concurrency limit drains the pool instead of waiting out the sleep.
 async fn spawn_upload(inner: &Arc<EngineInner>, item: PreparedItem) {
-    let permit = match Arc::clone(&inner.upload_slots).acquire_owned().await {
-        Ok(permit) => permit,
-        // No worker can take the item, so the claim goes back: `prepare` skips
-        // a claimed path, and nothing else would ever queue it again (R6.7).
-        Err(_) => {
-            inner.release_item(&item);
-            return;
-        }
-    };
     if inner.gate.is_paused() {
-        drop(permit);
         inner.finish_item(&item, &UploadOutcome::Deferred);
         return;
     }
@@ -1655,7 +1648,6 @@ async fn spawn_upload(inner: &Arc<EngineInner>, item: PreparedItem) {
     let mut uploads = inner.uploads.lock().expect("the upload list");
     if inner.stopped.load(Ordering::SeqCst) {
         // `stop` ran first: the item stays pending for the next engine (R6.7).
-        drop(permit);
         inner.release_item(&item);
         return;
     }
@@ -1683,7 +1675,6 @@ async fn spawn_upload(inner: &Arc<EngineInner>, item: PreparedItem) {
             }
             UploadOutcome::Deferred => {}
         }
-        drop(permit);
     });
 }
 
@@ -1714,6 +1705,17 @@ async fn upload_with_retries(inner: &Arc<EngineInner>, item: &PreparedItem) -> U
             // without a request (R6.5, R6.7).
             return inner.park_dead_letter(item, None);
         }
+        // R7.2: one permit per attempt, released before the backoff sleep so
+        // a lowered limit can drain the pool without waiting it out. A closed
+        // pool has no worker to take the item, so it stays queued for the
+        // next engine (R6.7).
+        let permit = match Arc::clone(&inner.upload_slots).acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                inner.release_item(item);
+                return UploadOutcome::Deferred;
+            }
+        };
         let started_ns = now_ns();
         attempts += 1;
         let mut outcome = inner
@@ -1736,6 +1738,8 @@ async fn upload_with_retries(inner: &Arc<EngineInner>, item: &PreparedItem) -> U
             inner.park_row(item, &failure, Some(asset_id));
             outcome = UploadOutcome::Failed(failure);
         }
+        // The attempt is over; a later one takes its own permit.
+        drop(permit);
         let (attempt_outcome, failure) = match &outcome {
             UploadOutcome::Created { .. } | UploadOutcome::Duplicate { .. } => {
                 // R6.6: a request the server answered ends the run of
@@ -2190,11 +2194,21 @@ mod tests {
             panic!("an item a stopped engine could not spawn is stuck claimed forever");
         };
 
-        // The pool is closed, so no permit is left to take.
+        // The pool is closed, so no permit is left to take. The worker takes
+        // its permit asynchronously now, so give it the chance to fail and
+        // release the claim before asking whether the file is claimable.
         inner.upload_slots.close();
         spawn_upload(&inner, reclaimed).await;
+        let mut reclaimed = false;
+        for _ in 0..100 {
+            if prepare(&inner, &file, &index).await.is_some() {
+                reclaimed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert!(
-            prepare(&inner, &file, &index).await.is_some(),
+            reclaimed,
             "an item a closed pool could not spawn is stuck claimed forever"
         );
     }

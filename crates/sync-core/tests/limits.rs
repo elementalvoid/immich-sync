@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use mock_immich::MockImmich;
+use mock_immich::{Fault, MockImmich, Operation};
 use sync_core::connection::{AuthMethod, Connection, Secret, SharedSession, SignIn};
 use sync_core::credential::MemoryCredentialStore;
 use sync_core::engine::{Engine, EngineConfig, Limits};
@@ -329,6 +329,54 @@ async fn lowering_concurrency_does_not_abandon_an_in_flight_upload() {
         1,
         "the new limit is the live one"
     );
+}
+
+#[tokio::test]
+async fn lowering_concurrency_completes_while_a_retry_sleeps() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    write_file(&photos, "retrying.bin", 64 * 1024);
+    add_folder(&store, &photos);
+    // A long server-requested wait: a worker that held its permit across the
+    // sleep would make the resize below wait the whole 30 s.
+    server.fail(
+        Operation::Upload,
+        Fault::Status {
+            code: 503,
+            retry_after: Some(30),
+        },
+    );
+    let engine = start_engine(
+        &server,
+        &store,
+        EngineConfig {
+            concurrency: 2,
+            ..EngineConfig::default()
+        },
+    )
+    .await;
+    assert!(
+        wait_until(|| server.upload_requests() == 1, Duration::from_secs(10)).await,
+        "the first attempt never reached the server"
+    );
+    // Let the worker reach its backoff sleep.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let changed = tokio::time::timeout(
+        Duration::from_secs(3),
+        engine.set_limits(Limits {
+            bandwidth_bytes_per_second: 0,
+            concurrency: 1,
+        }),
+    )
+    .await;
+    assert!(
+        changed.is_ok(),
+        "R7.2: lowering the limit waited on a permit held through the backoff sleep"
+    );
+    engine.stop();
 }
 
 #[tokio::test]
