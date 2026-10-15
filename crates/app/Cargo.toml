@@ -78,6 +78,17 @@ depends = [
     "libwayland-egl1",
     "libegl1",
 ]
+# `licenseFile` only reaches NSIS/WiX/DMG, so the deb ships both licence texts
+# itself. Sources are relative to the working directory, which the release
+# workflow sets to this crate. See `Config::resources` in cargo-packager.
+[package.metadata.packager.deb.files]
+"../../LICENSE-MIT" = "usr/share/doc/immich-sync/LICENSE-MIT"
+"../../LICENSE-APACHE" = "usr/share/doc/immich-sync/LICENSE-APACHE"
+
+# The AppImage has no licence page either; ship the same texts in the AppDir.
+[package.metadata.packager.appimage.files]
+"../../LICENSE-MIT" = "usr/share/doc/immich-sync/LICENSE-MIT"
+"../../LICENSE-APACHE" = "usr/share/doc/immich-sync/LICENSE-APACHE"
 
 [target."cfg(target_os = \"linux\")".dependencies]
 # The Secret Service store, pinned: the keyring ecosystem restructured in 2026
