@@ -41,6 +41,13 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 identifier = "com.elementalvoid.immich-sync"
 productName = "Immich Sync"
 description = "Uploads photos and videos from local folders to one Immich server."
+# The deb Description body. Windows formats can read the whole README; this is
+# what `apt show` and `dpkg -s` print, so it stays short.
+longDescription = """\
+Uploads photos and videos from local folders to one Immich server.
+Keeps the server in step as files change, with deletion review, bandwidth
+limits, and a tray that shows progress and the last error.
+"""
 category = "Photography"
 publisher = "elementalvoid"
 authors = ["Matt Klich <elementalvoid@users.noreply.github.com>"]
