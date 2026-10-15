@@ -36,6 +36,11 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: linux
+          # Key on the files that decide the build. The automatic environment
+          # hash varies across runner images (Windows attempt to attempt), which
+          # made the cache miss; our lockfile/toolchain hash is stable.
+          key: ${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'Cargo.toml', 'crates/*/Cargo.toml') }}
+          add-rust-environment-hash-key: "false"
           cache-on-failure: "true"
       - name: Install system dependencies
         run: |
@@ -61,6 +66,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: windows
+          key: ${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'Cargo.toml', 'crates/*/Cargo.toml') }}
+          add-rust-environment-hash-key: "false"
           cache-on-failure: "true"
       # fmt is platform-independent and already checked on Linux; running it
       # here only paid for a toolchain component and a fresh checkout.
@@ -80,8 +87,13 @@ jobs:
         with:
           # Shared with the Linux job: rust-cache persists dependencies only, so
           # this job restores the same dependency artifacts instead of
-          # compiling them a third time.
+          # compiling them a third time. It never saves: the Linux job owns the
+          # key and its cache covers the test targets too, while a bin-only save
+          # here finished first and starved the Linux job of dev-dependencies.
           shared-key: linux
+          key: ${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'Cargo.toml', 'crates/*/Cargo.toml') }}
+          add-rust-environment-hash-key: "false"
+          save-if: "false"
           cache-on-failure: "true"
       - name: Install system dependencies
         run: |
