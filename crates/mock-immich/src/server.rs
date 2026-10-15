@@ -1502,16 +1502,17 @@ async fn restore_assets(
     }
     let ids = id_list(body.get("ids"));
     let mut inner = state.inner.lock().expect("mock state poisoned");
-    let mut count = 0;
     for id in &ids {
         if let Some(asset) = inner.assets.get_mut(id)
             && asset.trashed
         {
             asset.trashed = false;
-            count += 1;
         }
     }
-    Json(json!({ "count": count })).into_response()
+    // Immich's TrashService.restoreAssets answers with the number of ids the
+    // request named, not the number whose deletedAt it cleared, so a double
+    // must not answer a smaller count for an id that was not trashed.
+    Json(json!({ "count": ids.len() })).into_response()
 }
 
 async fn delete_assets(

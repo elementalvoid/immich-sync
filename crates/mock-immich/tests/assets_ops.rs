@@ -254,6 +254,27 @@ async fn restore_brings_a_trashed_asset_back() {
 }
 
 #[tokio::test]
+async fn restore_counts_the_ids_the_request_named() {
+    // Immich's TrashService.restoreAssets answers with the number of ids the
+    // request named, not the number it moved out of the trash, so the double
+    // must count an id that was already live too.
+    let server = MockImmich::start().await;
+    let client = reqwest::Client::new();
+    let id = upload(&client, &server, 1).await;
+
+    let response = client
+        .post(format!("{}/trash/restore/assets", server.base_url()))
+        .json(&serde_json::json!({ "ids": [id] }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["count"], 1, "the id was named, so it is counted");
+}
+
+#[tokio::test]
 async fn force_delete_removes_an_asset() {
     let server = MockImmich::start().await;
     let client = reqwest::Client::new();
