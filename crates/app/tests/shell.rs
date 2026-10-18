@@ -147,6 +147,10 @@ fn the_main_window_opens_compact_resizable_and_with_a_floor(cx: &mut TestAppCont
     );
     let minimum = options.window_min_size.expect("a sensible minimum size");
     assert!(
+        minimum.width < bounds.size.width && minimum.height < bounds.size.height,
+        "the minimum leaves the default resizable: {minimum:?}"
+    );
+    assert!(
         minimum.width >= px(320.) && minimum.height >= px(320.),
         "the minimum is a real window, not a sliver: {minimum:?}"
     );
