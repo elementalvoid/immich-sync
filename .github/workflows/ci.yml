@@ -79,11 +79,32 @@ jobs:
       # here only paid for a toolchain component and a fresh checkout.
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo test --locked --workspace
+
+  windows-gui-subsystem:
+    name: Windows GUI subsystem (release PE)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust 1.99.0
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal --component rustfmt --component clippy
+          rustup default 1.99.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Its own key: this job builds only the release profile, and sharing
+          # the Windows job's key would let whichever job saved first starve
+          # the other. Separate keys also keep the release profile out of the
+          # debug cache the critical-path job restores.
+          shared-key: windows-release
+          prefix-key: v0-rust-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'Cargo.toml', 'crates/*/Cargo.toml') }}
+          add-rust-environment-hash-key: "false"
+          cache-on-failure: "true"
       # #28: the app is a tray process, so the release binary must be a GUI
       # subsystem image. Explorer then starts it with no console, and closing
       # the terminal that launched it does not end it. The crate attribute that
       # does this is gated on debug_assertions, so the check needs the release
-      # profile rather than the debug binary the steps above built.
+      # profile rather than the debug binary the Windows job builds. Its own
+      # job keeps that second profile off the Windows critical path.
       - run: cargo build --locked --release --bin immich-sync
       - name: Assert the release binary uses the GUI subsystem
         shell: pwsh
