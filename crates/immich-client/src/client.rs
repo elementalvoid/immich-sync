@@ -228,6 +228,14 @@ impl ImmichClient {
             let path = format!("{}/", base.path());
             base.set_path(&path);
         }
+        // Immich serves the API under its global `api` prefix
+        // (`setGlobalPrefix('api')` in `server/src/app.common.ts`). A URL that
+        // already ends in the prefix keeps it once, so a reverse-proxy path in
+        // front of it is preserved and the prefix never doubles.
+        if !base.path().ends_with("/api/") {
+            let path = format!("{}api/", base.path());
+            base.set_path(&path);
+        }
         let http = Client::builder().build().map_err(ClientError::HttpClient)?;
         Ok(Self { http, base })
     }

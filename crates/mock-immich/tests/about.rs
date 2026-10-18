@@ -8,7 +8,7 @@ async fn about_reports_a_server_version() {
     // The real `GET /server/about` is permission-checked (`server.about`), so
     // the double requires a credential the same way.
     let about: serde_json::Value = reqwest::Client::new()
-        .get(format!("{}/server/about", server.base_url()))
+        .get(format!("{}/api/server/about", server.base_url()))
         .header("x-api-key", "api-key-abc123")
         .send()
         .await
@@ -29,7 +29,7 @@ async fn about_reports_a_server_version() {
 async fn about_refuses_a_request_with_no_credential() {
     let server = MockImmich::start().await;
 
-    let response = reqwest::get(format!("{}/server/about", server.base_url()))
+    let response = reqwest::get(format!("{}/api/server/about", server.base_url()))
         .await
         .unwrap();
 
@@ -44,7 +44,7 @@ async fn about_refuses_a_key_that_lacks_the_server_about_permission() {
     server.set_api_key_permissions(&["asset.upload"]);
 
     let response = reqwest::Client::new()
-        .get(format!("{}/server/about", server.base_url()))
+        .get(format!("{}/api/server/about", server.base_url()))
         .header("x-api-key", "api-key-abc123")
         .send()
         .await

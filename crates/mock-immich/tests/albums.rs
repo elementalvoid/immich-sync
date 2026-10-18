@@ -17,7 +17,7 @@ async fn upload_asset(client: &reqwest::Client, server: &MockImmich, n: u64) -> 
         .text("fileCreatedAt", "2026-01-01T00:00:00.000Z")
         .text("fileModifiedAt", "2026-01-01T00:00:00.000Z");
     let response: serde_json::Value = client
-        .post(format!("{}/assets", server.base_url()))
+        .post(format!("{}/api/assets", server.base_url()))
         .header("x-immich-checksum", checksum(n))
         .multipart(form)
         .send()
@@ -36,7 +36,7 @@ async fn create_album_links_its_initial_assets() {
     let asset = upload_asset(&client, &server, 1).await;
 
     let response = client
-        .post(format!("{}/albums", server.base_url()))
+        .post(format!("{}/api/albums", server.base_url()))
         .json(&serde_json::json!({
             "albumName": "Vacation",
             "assetIds": [asset],
@@ -62,7 +62,10 @@ async fn add_asset(
     asset: &str,
 ) -> serde_json::Value {
     let response = client
-        .put(format!("{}/albums/{album_id}/assets", server.base_url()))
+        .put(format!(
+            "{}/api/albums/{album_id}/assets",
+            server.base_url()
+        ))
         .json(&serde_json::json!({ "ids": [asset] }))
         .send()
         .await
@@ -80,7 +83,7 @@ async fn add_assets_to_album_links_an_asset() {
     let asset = upload_asset(&client, &server, 1).await;
 
     let album: serde_json::Value = client
-        .post(format!("{}/albums", server.base_url()))
+        .post(format!("{}/api/albums", server.base_url()))
         .json(&serde_json::json!({ "albumName": "Later" }))
         .send()
         .await
@@ -102,7 +105,7 @@ async fn adding_an_asset_twice_leaves_one_membership() {
     let client = reqwest::Client::new();
     let asset = upload_asset(&client, &server, 1).await;
     let album: serde_json::Value = client
-        .post(format!("{}/albums", server.base_url()))
+        .post(format!("{}/api/albums", server.base_url()))
         .json(&serde_json::json!({ "albumName": "Later" }))
         .send()
         .await
@@ -145,7 +148,7 @@ async fn the_album_counters_and_names_report_what_arrived() {
     let mut ids = Vec::new();
     for name in ["Holiday", "Holiday"] {
         let album: serde_json::Value = client
-            .post(format!("{}/albums", server.base_url()))
+            .post(format!("{}/api/albums", server.base_url()))
             .json(&serde_json::json!({ "albumName": name }))
             .send()
             .await
@@ -157,7 +160,11 @@ async fn the_album_counters_and_names_report_what_arrived() {
     }
     for _ in 0..2 {
         client
-            .put(format!("{}/albums/{}/assets", server.base_url(), ids[0]))
+            .put(format!(
+                "{}/api/albums/{}/assets",
+                server.base_url(),
+                ids[0]
+            ))
             .json(&serde_json::json!({ "ids": [asset] }))
             .send()
             .await
@@ -182,7 +189,7 @@ async fn add_assets_to_an_unknown_album_is_not_found() {
 
     let response = client
         .put(format!(
-            "{}/albums/99999999-9999-4999-8999-999999999999/assets",
+            "{}/api/albums/99999999-9999-4999-8999-999999999999/assets",
             server.base_url()
         ))
         .json(&serde_json::json!({ "ids": [asset] }))

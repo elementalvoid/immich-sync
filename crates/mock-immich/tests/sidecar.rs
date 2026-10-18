@@ -28,7 +28,7 @@ async fn upload(
         form = form.text("livePhotoVideoId", id.to_string());
     }
     client
-        .post(format!("{}/assets", server.base_url()))
+        .post(format!("{}/api/assets", server.base_url()))
         .header("x-immich-checksum", checksum(body))
         .multipart(form)
         .send()

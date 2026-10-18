@@ -8,7 +8,7 @@ async fn api_key_me_reports_the_key_and_its_permissions() {
     server.set_api_key_permissions(&["asset.upload", "server.about"]);
 
     let body: serde_json::Value = reqwest::Client::new()
-        .get(format!("{}/api-keys/me", server.base_url()))
+        .get(format!("{}/api/api-keys/me", server.base_url()))
         .header("x-api-key", "api-key-abc123")
         .send()
         .await
@@ -28,7 +28,7 @@ async fn api_key_me_refuses_a_session_token() {
     let server = MockImmich::start().await;
 
     let response = reqwest::Client::new()
-        .get(format!("{}/api-keys/me", server.base_url()))
+        .get(format!("{}/api/api-keys/me", server.base_url()))
         .bearer_auth("a-session-token")
         .send()
         .await
@@ -46,7 +46,7 @@ async fn api_key_me_requires_a_credential() {
     let server = MockImmich::start().await;
 
     let response = reqwest::Client::new()
-        .get(format!("{}/api-keys/me", server.base_url()))
+        .get(format!("{}/api/api-keys/me", server.base_url()))
         .send()
         .await
         .unwrap();

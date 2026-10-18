@@ -20,7 +20,7 @@ async fn upload(
     server: &MockImmich,
     checksum: Option<&str>,
 ) -> reqwest::Response {
-    let request = client.post(format!("{}/assets", server.base_url()));
+    let request = client.post(format!("{}/api/assets", server.base_url()));
     let request = match checksum {
         Some(checksum) => request.header("x-immich-checksum", checksum),
         None => request,
@@ -30,7 +30,10 @@ async fn upload(
 
 async fn bulk(client: &reqwest::Client, server: &MockImmich, checksum: &str) -> serde_json::Value {
     let body: serde_json::Value = client
-        .post(format!("{}/assets/bulk-upload-check", server.base_url()))
+        .post(format!(
+            "{}/api/assets/bulk-upload-check",
+            server.base_url()
+        ))
         .json(&serde_json::json!({
             "assets": [{ "id": "hello.txt", "checksum": checksum }]
         }))
@@ -130,7 +133,7 @@ async fn a_duplicate_header_short_circuits_without_reading_the_body() {
     upload(&client, &server, Some(HELLO_WORLD_SHA1)).await;
 
     let response = client
-        .post(format!("{}/assets", server.base_url()))
+        .post(format!("{}/api/assets", server.base_url()))
         .header("x-immich-checksum", HELLO_WORLD_SHA1)
         .header("content-type", "multipart/form-data; boundary=garbage")
         .body("this is not a parsable multipart body")

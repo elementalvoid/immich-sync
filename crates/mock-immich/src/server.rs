@@ -111,6 +111,9 @@ struct Inner {
     about_auth: Option<String>,
     /// How many `GET /api-keys/me` requests arrived.
     api_key_me_requests: u64,
+    /// Every request that arrived, matched or not, as `METHOD PATH`. A test
+    /// reads the wire shape here, not only the response the double gave.
+    requests: Vec<String>,
     /// The session tokens this server issued and has not revoked.
     tokens: HashSet<String>,
     /// When set, only an issued, unrevoked token validates.
@@ -592,6 +595,20 @@ impl MockImmich {
             .api_key_me_requests
     }
 
+    /// Every request the double received, in arrival order, as `METHOD PATH`.
+    ///
+    /// Requests no route matched are in the list too, so a test can prove what
+    /// the client put on the wire even when the double answered 404.
+    #[must_use]
+    pub fn requests(&self) -> Vec<String> {
+        self.state
+            .inner
+            .lock()
+            .expect("mock state poisoned")
+            .requests
+            .clone()
+    }
+
     /// The `POST /assets` requests whose body the server read, in arrival
     /// order.
     ///
@@ -760,7 +777,10 @@ impl MockImmich {
         let state = Arc::new(State {
             inner: Mutex::new(Inner::default()),
         });
-        let router = Router::new()
+        // Immich v3 serves the API under the global `api` prefix
+        // (`setGlobalPrefix('api')` in `server/src/app.common.ts`), so the
+        // double mounts the same wire routes and nothing at the root (#27).
+        let api = Router::new()
             .route("/server/about", get(about))
             .route("/api-keys/me", get(api_key_me))
             .route("/auth/login", post(login))
@@ -775,6 +795,12 @@ impl MockImmich {
             .route("/albums", post(create_album))
             .route("/albums/{id}/assets", put(add_assets_to_album))
             .with_state(Arc::clone(&state));
+        let router = Router::new()
+            .nest("/api", api)
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                record_request,
+            ));
 
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -789,6 +815,22 @@ impl MockImmich {
             state,
         }
     }
+}
+
+/// Records every arriving request as `METHOD PATH`, before any route matches,
+/// so a test can assert the exact request the client sent.
+async fn record_request(
+    AxumState(state): AxumState<Arc<State>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    state
+        .inner
+        .lock()
+        .expect("mock state poisoned")
+        .requests
+        .push(format!("{} {}", request.method(), request.uri().path()));
+    next.run(request).await
 }
 
 fn message(code: StatusCode, text: &str) -> Response {
