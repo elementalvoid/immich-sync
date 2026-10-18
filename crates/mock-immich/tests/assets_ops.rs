@@ -17,7 +17,7 @@ async fn upload(client: &reqwest::Client, server: &MockImmich, n: u64) -> String
         .text("fileCreatedAt", "2026-01-01T00:00:00.000Z")
         .text("fileModifiedAt", "2026-01-01T00:00:00.000Z");
     let body: serde_json::Value = client
-        .post(format!("{}/assets", server.base_url()))
+        .post(format!("{}/api/assets", server.base_url()))
         .header("x-immich-checksum", checksum_for(n))
         .multipart(form)
         .send()
@@ -35,7 +35,10 @@ async fn bulk_action(
     checksum: &str,
 ) -> serde_json::Value {
     let body: serde_json::Value = client
-        .post(format!("{}/assets/bulk-upload-check", server.base_url()))
+        .post(format!(
+            "{}/api/assets/bulk-upload-check",
+            server.base_url()
+        ))
         .json(&serde_json::json!({
             "assets": [{ "id": "a.txt", "checksum": checksum }]
         }))
@@ -56,7 +59,7 @@ async fn copy_accepts_two_known_assets() {
     let target = upload(&client, &server, 2).await;
 
     let response = client
-        .put(format!("{}/assets/copy", server.base_url()))
+        .put(format!("{}/api/assets/copy", server.base_url()))
         .json(&serde_json::json!({
             "sourceId": source,
             "targetId": target,
@@ -80,7 +83,7 @@ async fn copy_rejects_an_unknown_asset() {
     let source = upload(&client, &server, 1).await;
 
     let response = client
-        .put(format!("{}/assets/copy", server.base_url()))
+        .put(format!("{}/api/assets/copy", server.base_url()))
         .json(&serde_json::json!({
             "sourceId": source,
             "targetId": "99999999-9999-4999-8999-999999999999",
@@ -100,7 +103,7 @@ async fn create_stack_returns_the_primary_asset() {
     let second = upload(&client, &server, 2).await;
 
     let response = client
-        .post(format!("{}/stacks", server.base_url()))
+        .post(format!("{}/api/stacks", server.base_url()))
         .json(&serde_json::json!({ "assetIds": [first, second] }))
         .send()
         .await
@@ -121,7 +124,7 @@ async fn create_stack_returns_conformant_asset_objects() {
     let second = upload(&client, &server, 2).await;
 
     let body: serde_json::Value = client
-        .post(format!("{}/stacks", server.base_url()))
+        .post(format!("{}/api/stacks", server.base_url()))
         .json(&serde_json::json!({ "assetIds": [first, second] }))
         .send()
         .await
@@ -168,7 +171,7 @@ async fn tag_assets_reports_the_tagged_count() {
     let second = upload(&client, &server, 2).await;
 
     let response = client
-        .put(format!("{}/tags/assets", server.base_url()))
+        .put(format!("{}/api/tags/assets", server.base_url()))
         .json(&serde_json::json!({
             "assetIds": [first, second],
             "tagIds": ["11111111-1111-4111-8111-111111111111"],
@@ -189,7 +192,7 @@ async fn delete_records_the_exact_request_the_client_sent() {
     let id = upload(&client, &server, 1).await;
 
     client
-        .delete(format!("{}/assets", server.base_url()))
+        .delete(format!("{}/api/assets", server.base_url()))
         .json(&serde_json::json!({ "ids": [id.clone()], "force": false }))
         .send()
         .await
@@ -212,7 +215,7 @@ async fn delete_moves_an_asset_to_the_trash() {
     let id = upload(&client, &server, 1).await;
 
     let response = client
-        .delete(format!("{}/assets", server.base_url()))
+        .delete(format!("{}/api/assets", server.base_url()))
         .json(&serde_json::json!({ "ids": [id], "force": false }))
         .send()
         .await
@@ -231,7 +234,7 @@ async fn restore_brings_a_trashed_asset_back() {
     let client = reqwest::Client::new();
     let id = upload(&client, &server, 1).await;
     client
-        .delete(format!("{}/assets", server.base_url()))
+        .delete(format!("{}/api/assets", server.base_url()))
         .json(&serde_json::json!({ "ids": [id.clone()], "force": false }))
         .send()
         .await
@@ -239,7 +242,7 @@ async fn restore_brings_a_trashed_asset_back() {
     assert!(server.trashed(&id));
 
     let response = client
-        .post(format!("{}/trash/restore/assets", server.base_url()))
+        .post(format!("{}/api/trash/restore/assets", server.base_url()))
         .json(&serde_json::json!({ "ids": [id.clone()] }))
         .send()
         .await
@@ -263,7 +266,7 @@ async fn restore_counts_the_ids_the_request_named() {
     let id = upload(&client, &server, 1).await;
 
     let response = client
-        .post(format!("{}/trash/restore/assets", server.base_url()))
+        .post(format!("{}/api/trash/restore/assets", server.base_url()))
         .json(&serde_json::json!({ "ids": [id] }))
         .send()
         .await
@@ -281,7 +284,7 @@ async fn force_delete_removes_an_asset() {
     let id = upload(&client, &server, 1).await;
 
     client
-        .delete(format!("{}/assets", server.base_url()))
+        .delete(format!("{}/api/assets", server.base_url()))
         .json(&serde_json::json!({ "ids": [id], "force": true }))
         .send()
         .await

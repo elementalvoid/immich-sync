@@ -28,6 +28,105 @@ async fn login_returns_the_session_token_and_the_user() {
 }
 
 #[tokio::test]
+async fn login_posts_the_api_prefix_path() {
+    let server = MockImmich::start().await;
+    let client = client(&server);
+
+    client
+        .login("sync@example.com", "correct horse")
+        .await
+        .expect("the mock accepts these credentials");
+
+    assert_eq!(
+        server.requests(),
+        vec!["POST /api/auth/login"],
+        "Immich v3 serves login under its global api prefix"
+    );
+}
+
+#[tokio::test]
+async fn a_configured_reverse_proxy_path_stays_before_the_api_prefix() {
+    let server = MockImmich::start().await;
+    // A server mounted behind a path prefix, as a reverse proxy offers it.
+    let client = ImmichClient::new(&format!("{}/immich", server.base_url())).expect("a valid URL");
+
+    // The double serves only `/api`, so this call cannot succeed; the request
+    // it put on the wire is what the test reads.
+    let _ = client.login("sync@example.com", "correct horse").await;
+
+    assert_eq!(server.requests(), vec!["POST /immich/api/auth/login"]);
+}
+
+#[tokio::test]
+async fn a_configured_url_that_ends_in_api_does_not_double_it() {
+    let server = MockImmich::start().await;
+    let client = ImmichClient::new(&format!("{}/api", server.base_url())).expect("a valid URL");
+
+    let login = client
+        .login("sync@example.com", "correct horse")
+        .await
+        .expect("the mock accepts these credentials against the one api prefix");
+
+    assert_eq!(server.requests(), vec!["POST /api/auth/login"]);
+    assert!(!login.access_token.expose().is_empty());
+}
+
+#[tokio::test]
+async fn every_endpoint_the_client_builds_carries_the_api_prefix() {
+    let server = MockImmich::start().await;
+    let client = client(&server);
+    let token = client
+        .login("sync@example.com", "correct horse")
+        .await
+        .expect("the mock accepts these credentials")
+        .access_token;
+    let auth = Auth::Token(&token);
+
+    // The outcomes do not matter here: the double records the method and the
+    // exact path of every request, matched or not. A call site that skipped
+    // the shared endpoint construction fails the assertion below.
+    let _ = client.validate_token(&token).await;
+    let _ = client.about(auth).await;
+    let _ = client.api_key_permissions(auth).await;
+    let _ = client
+        .bulk_upload_check(
+            auth,
+            &[BulkCheckItem {
+                id: "hello.txt".to_string(),
+                checksum: HELLO_WORLD_SHA1_BASE64.to_string(),
+            }],
+        )
+        .await;
+    let _ = client.asset_info(auth, "missing").await;
+    let _ = client.add_assets_to_album(auth, "missing", &[]).await;
+    let _ = client.trash_assets(auth, &[]).await;
+    let _ = client.create_stack(auth, &[]).await;
+    let _ = client.create_album(auth, "Holiday", &[]).await;
+    let _ = client.copy_asset(auth, "a", "b", false).await;
+    let _ = client.bulk_tag_assets(auth, &[], &[]).await;
+    let _ = client.restore_assets(auth, &[]).await;
+
+    assert_eq!(
+        server.requests(),
+        vec![
+            "POST /api/auth/login",
+            "POST /api/auth/validateToken",
+            "GET /api/server/about",
+            "GET /api/api-keys/me",
+            "POST /api/assets/bulk-upload-check",
+            "GET /api/assets/missing",
+            "PUT /api/albums/missing/assets",
+            "DELETE /api/assets",
+            "POST /api/stacks",
+            "POST /api/albums",
+            "PUT /api/assets/copy",
+            "PUT /api/tags/assets",
+            "POST /api/trash/restore/assets",
+        ]
+    );
+}
+
+#[tokio::test]
 async fn a_wrong_password_is_its_own_error() {
     let server = MockImmich::start().await;
     let client = client(&server);

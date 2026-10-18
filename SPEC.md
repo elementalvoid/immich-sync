@@ -37,7 +37,7 @@ Acceptance criteria are testable. "Default" values are configurable.
 
 - R1.1 The config window accepts a server URL, an email address, and a password.
 - R1.2 The client stores the password in the OS credential store. It never writes the password to the config file or the logs.
-- R1.3 The client logs in at startup with `POST /auth/login`. The session token stays in memory.
+- R1.3 The client logs in at startup with `POST /api/auth/login` (Immich's global API prefix). The session token stays in memory.
 - R1.4 After a 401, the client re-logs in once with the stored password. Once a run of consecutive failed requests reaches the attention threshold (default 3, reset by a success), the connection enters a needs-attention state and the tray shows it. One refused batch adds at most two failures to the run (the 401 and the retry after the re-login), so a single transient batch stays below the alarm. The run is separate from the circuit breaker's run (R6.6).
 - R1.5 The config window also accepts an API key. The key is validated at startup and stored in the OS credential store, like the password.
 - R1.6 The client shows a clear message when the server disables password login.
@@ -56,7 +56,7 @@ Acceptance: a file added while the client is stopped is found at startup. A file
 
 ### R3 — Upload pipeline
 
-- R3.1 New files are hashed with SHA-1, checked with `POST /assets/bulk-upload-check` in batches, and uploaded with `POST /assets` and the `x-immich-checksum` header.
+- R3.1 New files are hashed with SHA-1, checked with `POST /api/assets/bulk-upload-check` in batches, and uploaded with `POST /api/assets` and the `x-immich-checksum` header.
 - R3.2 `created` and `duplicate` both count as success.
 - R3.3 A sidecar file uploads as `sidecarData`. A live photo video uploads first, and the photo links it with `livePhotoVideoId`.
 - R3.4 Album mapping is opt-in per folder. The album scope is per folder: leaf folders or the whole source folder.
@@ -68,8 +68,8 @@ Acceptance: a 100-file folder syncs. Duplicate content is not uploaded twice. A 
 ### R4 — Changed files
 
 - R4.1 A tracked file that changes in place keeps its sync item identity.
-- R4.2 The client uploads the new bytes as a new asset. It calls `PUT /assets/copy` with the old asset as source and the new asset as target, with albums, shared links, favorite, sidecar, and stack enabled. It applies the old asset's tags to the new asset with the tag endpoints.
-- R4.3 If the old asset is in no stack, the client calls `POST /stacks` with the new asset first and the old asset second.
+- R4.2 The client uploads the new bytes as a new asset. It calls `PUT /api/assets/copy` with the old asset as source and the new asset as target, with albums, shared links, favorite, sidecar, and stack enabled. It applies the old asset's tags to the new asset with the tag endpoints.
+- R4.3 If the old asset is in no stack, the client calls `POST /api/stacks` with the new asset first and the old asset second.
 - R4.4 The old version stays. The state database records the version chain and the stack id.
 - R4.5 An unchanged SHA-1 means no upload.
 

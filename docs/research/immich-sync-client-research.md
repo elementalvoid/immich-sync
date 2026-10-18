@@ -19,7 +19,7 @@ Immich exposes four authentication mechanisms. The API's `securitySchemes` are d
 
 **Username/password login is viable and marked Stable.**
 
-- `POST /auth/login` — "Login with username and password and receive a session token." Request `LoginCredentialDto`, response `LoginResponseDto` (`201`). See [`POST /auth/login`](https://api.immich.app/endpoints/authentication/login) and the spec's `/auth/login` node.
+- `POST /api/auth/login` — "Login with username and password and receive a session token." Request `LoginCredentialDto`, response `LoginResponseDto` (`201`). The spec node is server-relative (`/auth/login`); the server sets the global `api` prefix in [`server/src/app.common.ts`](https://github.com/immich-app/immich/blob/v3.3.3/server/src/app.common.ts), so the wire path is `/api/auth/login`. See [`POST /auth/login`](https://api.immich.app/endpoints/authentication/login) and the spec's `/auth/login` node.
 - The "username" is an **email address**: `LoginCredentialDto` requires `email` (with an `email` format pattern) and `password`. There is no separate username field.
 - Response contains `accessToken`, `userId`, `userEmail`, `name`, `isAdmin`, `isOnboarded`, `profileImagePath`, `shouldChangePassword` — all required.
 - The spec records stability per endpoint via `x-immich-history`, e.g. `/auth/login` is `Added v1 → Beta v1 → Stable v2` with `x-immich-state: Stable`. This gives a machine-readable stability signal per operation, which is unusually good for a self-hosted project.
@@ -406,7 +406,7 @@ Facts that follow, all from primary sources:
 ### 6.2 Minimum viable v1
 
 Must have (maps 1:1 to the requirements):
-1. **Config window**: server URL, email+password login (`POST /auth/login`), optional API-key path (`x-api-key`) for servers where `passwordLogin.enabled` is off; credential stored via OS keyring; `POST /auth/validateToken` on startup.
+1. **Config window**: server URL, email+password login (`POST /api/auth/login`), optional API-key path (`x-api-key`) for servers where `passwordLogin.enabled` is off; credential stored via OS keyring; `POST /api/auth/validateToken` on startup.
 2. **Folder selection**: add/remove local folders, recursive toggle, include/exclude globs, optional album-per-folder mapping (`--album` semantics).
 3. **Resident sync engine**: fsnotify (ReadDirectoryChangesW on Windows) + periodic reconciliation scan; SQLite state table; SHA-1 index; `bulk-upload-check` → `POST /assets` with `x-immich-checksum`; sidecar (`sidecarData`) and live-photo (`livePhotoVideoId`) support.
 4. **User limits**: bandwidth cap (token bucket over the request body, live-adjustable) and upload concurrency (semaphore), both persisted.
