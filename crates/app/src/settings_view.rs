@@ -1149,6 +1149,7 @@ impl Render for SettingsView {
 
         div()
             .id("settings-scroll")
+            .test_support()
             .flex()
             .flex_col()
             .size_full()

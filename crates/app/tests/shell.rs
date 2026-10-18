@@ -5,7 +5,7 @@
 //! The state-to-tooltip mapping is pure, so it is tested here.
 
 use gpui_kit::test::TestWindowExt as _;
-use gpui_kit::{Action, AppContext as _, MenuItem, TestAppContext};
+use gpui_kit::{Action, AppContext as _, MenuItem, TestAppContext, WindowBounds, px, size};
 use immich_sync::shell::{self, Hide, Pause, Resume, Show, SyncNow};
 use sync_core::connection::{Attention, ConnectionState};
 
@@ -112,6 +112,38 @@ fn showing_twice_keeps_a_single_window(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     assert_eq!(windows(cx), 1);
+}
+
+#[test]
+fn the_main_window_opens_compact_resizable_and_with_a_floor() {
+    let options = shell::main_window_options();
+    let bounds = match options.window_bounds {
+        Some(WindowBounds::Windowed(bounds)) => bounds,
+        other => panic!("the main window opens windowed, not {other:?}"),
+    };
+
+    assert_eq!(
+        bounds.size,
+        size(px(900.), px(650.)),
+        "issue #26: compact default"
+    );
+    assert!(
+        options.is_resizable,
+        "issue #26: the user resizes the window from its edges and corners"
+    );
+    assert!(
+        bounds.size.width > px(400.) && bounds.size.height > px(300.),
+        "the default keeps the first-use UI usable: {bounds:?}"
+    );
+    let minimum = options.window_min_size.expect("a sensible minimum size");
+    assert!(
+        minimum.width < bounds.size.width && minimum.height < bounds.size.height,
+        "the minimum leaves the default resizable: {minimum:?}"
+    );
+    assert!(
+        minimum.width >= px(320.) && minimum.height >= px(320.),
+        "the minimum is a real window, not a sliver: {minimum:?}"
+    );
 }
 
 #[test]

@@ -111,11 +111,16 @@ impl Render for UploadView {
         let busy = self.model.read(cx).report().is_busy();
 
         div()
+            .id("upload-view")
+            .test_support()
             .flex()
             .flex_col()
             .size_full()
             .bg(background)
             .text_color(foreground)
+            // A short window scrolls instead of clipping the upload control
+            // (#26).
+            .overflow_y_scroll()
             .p_4()
             .gap_2()
             .child(

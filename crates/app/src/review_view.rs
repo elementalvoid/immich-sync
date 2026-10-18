@@ -65,11 +65,15 @@ impl Render for ReviewView {
         let problem = self.engine.read(cx).review_problem().map(str::to_string);
 
         div()
+            .id("review-view")
+            .test_support()
             .flex()
             .flex_col()
             .size_full()
             .bg(background)
             .text_color(foreground)
+            // A short window scrolls instead of clipping the last row (#26).
+            .overflow_y_scroll()
             .p_6()
             .gap_4()
             .child(
