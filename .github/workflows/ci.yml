@@ -80,6 +80,51 @@ jobs:
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo test --locked --workspace
 
+  windows-gui-subsystem:
+    name: Windows GUI subsystem (release PE)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust 1.99.0
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal --component rustfmt --component clippy
+          rustup default 1.99.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Its own key: this job builds only the release profile, and sharing
+          # the Windows job's key would let whichever job saved first starve
+          # the other. Separate keys also keep the release profile out of the
+          # debug cache the critical-path job restores.
+          shared-key: windows-release
+          prefix-key: v0-rust-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'Cargo.toml', 'crates/*/Cargo.toml') }}
+          add-rust-environment-hash-key: "false"
+          cache-on-failure: "true"
+      # #28: the app is a tray process, so the release binary must be a GUI
+      # subsystem image. Explorer then starts it with no console, and closing
+      # the terminal that launched it does not end it. The crate attribute that
+      # does this is gated on debug_assertions, so the check needs the release
+      # profile rather than the debug binary the Windows job builds. Its own
+      # job keeps that second profile off the Windows critical path.
+      - run: cargo build --locked --release --bin immich-sync
+      - name: Assert the release binary uses the GUI subsystem
+        shell: pwsh
+        run: |
+          $exe = "target/release/immich-sync.exe"
+          $bytes = [System.IO.File]::ReadAllBytes($exe)
+          # IMAGE_DOS_HEADER.e_lfanew points at the PE signature.
+          $pe = [BitConverter]::ToInt32($bytes, 0x3c)
+          if ([BitConverter]::ToUInt32($bytes, $pe) -ne 0x00004550) {
+            throw "$exe is not a PE image"
+          }
+          # The subsystem is the u16 at 0x44 of the optional header, which
+          # follows the 4-byte PE signature and the 20-byte COFF header.
+          # 2 is IMAGE_SUBSYSTEM_WINDOWS_GUI; 3 is console.
+          $subsystem = [BitConverter]::ToUInt16($bytes, $pe + 24 + 0x44)
+          if ($subsystem -ne 2) {
+            throw "expected the GUI subsystem (2) in $exe, found $subsystem"
+          }
+          "subsystem: GUI (2)"
+
   linux-gui-smoke:
     name: Linux GUI smoke (Xvfb + lavapipe)
     runs-on: ubuntu-24.04
