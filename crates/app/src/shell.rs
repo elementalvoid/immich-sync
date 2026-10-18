@@ -237,12 +237,11 @@ pub fn hide_window(cx: &mut App) {
 /// every edge and corner, and never smaller than the shell still works at
 /// (issue #26).
 #[must_use]
-pub fn main_window_options() -> WindowOptions {
+pub fn main_window_options(cx: &App) -> WindowOptions {
     WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(Bounds {
-            origin: Point::default(),
-            size: size(px(900.), px(650.)),
-        })),
+        // Centred on the primary display's visible bounds, so the taskbar
+        // cannot cover the window (issue #26).
+        window_bounds: Some(WindowBounds::centered(size(px(900.), px(650.)), cx)),
         is_resizable: true,
         // Narrower and the seven view tabs no longer fit on one row.
         window_min_size: Some(size(px(720.), px(480.))),
@@ -276,7 +275,7 @@ pub fn open_main_window(cx: &mut App) -> anyhow::Result<()> {
         .try_global::<StoreHandle>()
         .map(|handle| handle.0.clone())
         .ok_or_else(|| anyhow::anyhow!("the state store is not installed"))?;
-    let (window, _view) = gpui_kit::open_window(main_window_options(), cx, |window, cx| {
+    let (window, _view) = gpui_kit::open_window(main_window_options(cx), cx, |window, cx| {
         // The connection state is one entity both surfaces read, so the
         // dashboard's global card follows a sign-in from the settings form,
         // and reopening the window after a hide reuses the same state.

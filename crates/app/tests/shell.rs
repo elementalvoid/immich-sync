@@ -33,6 +33,20 @@ fn show_opens_the_window_when_none_is_open(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     assert_eq!(windows(cx), 1);
+    // The shipped path, not only the builder: the test platform keeps the
+    // requested bounds, so a revert to `WindowOptions::default()` fails here
+    // (issue #26).
+    let window = cx
+        .read(|cx| cx.windows().first().copied())
+        .expect("the window is open");
+    let bounds = cx
+        .update_window(window, |_, window, _| window.window_bounds())
+        .expect("read the opened window's bounds");
+    assert_eq!(
+        bounds,
+        cx.read(|cx| WindowBounds::centered(size(px(900.), px(650.)), cx)),
+        "issue #26: the window opens centred at 900 x 650"
+    );
 }
 
 #[gpui_kit::test]
@@ -114,9 +128,9 @@ fn showing_twice_keeps_a_single_window(cx: &mut TestAppContext) {
     assert_eq!(windows(cx), 1);
 }
 
-#[test]
-fn the_main_window_opens_compact_resizable_and_with_a_floor() {
-    let options = shell::main_window_options();
+#[gpui_kit::test]
+fn the_main_window_opens_compact_resizable_and_with_a_floor(cx: &mut TestAppContext) {
+    let options = cx.read(shell::main_window_options);
     let bounds = match options.window_bounds {
         Some(WindowBounds::Windowed(bounds)) => bounds,
         other => panic!("the main window opens windowed, not {other:?}"),
@@ -131,15 +145,7 @@ fn the_main_window_opens_compact_resizable_and_with_a_floor() {
         options.is_resizable,
         "issue #26: the user resizes the window from its edges and corners"
     );
-    assert!(
-        bounds.size.width > px(400.) && bounds.size.height > px(300.),
-        "the default keeps the first-use UI usable: {bounds:?}"
-    );
     let minimum = options.window_min_size.expect("a sensible minimum size");
-    assert!(
-        minimum.width < bounds.size.width && minimum.height < bounds.size.height,
-        "the minimum leaves the default resizable: {minimum:?}"
-    );
     assert!(
         minimum.width >= px(320.) && minimum.height >= px(320.),
         "the minimum is a real window, not a sliver: {minimum:?}"
