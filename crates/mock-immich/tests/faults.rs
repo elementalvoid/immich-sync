@@ -16,7 +16,7 @@ fn upload_form() -> Form {
 
 async fn upload(client: &reqwest::Client, server: &MockImmich) -> reqwest::Response {
     client
-        .post(format!("{}/assets", server.base_url()))
+        .post(format!("{}/api/assets", server.base_url()))
         .multipart(upload_form())
         .send()
         .await
@@ -95,7 +95,7 @@ async fn a_slow_fault_delays_the_response() {
     server.fail(Operation::About, Fault::Slow(delay));
 
     let started = Instant::now();
-    reqwest::get(format!("{}/server/about", server.base_url()))
+    reqwest::get(format!("{}/api/server/about", server.base_url()))
         .await
         .unwrap();
     let elapsed = started.elapsed();
@@ -109,7 +109,7 @@ async fn a_disconnect_fault_breaks_the_response() {
     server.fail(Operation::Upload, Fault::Disconnect);
 
     let result = reqwest::Client::new()
-        .post(format!("{}/assets", server.base_url()))
+        .post(format!("{}/api/assets", server.base_url()))
         .multipart(upload_form())
         .send()
         .await;
@@ -128,10 +128,16 @@ async fn a_fault_is_consumed_by_the_next_request() {
         },
     );
 
-    let first = reqwest::get(format!("{}/server/about", server.base_url()))
+    let first = reqwest::Client::new()
+        .get(format!("{}/api/server/about", server.base_url()))
+        .header("x-api-key", "api-key-abc123")
+        .send()
         .await
         .unwrap();
-    let second = reqwest::get(format!("{}/server/about", server.base_url()))
+    let second = reqwest::Client::new()
+        .get(format!("{}/api/server/about", server.base_url()))
+        .header("x-api-key", "api-key-abc123")
+        .send()
         .await
         .unwrap();
 
@@ -151,7 +157,10 @@ async fn reset_faults_removes_pending_faults() {
     );
     server.reset_faults();
 
-    let response = reqwest::get(format!("{}/server/about", server.base_url()))
+    let response = reqwest::Client::new()
+        .get(format!("{}/api/server/about", server.base_url()))
+        .header("x-api-key", "api-key-abc123")
+        .send()
         .await
         .unwrap();
 

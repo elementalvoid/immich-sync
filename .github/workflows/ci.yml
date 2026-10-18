@@ -1,0 +1,250 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental artifacts are not reusable on ephemeral runners and bloat the
+  # dependency cache; rust-cache sets this too, but keep it explicit.
+  CARGO_INCREMENTAL: 0
+  # Keep file/line panic locations while cutting codegen, link time (Windows
+  # especially) and cache size. Dependency debug info is already off in
+  # Cargo.toml; this trims the workspace crates and test binaries too.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+
+# A newer push to the same ref replaces an in-flight run: before this,
+# superseded merges kept burning 10-25 minutes each.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux
+    runs-on: ubuntu-24.04
+    steps:
+      # Pinned by commit SHA, version tag in the comment. Update deliberately:
+      # only releases at least a week old.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust 1.99.0
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal --component rustfmt --component clippy
+          rustup default 1.99.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: linux
+          # `key:` is ignored once `shared-key:` is set (rust-cache composes
+          # only prefix-key + shared-key + OS + arch), and the automatic
+          # environment hash varies across runner images. Put the lockfile
+          # hash in the prefix: it rotates when dependencies change and stays
+          # stable across runners.
+          prefix-key: v0-rust-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'Cargo.toml', 'crates/*/Cargo.toml') }}
+          add-rust-environment-hash-key: "false"
+          cache-on-failure: "true"
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc g++ clang pkg-config \
+            libfontconfig-dev libfreetype-dev libwayland-dev libxkbcommon-dev \
+            libxkbcommon-x11-dev libx11-xcb-dev libxcb1-dev libvulkan1 \
+            libssl-dev libzstd-dev libdbus-1-dev
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
+
+  windows:
+    name: Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust 1.99.0
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal --component rustfmt --component clippy
+          rustup default 1.99.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: windows
+          # Same scheme as Linux: the hash has to go in the prefix because
+          # `key:` is ignored with `shared-key:`. lld-link was tried here and
+          # reverted: the linker is a global fingerprint input, so switching it
+          # rebuilt all 526 crates every run and never warmed the cache.
+          prefix-key: v0-rust-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'Cargo.toml', 'crates/*/Cargo.toml') }}
+          add-rust-environment-hash-key: "false"
+          cache-on-failure: "true"
+      # fmt is platform-independent and already checked on Linux; running it
+      # here only paid for a toolchain component and a fresh checkout.
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
+
+  windows-gui-subsystem:
+    name: Windows GUI subsystem (release PE)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust 1.99.0
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal --component rustfmt --component clippy
+          rustup default 1.99.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Its own key: this job builds only the release profile, and sharing
+          # the Windows job's key would let whichever job saved first starve
+          # the other. Separate keys also keep the release profile out of the
+          # debug cache the critical-path job restores.
+          shared-key: windows-release
+          prefix-key: v0-rust-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'Cargo.toml', 'crates/*/Cargo.toml') }}
+          add-rust-environment-hash-key: "false"
+          cache-on-failure: "true"
+      # #28: the app is a tray process, so the release binary must be a GUI
+      # subsystem image. Explorer then starts it with no console, and closing
+      # the terminal that launched it does not end it. The crate attribute that
+      # does this is gated on debug_assertions, so the check needs the release
+      # profile rather than the debug binary the Windows job builds. Its own
+      # job keeps that second profile off the Windows critical path.
+      - run: cargo build --locked --release --bin immich-sync
+      - name: Assert the release binary uses the GUI subsystem
+        shell: pwsh
+        run: |
+          $exe = "target/release/immich-sync.exe"
+          $bytes = [System.IO.File]::ReadAllBytes($exe)
+          # IMAGE_DOS_HEADER.e_lfanew points at the PE signature.
+          $pe = [BitConverter]::ToInt32($bytes, 0x3c)
+          if ([BitConverter]::ToUInt32($bytes, $pe) -ne 0x00004550) {
+            throw "$exe is not a PE image"
+          }
+          # The subsystem is the u16 at 0x44 of the optional header, which
+          # follows the 4-byte PE signature and the 20-byte COFF header.
+          # 2 is IMAGE_SUBSYSTEM_WINDOWS_GUI; 3 is console.
+          $subsystem = [BitConverter]::ToUInt16($bytes, $pe + 24 + 0x44)
+          if ($subsystem -ne 2) {
+            throw "expected the GUI subsystem (2) in $exe, found $subsystem"
+          }
+          "subsystem: GUI (2)"
+
+  linux-gui-smoke:
+    name: Linux GUI smoke (Xvfb + lavapipe)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust 1.99.0
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal --component rustfmt --component clippy
+          rustup default 1.99.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Shared with the Linux job: rust-cache persists dependencies only, so
+          # this job restores the same dependency artifacts instead of
+          # compiling them a third time. It never saves: the Linux job owns the
+          # key and its cache covers the test targets too, while a bin-only save
+          # here finished first and starved the Linux job of dev-dependencies.
+          # The prefix must match the Linux job's exactly to share the cache.
+          shared-key: linux
+          prefix-key: v0-rust-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'Cargo.toml', 'crates/*/Cargo.toml') }}
+          add-rust-environment-hash-key: "false"
+          save-if: "false"
+          cache-on-failure: "true"
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc g++ clang pkg-config \
+            libfontconfig-dev libfreetype-dev libwayland-dev libxkbcommon-dev \
+            libxkbcommon-x11-dev libx11-xcb-dev libxcb1-dev \
+            libvulkan1 mesa-vulkan-drivers libdbus-1-dev \
+            xvfb xauth dbus-daemon imagemagick x11-utils
+      - run: cargo build --locked --bin immich-sync
+      - name: Capture a real frame
+        run: |
+          set -euo pipefail
+          # The ICD file name depends on the mesa version (lvp_icd.json vs lvp_icd.x86_64.json).
+          ICD=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json 2>/dev/null | head -1) || ICD=""
+          if [ -z "$ICD" ]; then
+            echo "no lavapipe ICD file under /usr/share/vulkan/icd.d" >&2
+            exit 1
+          fi
+          echo "lavapipe ICD=$ICD"
+          export VK_ICD_FILENAMES="$ICD"
+          export VK_DRIVER_FILES="$ICD"
+          export LIBGL_ALWAYS_SOFTWARE=1
+          unset WAYLAND_DISPLAY
+          dbus-run-session -- xvfb-run -a -s "-screen 0 1280x800x24" bash -c '
+            set -euo pipefail
+            # Give this run its own log and state directory: a log left by an
+            # earlier run would satisfy the started poll below before this app
+            # ever starts, and a stale state database would hand off instead.
+            export XDG_DATA_HOME="$PWD/xdg-data"
+            target/debug/immich-sync >shot.png.log 2>&1 &
+            APP=$!
+            # The app logs here, not to stdout.
+            LOG_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/immich-sync"
+            started() { grep -qs "immich-sync started" "$LOG_DIR"/immich-sync.log* 2>/dev/null; }
+            alive() { kill -0 $APP 2>/dev/null; }
+            # Wait for the client instead of sleeping a fixed 10 s: opening the
+            # store made startup slower, and a fixed budget captured a black
+            # root while the app was still booting.
+            START_TIMEOUT=60
+            waited=$SECONDS
+            until started; do
+              alive || { echo "the app exited during startup:" >&2; cat shot.png.log >&2; exit 1; }
+              if [ $((SECONDS - waited)) -ge $START_TIMEOUT ]; then
+                echo "timeout: no immich-sync started line in $LOG_DIR after ${START_TIMEOUT}s" >&2
+                cat shot.png.log >&2
+                kill $APP 2>/dev/null || true
+                exit 1
+              fi
+              sleep 1
+            done
+            echo "app started after $((SECONDS - waited))s"
+            kill -0 $APP                  # the app survived startup
+            # That line is logged before the window opens, so wait for a drawn
+            # frame too: a bare root captures as one flat colour.
+            PAINT_TIMEOUT=60
+            waited=$SECONDS
+            while :; do
+              alive || { echo "the app exited before it painted:" >&2; cat shot.png.log >&2; exit 1; }
+              # Bound the capture: a wedged import must not block the loop past
+              # the deadline below.
+              timeout 30 import -window root shot.png
+              colors=$(identify -format %k shot.png)
+              if [ "$colors" -gt 1 ]; then break; fi
+              if [ $((SECONDS - waited)) -ge $PAINT_TIMEOUT ]; then
+                echo "timeout: the frame is still one flat colour after ${PAINT_TIMEOUT}s (colors=$colors)" >&2
+                cat shot.png.log >&2
+                kill $APP 2>/dev/null || true
+                exit 1
+              fi
+              sleep 1
+            done
+            echo "frame painted after $((SECONDS - waited))s"
+            target/debug/immich-sync      # second launch: non-primary, exits 0 under set -e
+            sleep 2
+            kill -0 $APP                  # the handoff did not stop the primary
+            kill $APP 2>/dev/null || true
+            wait $APP 2>/dev/null || true
+            cat shot.png.log
+            echo "--- app log directory: $LOG_DIR"
+            ls -la "$LOG_DIR" 2>/dev/null || true
+            newest=$(ls -t "$LOG_DIR"/immich-sync.log* 2>/dev/null | head -1 || true)
+            if [ -n "$newest" ]; then
+              echo "--- app log: $newest"
+              cat "$newest"
+            else
+              echo "--- no app log file found"
+            fi
+          '
+      - name: Assert the frame is not blank
+        run: |
+          set -euo pipefail
+          identify -format "geom=%wx%h colors=%k\n" shot.png
+          colors=$(identify -format %k shot.png)
+          mean=$(convert shot.png -colorspace gray -format '%[fx:mean]' info:)
+          echo "screenshot gray mean=$mean"
+          # The colour test is what rejects a flat frame whatever its
+          # brightness: a uniform grey frame is colors=1 with mean~0.5, so the
+          # mean test alone would pass it. Together they reject a bare root.
+          test "$colors" -gt 1
+          test "$mean" != "0"

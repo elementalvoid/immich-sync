@@ -1,0 +1,39 @@
+[package]
+name = "sync-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+base64 = "0.22"
+# The jitter draw for the retry backoff (R6.1): `backon` gives an exponential
+# backoff but no pinnable seed, and a test that cannot reproduce its waits
+# cannot pin them. Three lines on top of a seeded generator.
+fastrand = "2"
+# The reconciliation scan: one parallel walk plus the hidden-entry filter
+# (docs/research/rust-sync-engine-crates.md §5).
+ignore = "0.4"
+immich-client = { path = "../immich-client" }
+# The watcher, pinned with its debouncer (docs/research/rust-sync-engine-crates.md §5).
+notify = "8.2"
+notify-debouncer-full = "0.7"
+# Bundled SQLite: no system library, no version drift across platforms (ADR 0005).
+rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite_migration = "2.6"
+serde = { version = "1", features = ["derive"] }
+# Shared with mock-immich, so the workspace compiles one SHA-1 implementation.
+sha1 = "0.10"
+thiserror = "2"
+# spawn_blocking for the hashing pass, the queue channels, the pause notify,
+# the concurrency semaphore, and the scan interval.
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+tracing = "0.1"
+
+[dev-dependencies]
+mock-immich = { path = "../mock-immich" }
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = "0.3"

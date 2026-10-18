@@ -1,4 +1,4 @@
-use mock_immich::MockImmich;
+use mock_immich::{DeleteCall, MockImmich};
 use reqwest::multipart::{Form, Part};
 use sha1::{Digest, Sha1};
 
@@ -17,7 +17,7 @@ async fn upload(client: &reqwest::Client, server: &MockImmich, n: u64) -> String
         .text("fileCreatedAt", "2026-01-01T00:00:00.000Z")
         .text("fileModifiedAt", "2026-01-01T00:00:00.000Z");
     let body: serde_json::Value = client
-        .post(format!("{}/assets", server.base_url()))
+        .post(format!("{}/api/assets", server.base_url()))
         .header("x-immich-checksum", checksum_for(n))
         .multipart(form)
         .send()
@@ -35,7 +35,10 @@ async fn bulk_action(
     checksum: &str,
 ) -> serde_json::Value {
     let body: serde_json::Value = client
-        .post(format!("{}/assets/bulk-upload-check", server.base_url()))
+        .post(format!(
+            "{}/api/assets/bulk-upload-check",
+            server.base_url()
+        ))
         .json(&serde_json::json!({
             "assets": [{ "id": "a.txt", "checksum": checksum }]
         }))
@@ -56,7 +59,7 @@ async fn copy_accepts_two_known_assets() {
     let target = upload(&client, &server, 2).await;
 
     let response = client
-        .put(format!("{}/assets/copy", server.base_url()))
+        .put(format!("{}/api/assets/copy", server.base_url()))
         .json(&serde_json::json!({
             "sourceId": source,
             "targetId": target,
@@ -80,7 +83,7 @@ async fn copy_rejects_an_unknown_asset() {
     let source = upload(&client, &server, 1).await;
 
     let response = client
-        .put(format!("{}/assets/copy", server.base_url()))
+        .put(format!("{}/api/assets/copy", server.base_url()))
         .json(&serde_json::json!({
             "sourceId": source,
             "targetId": "99999999-9999-4999-8999-999999999999",
@@ -100,7 +103,7 @@ async fn create_stack_returns_the_primary_asset() {
     let second = upload(&client, &server, 2).await;
 
     let response = client
-        .post(format!("{}/stacks", server.base_url()))
+        .post(format!("{}/api/stacks", server.base_url()))
         .json(&serde_json::json!({ "assetIds": [first, second] }))
         .send()
         .await
@@ -121,7 +124,7 @@ async fn create_stack_returns_conformant_asset_objects() {
     let second = upload(&client, &server, 2).await;
 
     let body: serde_json::Value = client
-        .post(format!("{}/stacks", server.base_url()))
+        .post(format!("{}/api/stacks", server.base_url()))
         .json(&serde_json::json!({ "assetIds": [first, second] }))
         .send()
         .await
@@ -168,7 +171,7 @@ async fn tag_assets_reports_the_tagged_count() {
     let second = upload(&client, &server, 2).await;
 
     let response = client
-        .put(format!("{}/tags/assets", server.base_url()))
+        .put(format!("{}/api/tags/assets", server.base_url()))
         .json(&serde_json::json!({
             "assetIds": [first, second],
             "tagIds": ["11111111-1111-4111-8111-111111111111"],
@@ -183,13 +186,36 @@ async fn tag_assets_reports_the_tagged_count() {
 }
 
 #[tokio::test]
+async fn delete_records_the_exact_request_the_client_sent() {
+    let server = MockImmich::start().await;
+    let client = reqwest::Client::new();
+    let id = upload(&client, &server, 1).await;
+
+    client
+        .delete(format!("{}/api/assets", server.base_url()))
+        .json(&serde_json::json!({ "ids": [id.clone()], "force": false }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        server.delete_calls(),
+        vec![DeleteCall {
+            ids: vec![id],
+            force: false,
+        }],
+        "R5.3: the trash call is a DELETE /assets with force false"
+    );
+}
+
+#[tokio::test]
 async fn delete_moves_an_asset_to_the_trash() {
     let server = MockImmich::start().await;
     let client = reqwest::Client::new();
     let id = upload(&client, &server, 1).await;
 
     let response = client
-        .delete(format!("{}/assets", server.base_url()))
+        .delete(format!("{}/api/assets", server.base_url()))
         .json(&serde_json::json!({ "ids": [id], "force": false }))
         .send()
         .await
@@ -199,6 +225,56 @@ async fn delete_moves_an_asset_to_the_trash() {
     let result = bulk_action(&client, &server, &checksum_for(1)).await;
     assert_eq!(result["action"], "reject");
     assert_eq!(result["isTrashed"], true);
+    assert!(server.trashed(&id), "R5.3: the asset is in the trash");
+}
+
+#[tokio::test]
+async fn restore_brings_a_trashed_asset_back() {
+    let server = MockImmich::start().await;
+    let client = reqwest::Client::new();
+    let id = upload(&client, &server, 1).await;
+    client
+        .delete(format!("{}/api/assets", server.base_url()))
+        .json(&serde_json::json!({ "ids": [id.clone()], "force": false }))
+        .send()
+        .await
+        .unwrap();
+    assert!(server.trashed(&id));
+
+    let response = client
+        .post(format!("{}/api/trash/restore/assets", server.base_url()))
+        .json(&serde_json::json!({ "ids": [id.clone()] }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["count"], 1, "one trashed asset came back");
+    assert!(!server.trashed(&id), "R5.3: the asset is live again");
+    let result = bulk_action(&client, &server, &checksum_for(1)).await;
+    assert_eq!(result["isTrashed"], false, "bulk-check sees a live asset");
+}
+
+#[tokio::test]
+async fn restore_counts_the_ids_the_request_named() {
+    // Immich's TrashService.restoreAssets answers with the number of ids the
+    // request named, not the number it moved out of the trash, so the double
+    // must count an id that was already live too.
+    let server = MockImmich::start().await;
+    let client = reqwest::Client::new();
+    let id = upload(&client, &server, 1).await;
+
+    let response = client
+        .post(format!("{}/api/trash/restore/assets", server.base_url()))
+        .json(&serde_json::json!({ "ids": [id] }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["count"], 1, "the id was named, so it is counted");
 }
 
 #[tokio::test]
@@ -208,7 +284,7 @@ async fn force_delete_removes_an_asset() {
     let id = upload(&client, &server, 1).await;
 
     client
-        .delete(format!("{}/assets", server.base_url()))
+        .delete(format!("{}/api/assets", server.base_url()))
         .json(&serde_json::json!({ "ids": [id], "force": true }))
         .send()
         .await

@@ -37,8 +37,8 @@ Acceptance criteria are testable. "Default" values are configurable.
 
 - R1.1 The config window accepts a server URL, an email address, and a password.
 - R1.2 The client stores the password in the OS credential store. It never writes the password to the config file or the logs.
-- R1.3 The client logs in at startup with `POST /auth/login`. The session token stays in memory.
-- R1.4 After a 401, the client re-logs in once with the stored password. After a second 401, the connection enters a needs-attention state and the tray shows it.
+- R1.3 The client logs in at startup with `POST /api/auth/login` (Immich's global API prefix). The session token stays in memory.
+- R1.4 After a 401, the client re-logs in once with the stored password. Once a run of consecutive failed requests reaches the attention threshold (default 3, reset by a success), the connection enters a needs-attention state and the tray shows it. One refused batch adds at most two failures to the run (the 401 and the retry after the re-login), so a single transient batch stays below the alarm. The run is separate from the circuit breaker's run (R6.6).
 - R1.5 The config window also accepts an API key. The key is validated at startup and stored in the OS credential store, like the password.
 - R1.6 The client shows a clear message when the server disables password login.
 
@@ -56,7 +56,7 @@ Acceptance: a file added while the client is stopped is found at startup. A file
 
 ### R3 — Upload pipeline
 
-- R3.1 New files are hashed with SHA-1, checked with `POST /assets/bulk-upload-check` in batches, and uploaded with `POST /assets` and the `x-immich-checksum` header.
+- R3.1 New files are hashed with SHA-1, checked with `POST /api/assets/bulk-upload-check` in batches, and uploaded with `POST /api/assets` and the `x-immich-checksum` header.
 - R3.2 `created` and `duplicate` both count as success.
 - R3.3 A sidecar file uploads as `sidecarData`. A live photo video uploads first, and the photo links it with `livePhotoVideoId`.
 - R3.4 Album mapping is opt-in per folder. The album scope is per folder: leaf folders or the whole source folder.
@@ -68,8 +68,8 @@ Acceptance: a 100-file folder syncs. Duplicate content is not uploaded twice. A 
 ### R4 — Changed files
 
 - R4.1 A tracked file that changes in place keeps its sync item identity.
-- R4.2 The client uploads the new bytes as a new asset. It calls `PUT /assets/copy` with the old asset as source and the new asset as target, with albums, shared links, favorite, sidecar, and stack enabled. It applies the old asset's tags to the new asset with the tag endpoints.
-- R4.3 If the old asset is in no stack, the client calls `POST /stacks` with the new asset first and the old asset second.
+- R4.2 The client uploads the new bytes as a new asset. It calls `PUT /api/assets/copy` with the old asset as source and the new asset as target, with albums, shared links, favorite, sidecar, and stack enabled. It applies the old asset's tags to the new asset with the tag endpoints.
+- R4.3 If the old asset is in no stack, the client calls `POST /api/stacks` with the new asset first and the old asset second.
 - R4.4 The old version stays. The state database records the version chain and the stack id.
 - R4.5 An unchanged SHA-1 means no upload.
 
@@ -92,7 +92,7 @@ Acceptance: deleting a file creates one review item. "Keep" clears the item and 
 - R6.3 The client does not retry HTTP 400, 403, 404, 409, 413, 415, and 422. It marks those permanent.
 - R6.4 The client persists the failure class: auth_failed, permission_denied, quota_exceeded, unsupported_format, network_transient, server_transient, local_read_error, too_large.
 - R6.5 After the attempt cap, the item enters the dead letter state and appears in the failed-items view with a manual retry action.
-- R6.6 A run of connection failures trips a circuit breaker. The client probes with the credential validation endpoint before it resumes.
+- R6.6 A run of connection failures trips a circuit breaker. The client probes with the credential validation endpoint before it resumes. The breaker's run (default 5) is separate from and longer than the connection's attention threshold (R1.4), so the tray changes before the queue does.
 - R6.7 The upload queue survives a restart. No completed item uploads twice.
 
 Acceptance: stopping the server mid-sync produces backoff retries, not a hot loop. A 415 response produces exactly one permanent failure. A restart resumes the queue. A full disk error does not corrupt the database.
@@ -102,8 +102,9 @@ Acceptance: stopping the server mid-sync produces backoff retries, not a hot loo
 - R7.1 The bandwidth limit is user-settable in bytes per second. 0 means unlimited. Changes apply without a restart.
 - R7.2 The concurrency limit is user-settable. The default is 4. Changes apply without a restart.
 - R7.3 Both limits persist across restarts.
+- R7.4 R7 governs the sync engine. The manual one-file upload in the Upload view is deliberately exempt from both limits: it is an explicit one-off request, not sync work. This is by design, not a defect.
 
-Acceptance: a 1 MB/s limit produces near-limit observed throughput. Raising concurrency during a sync starts new workers without a restart.
+Acceptance: a sync at a 1 MB/s limit produces near-limit observed throughput. Raising concurrency during a sync starts new workers without a restart.
 
 ### R8 — Shell and user experience
 
@@ -127,7 +128,7 @@ Acceptance: on Windows, config resolves under `%APPDATA%` and state under `%LOCA
 
 ### R10 — Diagnostics and notifications
 
-- R10.1 The client notifies the user about a permanent error or a lost connection, and about a new deletion review item.
+- R10.1 The client notifies the user about a permanent error or a lost connection, and about a new deletion review item. A permanent error already parked at startup is not re-announced.
 - R10.2 A diagnostics view shows the server version, the granted permissions, the last error per class, and current throughput.
 - R10.3 The client writes a rotating log file. The log contains no password, API key, or session token.
 - R10.4 The diagnostics view offers a state rebuild. The rebuild rescans folders and re-checks the server.
@@ -155,6 +156,7 @@ Acceptance: a clean Windows machine installs from the NSIS installer. A clean Li
 ## 5. Data model summary
 
 - `source_folder`: path, recursive flag, album mapping flag, album scope.
+- `album`: mapped folder path key, album name, album id.
 - `sync_item`: path, size, mtime, SHA-1, current asset id, stack id, state, last error class.
 - `version`: item id, asset id, SHA-1, created at, current flag.
 - `attempt`: item id, start time, outcome, error class.
