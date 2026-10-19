@@ -205,7 +205,7 @@ fn versions_text(info: &Option<SqliteInfo>, snapshot: &Snapshot) -> String {
     }
     text.push_str(&format!("Architecture: {}\n", std::env::consts::ARCH));
     match &snapshot.server_version {
-        Some(server) => text.push_str(&format!("Immich server: {server}\n")),
+        Some(server) => text.push_str(&format!("Immich server: {}\n", server_version_text(server))),
         None => text.push_str(
             "Immich server: not read (the client was not connected to the server when the \
              bundle was collected)\n",
@@ -222,6 +222,21 @@ fn versions_text(info: &Option<SqliteInfo>, snapshot: &Snapshot) -> String {
         ),
     }
     text
+}
+
+/// The server's version, or a byte count when it is not a release number.
+///
+/// The value is the server's own text, the one server-controlled string the
+/// archive copies: only a `v?NN.NN.NN` release number is copied, so a broken or
+/// hostile server cannot ride anything else in through it (SPEC N3).
+fn server_version_text(version: &str) -> String {
+    let number = version.strip_prefix('v').unwrap_or(version);
+    let is_number = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+    let mut groups = number.split('.');
+    if (0..3).all(|_| groups.next().is_some_and(is_number)) && groups.next().is_none() {
+        return version.to_string();
+    }
+    format!("unrecognized ({} bytes)", version.len())
 }
 
 /// The kernel release, where the platform exposes one as a file.
@@ -652,7 +667,7 @@ fn timestamp(now: time::OffsetDateTime) -> String {
 mod tests {
     use super::{
         BUNDLE_PREFIX, BundleReport, LOG_BYTES, LOG_FILES, Snapshot, collect, count_of,
-        database_text, sizing_text,
+        database_text, sizing_text, versions_text,
     };
     use crate::logging::LOG_PREFIX;
     use crate::paths::AppPaths;
@@ -1137,6 +1152,27 @@ log_level = \"debug\"
         assert!(
             !newest.contains("first line that must be cut"),
             "the entry drops what the cap cut away"
+        );
+    }
+
+    /// Issue #25, acceptance criterion 3: the server version is the one
+    /// server-controlled string the archive copies, so only a release number
+    /// is copied and anything else is counted, never echoed.
+    #[test]
+    fn a_server_version_that_is_not_a_release_number_is_counted_not_copied() {
+        let mut hostile = snapshot();
+        hostile.server_version = Some(format!("1.2.3 {SENTINEL}"));
+        let versions = versions_text(&None, &hostile);
+        assert!(
+            versions.contains("Immich server: unrecognized (") && !versions.contains(SENTINEL),
+            "a server's text is counted, not copied: {versions}"
+        );
+
+        let mut release = snapshot();
+        release.server_version = Some("v1.119.0".to_string());
+        assert!(
+            versions_text(&None, &release).contains("Immich server: v1.119.0"),
+            "a release number is kept"
         );
     }
 
