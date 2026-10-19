@@ -44,14 +44,15 @@ fn main() {
 /// which cargo resolves against the host too and would leave this file with no
 /// crate to call when a Linux host builds for Windows.
 fn embed_windows_icon() {
+    // Unconditional, so swapping the artwork rebuilds the executable on every
+    // platform rather than only where the resource is embedded. `embed-resource`
+    // emits no `rerun-if-changed` of its own (it cannot trace what a resource
+    // file includes), so the two files it reads are named here.
+    println!("cargo:rerun-if-changed=icon.rc");
+    println!("cargo:rerun-if-changed=icons/icon.ico");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
-    // `embed-resource` emits no `rerun-if-changed` of its own (it cannot trace
-    // what a resource file includes), so name the icon here: swapping the
-    // artwork must rebuild the executable.
-    println!("cargo:rerun-if-changed=icon.rc");
-    println!("cargo:rerun-if-changed=icons/icon.ico");
     // A Windows build that cannot produce the icon is a broken artifact, so this
     // fails the build rather than shipping an executable with the default icon.
     // `manifest_required` still returns Ok for a non-Windows target, so the gate
