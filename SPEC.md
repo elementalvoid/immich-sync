@@ -137,7 +137,7 @@ Acceptance: a permanent error raises one notification. Grep of the log finds no 
 
 ### R11 — Packaging and distribution
 
-- R11.1 `cargo-packager` produces an NSIS installer for Windows and deb and AppImage packages for Linux.
+- R11.1 `cargo-packager` produces an NSIS installer for Windows and deb and AppImage packages for Linux. The Windows installer offers an install-mode choice and defaults to a system-wide install under `C:\Program Files`, with a current-user install as the alternative; either mode ships the app icon on the installed executable.
 - R11.2 Windows binaries ship unsigned in v1. The installer warns under SmartScreen. Code signing belongs to the public-release ticket.
 - R11.3 CI builds both platforms, publishes a SHA256SUMS file, and contains provenance attestation steps guarded by a repository variable. The steps stay skipped while the repository is private. `gh attestation verify` succeeds when they are enabled.
 - R11.4 The README documents install and verification steps for both platforms.

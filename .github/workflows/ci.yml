@@ -125,6 +125,34 @@ jobs:
           }
           "subsystem: GUI (2)"
 
+      # R11.1: the installed executable carries icons/icon.ico as icon resource
+      # 1, which is the id GPUI's Windows backend loads for the window class and
+      # the one Explorer, the taskbar, and Settings -> Apps read. It is asserted
+      # on the built PE because nothing else here can: the resource compiler only
+      # runs for a Windows target, and the NSIS installer's own behaviour stays
+      # manual (it needs an interactive Windows desktop).
+      - name: Assert the release binary carries the app icon
+        shell: pwsh
+        run: |
+          $exe = "target/release/immich-sync.exe"
+          # llvm-readobj ships in the llvm-tools component, which the toolchain
+          # step above does not install yet.
+          rustup component add llvm-tools --toolchain 1.99.0
+          $host = (rustc -vV | Select-String '^host: ').Line -replace '^host: ', ''
+          $readobj = Join-Path (rustc --print sysroot) "lib/rustlib/$host/bin/llvm-readobj.exe"
+          if (-not (Test-Path $readobj)) { throw "llvm-readobj not found at $readobj" }
+          $resources = (& $readobj --coff-resources $exe) -join "`n"
+          $resources
+          # Match inside the ICON type block only: a bare `Name: (ID 1)` also
+          # matches the MANIFEST and VERSIONINFO entries, which is precisely the
+          # state this check exists to reject (an exe with no icon resource).
+          # RT_GROUP_ICON named 1 is the same icon through the group table; the
+          # resource compiler emits both, so accept either.
+          if (-not ($resources -match '(?ms)^\s*Type: (?:ICON \(ID 3\)|GROUP_ICON \(ID 14\))\s*\[.*?^\s*Name: \(ID 1\)')) {
+            throw "$exe has no icon resource 1; GPUI's window class icon and the shell icon would be blank"
+          }
+          "icon resource 1 present"
+
   linux-gui-smoke:
     name: Linux GUI smoke (Xvfb + lavapipe)
     runs-on: ubuntu-24.04

@@ -54,10 +54,16 @@ homepage = "https://github.com/elementalvoid/immich-sync"
 icons = ["icons/icon.png", "icons/icon.ico"]
 licenseFile = "../../LICENSE-MIT"
 
-# The installer icon; the installed executable carries the toolchain default
-# because the app has no Windows resource script.
+# The installer icon, and the install-mode page. `both` lets the user choose
+# All users (the default: `$PROGRAMFILES64\Immich Sync`, HKLM metadata, All
+# Users shortcuts) or Current user only (`%LOCALAPPDATA%\Programs\Immich Sync`,
+# HKCU metadata, current-user shortcuts). `both` requests the highest execution
+# level, so the installer prompts for elevation whichever mode is chosen, and a
+# reinstall preselects the mode the previous install recorded. The installed
+# executable carries the same icon as resource 1; see `build.rs`.
 [package.metadata.packager.nsis]
 installerIcon = "icons/icon.ico"
+installMode = "both"
 
 # Runtime libraries for the deb, read off the release binary (readelf NEEDED
 # plus the dlopen names): the linked ones, the Vulkan loader, the Wayland
@@ -88,6 +94,15 @@ depends = [
 [package.metadata.packager.appimage.files]
 "../../LICENSE-MIT" = "usr/share/doc/immich-sync/LICENSE-MIT"
 "../../LICENSE-APACHE" = "usr/share/doc/immich-sync/LICENSE-APACHE"
+
+# The Windows resource script `icon.rc` is compiled with this, so the installed
+# executable carries the app icon. It is deliberately not under
+# `[target.'cfg(windows)'.build-dependencies]`: a build script is compiled for
+# the host, and cargo resolves that table against the host too, so the crate
+# would be missing when a Linux host cross-compiles to Windows. `build.rs`
+# gates on `CARGO_CFG_TARGET_OS` instead and stays inert on other targets.
+[build-dependencies]
+embed-resource = "3"
 
 [target."cfg(target_os = \"linux\")".dependencies]
 # The Secret Service store, pinned: the keyring ecosystem restructured in 2026
