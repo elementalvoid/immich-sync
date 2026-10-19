@@ -7,6 +7,7 @@
 
 use std::path::PathBuf;
 
+use gpui_kit::base::{Disableable as _, SelectableText};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::Button;
 use gpui_kit::component::radio::Radio;
@@ -33,6 +34,9 @@ pub struct LogsView {
     /// Keeps the level notice in step with the settings surface's save
     /// failures, which now land after the worker write (N2).
     _subscriptions: Vec<Subscription>,
+    /// Holds keyboard focus while the tail is dragged, which is what lets the
+    /// Root's Ctrl+C binding reach the selection.
+    lines_focus: FocusHandle,
 }
 
 impl LogsView {
@@ -52,6 +56,7 @@ impl LogsView {
             read_problem: None,
             save_problem,
             _subscriptions: vec![subscription],
+            lines_focus: cx.focus_handle(),
         };
         view.refresh(cx);
         view
@@ -91,6 +96,18 @@ impl LogsView {
     fn set_level(&mut self, level: LogLevel, cx: &mut Context<Self>) {
         self.settings
             .update(cx, |settings, cx| settings.set_log_level(level, cx));
+    }
+
+    /// Copies the whole displayed tail, one line per line, in order.
+    ///
+    /// The clipboard is written from the lines the view holds, so nothing that
+    /// was not written to the log can reach it. Joining keeps blank lines,
+    /// which the selection layer's copy path drops.
+    fn copy_all(&mut self, cx: &mut Context<Self>) {
+        if self.lines.is_empty() {
+            return;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(self.lines.join("\n")));
     }
 
     /// The page header.
@@ -249,7 +266,31 @@ impl LogsView {
     fn lines_section(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let palette = CardPalette::new(theme);
-        let mut body: Vec<AnyElement> = Vec::with_capacity(2);
+        let mut body: Vec<AnyElement> = Vec::with_capacity(3);
+        body.push(
+            div()
+                .id("logs-copy-row")
+                .test_support()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap_6()
+                .min_h(rems(2.25))
+                .child(field_text(
+                    "Copy all",
+                    "Copies every line shown below, in order.",
+                    &palette,
+                ))
+                .child(
+                    Button::new("logs-copy-all")
+                        .label("Copy all")
+                        .accessibility_label("Copy every displayed log line")
+                        .disabled(self.lines.is_empty())
+                        .on_click(cx.listener(|this, _, _, cx| this.copy_all(cx))),
+                )
+                .into_any_element(),
+        );
         if let Some(problem) = &self.read_problem {
             body.push(
                 notice("logs-problem", problem.clone(), theme.danger, &palette).into_any_element(),
@@ -281,14 +322,27 @@ impl LogsView {
                         .font_family(theme.mono_font_family.clone())
                         .text_xs()
                         .text_color(palette.text)
-                        .child(Text::new_inaccessible(line.clone().into()))
+                        // One handle per line: a shared handle registers once
+                        // and the last line painted would win (probe Q1).
+                        .child(
+                            SelectableText::new(
+                                ElementId::Name(format!("logs-text-{index}").into()),
+                                line.clone(),
+                            )
+                            .document_order(index as u64),
+                        )
                         .into_any_element()
                 })
                 .collect();
+            let focus = self.lines_focus.clone();
             body.push(
                 div()
                     .id("logs-lines")
                     .test_support()
+                    .track_focus(&self.lines_focus)
+                    .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                        window.focus(&focus, cx);
+                    })
                     .flex()
                     .flex_col()
                     .gap_0p5()
