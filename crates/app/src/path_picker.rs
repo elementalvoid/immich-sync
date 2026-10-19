@@ -39,6 +39,31 @@ pub fn picked(result: anyhow::Result<Option<Vec<PathBuf>>>) -> Picked {
     }
 }
 
+/// Opens one OS path dialog and hands its result to `apply` on the UI thread.
+///
+/// The dialog is awaited off the UI thread, so a picker that never answers
+/// cannot freeze the window. A dialog that goes away without an answer is
+/// reported the way one that could not open is.
+pub fn browse<T: 'static>(
+    options: PathPromptOptions,
+    window: &Window,
+    cx: &mut Context<T>,
+    apply: impl FnOnce(&mut T, anyhow::Result<Option<Vec<PathBuf>>>, &mut Window, &mut Context<T>)
+    + 'static,
+) {
+    let prompt = cx.prompt_for_paths(options);
+    cx.spawn_in(window, async move |this, cx| {
+        let result = prompt.await.unwrap_or_else(|_| {
+            Err(anyhow::anyhow!("the file dialog closed without an answer"))
+        });
+        this.update_in(cx, move |view, window, cx| {
+            apply(view, result, window, cx);
+        })
+        .ok();
+    })
+    .detach();
+}
+
 /// The inline notice a Browse… that could not open shows.
 ///
 /// The accessible name carries the message, so the visible copy is not

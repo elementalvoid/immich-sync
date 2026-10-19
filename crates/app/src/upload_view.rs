@@ -4,19 +4,25 @@
 //! types one path and sees one outcome. The view holds the input and renders
 //! the model's report; the model owns the app-scoped state.
 
+use std::path::PathBuf;
+
 use gpui_kit::base::Disableable as _;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::dashboard::CardPalette;
+use crate::path_picker::{self, Picked};
 use crate::upload::UploadModel;
 
 /// The Upload surface.
 pub struct UploadView {
     model: Entity<UploadModel>,
     path_input: Entity<InputState>,
+    /// The notice a failed Browse… left behind (#30).
+    pick_notice: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -44,8 +50,52 @@ impl UploadView {
         Self {
             model,
             path_input,
+            pick_notice: None,
             _subscriptions: subscriptions,
         }
+    }
+
+    /// Opens the OS file picker and fills the field with the chosen file (#30).
+    ///
+    /// A cancel changes nothing. A dialog that cannot open shows a notice and
+    /// leaves the typed path alone.
+    fn browse(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        path_picker::browse(
+            PathPromptOptions {
+                files: true,
+                directories: false,
+                multiple: false,
+                prompt: None,
+            },
+            window,
+            cx,
+            |this, result, window, cx| this.apply_pick(result, window, cx),
+        );
+    }
+
+    /// Applies one picker result: the chosen file fills the field, a cancel
+    /// changes nothing, and a failure shows the notice (#30).
+    ///
+    /// This takes the result rather than reading it at the click site, because
+    /// the test harness can answer a prompt with a choice or a cancel but never
+    /// with an error.
+    pub fn apply_pick(
+        &mut self,
+        result: anyhow::Result<Option<Vec<PathBuf>>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pick_notice = None;
+        match path_picker::picked(result) {
+            Picked::Path(path) => {
+                let path = path.to_string_lossy().into_owned();
+                self.path_input
+                    .update(cx, |state, cx| state.set_value(path, window, cx));
+            }
+            Picked::Cancelled => {}
+            Picked::Failed(notice) => self.pick_notice = Some(notice),
+        }
+        cx.notify();
     }
 
     /// Hands the typed path to the model.
@@ -185,8 +235,20 @@ impl Render for UploadView {
                                     .flex_1()
                                     .min_w_0()
                                     .child(Input::new(&self.path_input).aria_label("File path")),
+                            )
+                            .child(
+                                Button::new("upload-browse")
+                                    .secondary()
+                                    .label("Browse…")
+                                    .accessibility_label("Browse for the file to upload")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.browse(window, cx);
+                                    })),
                             ),
                     )
+                    .when_some(self.pick_notice.clone(), |this, notice| {
+                        this.child(path_picker::notice("upload-browse-notice", notice, theme))
+                    })
                     .child(
                         div().flex().flex_row().justify_end().child(
                             Button::new("upload-button")

@@ -137,30 +137,19 @@ impl Dashboard {
     /// (R2.1).
     ///
     /// A cancel changes nothing. A dialog that cannot open shows a notice and
-    /// leaves the typed path alone (#30); the picker is awaited off the UI
-    /// thread.
+    /// leaves the typed path alone (#30).
     fn browse(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.folder_input.is_none() {
-            return;
-        }
-        let prompt = cx.prompt_for_paths(PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: false,
-            prompt: None,
-        });
-        cx.spawn_in(window, async move |this, cx| {
-            let result = prompt.await.unwrap_or_else(|_| {
-                // The dialog went away without an answer: report it the way a
-                // dialog that could not open is reported.
-                Err(anyhow::anyhow!("the file dialog closed without an answer"))
-            });
-            this.update_in(cx, |this, window, cx| {
-                this.apply_pick(result, window, cx);
-            })
-            .ok();
-        })
-        .detach();
+        path_picker::browse(
+            PathPromptOptions {
+                files: false,
+                directories: true,
+                multiple: false,
+                prompt: None,
+            },
+            window,
+            cx,
+            |this, result, window, cx| this.apply_pick(result, window, cx),
+        );
     }
 
     /// Applies one picker result: the chosen folder fills the field, a cancel
