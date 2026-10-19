@@ -9,6 +9,8 @@ pub mod diagnostics_view;
 pub mod engine;
 pub mod failed;
 pub mod failed_view;
+#[cfg(test)]
+mod git_revision;
 pub mod instance;
 pub mod logging;
 pub mod logs_view;
@@ -23,6 +25,7 @@ pub mod store;
 pub mod theme;
 pub mod upload;
 pub mod upload_view;
+pub mod version;
 
 use anyhow::Context as _;
 use async_channel::Receiver;

@@ -353,6 +353,16 @@ async fn the_view_shows_the_sqlite_state_the_server_and_the_permissions(cx: &mut
                 Some("v3.3.1"),
                 "the server version is shown"
             );
+            assert_eq!(
+                window.find("diagnostics-client-version-value").label(),
+                Some(concat!(
+                    env!("CARGO_PKG_VERSION"),
+                    " (",
+                    env!("IMMICH_SYNC_GIT_REVISION"),
+                    ")"
+                )),
+                "the client version row names the running binary"
+            );
             let permissions = window
                 .find("diagnostics-permissions-value")
                 .label()

@@ -164,7 +164,7 @@ its card instead of producing one error per file.
   (off by default), Limits holds the bandwidth limit (0 means unlimited),
   concurrent uploads, the reconciliation scan interval, and the retry attempt
   cap.
-- **Diagnostics.** Server version and permissions, the state database and its
+- **Diagnostics.** Client and server versions and permissions, the state database and its
   integrity, the last error per class, throughput, and a **Rebuild** action that
   starts the state over and rescans every folder.
 - **Logs.** The tail of the log file and the level control. The log never

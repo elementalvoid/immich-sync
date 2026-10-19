@@ -1,5 +1,6 @@
-//! The Diagnostics view (SPEC R10.2, R10.4): the server, the sqlite state, the
-//! last error per class, the throughput, and the rebuild action.
+//! The Diagnostics view (SPEC R10.2, R10.4): the client and server versions,
+//! the sqlite state, the last error per class, the throughput, and the rebuild
+//! action.
 
 use gpui_kit::base::Disableable as _;
 use gpui_kit::component::ActiveTheme as _;
@@ -9,6 +10,7 @@ use gpui_kit::*;
 use crate::dashboard::CardPalette;
 use crate::diagnostics::{DiagnosticsModel, Permissions, format_bytes, format_rate};
 use crate::settings_view::{field_text, notice, section};
+use crate::version;
 use sync_core::store::SqliteInfo;
 
 /// The Diagnostics view.
@@ -97,7 +99,7 @@ impl DiagnosticsView {
             }
             Permissions::Unavailable(reason) => reason.clone(),
         };
-        let mut rows = Vec::with_capacity(4);
+        let mut rows = Vec::with_capacity(5);
         if let Some(problem) = &server.problem {
             rows.push(
                 notice(
@@ -109,6 +111,13 @@ impl DiagnosticsView {
                 .into_any_element(),
             );
         }
+        rows.push(Self::value_row(
+            "Client version",
+            "The running binary: the package version and the short build revision.",
+            "diagnostics-client-version-value",
+            version::client_version().to_string(),
+            &palette,
+        ));
         rows.push(Self::value_row(
             "Server version",
             "GET /server/about with this credential.",

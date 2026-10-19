@@ -27,6 +27,7 @@ use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::reload;
 
 use crate::paths::AppPaths;
+use crate::version;
 
 /// The prefix every log file shares.
 pub const LOG_PREFIX: &str = "immich-sync.log";
@@ -369,7 +370,7 @@ pub fn newest_file(directory: &Path) -> anyhow::Result<Option<PathBuf>> {
 /// fallback paths says so in the file a support session reads.
 pub fn record_start(paths: &AppPaths, resolution_problem: Option<&str>) {
     tracing::info!(
-        version = env!("CARGO_PKG_VERSION"),
+        version = version::client_version(),
         os = std::env::consts::OS,
         config = %paths.config_file.display(),
         state = %paths.state_db.display(),
