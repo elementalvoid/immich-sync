@@ -939,21 +939,27 @@ async fn the_bundle_action_saves_an_archive_shows_its_path_and_copies_it(cx: &mu
     server.set_api_key_permissions(&["asset.upload", "server.about"]);
     let temp = tempfile::tempdir().expect("create a temp dir");
     let paths = temporary_paths(temp.path());
-    // A log file and a settings file, as a running client would have written
-    // them. Neither holds the credential: the settings file never stores one.
-    fs::create_dir_all(paths.log_directory()).expect("create the log directory");
-    fs::write(
-        paths
-            .log_directory()
-            .join(format!("{LOG_PREFIX}.2026-10-16")),
-        "2026-10-16T10:00:00Z  INFO immich_sync: immich-sync started\n",
+    // The real log pipeline writes the archive's logs, so a #17 redaction
+    // regression fails the sentinel scan below. It is installed on this thread
+    // only: a process installs one subscriber and the test binary shares it.
+    let mut sink = LogSink::start(
+        &paths.log_directory(),
+        LogPolicy::default(),
+        LogLevel::Trace,
     )
-    .expect("write the log file");
+    .expect("start the log");
+    let guard = sink.thread_default();
+    // A settings file, as a running client would have written it. The URL
+    // carries a password in its userinfo, which #17's pipeline must drop, and
+    // the settings file never holds the credential itself.
     fs::create_dir_all(paths.config_file.parent().expect("the config directory"))
         .expect("create the config directory");
     fs::write(
         &paths.config_file,
-        "server_url = \"https://immich.example.com\"\nemail = \"sync@example.com\"\n",
+        format!(
+            "server_url = \"https://sync:{BUNDLE_SENTINEL}@immich.example.com\"\n\
+             email = \"sync@example.com\"\n"
+        ),
     )
     .expect("write the settings");
     // The test shell saves bundles beside the logs; the real shell saves into
@@ -996,6 +1002,9 @@ async fn the_bundle_action_saves_an_archive_shows_its_path_and_copies_it(cx: &mu
         diagnostics.read(cx).server().version.is_some()
     })
     .await;
+    // Flush the queued lines before the collector reads the log directory.
+    drop(guard);
+    drop(sink);
 
     cx.update_window(window, |_, window, cx| {
         show_diagnostics(window, cx);
@@ -1073,11 +1082,19 @@ async fn the_bundle_action_saves_an_archive_shows_its_path_and_copies_it(cx: &mu
             entries.iter().map(|(name, _)| name).collect::<Vec<_>>()
         );
     }
+    let logs: Vec<&str> = entries
+        .iter()
+        .filter(|(name, _)| name.starts_with("logs/"))
+        .map(|(_, body)| body.as_str())
+        .collect();
     assert!(
-        entries
-            .iter()
-            .any(|(name, _)| name == &format!("logs/{LOG_PREFIX}.2026-10-16")),
-        "the archive holds the log file"
+        logs.iter().any(|body| body.contains("sign-in attempt")),
+        "the archive holds the log the client wrote: {logs:?}"
+    );
+    assert!(
+        logs.iter()
+            .any(|body| body.contains("https://<redacted>@immich.example.com")),
+        "the pipeline's line drops the URL's userinfo: {logs:?}"
     );
     for (name, body) in &entries {
         assert!(
