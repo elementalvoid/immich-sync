@@ -23,12 +23,11 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::Registry;
 use tracing_subscriber::filter::{LevelFilter, Targets};
-
-use crate::version;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::reload;
 
 use crate::paths::AppPaths;
+use crate::version;
 
 /// The prefix every log file shares.
 pub const LOG_PREFIX: &str = "immich-sync.log";
