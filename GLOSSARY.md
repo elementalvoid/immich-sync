@@ -125,7 +125,7 @@ _Avoid_: folder state, folder progress
 ### Diagnostics
 
 **Client version**:
-The package version and the short source revision the running binary was built from, for example `0.1.0 (abc1234)`. A build outside a git repository reports `unknown` in place of the revision.
+The package version and the short source revision the running binary was built from, for example `0.1.0 (abc1234)`. Diagnostics and the log's start line both report it, and a build outside a git repository reports `unknown` in place of the revision.
 _Avoid_: app version, build version
 
 **Server version**:
