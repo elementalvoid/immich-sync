@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, Bounds, Point, TestAppContext, Window, WindowBounds,
-    WindowOptions, px, size,
+    AnyWindowHandle, App, AppContext as _, Bounds, ClipboardItem, Point, TestAppContext, Window,
+    WindowBounds, WindowOptions, point, px, size,
 };
 use immich_sync::autostart::{Autostart, UnavailableAutostart};
 use immich_sync::connection::{ConnectionModel, profile_from_settings};
@@ -237,6 +237,8 @@ fn refresh_reads_the_lines_written_since_the_view_opened(cx: &mut TestAppContext
 fn every_logs_control_is_named_and_keyboard_reachable(cx: &mut TestAppContext) {
     let temp = tempfile::tempdir().expect("create a temp dir");
     let paths = temporary_paths(temp.path());
+    // One line, so Copy all is enabled and therefore a tab stop.
+    write_log(&paths, &["a stable line"]);
     let store = SettingsStore::open(paths.config_file.clone());
     let window = open_shell(cx, store, paths);
 
@@ -251,6 +253,7 @@ fn every_logs_control_is_named_and_keyboard_reachable(cx: &mut TestAppContext) {
             ("logs-level-info", "Log level: Info"),
             ("logs-level-warn", "Log level: Warn"),
             ("logs-level-error", "Log level: Error"),
+            ("logs-copy-all", "Copy every displayed log line"),
         ] {
             assert_eq!(window.find(id).label(), Some(label), "{id} is named");
         }
@@ -262,6 +265,7 @@ fn every_logs_control_is_named_and_keyboard_reachable(cx: &mut TestAppContext) {
             "logs-refresh",
             "logs-level-trace",
             "logs-level-error",
+            "logs-copy-all",
         ] {
             tab_to(window, id, cx);
         }
@@ -327,4 +331,121 @@ fn the_logs_view_renders_in_both_themes(cx: &mut TestAppContext) {
         })
         .expect("update the shell window");
     }
+}
+
+#[gpui_kit::test]
+fn a_drag_across_lines_and_ctrl_c_copies_the_selection(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    write_log(
+        &paths,
+        &[
+            "alpha first line",
+            "bravo second line",
+            "charlie third line",
+        ],
+    );
+    let store = SettingsStore::open(paths.config_file.clone());
+    let window = open_shell(cx, store, paths);
+
+    cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string("SENTINEL".into())));
+    cx.update_window(window, |_, window, cx| {
+        show_logs(window, cx);
+        // `show_logs` leaves focus on `nav-logs`, and the Root's Ctrl+C binding
+        // fires for any focus inside it, so leaving that focus in place would
+        // let the copy pass without the tail ever taking focus. Blur it first:
+        // the drag must be what puts keyboard focus inside the tail.
+        window.blur(cx);
+        window.render_frame(cx);
+        let first = window.find("logs-line-0").bounds();
+        let last = window.find("logs-line-2").bounds();
+        window.drag(
+            point(
+                first.origin.x + px(2.),
+                first.origin.y + first.size.height / 2.,
+            ),
+            point(
+                last.origin.x + last.size.width - px(2.),
+                last.origin.y + last.size.height / 2.,
+            ),
+            cx,
+        );
+        assert_eq!(
+            window.find("logs-lines").focused(),
+            Some(true),
+            "the dragged tail holds keyboard focus, so Ctrl+C can reach it"
+        );
+        window.press("ctrl-c", cx);
+    })
+    .expect("update the shell window");
+
+    let copied = cx
+        .update(|cx| cx.read_from_clipboard().and_then(|item| item.text()))
+        .unwrap_or_default();
+    assert_eq!(
+        copied, "alpha first line\nbravo second line\ncharlie third line",
+        "Ctrl+C copies every dragged line, in order"
+    );
+}
+
+#[gpui_kit::test]
+fn copy_all_writes_every_displayed_line_in_order(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    write_log(
+        &paths,
+        &[
+            "alpha first line",
+            "",
+            "charlie third line",
+            "delta fourth line",
+        ],
+    );
+    let store = SettingsStore::open(paths.config_file.clone());
+    let window = open_shell(cx, store, paths);
+
+    cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string("SENTINEL".into())));
+    cx.update_window(window, |_, window, cx| {
+        show_logs(window, cx);
+        window.click("logs-copy-all", cx);
+    })
+    .expect("update the shell window");
+
+    let copied = cx
+        .update(|cx| cx.read_from_clipboard().and_then(|item| item.text()))
+        .unwrap_or_default();
+    assert_eq!(
+        copied, "alpha first line\n\ncharlie third line\ndelta fourth line",
+        "Copy all keeps every displayed line, blank ones included, in order"
+    );
+}
+
+#[gpui_kit::test]
+fn copy_all_with_an_empty_tail_copies_nothing_and_does_not_panic(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let store = SettingsStore::open(paths.config_file.clone());
+    let window = open_shell(cx, store, paths);
+
+    cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string("SENTINEL".into())));
+    cx.update_window(window, |_, window, cx| {
+        show_logs(window, cx);
+        assert!(window.find("logs-empty").visible(), "an empty tail says so");
+        assert_eq!(
+            window.find("logs-copy-all").label(),
+            Some("Copy every displayed log line"),
+            "the control is there and named"
+        );
+        // The control is built disabled, but a disabled `Button`'s state is not
+        // observable here: GPUI has no aria-disabled setter for stateful
+        // elements (gpui-base `button.rs` records the same gap). Clicking it
+        // must therefore be the check: no panic, and nothing copied.
+        window.click("logs-copy-all", cx);
+    })
+    .expect("update the shell window");
+
+    let copied = cx
+        .update(|cx| cx.read_from_clipboard().and_then(|item| item.text()))
+        .unwrap_or_default();
+    assert_eq!(copied, "SENTINEL", "the clipboard is untouched");
 }
