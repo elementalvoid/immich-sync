@@ -28,8 +28,17 @@ pub fn watch_paths(directory: &Path) -> Vec<PathBuf> {
     let Some(git_dir) = git_dir(directory) else {
         return Vec::new();
     };
+    watch_paths_in(directory, &git_dir)
+}
 
-    let mut paths = vec![git_dir.join("HEAD")];
+/// The watch paths of a git directory `directory` belongs to.
+///
+/// Split from `watch_paths` so a test can pass a git directory without
+/// `HEAD`, which `git rev-parse` refuses to resolve.
+fn watch_paths_in(directory: &Path, git_dir: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let head_path = git_dir.join("HEAD");
+    paths.extend(head_path.exists().then_some(head_path));
     let head = fs::read_to_string(git_dir.join("HEAD")).unwrap_or_default();
     for name in ["logs/HEAD", "packed-refs"] {
         paths.extend(git_path(directory, name));
@@ -131,6 +140,24 @@ mod tests {
         assert!(
             paths.contains(&ref_file),
             "a commit moves the branch ref, so the build must watch it"
+        );
+        assert!(
+            paths.iter().all(|path| path.exists()),
+            "a missing rerun-if-changed path re-runs the build script on every build: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn a_git_dir_without_head_is_not_watched() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let git_dir = temp.path().join("git-dir");
+        fs::create_dir(&git_dir).expect("create a fake git dir");
+
+        let paths = super::watch_paths_in(temp.path(), &git_dir);
+
+        assert!(
+            !paths.contains(&git_dir.join("HEAD")),
+            "HEAD is missing, so watching it would re-run the build script on every build: {paths:?}"
         );
         assert!(
             paths.iter().all(|path| path.exists()),
