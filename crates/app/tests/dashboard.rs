@@ -11,8 +11,8 @@ use gpui_kit::component::Theme;
 use gpui_kit::component::ThemeMode;
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, Bounds, ElementId, Entity, Hsla, Point, TestAppContext,
-    Window, WindowAppearance, WindowBounds, WindowOptions, px, size,
+    AnyWindowHandle, App, AppContext as _, Bounds, ElementId, Entity, Hsla, Point, Role,
+    TestAppContext, Window, WindowAppearance, WindowBounds, WindowOptions, px, size,
 };
 use immich_sync::dashboard::{CardPalette, Dashboard, state_border};
 use immich_sync::status::{ActivityState, DashboardModel, StatusCard, sample};
@@ -400,10 +400,17 @@ fn pause_control_renames_itself_and_flips_the_global_state(cx: &mut TestAppConte
 }
 
 /// The live dashboard over a real (initially disconnected) engine model.
+///
+/// The view handle comes back too, so a test can drive one of its seams
+/// directly when the simulated dialog cannot produce the case (#30).
 fn open_live_dashboard(
     cx: &mut TestAppContext,
     temp: &std::path::Path,
-) -> (AnyWindowHandle, Entity<immich_sync::store::StoreModel>) {
+) -> (
+    AnyWindowHandle,
+    Entity<immich_sync::store::StoreModel>,
+    Entity<Dashboard>,
+) {
     let paths = immich_sync::paths::AppPaths {
         config_file: temp.join("config").join("settings.toml"),
         state_db: temp.join("data").join("state.db"),
@@ -422,7 +429,7 @@ fn open_live_dashboard(
         let store = cx.new(|cx| immich_sync::store::StoreModel::open(&paths, cx));
         let engine = cx
             .new(|cx| immich_sync::engine::EngineModel::new(connection, store.clone(), &paths, cx));
-        let window = gpui_kit::open_window(
+        let (window, view) = gpui_kit::open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds {
                     origin: Point::default(),
@@ -436,10 +443,24 @@ fn open_live_dashboard(
                 cx.new(|cx| Dashboard::with_engine(engine, window, cx))
             },
         )
-        .expect("open the live dashboard window")
-        .0;
-        (window, store)
+        .expect("open the live dashboard window");
+        (window, store, view)
     })
+}
+
+/// Waits until the shared state store has opened; it opens off the UI thread
+/// (N2), so a control driven before that is refused.
+async fn wait_for_store(cx: &mut TestAppContext, store: &Entity<immich_sync::store::StoreModel>) {
+    for _ in 0..600 {
+        if cx.read(|cx| store.read(cx).store().is_some()) {
+            return;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+        cx.run_until_parked();
+    }
+    panic!("the state store never opened");
 }
 
 /// Moves focus to the next tab stop, as the Root's Tab binding does.
@@ -547,16 +568,8 @@ async fn folder_add_and_remove_controls_reach_the_store(cx: &mut TestAppContext)
     let temp = tempfile::tempdir().expect("create a temp dir");
     let photos = temp.path().join("photos");
     std::fs::create_dir_all(&photos).expect("create the fixture folder");
-    let (window, store) = open_live_dashboard(cx, temp.path());
-    for _ in 0..600 {
-        if cx.read(|cx| store.read(cx).store().is_some()) {
-            break;
-        }
-        cx.executor()
-            .timer(std::time::Duration::from_millis(10))
-            .await;
-        cx.run_until_parked();
-    }
+    let (window, store, _view) = open_live_dashboard(cx, temp.path());
+    wait_for_store(cx, &store).await;
 
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
@@ -634,17 +647,7 @@ async fn add_folder_through_ui(
     store: &Entity<immich_sync::store::StoreModel>,
     path: &std::path::Path,
 ) {
-    // The store opens off the UI thread (N2); an add before it is ready is
-    // refused, so the controls are only driven once it is.
-    for _ in 0..600 {
-        if cx.read(|cx| store.read(cx).store().is_some()) {
-            break;
-        }
-        cx.executor()
-            .timer(std::time::Duration::from_millis(10))
-            .await;
-        cx.run_until_parked();
-    }
+    wait_for_store(cx, store).await;
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
         tab_to(window, "dashboard-folder-path", cx);
@@ -691,7 +694,7 @@ async fn a_folder_card_names_the_album_mapping_and_its_scope(cx: &mut TestAppCon
     let temp = tempfile::tempdir().expect("create a temp dir");
     let photos = temp.path().join("photos");
     std::fs::create_dir_all(&photos).expect("create the fixture folder");
-    let (window, store) = open_live_dashboard(cx, temp.path());
+    let (window, store, _view) = open_live_dashboard(cx, temp.path());
     add_folder_through_ui(cx, window, &store, &photos).await;
 
     cx.update_window(window, |_, window, cx| {
@@ -739,7 +742,7 @@ async fn the_album_controls_reach_the_store_by_pointer_and_by_keyboard(cx: &mut 
     let temp = tempfile::tempdir().expect("create a temp dir");
     let photos = temp.path().join("photos");
     std::fs::create_dir_all(&photos).expect("create the fixture folder");
-    let (window, store) = open_live_dashboard(cx, temp.path());
+    let (window, store, _view) = open_live_dashboard(cx, temp.path());
     add_folder_through_ui(cx, window, &store, &photos).await;
 
     // The switch is a tab stop that activates with Space (N5).
@@ -799,7 +802,7 @@ async fn the_recursive_switch_reaches_the_store_by_pointer_and_by_keyboard(
     let temp = tempfile::tempdir().expect("create a temp dir");
     let photos = temp.path().join("photos");
     std::fs::create_dir_all(&photos).expect("create the fixture folder");
-    let (window, store) = open_live_dashboard(cx, temp.path());
+    let (window, store, _view) = open_live_dashboard(cx, temp.path());
     add_folder_through_ui(cx, window, &store, &photos).await;
 
     // R2.1: the field adds a folder recursively, and the card's switch shows
@@ -849,5 +852,183 @@ async fn the_recursive_switch_reaches_the_store_by_pointer_and_by_keyboard(
     assert!(
         recursive.album_mapping,
         "R2.1: the switch back keeps the album mapping"
+    );
+}
+
+/// The text input the kit nests inside the row `id`.
+fn row_text_input(
+    window: &Window,
+    id: &'static str,
+) -> gpui_kit::base::test_support::ElementSnapshot {
+    gpui_kit::base::test_support::snapshots(window)
+        .into_iter()
+        .find(|snapshot| {
+            snapshot.role() == Some(Role::TextInput)
+                && snapshot.path().contains(&ElementId::Name(id.into()))
+        })
+        .expect("a text input inside the row")
+}
+
+#[gpui_kit::test]
+async fn browsing_for_a_folder_fills_the_field_and_add_folder_adds_it(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the fixture folder");
+    let (window, store, _view) = open_live_dashboard(cx, temp.path());
+    wait_for_store(cx, &store).await;
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("dashboard-browse-folder").label(),
+            Some("Browse for a source folder"),
+            "the browse control is named for assistive technology"
+        );
+        // The control is a tab stop, like the field and the add button (N5).
+        tab_to(window, "dashboard-browse-folder", cx);
+        window.click("dashboard-browse-folder", cx);
+    })
+    .expect("open the folder picker");
+
+    assert!(
+        cx.did_prompt_for_paths(),
+        "R2.1: Browse… opens the OS folder picker"
+    );
+    cx.simulate_path_prompt_response(|options| {
+        assert!(
+            options.directories,
+            "R2.1: the source folder picker chooses directories"
+        );
+        assert!(!options.files, "R2.1: it does not choose files");
+        assert!(!options.multiple, "#30: one source folder at a time");
+        Some(vec![photos.clone()])
+    });
+    cx.run_until_parked();
+
+    let path_text = photos.display().to_string();
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            row_text_input(window, "dashboard-folder-path").value(),
+            Some(path_text.as_str()),
+            "the chosen folder fills the existing field"
+        );
+        assert!(
+            window.try_find("dashboard-browse-notice").is_none(),
+            "a chosen folder is not a notice"
+        );
+        window.click("dashboard-add-folder", cx);
+    })
+    .expect("add the chosen folder");
+
+    let added = wait_for_folder(cx, &store, |_| true).await;
+    assert_eq!(
+        added.path, path_text,
+        "R2.1: Add folder adds the browsed folder"
+    );
+}
+
+#[gpui_kit::test]
+async fn cancelling_the_folder_picker_changes_nothing(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let (window, store, _view) = open_live_dashboard(cx, temp.path());
+    wait_for_store(cx, &store).await;
+    let typed = temp
+        .path()
+        .join("typed but not chosen")
+        .display()
+        .to_string();
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        tab_to(window, "dashboard-folder-path", cx);
+        window.input(&typed, cx);
+        window.click("dashboard-browse-folder", cx);
+    })
+    .expect("open the picker with the field already typed in");
+    assert!(cx.did_prompt_for_paths());
+    cx.simulate_path_prompt_response(|_| None);
+    cx.run_until_parked();
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            row_text_input(window, "dashboard-folder-path").value(),
+            Some(typed.as_str()),
+            "#30: a cancel leaves the typed path alone"
+        );
+        assert!(
+            window.try_find("dashboard-browse-notice").is_none(),
+            "a cancel is not an error"
+        );
+    })
+    .expect("read the field after the cancel");
+    assert!(
+        cx.read(|cx| store.read(cx).folders().is_empty()),
+        "#30: a cancel adds nothing"
+    );
+}
+
+#[gpui_kit::test]
+async fn a_picker_that_cannot_open_keeps_the_typed_path_usable(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the fixture folder");
+    let (window, store, view) = open_live_dashboard(cx, temp.path());
+    wait_for_store(cx, &store).await;
+    let path_text = photos.display().to_string();
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        tab_to(window, "dashboard-folder-path", cx);
+        window.input(&path_text, cx);
+        // The harness answers a prompt with a choice or a cancel and nothing
+        // else, so the portal-less failure comes in through the seam the click
+        // handler uses (#30).
+        view.update(cx, |view, cx| {
+            view.apply_pick(
+                Err(anyhow::anyhow!(
+                    "Couldn't open file picker due to missing xdg-desktop-portal implementation."
+                )),
+                window,
+                cx,
+            );
+        });
+    })
+    .expect("apply a picker that could not open");
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let notice = window.find("dashboard-browse-notice");
+        assert_eq!(
+            notice.role(),
+            Some(Role::Alert),
+            "the failure notice is announced"
+        );
+        let label = notice
+            .label()
+            .expect("the notice has a message")
+            .to_string();
+        assert!(
+            label.contains("xdg-desktop-portal"),
+            "the notice keeps the reason the dialog gave: {label}"
+        );
+        assert_eq!(
+            row_text_input(window, "dashboard-folder-path").value(),
+            Some(path_text.as_str()),
+            "the typed path survives a failure"
+        );
+        // And it is still usable: Add folder submits it.
+        window.click("dashboard-add-folder", cx);
+    })
+    .expect("use the typed path after the failure");
+
+    let added = wait_for_folder(cx, &store, |_| true).await;
+    assert_eq!(
+        added.path, path_text,
+        "#30: the typed path still reaches Add folder after a failed picker"
     );
 }

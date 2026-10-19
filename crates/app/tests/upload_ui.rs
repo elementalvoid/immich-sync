@@ -73,20 +73,23 @@ fn open_upload(
     cx: &mut TestAppContext,
     paths: &AppPaths,
     connection: Entity<ConnectionModel>,
-) -> (AnyWindowHandle, Entity<immich_sync::store::StoreModel>) {
+) -> (
+    AnyWindowHandle,
+    Entity<immich_sync::store::StoreModel>,
+    Entity<UploadView>,
+) {
     let paths = paths.clone();
     cx.update(|cx| {
         gpui_kit::init(cx);
         let store = cx.new(|cx| immich_sync::store::StoreModel::open(&paths, cx));
-        let window = gpui_kit::open_window(window_options(), cx, |window, cx| {
+        let (window, view) = gpui_kit::open_window(window_options(), cx, |window, cx| {
             let model = cx.new(|cx| {
                 immich_sync::upload::UploadModel::new(connection.clone(), store.clone(), cx)
             });
             cx.new(|cx| UploadView::new(model, window, cx))
         })
-        .expect("open the upload window")
-        .0;
-        (window, store)
+        .expect("open the upload window");
+        (window, store, view)
     })
 }
 
@@ -192,7 +195,7 @@ fn the_upload_view_names_its_controls(cx: &mut TestAppContext) {
         let store: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
         cx.new(|_| ConnectionModel::new(ServerProfile::default(), store))
     });
-    let (window, _store) = open_upload(cx, &paths, connection);
+    let (window, _store, _view) = open_upload(cx, &paths, connection);
 
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
@@ -228,7 +231,7 @@ async fn uploading_a_file_shows_the_asset_id_and_a_repeat_shows_the_duplicate(
     let temp = tempfile::tempdir().expect("create a temp dir");
     let paths = temporary_paths(temp.path());
     let connection = connected_model(cx, &server);
-    let (window, store) = open_upload(cx, &paths, connection.clone());
+    let (window, store, _view) = open_upload(cx, &paths, connection.clone());
     wait_for_store(cx, &store).await;
     cx.wait_for(window, Duration::from_secs(60), |_, cx| {
         connection.read(cx).state().is_connected()
@@ -311,7 +314,7 @@ async fn a_second_enter_during_an_upload_starts_nothing(cx: &mut TestAppContext)
     let temp = tempfile::tempdir().expect("create a temp dir");
     let paths = temporary_paths(temp.path());
     let connection = connected_model(cx, &server);
-    let (window, store) = open_upload(cx, &paths, connection.clone());
+    let (window, store, _view) = open_upload(cx, &paths, connection.clone());
     wait_for_store(cx, &store).await;
     cx.wait_for(window, Duration::from_secs(60), |_, cx| {
         connection.read(cx).state().is_connected()
@@ -353,7 +356,7 @@ async fn an_upload_without_a_session_is_unavailable_not_a_crash(cx: &mut TestApp
         let store: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
         cx.new(|_| ConnectionModel::new(ServerProfile::default(), store))
     });
-    let (window, store) = open_upload(cx, &paths, connection);
+    let (window, store, _view) = open_upload(cx, &paths, connection);
     wait_for_store(cx, &store).await;
     let file = temp.path().join("hello.txt");
     std::fs::write(&file, b"hello world").expect("write the fixture");
@@ -378,6 +381,219 @@ async fn an_upload_without_a_session_is_unavailable_not_a_crash(cx: &mut TestApp
                 .as_str()
             ),
             "the window says what to do instead of failing silently"
+        );
+    })
+    .expect("read the result");
+}
+
+#[gpui_kit::test]
+async fn browsing_for_a_file_fills_the_field_and_upload_sends_it(cx: &mut TestAppContext) {
+    let (_runtime, server) = mock_server();
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let connection = connected_model(cx, &server);
+    let (window, store, _view) = open_upload(cx, &paths, connection.clone());
+    wait_for_store(cx, &store).await;
+    cx.wait_for(window, Duration::from_secs(60), |_, cx| {
+        connection.read(cx).state().is_connected()
+    })
+    .await;
+
+    let file = temp.path().join("hello.txt");
+    std::fs::write(&file, b"hello world").expect("write the fixture");
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("upload-browse").label(),
+            Some("Browse for the file to upload"),
+            "the browse control is named for assistive technology"
+        );
+        // The control is a tab stop, like the path field and Upload (N5).
+        tab_to(window, "upload-browse", cx);
+        window.click("upload-browse", cx);
+    })
+    .expect("open the file picker");
+
+    assert!(
+        cx.did_prompt_for_paths(),
+        "the manual upload offers the OS file picker"
+    );
+    cx.simulate_path_prompt_response(|options| {
+        assert!(options.files, "the upload picker chooses files");
+        assert!(
+            !options.directories,
+            "the upload picker does not choose directories"
+        );
+        assert!(!options.multiple, "#30: one file at a time");
+        Some(vec![file.clone()])
+    });
+    cx.run_until_parked();
+
+    let path_text = file.display().to_string();
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            row_text_input(window, "upload-path").value(),
+            Some(path_text.as_str()),
+            "the chosen file fills the existing field"
+        );
+        assert_eq!(
+            window.find("upload-result").label(),
+            Some(UploadReport::Idle.message().as_str()),
+            "picking a file is not an outcome"
+        );
+        window.click("upload-button", cx);
+    })
+    .expect("upload the chosen file");
+    cx.wait_for(window, Duration::from_secs(60), |window, _| {
+        window.find("upload-result").label().is_some_and(|label| {
+            !label.starts_with("Uploading") && label != "No file has been uploaded yet."
+        })
+    })
+    .await;
+
+    let label = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window
+                .find("upload-result")
+                .label()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .expect("read the result");
+    assert!(
+        label.starts_with("Uploaded"),
+        "the browsed file was uploaded: {label}"
+    );
+    assert_eq!(
+        server.upload_requests(),
+        1,
+        "the browsed path reached the upload handler"
+    );
+}
+
+#[gpui_kit::test]
+fn cancelling_the_file_picker_changes_nothing(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let connection = cx.update(|cx| {
+        let store: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+        cx.new(|_| ConnectionModel::new(ServerProfile::default(), store))
+    });
+    let (window, _store, _view) = open_upload(cx, &paths, connection);
+    let typed = temp
+        .path()
+        .join("typed but not chosen.txt")
+        .display()
+        .to_string();
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        tab_to(window, "upload-path", cx);
+        window.input(&typed, cx);
+        window.click("upload-browse", cx);
+    })
+    .expect("open the picker with the field already typed in");
+    assert!(cx.did_prompt_for_paths());
+    cx.simulate_path_prompt_response(|_| None);
+    cx.run_until_parked();
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            row_text_input(window, "upload-path").value(),
+            Some(typed.as_str()),
+            "#30: a cancel leaves the typed path alone"
+        );
+        assert!(
+            window.try_find("upload-browse-notice").is_none(),
+            "a cancel is not an error"
+        );
+        assert_eq!(
+            window.find("upload-result").label(),
+            Some(UploadReport::Idle.message().as_str()),
+            "#30: a cancel uploads nothing"
+        );
+    })
+    .expect("read the field after the cancel");
+}
+
+#[gpui_kit::test]
+async fn a_file_picker_that_cannot_open_keeps_the_typed_path_usable(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let connection = cx.update(|cx| {
+        let store: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+        cx.new(|_| ConnectionModel::new(ServerProfile::default(), store))
+    });
+    let (window, store, view) = open_upload(cx, &paths, connection);
+    wait_for_store(cx, &store).await;
+    let file = temp.path().join("hello.txt");
+    std::fs::write(&file, b"hello world").expect("write the fixture");
+    let typed = file.display().to_string();
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        tab_to(window, "upload-path", cx);
+        window.input(&typed, cx);
+        // The harness answers a prompt with a choice or a cancel and nothing
+        // else, so the portal-less failure comes in through the seam the click
+        // handler uses (#30).
+        view.update(cx, |view, cx| {
+            view.apply_pick(
+                Err(anyhow::anyhow!(
+                    "Couldn't open file picker due to missing xdg-desktop-portal implementation."
+                )),
+                window,
+                cx,
+            );
+        });
+    })
+    .expect("apply a picker that could not open");
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let notice = window.find("upload-browse-notice");
+        assert_eq!(
+            notice.role(),
+            Some(Role::Alert),
+            "the failure notice is announced"
+        );
+        let label = notice
+            .label()
+            .expect("the notice has a message")
+            .to_string();
+        assert!(
+            label.contains("xdg-desktop-portal"),
+            "the notice keeps the reason the dialog gave: {label}"
+        );
+        assert_eq!(
+            row_text_input(window, "upload-path").value(),
+            Some(typed.as_str()),
+            "the typed path survives a failure"
+        );
+        // And it is still usable: Upload submits it (there is no session here,
+        // so the model's answer proves the typed path reached the handler).
+        window.click("upload-button", cx);
+    })
+    .expect("use the typed path after the failure");
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("upload-result").label(),
+            Some(
+                UploadReport::CannotRun {
+                    message: "Sign in to a server before uploading a file.".to_string()
+                }
+                .message()
+                .as_str()
+            ),
+            "#30: the typed path still reaches the upload handler after a failed picker"
         );
     })
     .expect("read the result");
