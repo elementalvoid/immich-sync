@@ -267,6 +267,39 @@ Open the **Logs** view or read the file listed in
 while reproducing a problem, then set it back. Credentials are redacted, so the
 log is safe to attach.
 
+### Collect a debug bundle
+
+The **Diagnostics** view's **Collect bundle** action writes one `.zip` and shows
+its full path; **Copy path** puts that path on the clipboard, so it can be pasted
+into a message or a file manager. Collection runs in the background, so the
+window stays usable.
+
+The archive is saved as `immich-sync-debug-<date>-<time>.zip` in your Downloads
+folder (your home folder when there is none). It holds:
+
+- the newest three log files, with the last 256 KiB of each, so a full log
+  rotation is not included;
+- the client version, the operating system and architecture, the Immich server
+  version, and the schema version;
+- the state database's schema version, size, per-table row counts, `quick_check`
+  verdict, and the last error of each failure class;
+- the settings values as a `settings.toml` (only the settings the client knows,
+  so a line pasted into the file by hand is left out), plus the source folders
+  with their album mapping and scope;
+- the library's tracked bytes, item counts by state, and the folder, review,
+  dead-letter, and version counts;
+- the connection state, the engine's activity, and the upload rate.
+
+It holds no password, API key, or session token: the settings file never stores
+them, and the log pipeline redacts them. It does hold your folder paths, your
+account email, the server URL, and the log files, so review the archive before
+attaching it to a message. A recorded failure message is left out (only its
+class is included), because its text can come from the server.
+
+A collection that cannot read the logs, the state database, or the server still
+writes an archive; the view and the archive's `README.txt` both list what was
+missing.
+
 ## Releases
 
 For maintainers.

@@ -168,7 +168,13 @@ fn open_shell(
             let failed =
                 cx.new(|cx| immich_sync::failed_view::FailedView::new(engine.clone(), window, cx));
             let diagnostics_model = cx.new(|cx| {
-                DiagnosticsModel::new(store_model.clone(), engine.clone(), connection.clone(), cx)
+                DiagnosticsModel::new(
+                    store_model.clone(),
+                    engine.clone(),
+                    connection.clone(),
+                    model_paths.log_directory(),
+                    cx,
+                )
             });
             let diagnostics = cx.new(|cx| DiagnosticsView::new(diagnostics_model, cx));
             let review = cx.new(|cx| immich_sync::review_view::ReviewView::new(engine, window, cx));

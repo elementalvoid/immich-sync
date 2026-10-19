@@ -6,7 +6,7 @@
 //! the same re-login rule every other request uses (R1.4). The sqlite reads and
 //! the rebuild run off the UI thread (N2).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use gpui_kit::*;
@@ -16,6 +16,7 @@ use sync_core::engine::EngineStatus;
 use sync_core::store::{ClassError, SqliteInfo};
 
 use crate::connection::{ConnectionModel, WORKER_UNAVAILABLE, run_on_worker};
+use crate::debug_bundle::{self, BundleReport, Snapshot};
 use crate::engine::EngineModel;
 use crate::store::StoreModel;
 
@@ -50,11 +51,30 @@ pub enum Permissions {
     Unavailable(String),
 }
 
+/// What the Diagnostics view shows about the last bundle collection
+/// (issue #25).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum BundleState {
+    /// No collection has run in this session.
+    #[default]
+    Idle,
+    /// The collector is running on the background executor.
+    Collecting,
+    /// The archive that was written, with what it could not hold.
+    Ready(BundleReport),
+    /// The archive could not be written, with the reason.
+    Failed(String),
+}
+
 /// The diagnostics view's model.
 pub struct DiagnosticsModel {
     store: Entity<StoreModel>,
     engine: Entity<EngineModel>,
     connection: Entity<ConnectionModel>,
+    /// The folder a collected archive is written to (#25). The shell passes
+    /// [`crate::debug_bundle::bundle_directory`]; a test passes a temp dir.
+    bundle_dir: PathBuf,
+    bundle: BundleState,
     info: Option<SqliteInfo>,
     errors: Vec<ClassError>,
     server: ServerInfo,
@@ -75,6 +95,7 @@ impl DiagnosticsModel {
         store: Entity<StoreModel>,
         engine: Entity<EngineModel>,
         connection: Entity<ConnectionModel>,
+        bundle_dir: PathBuf,
         cx: &mut Context<Self>,
     ) -> Self {
         let subscriptions = vec![
@@ -86,6 +107,8 @@ impl DiagnosticsModel {
             store,
             engine,
             connection,
+            bundle_dir,
+            bundle: BundleState::default(),
             info: None,
             errors: Vec::new(),
             server: ServerInfo::default(),
@@ -152,6 +175,62 @@ impl DiagnosticsModel {
     #[must_use]
     pub fn is_rebuilding(&self) -> bool {
         self.rebuilding
+    }
+
+    /// Where a collection saves its archive (#25), for the view's help text.
+    #[must_use]
+    pub fn bundle_directory(&self) -> &Path {
+        &self.bundle_dir
+    }
+
+    /// What the last collection produced (#25).
+    #[must_use]
+    pub fn bundle(&self) -> &BundleState {
+        &self.bundle
+    }
+
+    /// Collects the debug bundle on the background executor (issue #25).
+    ///
+    /// The values only this thread can read (the server version, the
+    /// connection state, the engine's activity and rate) are sampled here; the
+    /// file-system and database reads run in the background, and the result
+    /// lands back here through `cx.spawn`. A second click while one runs is a
+    /// no-op.
+    pub fn collect_bundle(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.bundle, BundleState::Collecting) {
+            return;
+        }
+        let (paths, store) = {
+            let store = self.store.read(cx);
+            (store.paths().clone(), store.store())
+        };
+        let snapshot = Snapshot {
+            server_version: self.server.version.clone(),
+            // The summary, never the attention message: a server-supplied
+            // reason can quote a submitted credential (SPEC N3).
+            connection: self.connection.read(cx).state().summary().to_string(),
+            activity: self.status.activity.label().to_string(),
+            throughput: format_rate(self.throughput_bytes_per_second()),
+        };
+        let directory = self.bundle_dir.clone();
+        self.bundle = BundleState::Collecting;
+        cx.notify();
+        let collected = cx.background_executor().spawn(async move {
+            debug_bundle::collect(&paths, store.as_deref(), &snapshot, &directory)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = collected.await;
+            let _ = this.update(cx, |model, cx| {
+                model.bundle = match result {
+                    Ok(report) => BundleState::Ready(report),
+                    Err(error) => BundleState::Failed(format!(
+                        "The debug bundle could not be written: {error:#}"
+                    )),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Re-reads the sqlite state and the last error per class, and re-checks
@@ -443,7 +522,15 @@ mod tests {
             let store = cx.new(|cx| StoreModel::open(&paths, cx));
             let engine =
                 cx.new(|cx| EngineModel::new(connection.clone(), store.clone(), &paths, cx));
-            cx.new(|cx| super::DiagnosticsModel::new(store, engine, connection, cx))
+            cx.new(|cx| {
+                super::DiagnosticsModel::new(
+                    store,
+                    engine,
+                    connection,
+                    temp.path().join("downloads"),
+                    cx,
+                )
+            })
         });
         // The store opens on the background executor; the initial refresh only
         // starts a read once it is there.

@@ -100,6 +100,7 @@ fn open_shell(cx: &mut TestAppContext, store: SettingsStore, paths: AppPaths) ->
                     store_model.clone(),
                     engine_model.clone(),
                     connection.clone(),
+                    upload_paths.log_directory(),
                     cx,
                 )
             });
