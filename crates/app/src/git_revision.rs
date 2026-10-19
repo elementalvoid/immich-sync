@@ -29,10 +29,10 @@ pub fn watch_paths(directory: &Path) -> Vec<PathBuf> {
 
     let mut paths = vec![git_dir.join("HEAD")];
     let head = fs::read_to_string(git_dir.join("HEAD")).unwrap_or_default();
-    if let Some(reference) = head.trim().strip_prefix("ref: ") {
-        if let Some(path) = git_stdout(directory, &["rev-parse", "--git-path", reference]) {
-            paths.push(resolve(directory, path.trim()));
-        }
+    if let Some(reference) = head.trim().strip_prefix("ref: ")
+        && let Some(path) = git_stdout(directory, &["rev-parse", "--git-path", reference])
+    {
+        paths.push(resolve(directory, path.trim()));
     }
     if let Some(path) = git_stdout(directory, &["rev-parse", "--git-path", "packed-refs"]) {
         paths.push(resolve(directory, path.trim()));
