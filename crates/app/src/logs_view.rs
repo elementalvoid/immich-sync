@@ -324,6 +324,10 @@ impl LogsView {
                         .text_color(palette.text)
                         // One handle per line: a shared handle registers once
                         // and the last line painted would win (probe Q1).
+                        // A blank line selected by a drag is dropped from the
+                        // copied text: the selection layer drops whitespace-only
+                        // participants and the Root trims. That is vendored
+                        // gpui-base behaviour; Copy all keeps blank lines.
                         .child(
                             SelectableText::new(
                                 ElementId::Name(format!("logs-text-{index}").into()),

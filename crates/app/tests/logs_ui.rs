@@ -351,6 +351,11 @@ fn a_drag_across_lines_and_ctrl_c_copies_the_selection(cx: &mut TestAppContext) 
     cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string("SENTINEL".into())));
     cx.update_window(window, |_, window, cx| {
         show_logs(window, cx);
+        // `show_logs` leaves focus on `nav-logs`, and the Root's Ctrl+C binding
+        // fires for any focus inside it, so leaving that focus in place would
+        // let the copy pass without the tail ever taking focus. Blur it first:
+        // the drag must be what puts keyboard focus inside the tail.
+        window.blur(cx);
         window.render_frame(cx);
         let first = window.find("logs-line-0").bounds();
         let last = window.find("logs-line-2").bounds();
@@ -364,6 +369,11 @@ fn a_drag_across_lines_and_ctrl_c_copies_the_selection(cx: &mut TestAppContext) 
                 last.origin.y + last.size.height / 2.,
             ),
             cx,
+        );
+        assert_eq!(
+            window.find("logs-lines").focused(),
+            Some(true),
+            "the dragged tail holds keyboard focus, so Ctrl+C can reach it"
         );
         window.press("ctrl-c", cx);
     })
