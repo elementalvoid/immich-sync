@@ -449,21 +449,13 @@ impl DiagnosticsView {
                 // words its README uses.
                 for (index, note) in report.notes.iter().enumerate() {
                     rows.push(
-                        div()
-                            .id(ElementId::Name(
-                                format!("diagnostics-bundle-note-{index}").into(),
-                            ))
-                            .test_support()
-                            .role(Role::Alert)
-                            .aria_label(note.clone())
-                            .border_l_2()
-                            .border_color(theme.warning)
-                            .pl_2()
-                            .py_1()
-                            .text_xs()
-                            .text_color(palette.text)
-                            .child(Text::new_inaccessible(note.clone().into()))
-                            .into_any_element(),
+                        notice(
+                            ElementId::Name(format!("diagnostics-bundle-note-{index}").into()),
+                            note.clone(),
+                            theme.warning,
+                            &palette,
+                        )
+                        .into_any_element(),
                     );
                 }
             }

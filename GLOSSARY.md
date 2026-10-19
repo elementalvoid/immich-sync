@@ -131,3 +131,7 @@ _Avoid_: app version, build version
 **Server version**:
 The version the connected Immich server reports. Diagnostics shows it beside the client version, so a support session can tell which side a fault is on.
 _Avoid_: Immich version, API version
+
+**Debug bundle**:
+One archive Diagnostics collects for a support message: the logs, versions, database information, configuration, and sizing.
+_Avoid_: support bundle, log bundle, diagnostics archive

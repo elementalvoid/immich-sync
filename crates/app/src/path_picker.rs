@@ -8,7 +8,6 @@
 
 use std::path::PathBuf;
 
-use gpui_kit::component::Theme;
 use gpui_kit::*;
 
 /// What one Browse… dialog asks the surface to do.
@@ -37,7 +36,7 @@ pub fn picked(result: anyhow::Result<Option<Vec<PathBuf>>>) -> Picked {
             .map_or(Picked::Cancelled, Picked::Path),
         Ok(None) => Picked::Cancelled,
         Err(error) => Picked::Failed(format!(
-            "Couldn't open the file picker ({error}). Type the path instead."
+            "Couldn't open the folder or file picker ({error}). Type the path instead."
         )),
     }
 }
@@ -65,24 +64,6 @@ pub fn browse<T: 'static>(
         .ok();
     })
     .detach();
-}
-
-/// The inline notice a Browse… that could not open shows.
-///
-/// The accessible name carries the message, so the visible copy is not
-/// announced a second time.
-pub fn notice(id: &'static str, text: String, theme: &Theme) -> impl IntoElement + use<> {
-    div()
-        .id(id)
-        .test_support()
-        .role(Role::Alert)
-        .aria_label(text.clone())
-        .border_l_2()
-        .border_color(theme.danger)
-        .pl_2()
-        .text_xs()
-        .text_color(theme.foreground)
-        .child(Text::new_inaccessible(text.into()))
 }
 
 #[cfg(test)]
@@ -121,6 +102,10 @@ mod tests {
         assert!(
             notice.contains("Type the path instead"),
             "the notice says the field still works: {notice}"
+        );
+        assert!(
+            notice.contains("Couldn't open the folder or file picker"),
+            "the notice names both pickers, since the dashboard opens a folder: {notice}"
         );
     }
 }

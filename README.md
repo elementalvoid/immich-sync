@@ -186,8 +186,9 @@ its card instead of producing one error per file.
 - **Diagnostics.** Client and server versions and permissions, the state database and its
   integrity, the last error per class, throughput, and a **Rebuild** action that
   starts the state over and rescans every folder.
-- **Logs.** The tail of the log file and the level control. The log never
-  contains the password, API key, or session token.
+- **Logs.** The tail of the log file, selectable for copying, the level
+  control, and a **Copy all** control that copies every line shown. The log
+  never contains the password, API key, or session token.
 - The theme follows the system theme.
 
 ## Where everything lives
