@@ -34,13 +34,32 @@ release carries, for version `<version>`:
    planned for the public release; until then this warning is expected and is
    not a sign the download was altered. The checksums below are how you check
    that.
-3. The installer is per-user: it needs no administrator password, installs to
-   `%LOCALAPPDATA%\Immich Sync`, and adds Start Menu and desktop shortcuts. It
-   can start the app when it finishes.
+3. The installer asks who to install for. **All users** is preselected on a
+   first install and installs to `C:\Program Files\Immich Sync`, with its
+   uninstall entry in `HKLM` and shortcuts in the All Users Start Menu and on
+   the public desktop. **Current user only** installs to
+   `%LOCALAPPDATA%\Programs\Immich Sync`, with the entry in `HKCU` and
+   shortcuts for that account alone. A reinstall or upgrade preselects the
+   mode the previous install used.
+4. The installer prompts for administrator elevation in **either** mode: it is
+   built in a mode that always requests elevation, including for a current-user
+   install. Declining the prompt cancels the install. It can start the app when
+   it finishes.
 
-Uninstall from **Settings → Apps → Immich Sync**. Settings, state, and logs
-(see [Where everything lives](#where-everything-lives)) are kept; delete those
+Settings, state, logs, and the autostart entry are always per user, whichever
+mode you pick; the install directory holds only the program.
+
+Uninstall from **Settings → Apps → Immich Sync**. That removes the installed
+copy and its shortcuts. Settings, state, and logs (see
+[Where everything lives](#where-everything-lives)) are kept; delete those
 folders yourself for a complete reset.
+
+**Upgrading from a build before the install-mode choice.** Earlier installers
+were always per-user and wrote their uninstall entry under `HKCU`, so Windows
+still lists that copy separately. Uninstall it by hand from
+**Settings → Apps → Immich Sync** before installing this build, or you will have
+two copies. Nothing is migrated automatically, and the old copy's settings,
+state, and logs carry over because they live in the per-user folders above.
 
 ### Linux (deb)
 

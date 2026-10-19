@@ -3939,6 +3939,7 @@ dependencies = [
  "async-channel",
  "dbus-secret-service-keyring-store",
  "directories",
+ "embed-resource",
  "gpui-kit",
  "gpui-tray",
  "interprocess",
