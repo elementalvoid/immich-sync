@@ -14,30 +14,43 @@ pub fn revision_label(directory: &Path) -> String {
     short_revision(directory).unwrap_or_else(|| "unknown".to_string())
 }
 
-/// The files whose change moves the revision `directory` reports: the git
-/// dir's `HEAD`, the ref `HEAD` names, and `packed-refs` for a packed ref.
+/// The files whose change moves the revision `directory` reports.
 ///
-/// Empty outside a repository, where there is no revision to move. `build.rs`
-/// lists them as `rerun-if-changed`, so a commit re-runs the build script and
-/// re-embeds the revision.
+/// A commit moves the branch ref and `HEAD`'s reflog; a packed ref instead
+/// lands in `packed-refs`. Only paths that exist are reported, because cargo
+/// re-runs a build script on every build when a `rerun-if-changed` path is
+/// missing. `build.rs` lists them as `rerun-if-changed`, so a commit re-runs
+/// the build script and re-embeds the revision.
+///
+/// Empty outside a repository, where there is no revision to move.
 #[must_use]
 pub fn watch_paths(directory: &Path) -> Vec<PathBuf> {
-    let Some(git_dir) = git_stdout(directory, &["rev-parse", "--absolute-git-dir"]) else {
+    let Some(git_dir) = git_dir(directory) else {
         return Vec::new();
     };
-    let git_dir = PathBuf::from(git_dir.trim());
 
     let mut paths = vec![git_dir.join("HEAD")];
     let head = fs::read_to_string(git_dir.join("HEAD")).unwrap_or_default();
-    if let Some(reference) = head.trim().strip_prefix("ref: ")
-        && let Some(path) = git_stdout(directory, &["rev-parse", "--git-path", reference])
-    {
-        paths.push(resolve(directory, path.trim()));
+    for name in ["logs/HEAD", "packed-refs"] {
+        paths.extend(git_path(directory, name));
     }
-    if let Some(path) = git_stdout(directory, &["rev-parse", "--git-path", "packed-refs"]) {
-        paths.push(resolve(directory, path.trim()));
+    if let Some(reference) = head.trim().strip_prefix("ref: ") {
+        paths.extend(git_path(directory, reference));
     }
     paths
+}
+
+/// The repository's git directory, when `directory` is in a working tree.
+fn git_dir(directory: &Path) -> Option<PathBuf> {
+    let output = git_stdout(directory, &["rev-parse", "--absolute-git-dir"])?;
+    Some(PathBuf::from(output.trim()))
+}
+
+/// One git path, when it exists.
+fn git_path(directory: &Path, name: &str) -> Option<PathBuf> {
+    let output = git_stdout(directory, &["rev-parse", "--git-path", name])?;
+    let path = resolve(directory, output.trim());
+    path.exists().then_some(path)
 }
 
 /// The short revision, when git resolves one.
@@ -102,9 +115,26 @@ mod tests {
 
         let head_file = temp.path().join(".git").join("HEAD");
         assert!(head_file.exists(), "git init wrote {}", head_file.display());
+        let paths = watch_paths(temp.path());
         assert!(
-            watch_paths(temp.path()).contains(&head_file),
-            "a commit moves the git dir's HEAD, so the build must watch it"
+            paths.contains(&head_file),
+            "a checkout moves the git dir's HEAD, so the build must watch it"
+        );
+
+        let head = fs::read_to_string(&head_file).expect("read HEAD");
+        let reference = head
+            .trim()
+            .strip_prefix("ref: ")
+            .expect("HEAD names a branch after a commit");
+        let ref_file = temp.path().join(".git").join(reference);
+        assert!(ref_file.exists(), "the commit wrote {}", ref_file.display());
+        assert!(
+            paths.contains(&ref_file),
+            "a commit moves the branch ref, so the build must watch it"
+        );
+        assert!(
+            paths.iter().all(|path| path.exists()),
+            "a missing rerun-if-changed path re-runs the build script on every build: {paths:?}"
         );
     }
 
