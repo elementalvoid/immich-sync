@@ -36,7 +36,7 @@ pub fn picked(result: anyhow::Result<Option<Vec<PathBuf>>>) -> Picked {
             .map_or(Picked::Cancelled, Picked::Path),
         Ok(None) => Picked::Cancelled,
         Err(error) => Picked::Failed(format!(
-            "Couldn't open the file picker ({error}). Type the path instead."
+            "Couldn't open the folder or file picker ({error}). Type the path instead."
         )),
     }
 }
@@ -102,6 +102,10 @@ mod tests {
         assert!(
             notice.contains("Type the path instead"),
             "the notice says the field still works: {notice}"
+        );
+        assert!(
+            notice.contains("Couldn't open the folder or file picker"),
+            "the notice names both pickers, since the dashboard opens a folder: {notice}"
         );
     }
 }
