@@ -87,7 +87,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust 1.99.0
         run: |
-          rustup toolchain install 1.99.0 --profile minimal --component rustfmt --component clippy
+          # llvm-tools supplies llvm-readobj for the icon assertion below.
+          rustup toolchain install 1.99.0 --profile minimal --component rustfmt --component clippy --component llvm-tools
           rustup default 1.99.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -135,23 +136,37 @@ jobs:
         shell: pwsh
         run: |
           $exe = "target/release/immich-sync.exe"
-          # llvm-readobj ships in the llvm-tools component, which the toolchain
-          # step above does not install yet.
-          rustup component add llvm-tools --toolchain 1.99.0
-          $host = (rustc -vV | Select-String '^host: ').Line -replace '^host: ', ''
-          $readobj = Join-Path (rustc --print sysroot) "lib/rustlib/$host/bin/llvm-readobj.exe"
+          # Not `$host`: PowerShell reserves it for the host program object.
+          $hostTriple = (rustc -vV | Select-String '^host: ').Line -replace '^host: ', ''
+          $readobj = Join-Path (rustc --print sysroot) "lib/rustlib/$hostTriple/bin/llvm-readobj.exe"
           if (-not (Test-Path $readobj)) { throw "llvm-readobj not found at $readobj" }
-          $resources = (& $readobj --coff-resources $exe) -join "`n"
+          $resources = & $readobj --coff-resources $exe
           $resources
-          # Match inside the ICON type block only: a bare `Name: (ID 1)` also
-          # matches the MANIFEST and VERSIONINFO entries, which is precisely the
-          # state this check exists to reject (an exe with no icon resource).
-          # RT_GROUP_ICON named 1 is the same icon through the group table; the
-          # resource compiler emits both, so accept either.
-          if (-not ($resources -match '(?ms)^\s*Type: (?:ICON \(ID 3\)|GROUP_ICON \(ID 14\))\s*\[.*?^\s*Name: \(ID 1\)')) {
-            throw "$exe has no icon resource 1; GPUI's window class icon and the shell icon would be blank"
+          # GPUI's Windows backend loads its window-class icon with
+          # LoadImageW(module, MAKEINTRESOURCE(1), IMAGE_ICON, ..), which resolves
+          # the RT_GROUP_ICON table named 1, and the shell reads the group icon
+          # too. Assert that group entry rather than a bare `Name: (ID 1)`: the
+          # MANIFEST resource is also named 1, so a loose match would pass on an
+          # executable that has no icon at all (the state this check exists to
+          # reject). Both the PE (nested) and COFF .lib (flat) dump shapes are
+          # recognised so the same logic can be checked offline.
+          $inGroupIcon = $false
+          $found = $false
+          foreach ($line in $resources) {
+            if ($line -match '(Type|Resource type \(int\)): GROUP_ICON \(ID 14\)') {
+              $inGroupIcon = $true
+              continue
+            }
+            if ($line -match '(Type|Resource type \(int\)): \S') { $inGroupIcon = $false }
+            if ($inGroupIcon -and $line -match '^\s*(Name: \(ID 1\)|Resource name \(int\): 1$)') {
+              $found = $true
+              break
+            }
           }
-          "icon resource 1 present"
+          if (-not $found) {
+            throw "$exe has no icon resource group 1; GPUI's window class icon and the shell icon would be blank"
+          }
+          "icon resource group 1 present"
 
   linux-gui-smoke:
     name: Linux GUI smoke (Xvfb + lavapipe)
