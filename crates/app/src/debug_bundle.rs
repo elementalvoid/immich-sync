@@ -302,15 +302,20 @@ fn configuration_text(
             // Only the settings this build knows are copied. A line pasted
             // into the file by hand stays out of the archive, the same rule
             // that keeps a server's text out of it (SPEC N3).
-            Ok(parsed) => match toml::to_string_pretty(&parsed) {
-                Ok(written) => {
-                    entries.push(("settings.toml".to_string(), written.into_bytes()));
-                    settings = Some(parsed);
+            Ok(mut parsed) => {
+                // A hand-edited file can carry a password in the URL. The log
+                // pipeline drops that userinfo, and so does the archive (N3).
+                parsed.server_url = logging::without_userinfo(&parsed.server_url);
+                match toml::to_string_pretty(&parsed) {
+                    Ok(written) => {
+                        entries.push(("settings.toml".to_string(), written.into_bytes()));
+                        settings = Some(parsed);
+                    }
+                    Err(error) => notes.push(format!(
+                        "The settings could not be written into the archive: {error}"
+                    )),
                 }
-                Err(error) => notes.push(format!(
-                    "The settings could not be written into the archive: {error}"
-                )),
-            },
+            }
             Err(error) => notes.push(format!("The settings file could not be parsed: {error}")),
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -963,6 +968,40 @@ log_level = \"debug\"
             readme.contains("(none: every section was collected)"),
             "with nothing skipped the README says so: {readme}"
         );
+    }
+
+    /// Issue #25, acceptance criterion 3: a settings file with a password in
+    /// the URL is redacted the same way the log pipeline redacts one.
+    #[test]
+    fn a_settings_url_with_userinfo_is_redacted() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let paths = temporary_paths(temp.path());
+        fs::create_dir_all(paths.config_file.parent().expect("the config directory"))
+            .expect("create the config directory");
+        fs::write(
+            &paths.config_file,
+            format!(
+                "server_url = \"https://sync:{SENTINEL}@immich.example.com\"\n\
+                 email = \"sync@example.com\"\n"
+            ),
+        )
+        .expect("write the settings");
+
+        let report = collect(&paths, None, &snapshot(), &temp.path().join("downloads"))
+            .expect("collect the debug bundle");
+
+        let (entries, _) = read_bundle(&report);
+        for name in ["configuration.txt", "settings.toml"] {
+            let text = section(&entries, name);
+            assert!(
+                !text.contains(SENTINEL),
+                "{name} carries the URL's password: {text}"
+            );
+            assert!(
+                text.contains("https://<redacted>@immich.example.com"),
+                "{name} keeps the rest of the URL: {text}"
+            );
+        }
     }
 
     /// Issue #25, acceptance criterion 4: missing logs, an unreadable database,
