@@ -2,6 +2,74 @@
 // `build.rs` includes this file, so the tests below and the build run the same
 // code; keep it dependent on std only.
 
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+/// What the build embeds: the short revision of `directory`'s repository, or
+/// `unknown` when it is not a repository, has no commit, or git is not
+/// installed. A tree with no repository still builds.
+#[must_use]
+pub fn revision_label(directory: &Path) -> String {
+    short_revision(directory).unwrap_or_else(|| "unknown".to_string())
+}
+
+/// The files whose change moves the revision `directory` reports: the git
+/// dir's `HEAD`, the ref `HEAD` names, and `packed-refs` for a packed ref.
+///
+/// Empty outside a repository, where there is no revision to move. `build.rs`
+/// lists them as `rerun-if-changed`, so a commit re-runs the build script and
+/// re-embeds the revision.
+#[must_use]
+pub fn watch_paths(directory: &Path) -> Vec<PathBuf> {
+    let Some(git_dir) = git_stdout(directory, &["rev-parse", "--absolute-git-dir"]) else {
+        return Vec::new();
+    };
+    let git_dir = PathBuf::from(git_dir.trim());
+
+    let mut paths = vec![git_dir.join("HEAD")];
+    let head = fs::read_to_string(git_dir.join("HEAD")).unwrap_or_default();
+    if let Some(reference) = head.trim().strip_prefix("ref: ") {
+        if let Some(path) = git_stdout(directory, &["rev-parse", "--git-path", reference]) {
+            paths.push(resolve(directory, path.trim()));
+        }
+    }
+    if let Some(path) = git_stdout(directory, &["rev-parse", "--git-path", "packed-refs"]) {
+        paths.push(resolve(directory, path.trim()));
+    }
+    paths
+}
+
+/// The short revision, when git resolves one.
+fn short_revision(directory: &Path) -> Option<String> {
+    let revision = git_stdout(directory, &["rev-parse", "--short", "HEAD"])?;
+    let revision = revision.trim();
+    (!revision.is_empty()).then(|| revision.to_string())
+}
+
+/// One `git` command's stdout, or `None` when git is missing or fails.
+fn git_stdout(directory: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .current_dir(directory)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
+}
+
+/// An absolute path for git's output, which can be relative to `directory`.
+fn resolve(directory: &Path, path: &str) -> PathBuf {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        directory.join(path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;

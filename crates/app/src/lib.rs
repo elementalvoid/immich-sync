@@ -25,6 +25,7 @@ pub mod store;
 pub mod theme;
 pub mod upload;
 pub mod upload_view;
+pub mod version;
 
 use anyhow::Context as _;
 use async_channel::Receiver;
