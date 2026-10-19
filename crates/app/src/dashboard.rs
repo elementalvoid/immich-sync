@@ -4,7 +4,10 @@
 //! Keyboard navigation stays out until the form controls land in #3.
 
 use crate::engine::EngineModel;
+use crate::path_picker::{self, Picked};
 use crate::status::{ActivityState, DashboardModel, StatusCard};
+
+use std::path::PathBuf;
 
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::Colorize as _;
@@ -30,6 +33,8 @@ pub struct Dashboard {
     engine: Option<Entity<EngineModel>>,
     folder_input: Option<Entity<InputState>>,
     paused: bool,
+    /// The notice a failed Browse… left behind (#30).
+    pick_notice: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -42,6 +47,7 @@ impl Dashboard {
             engine: None,
             folder_input: None,
             paused: false,
+            pick_notice: None,
             _subscriptions: Vec::new(),
         }
     }
@@ -77,6 +83,7 @@ impl Dashboard {
             engine: Some(engine),
             folder_input: Some(folder_input),
             paused: false,
+            pick_notice: None,
             _subscriptions: subscriptions,
         }
     }
@@ -124,6 +131,62 @@ impl Dashboard {
                 cx.notify();
             }
         }
+    }
+
+    /// Opens the OS folder picker and fills the field with the chosen folder
+    /// (R2.1).
+    ///
+    /// A cancel changes nothing. A dialog that cannot open shows a notice and
+    /// leaves the typed path alone (#30); the picker is awaited off the UI
+    /// thread.
+    fn browse(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.folder_input.is_none() {
+            return;
+        }
+        let prompt = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: None,
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = prompt.await.unwrap_or_else(|_| {
+                // The dialog went away without an answer: report it the way a
+                // dialog that could not open is reported.
+                Err(anyhow::anyhow!("the file dialog closed without an answer"))
+            });
+            this.update_in(cx, |this, window, cx| {
+                this.apply_pick(result, window, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Applies one picker result: the chosen folder fills the field, a cancel
+    /// changes nothing, and a failure shows the notice (#30).
+    ///
+    /// This takes the result rather than reading it at the click site, because
+    /// the test harness can answer a prompt with a choice or a cancel but never
+    /// with an error.
+    pub fn apply_pick(
+        &mut self,
+        result: anyhow::Result<Option<Vec<PathBuf>>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pick_notice = None;
+        match path_picker::picked(result) {
+            Picked::Path(path) => {
+                if let Some(input) = self.folder_input.clone() {
+                    let path = path.to_string_lossy().into_owned();
+                    input.update(cx, |state, cx| state.set_value(path, window, cx));
+                }
+            }
+            Picked::Cancelled => {}
+            Picked::Failed(notice) => self.pick_notice = Some(notice),
+        }
+        cx.notify();
     }
 
     /// Adds the path the field holds (R2.1).
@@ -177,42 +240,64 @@ impl Dashboard {
         }
     }
 
-    /// The folder add field and its button (R2.1).
+    /// The folder add field, its Browse… control, and its button (R2.1).
     fn folder_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let muted = cx.theme().muted_foreground;
         let input = self.folder_input.clone();
         div()
             .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
+            .flex_col()
+            .gap_1()
             .child(
                 div()
-                    .text_sm()
-                    .text_color(muted)
-                    .child("Add a folder to sync"),
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(muted)
+                            .child("Add a folder to sync"),
+                    )
+                    .when_some(input, |this, input| {
+                        let focus = input.read(cx).focus_handle(cx);
+                        this.child(
+                            div()
+                                .id("dashboard-folder-path")
+                                .test_support()
+                                .track_focus(&focus)
+                                .aria_label("Source folder path")
+                                .flex_1()
+                                .min_w_0()
+                                .child(Input::new(&input).aria_label("Source folder path")),
+                        )
+                        .child(
+                            Button::new("dashboard-browse-folder")
+                                .secondary()
+                                .label("Browse…")
+                                .accessibility_label("Browse for a source folder")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.browse(window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("dashboard-add-folder")
+                                .primary()
+                                .label("Add folder")
+                                .accessibility_label("Add folder")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.add_folder(window, cx);
+                                })),
+                        )
+                    }),
             )
-            .when_some(input, |this, input| {
-                let focus = input.read(cx).focus_handle(cx);
-                this.child(
-                    div()
-                        .id("dashboard-folder-path")
-                        .test_support()
-                        .track_focus(&focus)
-                        .aria_label("Source folder path")
-                        .flex_1()
-                        .min_w_0()
-                        .child(Input::new(&input).aria_label("Source folder path")),
-                )
-                .child(
-                    Button::new("dashboard-add-folder")
-                        .primary()
-                        .label("Add folder")
-                        .accessibility_label("Add folder")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.add_folder(window, cx);
-                        })),
-                )
+            .when_some(self.pick_notice.clone(), |this, notice| {
+                this.child(path_picker::notice(
+                    "dashboard-browse-notice",
+                    notice,
+                    cx.theme(),
+                ))
             })
     }
 
