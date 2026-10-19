@@ -450,10 +450,7 @@ fn open_live_dashboard(
 
 /// Waits until the shared state store has opened; it opens off the UI thread
 /// (N2), so a control driven before that is refused.
-async fn wait_for_store(
-    cx: &mut TestAppContext,
-    store: &Entity<immich_sync::store::StoreModel>,
-) {
+async fn wait_for_store(cx: &mut TestAppContext, store: &Entity<immich_sync::store::StoreModel>) {
     for _ in 0..600 {
         if cx.read(|cx| store.read(cx).store().is_some()) {
             return;
@@ -938,7 +935,11 @@ async fn cancelling_the_folder_picker_changes_nothing(cx: &mut TestAppContext) {
     let temp = tempfile::tempdir().expect("create a temp dir");
     let (window, store, _view) = open_live_dashboard(cx, temp.path());
     wait_for_store(cx, &store).await;
-    let typed = temp.path().join("typed but not chosen").display().to_string();
+    let typed = temp
+        .path()
+        .join("typed but not chosen")
+        .display()
+        .to_string();
 
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
@@ -1007,7 +1008,10 @@ async fn a_picker_that_cannot_open_keeps_the_typed_path_usable(cx: &mut TestAppC
             Some(Role::Alert),
             "the failure notice is announced"
         );
-        let label = notice.label().expect("the notice has a message").to_string();
+        let label = notice
+            .label()
+            .expect("the notice has a message")
+            .to_string();
         assert!(
             label.contains("xdg-desktop-portal"),
             "the notice keeps the reason the dialog gave: {label}"

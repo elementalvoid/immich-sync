@@ -457,7 +457,11 @@ async fn browsing_for_a_file_fills_the_field_and_upload_sends_it(cx: &mut TestAp
     let label = cx
         .update_window(window, |_, window, cx| {
             window.render_frame(cx);
-            window.find("upload-result").label().unwrap_or_default().to_string()
+            window
+                .find("upload-result")
+                .label()
+                .unwrap_or_default()
+                .to_string()
         })
         .expect("read the result");
     assert!(
@@ -480,7 +484,11 @@ fn cancelling_the_file_picker_changes_nothing(cx: &mut TestAppContext) {
         cx.new(|_| ConnectionModel::new(ServerProfile::default(), store))
     });
     let (window, _store, _view) = open_upload(cx, &paths, connection);
-    let typed = temp.path().join("typed but not chosen.txt").display().to_string();
+    let typed = temp
+        .path()
+        .join("typed but not chosen.txt")
+        .display()
+        .to_string();
 
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
@@ -555,7 +563,10 @@ async fn a_file_picker_that_cannot_open_keeps_the_typed_path_usable(cx: &mut Tes
             Some(Role::Alert),
             "the failure notice is announced"
         );
-        let label = notice.label().expect("the notice has a message").to_string();
+        let label = notice
+            .label()
+            .expect("the notice has a message")
+            .to_string();
         assert!(
             label.contains("xdg-desktop-portal"),
             "the notice keeps the reason the dialog gave: {label}"

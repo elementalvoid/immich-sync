@@ -3,11 +3,11 @@
 //!
 //! Keyboard navigation stays out until the form controls land in #3.
 
+use std::path::PathBuf;
+
 use crate::engine::EngineModel;
 use crate::path_picker::{self, Picked};
 use crate::status::{ActivityState, DashboardModel, StatusCard};
-
-use std::path::PathBuf;
 
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::Colorize as _;

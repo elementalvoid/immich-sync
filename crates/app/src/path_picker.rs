@@ -31,7 +31,10 @@ pub enum Picked {
 #[must_use]
 pub fn picked(result: anyhow::Result<Option<Vec<PathBuf>>>) -> Picked {
     match result {
-        Ok(Some(paths)) => paths.into_iter().next().map_or(Picked::Cancelled, Picked::Path),
+        Ok(Some(paths)) => paths
+            .into_iter()
+            .next()
+            .map_or(Picked::Cancelled, Picked::Path),
         Ok(None) => Picked::Cancelled,
         Err(error) => Picked::Failed(format!(
             "Couldn't open the file picker ({error}). Type the path instead."
@@ -53,9 +56,9 @@ pub fn browse<T: 'static>(
 ) {
     let prompt = cx.prompt_for_paths(options);
     cx.spawn_in(window, async move |this, cx| {
-        let result = prompt.await.unwrap_or_else(|_| {
-            Err(anyhow::anyhow!("the file dialog closed without an answer"))
-        });
+        let result = prompt
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("the file dialog closed without an answer")));
         this.update_in(cx, move |view, window, cx| {
             apply(view, result, window, cx);
         })
@@ -96,10 +99,7 @@ mod tests {
     fn a_chosen_path_is_the_path_to_fill_in() {
         let chosen = PathBuf::from("/home/you/Pictures");
 
-        assert_eq!(
-            picked(Ok(Some(vec![chosen.clone()]))),
-            Picked::Path(chosen)
-        );
+        assert_eq!(picked(Ok(Some(vec![chosen.clone()]))), Picked::Path(chosen));
     }
 
     #[test]
