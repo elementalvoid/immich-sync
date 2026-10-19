@@ -650,7 +650,10 @@ fn timestamp(now: time::OffsetDateTime) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{BUNDLE_PREFIX, BundleReport, LOG_BYTES, LOG_FILES, Snapshot, collect, count_of};
+    use super::{
+        BUNDLE_PREFIX, BundleReport, LOG_BYTES, LOG_FILES, Snapshot, collect, count_of,
+        database_text, sizing_text,
+    };
     use crate::logging::LOG_PREFIX;
     use crate::paths::AppPaths;
     use std::fs;
@@ -661,7 +664,7 @@ mod tests {
     use sync_core::hash::sha1;
     use sync_core::store::{
         AlbumScope, AttemptOutcome, AttemptRecord, ItemRecord, ItemState, NewVersion, SourceFolder,
-        StateStore,
+        StateStore, StoreError,
     };
 
     /// A credential-like string nothing in the archive may hold.
@@ -1134,6 +1137,29 @@ log_level = \"debug\"
         assert!(
             !newest.contains("first line that must be cut"),
             "the entry drops what the cap cut away"
+        );
+    }
+
+    /// Issue #25, acceptance criterion 4: a store that is open but cannot be
+    /// read makes each section say so, rather than failing the collection.
+    #[test]
+    fn an_unreadable_database_is_a_note_in_each_section() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let paths = temporary_paths(temp.path());
+        let unreadable = StoreError::QuickCheck {
+            path: paths.state_db.clone(),
+            reason: "the database disk image is malformed".to_string(),
+        };
+
+        let database = database_text(&paths, &None, &[]);
+        assert!(
+            database.contains("could not be read"),
+            "the database section says why it is empty: {database}"
+        );
+        let sizing = sizing_text(&Some(Err(unreadable)));
+        assert!(
+            sizing.contains("could not be read") && sizing.contains("malformed"),
+            "the sizing section says why it is empty: {sizing}"
         );
     }
 
