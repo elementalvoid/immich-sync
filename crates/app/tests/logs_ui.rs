@@ -237,6 +237,8 @@ fn refresh_reads_the_lines_written_since_the_view_opened(cx: &mut TestAppContext
 fn every_logs_control_is_named_and_keyboard_reachable(cx: &mut TestAppContext) {
     let temp = tempfile::tempdir().expect("create a temp dir");
     let paths = temporary_paths(temp.path());
+    // One line, so Copy all is enabled and therefore a tab stop.
+    write_log(&paths, &["a stable line"]);
     let store = SettingsStore::open(paths.config_file.clone());
     let window = open_shell(cx, store, paths);
 
@@ -251,6 +253,7 @@ fn every_logs_control_is_named_and_keyboard_reachable(cx: &mut TestAppContext) {
             ("logs-level-info", "Log level: Info"),
             ("logs-level-warn", "Log level: Warn"),
             ("logs-level-error", "Log level: Error"),
+            ("logs-copy-all", "Copy every displayed log line"),
         ] {
             assert_eq!(window.find(id).label(), Some(label), "{id} is named");
         }
@@ -262,6 +265,7 @@ fn every_logs_control_is_named_and_keyboard_reachable(cx: &mut TestAppContext) {
             "logs-refresh",
             "logs-level-trace",
             "logs-level-error",
+            "logs-copy-all",
         ] {
             tab_to(window, id, cx);
         }
