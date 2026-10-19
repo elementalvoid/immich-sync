@@ -95,7 +95,7 @@ fn resolve(directory: &Path, path: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
 
     use super::{revision_label, watch_paths};
@@ -126,8 +126,9 @@ mod tests {
         assert!(head_file.exists(), "git init wrote {}", head_file.display());
         let paths = watch_paths(temp.path());
         assert!(
-            paths.contains(&head_file),
-            "a checkout moves the git dir's HEAD, so the build must watch it"
+            watches(&paths, &head_file),
+            "a checkout moves the git dir's HEAD, so the build must watch it: watched {paths:?}, expected {}",
+            head_file.display()
         );
 
         let head = fs::read_to_string(&head_file).expect("read HEAD");
@@ -138,8 +139,9 @@ mod tests {
         let ref_file = temp.path().join(".git").join(reference);
         assert!(ref_file.exists(), "the commit wrote {}", ref_file.display());
         assert!(
-            paths.contains(&ref_file),
-            "a commit moves the branch ref, so the build must watch it"
+            watches(&paths, &ref_file),
+            "a commit moves the branch ref, so the build must watch it: watched {paths:?}, expected {}",
+            ref_file.display()
         );
         assert!(
             paths.iter().all(|path| path.exists()),
@@ -178,6 +180,18 @@ mod tests {
             watch_paths(temp.path()).is_empty(),
             "with no repository there is no revision to watch"
         );
+    }
+
+    /// Whether `paths` names `expected`'s file. Compared by canonical path, not
+    /// by text: on Windows one file has more than one textual form (separators,
+    /// case, a short 8.3 path), and git need not print the one `tempfile` gave us.
+    fn watches(paths: &[PathBuf], expected: &Path) -> bool {
+        let Ok(expected) = fs::canonicalize(expected) else {
+            return false;
+        };
+        paths
+            .iter()
+            .any(|path| fs::canonicalize(path).is_ok_and(|path| path == expected))
     }
 
     /// Makes `directory` a repository with one commit, configured so the
