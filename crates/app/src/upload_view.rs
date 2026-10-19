@@ -247,7 +247,12 @@ impl Render for UploadView {
                             ),
                     )
                     .when_some(self.pick_notice.clone(), |this, notice| {
-                        this.child(path_picker::notice("upload-browse-notice", notice, theme))
+                        this.child(crate::settings_view::notice(
+                            "upload-browse-notice",
+                            notice,
+                            theme.danger,
+                            &palette,
+                        ))
                     })
                     .child(
                         div().flex().flex_row().justify_end().child(

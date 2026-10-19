@@ -18,8 +18,8 @@ use std::time::Duration;
 
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, Bounds, Entity, Point, TestAppContext, Window,
-    WindowBounds, WindowOptions, px, size,
+    AnyWindowHandle, App, AppContext as _, Bounds, ElementId, Entity, Point, Role, TestAppContext,
+    Window, WindowBounds, WindowOptions, px, size,
 };
 use immich_sync::autostart::{Autostart, UnavailableAutostart};
 use immich_sync::connection::ConnectionModel;
@@ -1181,8 +1181,12 @@ async fn an_unreachable_server_makes_a_partial_bundle_with_a_note(cx: &mut TestA
     };
     let credentials: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
     let connection = cx.update(|cx| cx.new(|_| ConnectionModel::new(profile.clone(), credentials)));
-    let store = open_store(cx, &paths);
-    let (_engine, diagnostics) = open_models(cx, &paths, connection.clone(), store);
+    let (window, _store, _engine, diagnostics) = open_shell(
+        cx,
+        SettingsStore::open(paths.config_file.clone()),
+        paths.clone(),
+        connection.clone(),
+    );
     cx.update(|cx| {
         connection.update(cx, |model, cx| {
             model.sign_in(
@@ -1237,4 +1241,25 @@ async fn an_unreachable_server_makes_a_partial_bundle_with_a_note(cx: &mut TestA
         versions.contains("Immich server: not read"),
         "the versions section says the server was not read: {versions}"
     );
+    // The view shows every note the archive could not collect, each announced
+    // on its own.
+    cx.update_window(window, |_, window, cx| {
+        show_diagnostics(window, cx);
+        for (index, note) in report.notes.iter().enumerate() {
+            let element = window.find(ElementId::Name(
+                format!("diagnostics-bundle-note-{index}").into(),
+            ));
+            assert_eq!(
+                element.role(),
+                Some(Role::Alert),
+                "the partial bundle's note is announced"
+            );
+            assert_eq!(
+                element.label().map(ToString::to_string),
+                Some(note.clone()),
+                "the note shows the archive's own text"
+            );
+        }
+    })
+    .expect("update the shell window");
 }

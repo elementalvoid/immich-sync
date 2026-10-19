@@ -1257,10 +1257,10 @@ pub(crate) fn section(
         .into_any_element()
 }
 
-/// A notice with a colored edge. The accessible name carries the message, so
-/// the visible copy is not announced a second time.
+/// A notice with a colored edge, named by `id`. The accessible name carries
+/// the message, so the visible copy is not announced a second time.
 pub(crate) fn notice(
-    id: &'static str,
+    id: impl Into<ElementId>,
     text: String,
     accent: Hsla,
     palette: &CardPalette,

@@ -231,6 +231,8 @@ impl Dashboard {
 
     /// The folder add field, its Browse… control, and its button (R2.1).
     fn folder_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let accent = cx.theme().danger;
+        let palette = CardPalette::new(cx.theme());
         let muted = cx.theme().muted_foreground;
         let input = self.folder_input.clone();
         div()
@@ -282,10 +284,11 @@ impl Dashboard {
                     }),
             )
             .when_some(self.pick_notice.clone(), |this, notice| {
-                this.child(path_picker::notice(
+                this.child(crate::settings_view::notice(
                     "dashboard-browse-notice",
                     notice,
-                    cx.theme(),
+                    accent,
+                    &palette,
                 ))
             })
     }

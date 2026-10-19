@@ -8,7 +8,6 @@
 
 use std::path::PathBuf;
 
-use gpui_kit::component::Theme;
 use gpui_kit::*;
 
 /// What one Browse… dialog asks the surface to do.
@@ -65,24 +64,6 @@ pub fn browse<T: 'static>(
         .ok();
     })
     .detach();
-}
-
-/// The inline notice a Browse… that could not open shows.
-///
-/// The accessible name carries the message, so the visible copy is not
-/// announced a second time.
-pub fn notice(id: &'static str, text: String, theme: &Theme) -> impl IntoElement + use<> {
-    div()
-        .id(id)
-        .test_support()
-        .role(Role::Alert)
-        .aria_label(text.clone())
-        .border_l_2()
-        .border_color(theme.danger)
-        .pl_2()
-        .text_xs()
-        .text_color(theme.foreground)
-        .child(Text::new_inaccessible(text.into()))
 }
 
 #[cfg(test)]
