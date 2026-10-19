@@ -46,7 +46,7 @@ Acceptance: password login works. API-key login works on a server with password 
 
 ### R2 — Source folders and watch rules
 
-- R2.1 The user adds and removes source folders. Each folder has a recursive toggle.
+- R2.1 The user adds and removes source folders, typing the path or choosing it in the OS folder picker. Each folder has a recursive toggle.
 - R2.2 The client skips hidden files and folders, symlinks and junctions, temporary and partial files, and system files by default.
 - R2.3 The watcher reports changes while the client runs. A reconciliation scan runs at startup and every 30 minutes by default.
 - R2.4 The client compares paths case-insensitively on Windows. It supports long paths.
@@ -102,7 +102,7 @@ Acceptance: stopping the server mid-sync produces backoff retries, not a hot loo
 - R7.1 The bandwidth limit is user-settable in bytes per second. 0 means unlimited. Changes apply without a restart.
 - R7.2 The concurrency limit is user-settable. The default is 4. Changes apply without a restart.
 - R7.3 Both limits persist across restarts.
-- R7.4 R7 governs the sync engine. The manual one-file upload in the Upload view is deliberately exempt from both limits: it is an explicit one-off request, not sync work. This is by design, not a defect.
+- R7.4 R7 governs the sync engine. The manual one-file upload in the Upload view, whether its path is typed or chosen in the OS file picker, is deliberately exempt from both limits: it is an explicit one-off request, not sync work. This is by design, not a defect.
 
 Acceptance: a sync at a 1 MB/s limit produces near-limit observed throughput. Raising concurrency during a sync starts new workers without a restart.
 
