@@ -13,6 +13,7 @@ use immich_sync::logging::{
 };
 use immich_sync::paths::AppPaths;
 use immich_sync::settings::SettingsStore;
+use immich_sync::version;
 use tracing_appender::rolling::Rotation;
 
 /// Every log file name in `directory`.
@@ -207,7 +208,7 @@ fn the_tail_returns_the_latest_lines_of_the_newest_file() {
 }
 
 #[test]
-fn the_start_line_names_the_version_and_the_resolved_paths() {
+fn the_start_line_names_the_client_version_and_the_resolved_paths() {
     let temp = tempfile::tempdir().expect("create a temp dir");
     let paths = AppPaths {
         config_file: temp.path().join("config").join("settings.toml"),
@@ -226,8 +227,8 @@ fn the_start_line_names_the_version_and_the_resolved_paths() {
 
     let text = newest_text(&logs);
     assert!(
-        text.contains(env!("CARGO_PKG_VERSION")),
-        "the version is in the start line: {text}"
+        text.contains(version::client_version()),
+        "the client version is in the start line: {text}"
     );
     assert!(
         text.contains(&paths.config_file.display().to_string()),
