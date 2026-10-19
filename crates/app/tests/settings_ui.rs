@@ -300,6 +300,7 @@ fn open_shell(
                     store_model.clone(),
                     engine_model.clone(),
                     connection.clone(),
+                    upload_paths.log_directory(),
                     cx,
                 )
             });

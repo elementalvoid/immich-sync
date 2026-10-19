@@ -24,7 +24,8 @@ use gpui_kit::{
 use immich_sync::autostart::{Autostart, UnavailableAutostart};
 use immich_sync::connection::ConnectionModel;
 use immich_sync::dashboard::Dashboard;
-use immich_sync::diagnostics::{DiagnosticsModel, Permissions};
+use immich_sync::debug_bundle::BUNDLE_PREFIX;
+use immich_sync::diagnostics::{BundleState, DiagnosticsModel, Permissions};
 use immich_sync::diagnostics_view::DiagnosticsView;
 use immich_sync::engine::EngineModel;
 use immich_sync::logging::{LOG_PREFIX, LogLevel, LogPolicy, LogSink};
@@ -37,9 +38,13 @@ use immich_sync::upload::UploadModel;
 use immich_sync::upload_view::UploadView;
 use immich_sync::{status, theme};
 use mock_immich::MockImmich;
-use sync_core::connection::{AuthMethod, Secret, ServerProfile, SignIn};
+use sync_core::connection::{AuthMethod, ConnectionState, Secret, ServerProfile, SignIn};
 use sync_core::credential::{MemoryCredentialStore, SharedCredentialStore};
-use sync_core::store::{AlbumScope, SourceFolder, StateStore};
+use sync_core::failure::FailureClass;
+use sync_core::hash::sha1;
+use sync_core::store::{
+    AlbumScope, AttemptOutcome, AttemptRecord, ItemRecord, ItemState, SourceFolder, StateStore,
+};
 
 const API_KEY: &str = "api-key-abc123";
 /// The schema stands at the ninth migration.
@@ -164,8 +169,15 @@ fn open_models(
     let paths = paths.clone();
     cx.update(|cx| {
         let engine = cx.new(|cx| EngineModel::new(connection.clone(), store.clone(), &paths, cx));
-        let diagnostics =
-            cx.new(|cx| DiagnosticsModel::new(store.clone(), engine.clone(), connection, cx));
+        let diagnostics = cx.new(|cx| {
+            DiagnosticsModel::new(
+                store.clone(),
+                engine.clone(),
+                connection,
+                paths.log_directory(),
+                cx,
+            )
+        });
         (engine, diagnostics)
     })
 }
@@ -208,6 +220,7 @@ fn open_shell(
                     store_model.clone(),
                     engine_model.clone(),
                     connection.clone(),
+                    paths.log_directory(),
                     cx,
                 )
             });
@@ -437,6 +450,10 @@ async fn every_diagnostics_control_is_named_and_keyboard_reachable(cx: &mut Test
                 "diagnostics-rebuild",
                 "Rebuild the state database and rescan the folders",
             ),
+            (
+                "diagnostics-bundle-collect",
+                "Collect the debug bundle into one archive",
+            ),
         ] {
             assert_eq!(window.find(id).label(), Some(label), "{id} is named");
         }
@@ -444,6 +461,7 @@ async fn every_diagnostics_control_is_named_and_keyboard_reachable(cx: &mut Test
             "nav-diagnostics",
             "diagnostics-refresh",
             "diagnostics-rebuild",
+            "diagnostics-bundle-collect",
         ] {
             tab_to(window, id, cx);
         }
@@ -863,5 +881,343 @@ async fn the_probe_logs_its_outcome_without_the_credential(cx: &mut TestAppConte
     assert!(
         !text.contains(API_KEY),
         "the log file holds the API key: {text}"
+    );
+}
+
+/// A credential-like string seeded where the client keeps one (the API key)
+/// and where a hostile server's answer would land (a recorded failure
+/// message). It must appear nowhere in the archive (issue #25).
+const BUNDLE_SENTINEL: &str = "s3cr3t-api-key-9f3c1b2a";
+
+/// One seeded item row for the bundle tests.
+fn bundle_item(path: &str, state: ItemState) -> ItemRecord {
+    ItemRecord {
+        path: path.to_string(),
+        size: 4096,
+        mtime_ns: 1_700_000_000_000_000_000,
+        sha1: sha1(b"bundle fixture"),
+        asset_id: None,
+        state,
+        error_class: None,
+        error_message: None,
+        attempts: 0,
+        sidecar: None,
+    }
+}
+
+/// The archive's entry names and texts, read with the archive reader.
+fn read_archive(path: &Path) -> (Vec<(String, String)>, Vec<u8>) {
+    use std::io::Read as _;
+    let bytes = fs::read(path).expect("read the archive");
+    let mut archive =
+        zip::ZipArchive::new(std::io::Cursor::new(bytes.clone())).expect("open the archive");
+    let names: Vec<String> = archive
+        .file_names()
+        .map(|name| name.expect("a readable entry name").into_owned())
+        .collect();
+    let mut entries = Vec::with_capacity(names.len());
+    for name in names {
+        let mut body = String::new();
+        archive
+            .by_name(&name)
+            .expect("open an archive entry")
+            .read_to_string(&mut body)
+            .expect("read an archive entry");
+        entries.push((name, body));
+    }
+    (entries, bytes)
+}
+
+/// Issue #25: one action writes one archive off the UI thread, the view shows
+/// its path, the copy control puts it on the clipboard, and no credential
+/// reaches the archive.
+#[gpui_kit::test]
+async fn the_bundle_action_saves_an_archive_shows_its_path_and_copies_it(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let (_runtime, server) = mock_server();
+    server.set_api_key(BUNDLE_SENTINEL);
+    server.set_api_key_permissions(&["asset.upload", "server.about"]);
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    // A log file and a settings file, as a running client would have written
+    // them. Neither holds the credential: the settings file never stores one.
+    fs::create_dir_all(paths.log_directory()).expect("create the log directory");
+    fs::write(
+        paths
+            .log_directory()
+            .join(format!("{LOG_PREFIX}.2026-10-16")),
+        "2026-10-16T10:00:00Z  INFO immich_sync: immich-sync started\n",
+    )
+    .expect("write the log file");
+    fs::create_dir_all(paths.config_file.parent().expect("the config directory"))
+        .expect("create the config directory");
+    fs::write(
+        &paths.config_file,
+        "server_url = \"https://immich.example.com\"\nemail = \"sync@example.com\"\n",
+    )
+    .expect("write the settings");
+    // The test shell saves bundles beside the logs; the real shell saves into
+    // the user's Downloads folder.
+    let bundle_directory = paths.log_directory();
+
+    let connection = connection_model(cx, &server, AuthMethod::ApiKey);
+    let (window, store, _engine, diagnostics) = open_shell(
+        cx,
+        SettingsStore::open(paths.config_file.clone()),
+        paths.clone(),
+        connection.clone(),
+    );
+    wait_until(cx, "the store", |cx| store.read(cx).store().is_some()).await;
+    // The seeded failure's message is the sentinel: the archive must not carry
+    // the stored server text even when it looks like a credential.
+    cx.read(|cx| {
+        let store = store.read(cx).store().expect("the store is open");
+        let mut failed = bundle_item("/photos/RAW_0002.cr3", ItemState::FailedPermanent);
+        failed.error_class = Some(FailureClass::UnsupportedFormat);
+        failed.error_message = Some(format!("the server answered: {BUNDLE_SENTINEL}"));
+        store.record(&failed).expect("write the failed item");
+        store
+            .record_attempt(&AttemptRecord {
+                path: failed.path.clone(),
+                started_ns: 10,
+                outcome: AttemptOutcome::Failed,
+                error_class: Some(FailureClass::UnsupportedFormat),
+            })
+            .expect("record the attempt");
+    });
+    sign_in(
+        cx,
+        &connection,
+        &server,
+        AuthMethod::ApiKey,
+        BUNDLE_SENTINEL,
+    );
+    wait_until(cx, "the server probe", |cx| {
+        diagnostics.read(cx).server().version.is_some()
+    })
+    .await;
+
+    cx.update_window(window, |_, window, cx| {
+        show_diagnostics(window, cx);
+        window.click("diagnostics-bundle-collect", cx);
+        // The click returned before the archive was written: collection runs
+        // off the UI thread.
+        assert!(
+            matches!(
+                diagnostics.read(cx).bundle(),
+                BundleState::Collecting | BundleState::Ready(_)
+            ),
+            "the click starts one collection"
+        );
+    })
+    .expect("update the shell window");
+    wait_until(cx, "the debug bundle", |cx| {
+        matches!(diagnostics.read(cx).bundle(), BundleState::Ready(_))
+    })
+    .await;
+
+    let report = match cx.read(|cx| diagnostics.read(cx).bundle().clone()) {
+        BundleState::Ready(report) => report,
+        other => panic!("the bundle is ready: {other:?}"),
+    };
+    assert_eq!(
+        report.path.parent(),
+        Some(bundle_directory.as_path()),
+        "the archive lands in the folder the view names"
+    );
+    assert!(
+        report
+            .path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with(BUNDLE_PREFIX)),
+        "the archive is named for the client: {}",
+        report.path.display()
+    );
+    assert!(
+        report.notes.is_empty(),
+        "every section was collected: {:?}",
+        report.notes
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        assert_eq!(
+            window.find("diagnostics-bundle-path-value").label(),
+            Some(report.path.display().to_string().as_str()),
+            "the view shows the archive's full path"
+        );
+        window.click("diagnostics-bundle-copy", cx);
+    })
+    .expect("update the shell window");
+    let copied = cx
+        .update(|cx| cx.read_from_clipboard().and_then(|item| item.text()))
+        .unwrap_or_default();
+    assert_eq!(
+        copied,
+        report.path.display().to_string(),
+        "the copy control puts the archive's path on the clipboard"
+    );
+
+    let (entries, bytes) = read_archive(&report.path);
+    for required in [
+        "README.txt",
+        "versions.txt",
+        "database.txt",
+        "configuration.txt",
+        "settings.toml",
+        "sizing.txt",
+        "runtime.txt",
+    ] {
+        assert!(
+            entries.iter().any(|(name, _)| name == required),
+            "the archive holds {required}: {:?}",
+            entries.iter().map(|(name, _)| name).collect::<Vec<_>>()
+        );
+    }
+    assert!(
+        entries
+            .iter()
+            .any(|(name, _)| name == &format!("logs/{LOG_PREFIX}.2026-10-16")),
+        "the archive holds the log file"
+    );
+    for (name, body) in &entries {
+        assert!(
+            !body.contains(BUNDLE_SENTINEL),
+            "{name} carries the credential: {body}"
+        );
+    }
+    assert!(
+        !bytes
+            .windows(BUNDLE_SENTINEL.len())
+            .any(|window| window == BUNDLE_SENTINEL.as_bytes()),
+        "the raw archive bytes carry the credential"
+    );
+    let database = entries
+        .iter()
+        .find(|(name, _)| name == "database.txt")
+        .map(|(_, body)| body.as_str())
+        .expect("the database section");
+    assert!(
+        database.contains("unsupported_format"),
+        "the last error per class names the class it recorded: {database}"
+    );
+}
+
+/// Issue #25: a second collect cannot start while one runs; the model guard is
+/// what a direct call cannot bypass, and only one archive is written.
+#[gpui_kit::test]
+async fn a_second_bundle_collection_cannot_start_while_one_runs(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let (_runtime, server) = mock_server();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let connection = connection_model(cx, &server, AuthMethod::Password);
+    let store = open_store(cx, &paths);
+    let (_engine, diagnostics) = open_models(cx, &paths, connection, store);
+    wait_until(cx, "the store", |cx| diagnostics.read(cx).info().is_some()).await;
+
+    cx.update(|cx| {
+        diagnostics.update(cx, |model, cx| {
+            model.collect_bundle(cx);
+            assert_eq!(
+                *model.bundle(),
+                BundleState::Collecting,
+                "the first call starts the collector"
+            );
+            model.collect_bundle(cx);
+            assert_eq!(
+                *model.bundle(),
+                BundleState::Collecting,
+                "the second call must not start a second collection"
+            );
+        });
+    });
+    wait_until(cx, "the debug bundle", |cx| {
+        matches!(diagnostics.read(cx).bundle(), BundleState::Ready(_))
+    })
+    .await;
+
+    let archives: Vec<_> = fs::read_dir(paths.log_directory())
+        .expect("read the bundle directory")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "zip"))
+        .collect();
+    assert_eq!(
+        archives.len(),
+        1,
+        "one collection writes one archive: {archives:?}"
+    );
+}
+
+/// Issue #25: a server the client cannot reach makes a partial archive with a
+/// note, not an error.
+#[gpui_kit::test]
+async fn an_unreachable_server_makes_a_partial_bundle_with_a_note(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    // Nothing listens on this port, so the sign-in fails as unreachable.
+    let profile = ServerProfile {
+        server_url: "http://127.0.0.1:1".to_string(),
+        email: "sync@example.com".to_string(),
+        method: AuthMethod::Password,
+    };
+    let credentials: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+    let connection = cx.update(|cx| cx.new(|_| ConnectionModel::new(profile.clone(), credentials)));
+    let store = open_store(cx, &paths);
+    let (_engine, diagnostics) = open_models(cx, &paths, connection.clone(), store);
+    cx.update(|cx| {
+        connection.update(cx, |model, cx| {
+            model.sign_in(
+                SignIn {
+                    email: profile.email.clone(),
+                    secret: Secret::new("correct horse"),
+                    method: AuthMethod::Password,
+                },
+                profile,
+                cx,
+            );
+        });
+    });
+    wait_until(cx, "the unreachable server", |cx| {
+        matches!(
+            connection.read(cx).state(),
+            ConnectionState::NeedsAttention(_)
+        )
+    })
+    .await;
+
+    cx.update(|cx| diagnostics.update(cx, |model, cx| model.collect_bundle(cx)));
+    wait_until(cx, "the partial bundle", |cx| {
+        matches!(diagnostics.read(cx).bundle(), BundleState::Ready(_))
+    })
+    .await;
+
+    let report = match cx.read(|cx| diagnostics.read(cx).bundle().clone()) {
+        BundleState::Ready(report) => report,
+        other => panic!("the partial bundle is ready: {other:?}"),
+    };
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|note| note.contains("server version")),
+        "the note says the server version is missing: {:?}",
+        report.notes
+    );
+    assert!(
+        report.notes.iter().any(|note| note.contains("No log file")),
+        "the note says the client never logged: {:?}",
+        report.notes
+    );
+    let (entries, _) = read_archive(&report.path);
+    let versions = entries
+        .iter()
+        .find(|(name, _)| name == "versions.txt")
+        .map(|(_, body)| body.as_str())
+        .expect("the versions section");
+    assert!(
+        versions.contains("Immich server: not read"),
+        "the versions section says the server was not read: {versions}"
     );
 }

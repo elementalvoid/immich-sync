@@ -548,6 +548,21 @@ pub struct SqliteInfo {
     pub integrity: String,
 }
 
+/// The library's size and the shape of its tracked state, for the debug
+/// bundle (issue #25). [`StateStore::sizing`] reads it without writing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Sizing {
+    /// The sum of every tracked item's recorded size, in bytes.
+    pub tracked_bytes: u64,
+    /// How many items each state holds, ordered by the stored state name. A
+    /// state a newer build wrote that this one does not know is left out.
+    pub by_state: Vec<(ItemState, u64)>,
+    /// How many source folders the user configured.
+    pub folders: u64,
+    /// How many rows the version chain holds.
+    pub versions: u64,
+}
+
 /// The newest failure of one class in the attempt log (R10.2).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClassError {
@@ -865,6 +880,50 @@ impl StateStore {
             errors.push(ClassError { class, message });
         }
         Ok(errors)
+    }
+
+    /// Reads the library's size and the shape of its state: the sum of the
+    /// tracked sizes, the item count per state, the source-folder count, and
+    /// the version count (issue #25).
+    ///
+    /// Read-only, like [`Self::sqlite_info`]: the debug bundle calls it while
+    /// the engine writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Query`] when a count cannot be read.
+    pub fn sizing(&self) -> Result<Sizing, StoreError> {
+        let reader = self.reader()?;
+        let tracked_bytes: i64 = reader
+            .query_row("SELECT COALESCE(SUM(size), 0) FROM sync_item", [], |row| {
+                row.get(0)
+            })
+            .map_err(|source| self.query_error(source))?;
+        let states: Vec<(String, i64)> = reader
+            .prepare("SELECT state, COUNT(*) FROM sync_item GROUP BY state ORDER BY state")
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .map_err(|source| self.query_error(source))?;
+        let count = |sql: &str| -> Result<i64, StoreError> {
+            reader
+                .query_row(sql, [], |row| row.get(0))
+                .map_err(|source| self.query_error(source))
+        };
+        Ok(Sizing {
+            tracked_bytes: u64::try_from(tracked_bytes).unwrap_or(0),
+            by_state: states
+                .into_iter()
+                .filter_map(|(text, rows)| {
+                    let state = ItemState::parse(&text)?;
+                    Some((state, u64::try_from(rows).unwrap_or(0)))
+                })
+                .collect(),
+            folders: u64::try_from(count("SELECT COUNT(*) FROM source_folder")?).unwrap_or(0),
+            versions: u64::try_from(count("SELECT COUNT(*) FROM version")?).unwrap_or(0),
+        })
     }
 
     /// Starts the state tables over (R10.4), in one transaction: the item,

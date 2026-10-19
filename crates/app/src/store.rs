@@ -240,6 +240,13 @@ impl StoreModel {
         &self.paths.state_db
     }
 
+    /// The resolved paths, so the debug bundle collects the settings file, the
+    /// logs, and the database the client actually uses (#25).
+    #[must_use]
+    pub fn paths(&self) -> &AppPaths {
+        &self.paths
+    }
+
     /// The store's generation: it changes when the store is replaced.
     #[must_use]
     pub fn generation(&self) -> u64 {

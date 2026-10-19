@@ -8,7 +8,8 @@ use gpui_kit::component::button::Button;
 use gpui_kit::*;
 
 use crate::dashboard::CardPalette;
-use crate::diagnostics::{DiagnosticsModel, Permissions, format_bytes, format_rate};
+use crate::debug_bundle::{LOG_BYTES, LOG_FILES};
+use crate::diagnostics::{BundleState, DiagnosticsModel, Permissions, format_bytes, format_rate};
 use crate::settings_view::{field_text, notice, section};
 use crate::version;
 use sync_core::store::SqliteInfo;
@@ -323,6 +324,178 @@ impl DiagnosticsView {
         )
     }
 
+    /// The debug bundle action and the archive it last wrote (issue #25).
+    ///
+    /// The privacy note stays visible whether or not a bundle exists: it is
+    /// the one thing a user needs to read before attaching the archive.
+    fn bundle_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let palette = CardPalette::new(theme);
+        let state = self.model.read(cx).bundle().clone();
+        let directory = self.model.read(cx).bundle_directory().display().to_string();
+        let collecting = matches!(state, BundleState::Collecting);
+        let mut rows: Vec<AnyElement> = Vec::with_capacity(6);
+        rows.push(
+            notice(
+                "diagnostics-bundle-privacy",
+                "The archive holds your folder paths, account email, server URL, and the log \
+                 files. It never holds your password, an API key, or a session token: the log \
+                 files are already redacted. Review it before you attach it to a message."
+                    .to_string(),
+                theme.info,
+                &palette,
+            )
+            .into_any_element(),
+        );
+        rows.push(
+            div()
+                .id("diagnostics-bundle-collect-row")
+                .test_support()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap_6()
+                .min_h(rems(2.25))
+                .child(field_text(
+                    "Collect",
+                    &format!(
+                        "Writes one .zip into {directory}: the newest {LOG_FILES} log files, \
+                         {} each at most, plus the versions, database, configuration, sizing, and \
+                         runtime sections.",
+                        format_bytes(LOG_BYTES)
+                    ),
+                    &palette,
+                ))
+                .child(
+                    Button::new("diagnostics-bundle-collect")
+                        .label("Collect bundle")
+                        .accessibility_label("Collect the debug bundle into one archive")
+                        .disabled(collecting)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.model.update(cx, |model, cx| model.collect_bundle(cx));
+                        })),
+                )
+                .into_any_element(),
+        );
+        match &state {
+            BundleState::Idle => {}
+            BundleState::Collecting => rows.push(
+                notice(
+                    "diagnostics-bundle-collecting",
+                    "Collecting the debug bundle…".to_string(),
+                    theme.info,
+                    &palette,
+                )
+                .into_any_element(),
+            ),
+            BundleState::Ready(report) => {
+                let path = report.path.display().to_string();
+                rows.push(
+                    div()
+                        .id("diagnostics-bundle-path-row")
+                        .test_support()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .gap_6()
+                        .min_h(rems(2.25))
+                        .child(field_text(
+                            "Archive",
+                            "Attach this file to your support message.",
+                            &palette,
+                        ))
+                        .child(
+                            div()
+                                .id("diagnostics-bundle-path-value")
+                                .test_support()
+                                .aria_label(path.clone())
+                                .min_w_0()
+                                .max_w(rems(48.))
+                                .text_right()
+                                .font_family(theme.mono_font_family.clone())
+                                .text_xs()
+                                .text_color(palette.meta)
+                                .child(path.clone()),
+                        )
+                        .into_any_element(),
+                );
+                rows.push(
+                    div()
+                        .id("diagnostics-bundle-copy-row")
+                        .test_support()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .gap_6()
+                        .min_h(rems(2.25))
+                        .child(field_text(
+                            "Copy path",
+                            "Puts the archive's full path on the clipboard, so it can be pasted \
+                             into a message or a file manager.",
+                            &palette,
+                        ))
+                        .child(
+                            Button::new("diagnostics-bundle-copy")
+                                .label("Copy path")
+                                .accessibility_label("Copy the debug bundle's path")
+                                .on_click(cx.listener(|this, _, _, cx| this.copy_bundle_path(cx))),
+                        )
+                        .into_any_element(),
+                );
+                // A partial archive says what it could not hold, in the same
+                // words its README uses.
+                for (index, note) in report.notes.iter().enumerate() {
+                    rows.push(
+                        div()
+                            .id(ElementId::Name(
+                                format!("diagnostics-bundle-note-{index}").into(),
+                            ))
+                            .test_support()
+                            .role(Role::Alert)
+                            .aria_label(note.clone())
+                            .border_l_2()
+                            .border_color(theme.warning)
+                            .pl_2()
+                            .py_1()
+                            .text_xs()
+                            .text_color(palette.text)
+                            .child(Text::new_inaccessible(note.clone().into()))
+                            .into_any_element(),
+                    );
+                }
+            }
+            BundleState::Failed(problem) => rows.push(
+                notice(
+                    "diagnostics-bundle-problem",
+                    problem.clone(),
+                    theme.danger,
+                    &palette,
+                )
+                .into_any_element(),
+            ),
+        }
+        section(
+            "diagnostics-bundle",
+            "Debug bundle",
+            "One archive with the logs, versions, database info, configuration, and sizing, \
+             ready to attach to a support message. Collecting runs in the background.",
+            rows,
+            cx,
+        )
+    }
+
+    /// Puts the last archive's path on the clipboard.
+    fn copy_bundle_path(&mut self, cx: &mut Context<Self>) {
+        let path = match self.model.read(cx).bundle() {
+            BundleState::Ready(report) => report.path.display().to_string(),
+            _ => return,
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(path));
+    }
+
     /// The upload rate from the engine's meter, and the live progress.
     fn throughput_section(&self, cx: &mut Context<Self>) -> AnyElement {
         let palette = CardPalette::new(cx.theme());
@@ -407,6 +580,7 @@ impl Render for DiagnosticsView {
         let state = self.state_section(cx);
         let errors = self.errors_section(cx);
         let throughput = self.throughput_section(cx);
+        let bundle = self.bundle_section(cx);
 
         div()
             .id("diagnostics-view")
@@ -424,5 +598,6 @@ impl Render for DiagnosticsView {
             .child(state)
             .child(throughput)
             .child(errors)
+            .child(bundle)
     }
 }

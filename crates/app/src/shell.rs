@@ -286,8 +286,15 @@ pub fn open_main_window(cx: &mut App) -> anyhow::Result<()> {
         settings.update(cx, |view, _| view.set_engine(engine.clone()));
         let upload_view = cx.new(|cx| UploadView::new(upload.clone(), window, cx));
         let failed_view = cx.new(|cx| FailedView::new(engine.clone(), window, cx));
-        let diagnostics_model = cx
-            .new(|cx| DiagnosticsModel::new(store.clone(), engine.clone(), connection.clone(), cx));
+        let diagnostics_model = cx.new(|cx| {
+            DiagnosticsModel::new(
+                store.clone(),
+                engine.clone(),
+                connection.clone(),
+                crate::debug_bundle::bundle_directory(),
+                cx,
+            )
+        });
         let diagnostics_view = cx.new(|cx| DiagnosticsView::new(diagnostics_model, cx));
         let review_view = cx.new(|cx| ReviewView::new(engine.clone(), window, cx));
         cx.new(|cx| {

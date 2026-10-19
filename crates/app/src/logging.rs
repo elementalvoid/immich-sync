@@ -336,15 +336,39 @@ impl LogSink {
 ///
 /// Returns an error when the directory cannot be read.
 pub fn newest_file(directory: &Path) -> anyhow::Result<Option<PathBuf>> {
+    Ok(log_files(directory)?
+        .into_iter()
+        .next()
+        .map(|(_, path)| path))
+}
+
+/// The newest `limit` log files in `directory`, newest first.
+///
+/// The debug bundle (#25) takes the newest few of them, so a support archive
+/// does not carry the whole rotation.
+///
+/// # Errors
+///
+/// Returns an error when the directory cannot be read.
+pub fn recent_files(directory: &Path, limit: usize) -> anyhow::Result<Vec<PathBuf>> {
+    Ok(log_files(directory)?
+        .into_iter()
+        .take(limit)
+        .map(|(_, path)| path)
+        .collect())
+}
+
+/// Every log file in `directory`, newest first, with its modification time.
+fn log_files(directory: &Path) -> anyhow::Result<Vec<(SystemTime, PathBuf)>> {
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => {
             return Err(error)
                 .with_context(|| format!("read the log directory {}", directory.display()));
         }
     };
-    let mut newest: Option<(SystemTime, PathBuf)> = None;
+    let mut files = Vec::new();
     for entry in entries {
         let entry =
             entry.with_context(|| format!("read the log directory {}", directory.display()))?;
@@ -356,11 +380,15 @@ pub fn newest_file(directory: &Path) -> anyhow::Result<Option<PathBuf>> {
             continue;
         }
         let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-        if newest.as_ref().is_none_or(|(at, _)| modified > *at) {
-            newest = Some((modified, entry.path()));
-        }
+        files.push((modified, entry.path()));
     }
-    Ok(newest.map(|(_, path)| path))
+    // Newest first. A file whose timestamp cannot be read sorts as the oldest,
+    // and the path breaks a tie so two files written in one tick keep a stable
+    // order.
+    files.sort_by(|(left_at, left), (right_at, right)| {
+        right_at.cmp(left_at).then_with(|| left.cmp(right))
+    });
+    Ok(files)
 }
 
 /// Records this process's start line (SPEC R10.3): the client version, the OS,
@@ -415,12 +443,19 @@ pub fn tail(directory: &Path, max_lines: usize) -> anyhow::Result<Vec<String>> {
     let Some(path) = newest_file(directory)? else {
         return Ok(Vec::new());
     };
-    tail_file(&path, max_lines, TAIL_BYTES)
+    tail_lines(&path, max_lines, TAIL_BYTES)
 }
 
 /// The last `max_lines` lines of one file, reading at most `max_bytes` from its
 /// end.
-fn tail_file(path: &Path, max_lines: usize, max_bytes: u64) -> anyhow::Result<Vec<String>> {
+///
+/// The Logs view reads the newest file, and the debug bundle (#25) reads each
+/// recent log file through this with its own byte cap.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be read.
+pub fn tail_lines(path: &Path, max_lines: usize, max_bytes: u64) -> anyhow::Result<Vec<String>> {
     let mut file =
         fs::File::open(path).with_context(|| format!("open the log file {}", path.display()))?;
     let length = file.metadata()?.len();
@@ -491,7 +526,7 @@ mod tests {
 
         // 64 bytes is about six lines, so a bounded read can never see the
         // first line of the file.
-        let lines = tail_file(&path, 3, 64).expect("tail the log");
+        let lines = tail_lines(&path, 3, 64).expect("tail the log");
 
         assert_eq!(
             lines,
@@ -510,7 +545,7 @@ mod tests {
         let path = temp.path().join("immich-sync.log.2026-01-01");
         numbered_log(&path, 3);
 
-        let lines = tail_file(&path, 10, TAIL_BYTES).expect("tail the log");
+        let lines = tail_lines(&path, 10, TAIL_BYTES).expect("tail the log");
 
         assert_eq!(lines, ["line 0000", "line 0001", "line 0002"]);
     }
@@ -521,7 +556,7 @@ mod tests {
         let path = temp.path().join("immich-sync.log.2026-01-01");
         numbered_log(&path, 100);
 
-        let lines = tail_file(&path, 1, 25).expect("tail the log");
+        let lines = tail_lines(&path, 1, 25).expect("tail the log");
 
         assert_eq!(
             lines,
@@ -548,6 +583,40 @@ mod tests {
         assert_eq!(
             newest_file(temp.path()).expect("find the newest file"),
             Some(current)
+        );
+    }
+
+    #[test]
+    fn the_recent_files_are_newest_first_and_limited() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let now = SystemTime::now();
+        for (name, age) in [
+            ("immich-sync.log.2026-01-01", 120),
+            ("immich-sync.log.2026-01-02", 60),
+            ("immich-sync.log.2026-01-03", 0),
+        ] {
+            let path = temp.path().join(name);
+            fs::write(&path, "line\n").expect("write the log file");
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .expect("open the log file")
+                .set_modified(now - std::time::Duration::from_secs(age))
+                .expect("age the log file");
+        }
+        // A file in the same directory that is not a log is not a candidate.
+        fs::write(temp.path().join("state.db"), "database").expect("write a non-log file");
+
+        let recent = recent_files(temp.path(), 2).expect("find the recent files");
+
+        assert_eq!(
+            recent
+                .iter()
+                .filter_map(|path| path.file_name())
+                .map(|name| name.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            ["immich-sync.log.2026-01-03", "immich-sync.log.2026-01-02"],
+            "the newest files first, limited to the requested count"
         );
     }
 

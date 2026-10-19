@@ -16,11 +16,16 @@ interprocess.workspace = true
 keyring-core = "=1.0.1"
 serde = { version = "1", features = ["derive"] }
 sync-core = { path = "../sync-core" }
+time = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 toml = "1"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = "0.3"
+# The debug bundle (#25). `.zip` opens on Windows without another tool, and
+# `default-features = false` keeps every compression backend out of the build:
+# the entries are stored uncompressed and the archive is size-capped anyway.
+zip = { version = "9", default-features = false }
 
 [dev-dependencies]
 gpui-kit = { workspace = true, features = ["test-support"] }

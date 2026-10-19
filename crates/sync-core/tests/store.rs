@@ -1237,6 +1237,63 @@ fn table_rows(info: &sync_core::store::SqliteInfo, table: &str) -> i64 {
         .rows
 }
 
+/// Issue #25: the debug bundle's sizing reports the library's bytes and the
+/// shape of its state in one read.
+#[test]
+fn the_sizing_reports_the_tracked_bytes_and_the_state_counts() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    store
+        .add_folder(&SourceFolder {
+            path: temp.path().join("photos").display().to_string(),
+            recursive: true,
+            album_mapping: false,
+            album_scope: AlbumScope::Leaf,
+        })
+        .expect("add the source folder");
+
+    for (path, state, size) in [
+        ("uploaded.jpg", ItemState::Uploaded, 100),
+        ("duplicate.jpg", ItemState::Duplicate, 50),
+        ("parked.jpg", ItemState::DeadLetter, 10),
+        ("gone.jpg", ItemState::Missing, 5),
+    ] {
+        let mut row = record(path, state);
+        row.size = size;
+        store.record(&row).expect("write the item");
+    }
+    for asset_id in ["asset-1", "asset-2"] {
+        store
+            .record_version(&NewVersion {
+                path: "uploaded.jpg".to_string(),
+                asset_id: asset_id.to_string(),
+                sha1: hello_world_sha1(),
+                created_at_ns: 1_700_000_000_000_000_000,
+                stack_id: None,
+            })
+            .expect("record the version");
+    }
+
+    let sizing = store.sizing().expect("read the sizing");
+
+    assert_eq!(
+        sizing.tracked_bytes, 165,
+        "the sum of the four recorded sizes"
+    );
+    assert_eq!(
+        sizing.by_state,
+        vec![
+            (ItemState::DeadLetter, 1),
+            (ItemState::Duplicate, 1),
+            (ItemState::Missing, 1),
+            (ItemState::Uploaded, 1),
+        ],
+        "one entry per stored state, ordered by the stored name"
+    );
+    assert_eq!(sizing.folders, 1, "the one source folder is counted");
+    assert_eq!(sizing.versions, 2, "both recorded versions are counted");
+}
+
 /// The most recent failure of each class the attempt log holds (R10.2).
 #[test]
 fn the_last_error_of_each_class_is_reported_with_its_message() {
