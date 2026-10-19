@@ -1,6 +1,6 @@
 // The `git rev-parse` lookup the build uses to embed the short revision.
 // `build.rs` includes this file, so the tests below and the build run the same
-// code; keep it dependent on std only.
+// code; keep the non-test code dependent on std only.
 
 use std::fs;
 use std::path::{Path, PathBuf};
