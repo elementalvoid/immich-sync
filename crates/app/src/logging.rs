@@ -23,6 +23,8 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::Registry;
 use tracing_subscriber::filter::{LevelFilter, Targets};
+
+use crate::version;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::reload;
 
@@ -369,7 +371,7 @@ pub fn newest_file(directory: &Path) -> anyhow::Result<Option<PathBuf>> {
 /// fallback paths says so in the file a support session reads.
 pub fn record_start(paths: &AppPaths, resolution_problem: Option<&str>) {
     tracing::info!(
-        version = env!("CARGO_PKG_VERSION"),
+        version = version::client_version(),
         os = std::env::consts::OS,
         config = %paths.config_file.display(),
         state = %paths.state_db.display(),
