@@ -1,0 +1,10 @@
+// The app icon the installed executable carries (SPEC R11.1), so Explorer, the
+// taskbar, the window title bar, and Settings -> Apps show it. The id is 1
+// because GPUI's Windows backend loads the window class icon with
+// `LoadImageW(module, MAKEINTRESOURCE(1), IMAGE_ICON, ...)`.
+//
+// This file sits at the crate root and names the icon from there because
+// `embed-resource` runs `rc.exe` and `windres` with the build script's working
+// directory, while `llvm-rc` gets the resource file's own directory.
+// `build.rs` compiles it for Windows targets only.
+1 ICON "icons/icon.ico"
