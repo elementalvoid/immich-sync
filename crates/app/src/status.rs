@@ -147,13 +147,18 @@ impl StatusCard {
 
 /// The upload line a card shows (R8.1).
 ///
-/// The engine's rate is a rolling average, so the window still holds the last
-/// bytes for a moment after an upload finishes. The count decides: no upload is
-/// on the wire, so the client is idle and the line says so instead of showing a
-/// rate nothing is moving any more.
+/// The engine's rate is a rolling average over two seconds, so the window still
+/// holds the last bytes after an upload finishes, and a burst shorter than one
+/// status poll has a rate with nothing on the wire. The line is `Idle` only when
+/// nothing is on the wire *and* no byte is moving; a rate on its own is shown
+/// alone rather than with a zero count.
 fn upload_line(uploads: UploadTraffic) -> String {
     if uploads.in_flight == 0 {
-        return "Idle".to_string();
+        return if uploads.bytes_per_second == 0 {
+            "Idle".to_string()
+        } else {
+            format_rate(uploads.bytes_per_second as f64)
+        };
     }
     format!(
         "{} · {} uploading",
@@ -303,7 +308,11 @@ pub fn sample() -> DashboardModel {
                 },
                 review_count: 0,
                 available: true,
-                uploads: UploadTraffic::default(),
+                uploads: UploadTraffic {
+                    bytes: 41_943_040,
+                    bytes_per_second: 2_516_582,
+                    in_flight: 3,
+                },
                 connection: None,
                 last_error: None,
                 recursive: true,
@@ -370,5 +379,44 @@ pub fn sample() -> DashboardModel {
                 album_scope: AlbumScope::Leaf,
             },
         ],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::upload_line;
+    use sync_core::meter::UploadTraffic;
+
+    /// A burst shorter than the poll interval leaves a rate with no upload on
+    /// the wire: the window still holds its bytes, so the line must show the
+    /// rate rather than claim the client is idle (R8.1).
+    #[test]
+    fn a_short_burst_reads_as_a_rate_then_fades_to_idle() {
+        assert_eq!(
+            upload_line(UploadTraffic {
+                bytes: 1_048_576,
+                bytes_per_second: 524_288,
+                in_flight: 0,
+            }),
+            "512.0 KiB/s",
+            "the burst is still in the window, so the line shows its rate"
+        );
+        assert_eq!(
+            upload_line(UploadTraffic {
+                bytes: 1_048_576,
+                bytes_per_second: 0,
+                in_flight: 0,
+            }),
+            "Idle",
+            "once the window is empty the client reads idle"
+        );
+        assert_eq!(
+            upload_line(UploadTraffic {
+                bytes: 0,
+                bytes_per_second: 524_288,
+                in_flight: 2,
+            }),
+            "512.0 KiB/s · 2 uploading"
+        );
     }
 }

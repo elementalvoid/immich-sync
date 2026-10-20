@@ -113,19 +113,27 @@ fn the_global_card_reads_the_upload_rate_and_the_count() {
 }
 
 #[gpui_kit::test]
-fn the_global_card_reads_idle_when_no_upload_is_running() {
+fn the_global_card_reads_idle_only_when_no_upload_is_moving() {
     use sync_core::meter::UploadTraffic;
 
     let mut card = sample().global;
     card.uploads = UploadTraffic::default();
     assert_eq!(card.content().uploads.as_deref(), Some("Idle"));
 
-    // The window still holds the last burst after the upload finished. No
-    // upload is running, so the card says so instead of showing a rate that
-    // nothing is moving any more.
+    // The window still holds the last burst after the upload finished: no
+    // upload is running, but bytes did move, so the line shows the rate alone
+    // instead of hiding a sub-poll burst behind `Idle`.
     card.uploads = UploadTraffic {
         bytes: 1_048_576,
         bytes_per_second: 524_288,
+        in_flight: 0,
+    };
+    assert_eq!(card.content().uploads.as_deref(), Some("512.0 KiB/s"));
+
+    // The burst faded out of the window: nothing is on the wire or moving.
+    card.uploads = UploadTraffic {
+        bytes: 1_048_576,
+        bytes_per_second: 0,
         in_flight: 0,
     };
     assert_eq!(card.content().uploads.as_deref(), Some("Idle"));
@@ -157,6 +165,8 @@ fn the_global_card_renders_the_upload_line(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn sample_data_covers_several_folders_and_states() {
+    use sync_core::meter::UploadTraffic;
+
     let model = sample();
 
     assert!(
@@ -176,6 +186,15 @@ fn sample_data_covers_several_folders_and_states() {
     assert!(
         states.len() >= 3,
         "the sample data exercises several states"
+    );
+
+    let mut summed = UploadTraffic::default();
+    for folder in &model.folders {
+        summed.add(folder.uploads);
+    }
+    assert_eq!(
+        model.global.uploads, summed,
+        "the fixture's global card is the sum of its folders"
     );
 }
 
