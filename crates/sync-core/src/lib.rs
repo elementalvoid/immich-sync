@@ -17,6 +17,7 @@ pub mod pairing;
 pub mod paths;
 pub mod scan;
 pub mod skip;
+pub mod status;
 pub mod store;
 pub mod tracking;
 pub mod upload;

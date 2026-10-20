@@ -20,7 +20,7 @@ use crate::store::StoreModel;
 use crate::upload::UploadModel;
 use crate::upload_view::UploadView;
 use sync_core::connection::{ConnectionState, ServerProfile};
-use sync_core::engine::Activity;
+use sync_core::status::Activity;
 use sync_core::store::FolderCounts;
 
 use std::sync::Mutex;
