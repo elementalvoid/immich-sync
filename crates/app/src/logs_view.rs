@@ -173,7 +173,9 @@ impl LogsView {
         self.window.is_some_and(|window| {
             window
                 .update(cx, |_, window, cx| TextSelection::has_selection(window, cx))
-                .unwrap_or(false)
+                // A window that cannot be read may hold a selection, and a
+                // replace over one loses the user's text: pause instead.
+                .unwrap_or(true)
         })
     }
 
@@ -244,9 +246,10 @@ impl LogsView {
         };
         self.read_problem = None;
         // The timer's read decided before the file read finished, and the user
-        // may have scrolled since: replacing now would pull them back to the
-        // end. A read the user asked for follows whatever the viewport says.
-        if self.follow == Follow::FromViewport && !self.at_bottom() {
+        // may have scrolled or selected since: replacing now would pull them
+        // back to the end or drop the text under the selection. A read the user
+        // asked for follows whatever the viewport says.
+        if self.follow == Follow::FromViewport && (!self.at_bottom() || self.has_selection(cx)) {
             self.paused = true;
         }
         if self.paused {

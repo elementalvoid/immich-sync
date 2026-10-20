@@ -1039,8 +1039,8 @@ async fn a_scroll_up_during_the_read_is_not_undone_when_it_lands(cx: &mut TestAp
     let mut lines = long_tail(60);
     write_lines(&paths, &lines);
     let store = SettingsStore::open(paths.config_file.clone());
-    // The Logs view alone: the only timer pending is its live poll, so the two
-    // ticks below are the poll and the read it starts.
+    // The Logs view alone: the only timer pending is its live poll, so the
+    // three ticks below are the poll and the read it starts.
     let (window, logs) = open_logs_view(cx, store, paths.clone());
     cx.update(|cx| logs.update(cx, |logs, cx| logs.set_visible(true, cx)));
     settle(cx, window);
@@ -1079,7 +1079,7 @@ async fn a_scroll_up_during_the_read_is_not_undone_when_it_lands(cx: &mut TestAp
     );
     // One tick expires the timer, one completes the timer's own task and wakes
     // the poll, and one runs the poll: it reads the viewport as "following"
-    // and starts the read. The read has landed by the fifth tick, so stop here.
+    // and starts the read. The read has not landed yet, so stop here.
     assert!(cx.dispatcher.tick(false), "the poll timer expires");
     assert!(cx.dispatcher.tick(false), "the timer wakes the poll");
     assert!(cx.dispatcher.tick(false), "the poll starts its read");
@@ -1318,6 +1318,41 @@ async fn leaving_the_logs_surface_stops_the_live_tail(cx: &mut TestAppContext) {
         !cx.update(|cx| logs.read(cx).is_live()),
         "switching away stops it, so a hidden surface reads nothing"
     );
+}
+
+/// A read already in flight when the surface hides lands on no surface at all:
+/// it must not fill the rows behind the one the user switched to.
+#[gpui_kit::test]
+async fn a_read_that_lands_after_the_surface_hides_leaves_the_rows_alone(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    write_log(&paths, &["a line appended while the read was out"]);
+    let store = SettingsStore::open(paths.config_file.clone());
+    let (window, logs) = open_logs_view(cx, store, paths.clone());
+
+    // Showing starts a read, and hiding before it lands leaves it in flight.
+    cx.update(|cx| logs.update(cx, |logs, cx| logs.set_visible(true, cx)));
+    cx.update(|cx| logs.update(cx, |logs, cx| logs.set_visible(false, cx)));
+    settle(cx, window);
+    cx.update_window(window, |_, window, _| {
+        assert!(
+            window.try_find("logs-line-0").is_none(),
+            "a read that lands while the surface is hidden changes nothing"
+        );
+    })
+    .expect("update the shell window");
+
+    // Showing it again reads, so the tail was never the hidden read's.
+    cx.update(|cx| logs.update(cx, |logs, cx| logs.set_visible(true, cx)));
+    settle(cx, window);
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(
+            window.find("logs-line-0").label(),
+            Some("a line appended while the read was out"),
+            "showing the surface reads it"
+        );
+    })
+    .expect("update the shell window");
 }
 
 #[gpui_kit::test]
