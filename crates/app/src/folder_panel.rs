@@ -8,6 +8,7 @@
 
 use std::path::Path;
 
+use gpui_kit::base::Disableable as _;
 use gpui_kit::base::FocusTrapElement as _;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -186,7 +187,12 @@ impl FolderPanel {
         cx.notify();
     }
 
+    /// Cancels the draft. While an Add is in flight this is a no-op: the write
+    /// will land, so the dialog waits for the result instead of stranding it.
     fn cancel(&mut self, cx: &mut Context<Self>) {
+        if self.pending.is_some() {
+            return;
+        }
         cx.emit(FolderPanelEvent::Cancelled);
     }
 
@@ -217,8 +223,7 @@ impl FolderPanel {
             .child(text)
     }
 
-    /// The path the dialog confirms (R2.1). The detail mode makes it
-    /// selectable and wraps it (#43); the draft shows it as one line.
+    /// The path the dialog confirms (R2.1), shown as one line.
     fn path(&self, cx: &Context<Self>) -> impl IntoElement + use<> {
         let shown = if self.draft.path.is_empty() {
             "No path yet.".to_string()
@@ -312,9 +317,9 @@ impl FolderPanel {
             )
     }
 
-    /// The draft footer: Cancel writes nothing, Add records the four values
-    /// (#43 gives the live mode its own footer).
+    /// The draft footer: Cancel writes nothing, Add records the four values.
     fn actions(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let pending = self.pending.is_some();
         div()
             .flex()
             .flex_row()
@@ -324,6 +329,7 @@ impl FolderPanel {
             .child(
                 Button::new("folder-panel-cancel")
                     .secondary()
+                    .disabled(pending)
                     .label("Cancel")
                     .accessibility_label("Cancel adding the folder")
                     .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
@@ -358,9 +364,10 @@ impl FolderPanel {
                     .bg(theme.background.opacity(0.75))
                     .track_focus(&focus)
                     .focus_trap("folder-panel-trap", &focus)
-                    // The backdrop swallows pointer events, so the dashboard
-                    // behind the modal stays inert.
+                    // The backdrop swallows pointer and wheel events, so the
+                    // dashboard behind the modal stays inert.
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                     .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                         if event.keystroke.key == "escape" {
                             this.cancel(cx);

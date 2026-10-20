@@ -1232,7 +1232,9 @@ async fn cancel_and_escape_close_the_setup_and_write_nothing(cx: &mut TestAppCon
 
     cx.update_window(window, |_, window, cx| {
         open_setup_through_the_field(window, &path, cx);
-        window.click("folder-panel-cancel", cx);
+        // N5: Cancel answers the keyboard.
+        tab_to(window, "folder-panel-cancel", cx);
+        window.press("enter", cx);
     })
     .expect("press Cancel");
 
@@ -1243,6 +1245,11 @@ async fn cancel_and_escape_close_the_setup_and_write_nothing(cx: &mut TestAppCon
         assert!(
             window.try_find("folder-panel").is_none(),
             "#40: Cancel closes the dialog"
+        );
+        assert_eq!(
+            window.find("dashboard-folder-path").focused(),
+            Some(true),
+            "#40: Cancel returns focus to the add field"
         );
         assert_eq!(
             row_text_input(window, "dashboard-folder-path").value(),
@@ -1264,6 +1271,11 @@ async fn cancel_and_escape_close_the_setup_and_write_nothing(cx: &mut TestAppCon
             window.try_find("folder-panel").is_none(),
             "#40: Escape cancels the dialog"
         );
+        assert_eq!(
+            window.find("dashboard-folder-path").focused(),
+            Some(true),
+            "#40: Escape returns focus to the add field"
+        );
     })
     .expect("read the dialog after Escape");
 
@@ -1271,6 +1283,61 @@ async fn cancel_and_escape_close_the_setup_and_write_nothing(cx: &mut TestAppCon
         cx.read(|cx| store.read(cx).folders().is_empty()),
         "#40: Cancel writes nothing"
     );
+}
+
+/// #40: Add is one in-flight write. While it runs, Cancel must not abandon
+/// the dialog: the write still lands, so the dialog waits for its own result.
+#[gpui_kit::test]
+async fn cancel_while_an_add_is_pending_leaves_the_dialog_and_the_write(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the fixture folder");
+    let (window, store, _view) = open_live_dashboard(cx, temp.path());
+    wait_for_store(cx, &store).await;
+    let path = photos.display().to_string();
+
+    cx.update_window(window, |_, window, cx| {
+        open_setup_through_the_field(window, &path, cx);
+        // Add and Cancel in one update: the worker cannot have answered yet.
+        add_in_setup(window, cx);
+        window.click("folder-panel-cancel", cx);
+        window.press("escape", cx);
+    })
+    .expect("press Add then Cancel");
+
+    // The dashboard closes a cancelled panel in the next update, so the check
+    // that it stayed open belongs in an update of its own: an inert Cancel is
+    // the only thing that keeps it there.
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("folder-panel").is_some(),
+            "#40: Cancel during a pending Add keeps the dialog open"
+        );
+    })
+    .expect("read the dialog after Cancel");
+
+    let added = wait_for_folder(cx, &store, |_| true).await;
+    assert_eq!(added.path, path, "#40: the pending write still lands");
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("folder-panel").is_none(),
+            "#40: the result closes the dialog the Cancel could not"
+        );
+        assert_eq!(
+            row_text_input(window, "dashboard-folder-path").value(),
+            Some(""),
+            "#40: the recorded folder clears the field"
+        );
+        assert!(
+            window.find(("status-folder", 0_usize)).visible(),
+            "#40: the recorded folder has its card"
+        );
+    })
+    .expect("read the dialog after the result");
 }
 
 #[gpui_kit::test]
@@ -1471,8 +1538,15 @@ async fn the_setup_dialog_names_its_controls_and_traps_focus(cx: &mut TestAppCon
             "Space changes the focused switch"
         );
         tab_to(window, "folder-panel-add", cx);
+        // N5: Add answers the keyboard too.
+        window.press("space", cx);
     })
     .expect("read the setup dialog's names and focus");
 
-    assert!(cx.read(|cx| store.read(cx).folders().is_empty()));
+    let added = wait_for_folder(cx, &store, |_| true).await;
+    assert_eq!(
+        added.path,
+        photos.display().to_string(),
+        "N5: Space on the focused Add records the folder"
+    );
 }
