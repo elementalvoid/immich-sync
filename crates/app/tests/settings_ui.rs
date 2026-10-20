@@ -1858,3 +1858,269 @@ async fn a_limits_change_reaches_the_running_engine(cx: &mut TestAppContext) {
         "R7.3: the concurrency limit was written back"
     );
 }
+
+/// R3.7: the Tagging section shows the fixed tag name and opens Immich's tag
+/// page on the configured server, minus the API prefix.
+#[gpui_kit::test]
+fn the_tagging_section_shows_the_fixed_tag_and_opens_its_immich_page(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    // A reverse-proxy prefix in front of the API prefix, which is the shape
+    // the client accepts as a base URL.
+    let mut seed = SettingsStore::open(paths.config_file.clone());
+    seed.update(|settings| {
+        settings.server_url = "https://immich.example.com/immich/api".to_string();
+    })
+    .expect("seed the server URL");
+    let store = SettingsStore::open(paths.config_file.clone());
+    let window = open_settings(cx, store, paths.clone(), FakeAutostart::new());
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("settings-tag-name").label(),
+            Some("immich-sync"),
+            "R3.7: the fixed tag name is shown"
+        );
+        assert!(
+            window.find("settings-tag-prerequisite").visible(),
+            "R3.7: the section explains Immich's Tags preference"
+        );
+        assert_eq!(
+            window.find("settings-tag-upload").checked(),
+            Some(false),
+            "R3.7: the switch is present and off"
+        );
+        window.click("settings-tag-link", cx);
+    })
+    .expect("open the tag page from the settings window");
+
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://immich.example.com/immich/tags?path=immich-sync"),
+        "R3.7: the URL is the server URL minus /api, with the tag's path"
+    );
+}
+
+/// R3.7: no server URL means no View in Immich link.
+#[gpui_kit::test]
+fn the_tagging_section_has_no_immich_link_without_a_server_url(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let store = SettingsStore::open(paths.config_file.clone());
+    let window = open_settings(cx, store, paths.clone(), FakeAutostart::new());
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.find("settings-tagging").visible(),
+            "the section is there without a server"
+        );
+        assert!(
+            window.try_find("settings-tag-link").is_none(),
+            "R3.7: there is no link to open without a server URL"
+        );
+    })
+    .expect("render the settings window");
+    assert_eq!(cx.opened_url(), None, "nothing was opened");
+}
+
+/// R3.7: the switch persists the setting and moves the running engine to it
+/// without a restart, in both directions.
+#[gpui_kit::test]
+async fn the_tag_switch_persists_and_reaches_the_running_engine(cx: &mut TestAppContext) {
+    let (_runtime, server) = mock_server();
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let mut stored = SettingsStore::open(paths.config_file.clone());
+    stored
+        .update(|settings| {
+            settings.server_url = server.base_url().to_string();
+        })
+        .expect("seed the server URL");
+
+    let credentials: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+    let (window, view, connection) =
+        open_settings_view(cx, stored, paths.clone(), FakeAutostart::new(), credentials);
+
+    // Sign in on the model the view already holds, so the engine can start.
+    let profile = ServerProfile {
+        server_url: server.base_url().to_string(),
+        email: "sync@example.com".to_string(),
+        method: AuthMethod::Password,
+    };
+    cx.update(|cx| {
+        connection.update(cx, |model, cx| {
+            model.sign_in(
+                SignIn {
+                    email: profile.email.clone(),
+                    secret: Secret::new("correct horse"),
+                    method: AuthMethod::Password,
+                },
+                profile,
+                cx,
+            );
+        });
+    });
+
+    let store_model = cx.update(|cx| cx.new(|cx| StoreModel::open(&paths, cx)));
+    let engine_model = cx.update(|cx| {
+        let engine = cx.new(|cx| EngineModel::new(connection, store_model, &paths, cx));
+        engine.update(cx, |model, cx| model.start(cx));
+        engine
+    });
+    for _ in 0..600 {
+        if cx.read(|cx| engine_model.read(cx).is_running()) {
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    assert!(
+        cx.read(|cx| engine_model.read(cx).is_running()),
+        "the engine never started"
+    );
+    assert!(
+        !cx.read(|cx| engine_model.read(cx).tag_status().enabled),
+        "R3.7: the stored default is off"
+    );
+
+    // The shell hands the view the engine it must push changes to; this is
+    // that same call.
+    cx.update(|cx| view.update(cx, |view, _| view.set_engine(engine_model.clone())));
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        tab_to(window, "settings-tag-upload", cx);
+        window.press("space", cx);
+    })
+    .expect("turn the tag on");
+
+    let saved = wait_for_settings(cx, &paths, |settings| settings.tag_uploaded_assets).await;
+    assert!(saved.tag_uploaded_assets, "R3.7: the setting persisted");
+    for _ in 0..600 {
+        if cx.read(|cx| engine_model.read(cx).tag_status().enabled) {
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    assert!(
+        cx.read(|cx| engine_model.read(cx).tag_status().enabled),
+        "R3.7: the switch reached the running engine"
+    );
+    // The engine resolved the tag on the worker runtime as part of that move.
+    for _ in 0..600 {
+        if server.tag_id(sync_core::tags::SYNC_TAG).is_some() {
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    assert!(
+        server.tag_id(sync_core::tags::SYNC_TAG).is_some(),
+        "R3.7: turning the setting on created the tag"
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        tab_to(window, "settings-tag-upload", cx);
+        window.press("space", cx);
+    })
+    .expect("turn the tag off");
+
+    let saved = wait_for_settings(cx, &paths, |settings| !settings.tag_uploaded_assets).await;
+    assert!(!saved.tag_uploaded_assets, "R3.7: turning it off persisted");
+    for _ in 0..600 {
+        if !cx.read(|cx| engine_model.read(cx).tag_status().enabled) {
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    assert!(
+        !cx.read(|cx| engine_model.read(cx).tag_status().enabled),
+        "R3.7: the engine stopped tagging"
+    );
+}
+
+/// R3.7: an API key that lacks a permission gets its name in the Tagging
+/// section, through the engine's own probe.
+#[gpui_kit::test]
+async fn a_missing_tag_permission_is_named_in_the_tagging_section(cx: &mut TestAppContext) {
+    let (_runtime, server) = mock_server();
+    cx.executor().allow_parking();
+    server.set_api_key("test-key");
+    // The upload may run, so the only missing permission is the tag's.
+    server.set_api_key_permissions(&["asset.upload", "tag.create", "tag.asset"]);
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let mut stored = SettingsStore::open(paths.config_file.clone());
+    stored
+        .update(|settings| {
+            settings.server_url = server.base_url().to_string();
+        })
+        .expect("seed the server URL");
+
+    let credentials: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+    let (window, view, connection) =
+        open_settings_view(cx, stored, paths.clone(), FakeAutostart::new(), credentials);
+
+    let profile = ServerProfile {
+        server_url: server.base_url().to_string(),
+        email: "sync@example.com".to_string(),
+        method: AuthMethod::ApiKey,
+    };
+    cx.update(|cx| {
+        connection.update(cx, |model, cx| {
+            model.sign_in(
+                SignIn {
+                    email: profile.email.clone(),
+                    secret: Secret::new("test-key"),
+                    method: AuthMethod::ApiKey,
+                },
+                profile,
+                cx,
+            );
+        });
+    });
+
+    let store_model = cx.update(|cx| cx.new(|cx| StoreModel::open(&paths, cx)));
+    let engine_model = cx.update(|cx| {
+        let engine = cx.new(|cx| EngineModel::new(connection, store_model, &paths, cx));
+        engine.update(cx, |model, cx| model.start(cx));
+        engine
+    });
+    for _ in 0..600 {
+        if cx.read(|cx| engine_model.read(cx).is_running()) {
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    assert!(
+        cx.read(|cx| engine_model.read(cx).is_running()),
+        "the engine never started"
+    );
+    cx.update(|cx| view.update(cx, |view, _| view.set_engine(engine_model.clone())));
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        tab_to(window, "settings-tag-upload", cx);
+        window.press("space", cx);
+    })
+    .expect("turn the tag on");
+
+    // The permission probe runs on the engine's worker runtime; the notice
+    // lands when the model's poll publishes the engine's tag state.
+    let label = wait_for_label(cx, window, "settings-tag-problem").await;
+    assert!(
+        label.contains("asset.update"),
+        "R3.7: the section names the missing permission: {label}"
+    );
+    assert!(
+        server.upsert_calls().is_empty(),
+        "R3.7: a key that may not create the tag sends no upsert"
+    );
+}
