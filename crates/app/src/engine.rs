@@ -5,7 +5,6 @@
 //! persists folder changes while the client is signed out, and republishes the
 //! engine's status to the dashboard on a short poll.
 
-use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,6 +19,7 @@ use sync_core::store::{
 use crate::connection::{
     ConnectionModel, STORE_OPENING, WORKER_UNAVAILABLE, run_on_worker, worker,
 };
+use crate::notify::Notifier;
 use crate::paths::AppPaths;
 use crate::settings::SettingsStore;
 use crate::status::DashboardModel;
@@ -56,22 +56,12 @@ pub struct EngineModel {
     /// model, not the row: the item is still in the review, and a later success
     /// clears it.
     review_problem: Option<String>,
-    /// The review count the last notification was based on, so the 250 ms
-    /// status poll cannot post the same notification twice (R5.4).
-    notified_review: u32,
-    /// Whether the attention notification already fired for the current
-    /// attention episode (R10.1). It clears when the activity leaves attention,
-    /// so a later episode notifies again.
-    notified_attention: bool,
-    /// The failed items the attention and failure notifications already cover
-    /// (R10.1), so a repeated read of the same parked item stays quiet while a
-    /// newly parked one raises its own notification.
-    notified_failed: HashSet<String>,
-    /// Whether the first read of the parked list has seeded `notified_failed`
-    /// (R10.1). The items the first read holds are the ones the process
-    /// started with, so they stay quiet; only a failure that parks later
-    /// notifies.
-    failed_latch_seeded: bool,
+    /// Decides which system notifications one observation raises (R5.4,
+    /// R10.1). It owns the latches, so the model keeps none of them.
+    notifier: Notifier,
+    /// Whether a successful read of the parked list has landed. The notifier
+    /// owns the seeding of its failure latch (R10.1).
+    failed_read: bool,
     paused: bool,
     problem: Option<String>,
     /// Bumped by every folder edit, so an older edit result cannot overwrite a
@@ -161,10 +151,8 @@ impl EngineModel {
             failed: Vec::new(),
             review: Vec::new(),
             review_problem: None,
-            notified_review: 0,
-            notified_attention: false,
-            notified_failed: HashSet::new(),
-            failed_latch_seeded: false,
+            notifier: Notifier::default(),
+            failed_read: false,
             paused: false,
             problem: None,
             generation: 0,
@@ -359,35 +347,12 @@ impl EngineModel {
                         cx.notify();
                     }
                     // R10.1: the first read is the parked list the process
-                    // started with, so it seeds the latch instead of notifying:
-                    // a relaunch must not announce the dead letter again. After
-                    // that, a newly parked item raises a notification of its
-                    // own, and an item that left the list forgets it was
-                    // announced, so a later failure notifies again.
-                    model
-                        .notified_failed
-                        .retain(|path| model.failed.iter().any(|item| item.path == *path));
-                    if !model.failed_latch_seeded {
-                        model.failed_latch_seeded = true;
-                        model
-                            .notified_failed
-                            .extend(model.failed.iter().map(|item| item.path.clone()));
-                        return;
-                    }
-                    let fresh: Vec<String> = model
-                        .failed
-                        .iter()
-                        .filter(|item| !model.notified_failed.contains(&item.path))
-                        .map(|item| item.path.clone())
-                        .collect();
-                    if !fresh.is_empty() {
-                        tracing::info!(
-                            count = fresh.len(),
-                            "R10.1: a failed item raised a notification"
-                        );
-                        model.notified_failed.extend(fresh.iter().cloned());
-                        cx.show_system_notification(crate::shell::new_failure_notification(&fresh));
-                    }
+                    // started with, so the notifier seeds its latch instead of
+                    // notifying: a relaunch must not announce the dead letter
+                    // again. After that, a newly parked item raises a
+                    // notification of its own.
+                    model.failed_read = true;
+                    model.publish_notifications(cx);
                 }
                 Err(error) => {
                     tracing::warn!(error = %error, "the failed items could not be read");
@@ -836,74 +801,24 @@ impl EngineModel {
                 })
             }
         };
-        // R5.4, R10.1: a new review item is the one thing the tray cannot show
-        // on its own, so it also raises a system notification. The count the
-        // last one was based on is kept, so the poll cannot repeat it.
-        let review = self.status.counts.review;
-        if let Some(notification) =
-            crate::shell::new_review_notification(review, self.notified_review)
-        {
-            tracing::info!(
-                count = review,
-                "R5.4: the deletion review raised a notification"
-            );
-            cx.show_system_notification(notification);
-        }
-        self.notified_review = review;
-
-        // R10.1: a lost connection, a refused credential, or a folder that
-        // cannot be read is the other thing the tray cannot show on its own.
-        self.refresh_attention_notification(cx);
+        self.publish_notifications(cx);
         cx.notify();
     }
 
-    /// Raises the attention notification once per attention episode (R10.1).
-    ///
-    /// A failed item has its own notification, so the generic one stays quiet
-    /// while the only reason is parked failures; the connection state is the
-    /// one reason that must speak even when the engine is not running yet.
-    fn refresh_attention_notification(&mut self, cx: &mut Context<Self>) {
-        // The status already takes the connection as an input (R8.2), so one
-        // activity decides the episode; the reason still names the connection
-        // first.
-        let attention = self.status.activity == Activity::NeedsAttention;
-        if !attention {
-            self.notified_attention = false;
-            return;
-        }
-        let Some(reason) = self.attention_reason(cx) else {
-            return;
+    /// Posts what the notification policy answers for the current status and
+    /// parked list (R5.4, R10.1).
+    fn publish_notifications(&mut self, cx: &mut Context<Self>) {
+        let reason = match self.connection.read(cx).state() {
+            ConnectionState::NeedsAttention(attention) => Some(attention.message()),
+            _ => None,
         };
-        if let Some(notification) =
-            crate::shell::new_attention_notification(attention, self.notified_attention, &reason)
+        let failed = self.failed_read.then_some(self.failed.as_slice());
+        for notification in self
+            .notifier
+            .observe(&self.status, failed, reason.as_deref())
         {
-            tracing::info!(
-                reason = %reason,
-                "R10.1: the client entered attention and raised a notification"
-            );
             cx.show_system_notification(notification);
         }
-        self.notified_attention = true;
-    }
-
-    /// The user-facing reason the client needs attention, when it is not a
-    /// deletion review or a parked failure. `None` lets the generic
-    /// notification stay quiet; the specific notification covers those.
-    ///
-    /// A permanent folder error keeps the engine's global error too, so it
-    /// speaks even with no parked item. A transient retry sets only the
-    /// folder's own error, so it stays quiet.
-    fn attention_reason(&self, cx: &Context<Self>) -> Option<String> {
-        if let ConnectionState::NeedsAttention(attention) = self.connection.read(cx).state() {
-            return Some(attention.message());
-        }
-        if self.status.counts.failed > 0 {
-            return None;
-        }
-        if let Some(folder) = self.status.folders.iter().find(|folder| !folder.available) {
-            return Some(format!("The source folder {} is unavailable.", folder.path));
-        }
-        self.status.last_error.clone()
     }
 
     /// The shared store, once it has opened.
