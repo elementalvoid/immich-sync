@@ -12,10 +12,11 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gpui_kit::test::TestWindowExt as _;
+use gpui_kit::base::TextSelection;
+use gpui_kit::test::{ElementSnapshot, TestWindowExt as _};
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, Bounds, ClipboardItem, Point, TestAppContext, Window,
-    WindowBounds, WindowOptions, point, px, size,
+    AnyWindowHandle, App, AppContext as _, Bounds, ClipboardItem, ElementId, Point, ScrollDelta,
+    TestAppContext, Window, WindowBounds, WindowOptions, point, px, size,
 };
 use immich_sync::autostart::{Autostart, UnavailableAutostart};
 use immich_sync::connection::{ConnectionModel, profile_from_settings};
@@ -234,6 +235,141 @@ fn refresh_reads_the_lines_written_since_the_view_opened(cx: &mut TestAppContext
     .expect("update the shell window");
 }
 
+/// One log line of the length a round asks for: short, medium, or long
+/// enough that the row has to truncate it.
+fn line_of(round: usize, index: usize) -> String {
+    let width = match (round + index) % 3 {
+        1 => 90,
+        2 => 400,
+        _ => 12,
+    };
+    format!("round {round} line {index} {}", "x".repeat(width))
+}
+
+/// The tail rows the harness can still see, with their index and snapshot. A
+/// row below the scroll box is not painted, so the harness cannot find it;
+/// every row it does find must be full height.
+fn tail_rows(window: &Window, count: usize) -> Vec<(usize, ElementSnapshot)> {
+    let mut rows = Vec::new();
+    for index in 0..count {
+        let id = ElementId::Name(format!("logs-line-{index}").into());
+        if let Some(snapshot) = window.try_find(id) {
+            rows.push((index, snapshot));
+        }
+    }
+    rows
+}
+
+/// Repeated refreshes with lines appended and truncated between them must
+/// always lay the newest tail out as single-line rows, however many lines the
+/// box has to scroll (#38).
+///
+/// The failing paint the issue reports is a row squashed into a thin strip: the
+/// box caps its height, so a flex column that lets its rows shrink squeezes
+/// every line into the cap instead of overflowing. A squashed row's bounds are
+/// shorter than the height one line of the same style needs, which is what this
+/// test measures: the height a one-line tail gives its row is the independent
+/// truth, and no row of any later tail may be shorter than it.
+#[gpui_kit::test]
+fn ten_refreshes_keep_every_row_at_full_height(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    write_log(&paths, &["the one line a fresh tail holds"]);
+    let store = SettingsStore::open(paths.config_file.clone());
+    let window = open_shell(cx, store, paths.clone());
+
+    let mut one_line = 0.;
+    cx.update_window(window, |_, window, cx| {
+        show_logs(window, cx);
+        one_line = window.find("logs-line-0").bounds().size.height.into();
+    })
+    .expect("update the shell window");
+    assert!(
+        one_line > 8.,
+        "one line of the tail is {one_line}px tall, tall enough for a line of text"
+    );
+
+    // Appends and truncations alternate, so a round that adds lines is followed
+    // by one that takes them away again.
+    for (round, count) in [3_usize, 21, 60, 5, 200, 1, 40, 12, 120, 8]
+        .into_iter()
+        .enumerate()
+    {
+        let lines: Vec<String> = (0..count).map(|index| line_of(round, index)).collect();
+        write_log(
+            &paths,
+            &lines.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        cx.update_window(window, |_, window, cx| {
+            window.click("logs-refresh", cx);
+            let rows = tail_rows(window, count);
+            assert!(
+                !rows.is_empty(),
+                "round {round}: {count} lines paint at least their first row"
+            );
+            for (position, (index, row)) in rows.iter().enumerate() {
+                assert_eq!(
+                    *index, position,
+                    "round {round}: the painted rows start at the top of the tail and leave no gap"
+                );
+                let bounds = row.bounds();
+                assert_eq!(
+                    row.label(),
+                    Some(lines[*index].as_str()),
+                    "round {round}: logs-line-{index} shows its own line"
+                );
+                assert!(
+                    f32::from(bounds.size.height) >= one_line - 0.5,
+                    "round {round}: logs-line-{index} is {}px tall, not the {one_line}px one \
+                     line needs: the row is squashed and its glyphs are clipped",
+                    f32::from(bounds.size.height)
+                );
+                if let Some((previous_index, previous)) = rows.get(position.wrapping_sub(1)) {
+                    assert!(
+                        bounds.origin.y
+                            >= previous.bounds().origin.y + previous.bounds().size.height,
+                        "round {round}: logs-line-{index} overlaps logs-line-{previous_index}"
+                    );
+                }
+            }
+            let box_bounds = window.find("logs-lines").bounds();
+            assert!(
+                f32::from(box_bounds.size.height) <= 24. * 16. + 0.5,
+                "round {round}: the tail keeps its 24rem cap"
+            );
+        })
+        .expect("update the shell window");
+    }
+
+    // The box that overflows scrolls: the lines a full tail holds beyond the
+    // first screenful are reachable, at full height, with the newest last.
+    let lines: Vec<String> = (0..200).map(|index| line_of(11, index)).collect();
+    write_log(
+        &paths,
+        &lines.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    cx.update_window(window, |_, window, cx| {
+        window.click("logs-refresh", cx);
+        window.scroll(
+            "logs-lines",
+            ScrollDelta::Pixels(point(px(0.), px(-4000.))),
+            cx,
+        );
+        window.render_frame(cx);
+        let newest = window.find(ElementId::Name("logs-line-199".into()));
+        assert_eq!(
+            newest.label(),
+            Some(lines[199].as_str()),
+            "scrolling the tail reaches the newest line"
+        );
+        assert!(
+            f32::from(newest.bounds().size.height) >= one_line - 0.5,
+            "the newest line of a full tail keeps the height one line needs"
+        );
+    })
+    .expect("update the shell window");
+}
+
 #[gpui_kit::test]
 fn every_logs_control_is_named_and_keyboard_reachable(cx: &mut TestAppContext) {
     let temp = tempfile::tempdir().expect("create a temp dir");
@@ -386,6 +522,114 @@ fn a_drag_across_lines_and_ctrl_c_copies_the_selection(cx: &mut TestAppContext) 
     assert_eq!(
         copied, "alpha first line\nbravo second line\ncharlie third line",
         "Ctrl+C copies every dragged line, in order"
+    );
+}
+
+#[gpui_kit::test]
+fn a_refresh_clears_the_old_selection_and_the_new_tail_still_copies(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    write_log(
+        &paths,
+        &[
+            "alpha first line",
+            "bravo second line",
+            "charlie third line",
+        ],
+    );
+    let store = SettingsStore::open(paths.config_file.clone());
+    let window = open_shell(cx, store, paths.clone());
+
+    cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string("SENTINEL".into())));
+    cx.update_window(window, |_, window, cx| {
+        show_logs(window, cx);
+        window.blur(cx);
+        window.render_frame(cx);
+        drag_across(window, cx, 0, 2);
+        assert!(
+            TextSelection::has_selection(window, cx),
+            "the drag selects the first tail"
+        );
+
+        write_log(
+            &paths,
+            &[
+                "delta after the refresh",
+                "echo after the refresh",
+                "foxtrot after the refresh",
+                "golf after the refresh",
+            ],
+        );
+        // Refresh from the keyboard: a click on the button would clear the
+        // selection on mouse-down, and the criterion must hold for the refresh
+        // itself, not for the pointer event that asked for it.
+        tab_to(window, "logs-refresh", cx);
+        window.press("enter", cx);
+        assert_eq!(
+            window.find(ElementId::Name("logs-line-0".into())).label(),
+            Some("delta after the refresh"),
+            "the keyboard refresh replaces the tail"
+        );
+        assert!(
+            !TextSelection::has_selection(window, cx),
+            "a refresh clears the selection the old tail held"
+        );
+
+        // The new tail must copy as the text now on screen, not the text the
+        // refreshed rows used to hold.
+        window.blur(cx);
+        window.render_frame(cx);
+        drag_across(window, cx, 0, 3);
+        window.press("ctrl-c", cx);
+    })
+    .expect("update the shell window");
+
+    cx.update_window(window, |_, window, cx| {
+        let copied = cx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(
+            copied.as_deref(),
+            Some(
+                "delta after the refresh\necho after the refresh\nfoxtrot after the refresh\ngolf after the refresh"
+            ),
+            "Ctrl+C copies the refreshed tail, in order"
+        );
+
+        // A blank line survives Copy all, which takes the tail the view holds
+        // rather than the selection layer's projection.
+        write_log(&paths, &["one", "", "three"]);
+        window.click("logs-refresh", cx);
+        window.click("logs-copy-all", cx);
+    })
+    .expect("update the shell window");
+
+    let copied = cx
+        .update(|cx| cx.read_from_clipboard().and_then(|item| item.text()))
+        .unwrap_or_default();
+    assert_eq!(
+        copied, "one\n\nthree",
+        "Copy all keeps the refreshed tail's blank line"
+    );
+}
+
+/// Drags from the middle of one tail row to the end of another, as a pointer
+/// gesture does, and renders the frame the selection needs.
+fn drag_across(window: &mut Window, cx: &mut App, from: usize, to: usize) {
+    let start = window
+        .find(ElementId::Name(format!("logs-line-{from}").into()))
+        .bounds();
+    let end = window
+        .find(ElementId::Name(format!("logs-line-{to}").into()))
+        .bounds();
+    window.drag(
+        point(
+            start.origin.x + px(2.),
+            start.origin.y + start.size.height / 2.,
+        ),
+        point(
+            end.origin.x + end.size.width - px(2.),
+            end.origin.y + end.size.height / 2.,
+        ),
+        cx,
     );
 }
 
