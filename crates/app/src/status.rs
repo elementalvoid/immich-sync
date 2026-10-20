@@ -6,7 +6,9 @@
 
 use std::path::Path;
 
+use crate::diagnostics::format_rate;
 use sync_core::engine::{Activity, EngineStatus};
+use sync_core::meter::UploadTraffic;
 use sync_core::store::{AlbumScope, FolderCounts};
 
 /// The activity state of the client or one source folder (SPEC R8.2).
@@ -64,6 +66,10 @@ pub struct StatusCard {
     /// Whether the source folder is readable (R2.5); always `true` for the
     /// global card.
     pub available: bool,
+    /// The upload traffic this card reads (R8.1): the rate over the last two
+    /// seconds and the uploads on the wire. The global card's is the sum of
+    /// the folders'.
+    pub uploads: UploadTraffic,
     /// The connection state, on the global card (R8.1).
     pub connection: Option<String>,
     /// The last error, already classified by the engine.
@@ -88,6 +94,9 @@ pub struct CardContent {
     pub album: Option<String>,
     /// Whether the folder is readable; the counts line says so when it is not.
     pub available: bool,
+    /// The upload line, on the global card (R8.1): the rate and the uploads on
+    /// the wire, or `Idle` when nothing is uploading.
+    pub uploads: Option<String>,
     /// The connection line, on the global card.
     pub connection: Option<String>,
     pub error: Option<String>,
@@ -127,10 +136,30 @@ impl StatusCard {
                 }
             }),
             available: self.available,
+            // R8.1: the line sums the folders, so it belongs to the card that
+            // is the sum.
+            uploads: self.path.is_none().then(|| upload_line(self.uploads)),
             connection: self.connection.clone(),
             error: self.last_error.clone(),
         }
     }
+}
+
+/// The upload line a card shows (R8.1).
+///
+/// The engine's rate is a rolling average, so the window still holds the last
+/// bytes for a moment after an upload finishes. The count decides: no upload is
+/// on the wire, so the client is idle and the line says so instead of showing a
+/// rate nothing is moving any more.
+fn upload_line(uploads: UploadTraffic) -> String {
+    if uploads.in_flight == 0 {
+        return "Idle".to_string();
+    }
+    format!(
+        "{} · {} uploading",
+        format_rate(uploads.bytes_per_second as f64),
+        uploads.in_flight
+    )
 }
 
 impl From<Activity> for ActivityState {
@@ -187,6 +216,7 @@ impl DashboardModel {
             counts: counts_from(status.counts),
             review_count: status.counts.review,
             available: true,
+            uploads: status.uploads,
             connection,
             last_error: status.last_error.clone(),
             recursive: false,
@@ -214,6 +244,7 @@ impl DashboardModel {
                 counts: counts_from(folder.counts),
                 review_count: folder.counts.review,
                 available: folder.available,
+                uploads: folder.uploads,
                 connection: None,
                 last_error: folder.last_error.clone(),
                 recursive: folder.recursive,
@@ -248,6 +279,11 @@ pub fn sample() -> DashboardModel {
             },
             review_count: 3,
             available: true,
+            uploads: UploadTraffic {
+                bytes: 41_943_040,
+                bytes_per_second: 2_516_582,
+                in_flight: 3,
+            },
             connection: Some("Connected".to_string()),
             last_error: None,
             recursive: false,
@@ -267,6 +303,7 @@ pub fn sample() -> DashboardModel {
                 },
                 review_count: 0,
                 available: true,
+                uploads: UploadTraffic::default(),
                 connection: None,
                 last_error: None,
                 recursive: true,
@@ -285,6 +322,7 @@ pub fn sample() -> DashboardModel {
                 },
                 review_count: 3,
                 available: true,
+                uploads: UploadTraffic::default(),
                 connection: None,
                 last_error: None,
                 recursive: true,
@@ -303,6 +341,7 @@ pub fn sample() -> DashboardModel {
                 },
                 review_count: 0,
                 available: true,
+                uploads: UploadTraffic::default(),
                 connection: None,
                 last_error: Some(
                     "permission_denied: the API key cannot write to this album".to_string(),
@@ -323,6 +362,7 @@ pub fn sample() -> DashboardModel {
                 },
                 review_count: 0,
                 available: true,
+                uploads: UploadTraffic::default(),
                 connection: None,
                 last_error: None,
                 recursive: true,
