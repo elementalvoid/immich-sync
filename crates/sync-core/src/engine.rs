@@ -40,6 +40,7 @@ use crate::pairing::FolderIndex;
 use crate::paths::{PathCase, is_within, path_key};
 use crate::scan::{ScanError, scan_folder};
 use crate::skip::{has_symlink_ancestor, skip_reason_below};
+use crate::status::{Connection, StatusInputs};
 use crate::store::{
     AlbumScope, AttemptOutcome, AttemptRecord, FailedItem, FolderCounts, ItemRecord, ItemState,
     ReviewDecision, ReviewItem, SourceFolder, StateStore, StoreError,
@@ -50,6 +51,10 @@ use crate::upload::{
     hash_in_background, pending_sidecar,
 };
 use crate::versions::Versioner;
+
+// The status types live in their own module; the engine re-exports them, so
+// its own interface stays one import for callers.
+pub use crate::status::{Activity, EngineStatus, FolderStatus};
 use crate::watch::FolderWatcher;
 
 /// How the engine decides what to do and when (SPEC R2.3, R3.1, R6, R7.2).
@@ -169,78 +174,6 @@ pub enum ReviewError {
     /// The path is not waiting for a decision.
     #[error("{0} is not waiting for a review decision")]
     NotInReview(String),
-}
-
-/// The activity state the tray and the dashboard show (R8.2).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Activity {
-    /// Nothing is queued.
-    Idle,
-    /// Files are queued or in flight.
-    Syncing,
-    /// The user paused new uploads (R8.7).
-    Paused,
-    /// A failure or a missing folder needs the user.
-    NeedsAttention,
-}
-
-impl Activity {
-    /// The human-readable name.
-    #[must_use]
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Idle => "Idle",
-            Self::Syncing => "Syncing",
-            Self::Paused => "Paused",
-            Self::NeedsAttention => "Needs attention",
-        }
-    }
-}
-
-/// The live state of one source folder (R2.5, R8.1).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FolderStatus {
-    /// The folder path the user chose.
-    pub path: String,
-    /// Whether the watcher and the scan descend into subfolders (R2.1).
-    pub recursive: bool,
-    /// Whether this folder's files join an album (R3.4).
-    pub album_mapping: bool,
-    /// What the folder maps to once album mapping is on (R3.4).
-    pub album_scope: AlbumScope,
-    /// Whether the folder is readable right now (R2.5).
-    pub available: bool,
-    /// The folder's live counts.
-    pub counts: FolderCounts,
-    /// The last failure under this folder, if any.
-    pub last_error: Option<String>,
-}
-
-/// Everything the dashboard and the tray read (R8.1, R8.2).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EngineStatus {
-    /// The global activity state.
-    pub activity: Activity,
-    /// One entry per source folder, in the stored order.
-    pub folders: Vec<FolderStatus>,
-    /// The summed counts across folders. The review count is the store's
-    /// global one, because a row under a removed source folder still waits
-    /// for a decision and still shows in [`Engine::review_items`].
-    pub counts: FolderCounts,
-    /// The last failure the engine recorded, if any.
-    pub last_error: Option<String>,
-}
-
-impl EngineStatus {
-    /// The upload progress across every folder, 0.0 to 1.0 (R8.1).
-    #[must_use]
-    pub fn progress(&self) -> f32 {
-        let total = self.counts.uploaded + self.counts.pending;
-        if total == 0 {
-            return 0.0;
-        }
-        self.counts.uploaded as f32 / total as f32
-    }
 }
 
 /// One source folder plus the live state the dashboard reads.
@@ -643,49 +576,29 @@ impl Engine {
                 last_error: entry.last_error.clone(),
             })
             .collect();
-        let mut counts = FolderCounts::default();
-        for folder in &folders {
-            counts.pending += folder.counts.pending;
-            counts.uploaded += folder.counts.uploaded;
-            counts.failed += folder.counts.failed;
-            counts.review += folder.counts.review;
-        }
         // R5.4: the review is counted from the store, not summed over the
         // current folders. A row under a removed source folder is still a
-        // decision the user owes, and it still shows in `review_items`, so a
-        // folder sum would let the tray total disagree with the list.
-        counts.review = self.inner.store.review_count().unwrap_or_else(|error| {
-            tracing::warn!(error = %error, "the review count could not be read");
-            counts.review
-        });
-        let activity = if self.inner.gate.is_paused() {
-            Activity::Paused
-        } else if !self.inner.session.state().is_connected()
-            || folders
-                .iter()
-                .any(|folder| !folder.available || folder.last_error.is_some())
-        {
-            Activity::NeedsAttention
-        } else if counts.pending > 0 {
-            Activity::Syncing
-        } else if counts.review > 0 {
-            // R5.4: a file waiting for a keep-or-trash decision is the user's
-            // to answer, like a failure.
-            Activity::NeedsAttention
-        } else {
-            Activity::Idle
+        // decision the user owes, so a folder sum would let the tray total
+        // disagree with the list. On a refused read the sum is the fallback.
+        let review_total = match self.inner.store.review_count() {
+            Ok(total) => Some(total),
+            Err(error) => {
+                tracing::warn!(error = %error, "the review count could not be read");
+                None
+            }
         };
-        EngineStatus {
-            activity,
+        EngineStatus::derive(StatusInputs {
             folders,
-            counts,
+            paused: self.inner.gate.is_paused(),
+            connection: Connection::from_state(&self.inner.session.state()),
+            review_total,
             last_error: self
                 .inner
                 .last_error
                 .lock()
                 .expect("the error lock")
                 .clone(),
-        }
+        })
     }
 
     /// The session this engine sends its requests through (R1.4).

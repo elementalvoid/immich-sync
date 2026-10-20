@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use gpui_kit::*;
 use sync_core::engine::{Activity, Engine, EngineConfig, EngineStatus, FolderStatus, Limits};
+use sync_core::status::{Connection, StatusInputs};
 use sync_core::store::{
     AlbumScope, FailedItem, FolderCounts, ReviewItem, SourceFolder, StateStore,
 };
@@ -820,31 +821,13 @@ impl EngineModel {
                         last_error: None,
                     })
                     .collect::<Vec<_>>();
-                let paused = self.paused;
-                let unavailable = folders.iter().any(|folder| !folder.available);
-                let mut counts = FolderCounts::default();
-                for folder in &folders {
-                    counts.pending += folder.counts.pending;
-                    counts.uploaded += folder.counts.uploaded;
-                    counts.failed += folder.counts.failed;
-                    counts.review += folder.counts.review;
-                }
-                EngineStatus {
-                    activity: if paused {
-                        Activity::Paused
-                    } else if unavailable {
-                        Activity::NeedsAttention
-                    } else if counts.pending > 0 {
-                        Activity::Syncing
-                    } else if counts.failed > 0 || counts.review > 0 {
-                        Activity::NeedsAttention
-                    } else {
-                        Activity::Idle
-                    },
+                EngineStatus::derive(StatusInputs {
                     folders,
-                    counts,
+                    paused: self.paused,
+                    connection: Connection::from_state(self.connection.read(cx).state()),
+                    review_total: None,
                     last_error: None,
-                }
+                })
             }
         };
         // R5.4, R10.1: a new review item is the one thing the tray cannot show
