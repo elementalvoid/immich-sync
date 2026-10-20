@@ -117,6 +117,7 @@ impl DiagnosticsModel {
                 folders: Vec::new(),
                 counts: sync_core::store::FolderCounts::default(),
                 last_error: None,
+                uploads: sync_core::meter::UploadTraffic::default(),
             },
             throughput: Throughput::default(),
             problem: None,
