@@ -1078,19 +1078,46 @@ impl StateStore {
     ///
     /// Returns [`StoreError`] when the write fails or the lock is poisoned.
     pub fn add_folder(&self, folder: &SourceFolder) -> Result<(), StoreError> {
+        self.write_folder(
+            folder,
+            "ON CONFLICT(path_key) DO UPDATE SET
+                 path = excluded.path,
+                 recursive = excluded.recursive,
+                 album_mapping = excluded.album_mapping,
+                 album_scope = excluded.album_scope",
+        )
+        .map(|_| ())
+    }
+
+    /// Records a new source folder with every setting it carries, and returns
+    /// whether it was inserted (#40).
+    ///
+    /// A folder the store already holds under the platform's path rule (R2.4)
+    /// is not replaced and `false` comes back, so the setup dialog can show
+    /// "Already added" without disturbing the stored settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the write fails or the lock is poisoned.
+    pub fn insert_folder(&self, folder: &SourceFolder) -> Result<bool, StoreError> {
+        self.write_folder(folder, "ON CONFLICT(path_key) DO NOTHING")
+            .map(|inserted| inserted > 0)
+    }
+
+    /// Writes one source folder row inside a transaction. `conflict` finishes
+    /// the statement: the update an edit needs, or `DO NOTHING` for an insert.
+    fn write_folder(&self, folder: &SourceFolder, conflict: &str) -> Result<usize, StoreError> {
         let mut writer = self.writer()?;
         let transaction = writer
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| self.query_error(source))?;
-        transaction
+        let written = transaction
             .execute(
-                "INSERT INTO source_folder (path, path_key, recursive, album_mapping, album_scope)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(path_key) DO UPDATE SET
-                     path = excluded.path,
-                     recursive = excluded.recursive,
-                     album_mapping = excluded.album_mapping,
-                     album_scope = excluded.album_scope",
+                &format!(
+                    "INSERT INTO source_folder (path, path_key, recursive, album_mapping, album_scope)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     {conflict}"
+                ),
                 params![
                     folder.path,
                     path_key(Path::new(&folder.path)),
@@ -1102,7 +1129,8 @@ impl StateStore {
             .map_err(|source| self.query_error(source))?;
         transaction
             .commit()
-            .map_err(|source| self.query_error(source))
+            .map_err(|source| self.query_error(source))?;
+        Ok(written)
     }
 
     /// Removes a source folder. Returns whether one was removed (R2.1).

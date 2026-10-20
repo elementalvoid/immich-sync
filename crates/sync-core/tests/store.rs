@@ -338,6 +338,69 @@ fn a_re_added_folder_keeps_the_album_mapping_the_user_chose() {
 }
 
 #[test]
+fn inserting_a_new_folder_writes_every_setting() {
+    use sync_core::store::{AlbumScope, SourceFolder};
+
+    // #40: the setup dialog confirms all four values, and the store records
+    // them in one insert.
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    let folder = SourceFolder {
+        path: "/photos".to_string(),
+        recursive: false,
+        album_mapping: true,
+        album_scope: AlbumScope::WholeFolder,
+    };
+
+    assert!(
+        store.insert_folder(&folder).expect("insert the folder"),
+        "a folder the store does not hold is inserted"
+    );
+    assert_eq!(
+        store.folders().expect("read the folders"),
+        vec![folder],
+        "#40: the insert keeps the settings the user confirmed"
+    );
+}
+
+#[test]
+fn inserting_a_tracked_folder_changes_nothing() {
+    use sync_core::store::{AlbumScope, SourceFolder};
+
+    // #40: the setup dialog must not overwrite a folder the client already
+    // tracks, even when the dialog carries different settings.
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    let original = SourceFolder {
+        path: "/photos".to_string(),
+        recursive: false,
+        album_mapping: true,
+        album_scope: AlbumScope::WholeFolder,
+    };
+    store
+        .add_folder(&original)
+        .expect("seed the tracked folder");
+
+    let changed = SourceFolder {
+        recursive: true,
+        album_mapping: false,
+        album_scope: AlbumScope::Leaf,
+        ..original.clone()
+    };
+    assert!(
+        !store
+            .insert_folder(&changed)
+            .expect("the insert is refused"),
+        "#40: an already-tracked folder reports that it was not inserted"
+    );
+    assert_eq!(
+        store.folders().expect("read the folders"),
+        vec![original],
+        "#40: the stored settings stay untouched"
+    );
+}
+
+#[test]
 fn a_remembered_album_id_survives_a_restart() {
     let temp = tempfile::tempdir().expect("create a temp dir");
     let path = temp.path().join("state.db");

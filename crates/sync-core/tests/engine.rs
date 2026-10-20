@@ -17,7 +17,7 @@ use sync_core::connection::{
     Attention, AuthMethod, Connection, ConnectionState, Secret, SharedSession, SignIn,
 };
 use sync_core::credential::MemoryCredentialStore;
-use sync_core::engine::{Activity, Engine, EngineConfig, ReviewError};
+use sync_core::engine::{Activity, Engine, EngineConfig, EngineError, ReviewError};
 use sync_core::failure::FailureClass;
 use sync_core::hash::{Sha1, sha1_file};
 use sync_core::store::{
@@ -1082,6 +1082,71 @@ async fn adding_a_folder_through_the_engine_syncs_its_existing_files() {
         .expect("remove the folder");
     assert!(engine.status().folders.is_empty());
     assert!(store.folders().expect("read the folders").is_empty());
+    engine.stop();
+}
+
+/// #40: the setup dialog writes a new folder's four settings together, and a
+/// folder the engine already tracks is refused without touching its row.
+#[tokio::test]
+async fn adding_a_folder_with_confirmed_settings_writes_every_choice_once() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let file = write_file(&photos, "existing.jpg", b"existing");
+    let config = EngineConfig {
+        watch: false,
+        ..EngineConfig::default()
+    };
+    let engine = start_engine(&server, &store, config).await;
+    let confirmed = SourceFolder {
+        path: photos.display().to_string(),
+        recursive: false,
+        album_mapping: true,
+        album_scope: AlbumScope::WholeFolder,
+    };
+
+    engine
+        .add_folder_settings(&confirmed)
+        .expect("add the folder with the confirmed settings");
+
+    assert_eq!(
+        store.folders().expect("read the folders"),
+        vec![confirmed.clone()],
+        "#40: one write records the path and all three settings"
+    );
+    let card = engine.status().folders[0].clone();
+    assert_eq!(card.recursive, confirmed.recursive);
+    assert_eq!(card.album_mapping, confirmed.album_mapping);
+    assert_eq!(card.album_scope, confirmed.album_scope);
+    assert!(
+        wait_until(
+            || all_terminal(&store, std::slice::from_ref(&file)),
+            Duration::from_secs(15)
+        )
+        .await,
+        "R2.1: the confirmed folder starts scanning its existing files"
+    );
+
+    // The second add of the same folder is refused, and the first row stays.
+    let changed = SourceFolder {
+        recursive: true,
+        album_mapping: false,
+        album_scope: AlbumScope::Leaf,
+        ..confirmed.clone()
+    };
+    let error = engine
+        .add_folder_settings(&changed)
+        .expect_err("the engine already tracks the folder");
+    assert!(
+        matches!(error, EngineError::FolderExists(_)),
+        "#40: an already-tracked folder is refused: {error}"
+    );
+    assert_eq!(
+        store.folders().expect("read the folders"),
+        vec![confirmed],
+        "#40: the refused add leaves the stored settings untouched"
+    );
     engine.stop();
 }
 
