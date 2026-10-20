@@ -142,6 +142,9 @@ pub enum EngineError {
     /// The folder path was blank.
     #[error("the source folder path is empty")]
     EmptyFolder,
+    /// The client already tracks this source folder (#40, R2.1).
+    #[error("{0} is already a source folder of this client")]
+    FolderExists(String),
     /// The path is not one of this engine's source folders.
     #[error("{0} is not a source folder of this client")]
     UnknownFolder(String),
@@ -619,35 +622,93 @@ impl Engine {
             album_scope,
         };
         self.inner.store.add_folder(&folder)?;
-        // R8.1: a folder new to this engine starts from what the store already
-        // holds for it; a zeroed card would never fill, because the rows are
-        // settled and `prepare` does not count them again.
+        self.track_folder(&mut folders, folder.clone());
+        drop(folders);
+        self.watch_folder(&folder);
+        Ok(())
+    }
+
+    /// Adds a source folder with the settings the setup dialog confirmed
+    /// (#40, R2.1, R3.4).
+    ///
+    /// Unlike [`Self::add_folder`], this is an insert: a folder the client
+    /// already tracks is [`EngineError::FolderExists`] and nothing is written,
+    /// so the dialog can say "Already added" and leave the stored settings
+    /// alone. The live entry and the store are checked under the folder lock,
+    /// and the store's insert refuses a row that another writer got there
+    /// first, so a path cannot become two folders (R2.4).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::EmptyFolder`] for a blank path,
+    /// [`EngineError::FolderExists`] when the client already tracks the path,
+    /// and [`EngineError::Store`] when the write fails.
+    pub fn add_folder_settings(&self, folder: &SourceFolder) -> Result<(), EngineError> {
+        let path = folder.path.trim();
+        if path.is_empty() {
+            return Err(EngineError::EmptyFolder);
+        }
+        let key = path_key(Path::new(path));
+        let mut folders = self.inner.folders.lock().expect("the folder lock");
+        if folders
+            .iter()
+            .any(|entry| path_key(Path::new(&entry.folder.path)) == key)
+        {
+            return Err(EngineError::FolderExists(path.to_string()));
+        }
+        let folder = SourceFolder {
+            path: path.to_string(),
+            ..folder.clone()
+        };
+        if !self.inner.store.insert_folder(&folder)? {
+            return Err(EngineError::FolderExists(path.to_string()));
+        }
+        self.track_folder(&mut folders, folder.clone());
+        drop(folders);
+        self.watch_folder(&folder);
+        Ok(())
+    }
+
+    /// Publishes one written folder row to the live status (R8.1): a new entry
+    /// starts from the counts the store already holds for it, and an existing
+    /// entry takes the whole row so no field is left stale.
+    ///
+    /// The caller holds the folder lock, so the row it just wrote is the one
+    /// the cards show before another edit can read it.
+    fn track_folder(&self, folders: &mut Vec<FolderEntry>, folder: SourceFolder) {
+        let key = path_key(Path::new(&folder.path));
         if let Some(entry) = folders
             .iter_mut()
             .find(|entry| path_key(Path::new(&entry.folder.path)) == key)
         {
-            // The whole row is taken, so the spelling the store just wrote is
-            // the one the live entry holds, and no field is left stale.
+            entry.available = Path::new(&folder.path).is_dir();
             entry.folder = folder;
-            entry.available = Path::new(path).is_dir();
-        } else {
-            let counts = self.inner.store.folder_counts(path).unwrap_or_else(|error| {
-                tracing::warn!(folder = path, error = %error, "the folder counts could not be read");
-                FolderCounts::default()
-            });
-            folders.push(FolderEntry {
-                available: Path::new(path).is_dir(),
-                meter: Arc::new(UploadMeter::new(&self.inner.bandwidth)),
-                folder,
-                counts,
-                last_error: None,
-            });
+            return;
         }
-        drop(folders);
+        // R8.1: a folder new to this engine starts from what the store already
+        // holds for it; a zeroed card would never fill, because the rows are
+        // settled and `prepare` does not count them again.
+        let counts = self.inner.store.folder_counts(&folder.path).unwrap_or_else(|error| {
+            tracing::warn!(folder = %folder.path, error = %error, "the folder counts could not be read");
+            FolderCounts::default()
+        });
+        folders.push(FolderEntry {
+            available: Path::new(&folder.path).is_dir(),
+            folder,
+            counts,
+            last_error: None,
+            meter: Arc::new(UploadMeter::new(&self.inner.bandwidth)),
+        });
+    }
+
+    /// Points the watch at a folder's current mode and asks for the scan that
+    /// finds the files already in it (R2.1).
+    fn watch_folder(&self, folder: &SourceFolder) {
+        let path = Path::new(&folder.path);
         let mut watcher = self.inner.watcher.lock().expect("the watcher lock");
         let mut watch_error = None;
         if let Some(watcher) = watcher.as_mut()
-            && Path::new(path).is_dir()
+            && path.is_dir()
         {
             // Re-adding an existing folder must move the watch to the new
             // mode. A recursive watch also watches every subfolder, and
@@ -656,15 +717,15 @@ impl Engine {
             // (the folder did not exist, or the watcher is off) makes the
             // unwatch a no-op, and a failed unwatch may leave the old watch
             // running.
-            let unwatched = match watcher.unwatch(Path::new(path)) {
+            let unwatched = match watcher.unwatch(path) {
                 Ok(()) => true,
                 Err(error) => {
-                    tracing::warn!(folder = path, error = %error, "the old folder watch could not be removed");
+                    tracing::warn!(folder = %folder.path, error = %error, "the old folder watch could not be removed");
                     false
                 }
             };
-            if let Err(error) = watcher.watch(Path::new(path), recursive) {
-                tracing::warn!(folder = path, error = %error, "the folder could not be watched");
+            if let Err(error) = watcher.watch(path, folder.recursive) {
+                tracing::warn!(folder = %folder.path, error = %error, "the folder could not be watched");
                 // Only a removed old watch leaves the folder unwatched, so
                 // only then does the failure belong on the card (R2.1).
                 if unwatched {
@@ -674,13 +735,16 @@ impl Engine {
         }
         drop(watcher);
         if let Some(error) = watch_error {
-            set_folder_error(&self.inner, path, error);
+            set_folder_error(&self.inner, &folder.path, error);
         }
-        tracing::info!(folder = path, recursive, "a source folder was added");
+        tracing::info!(
+            folder = %folder.path,
+            recursive = folder.recursive,
+            "a source folder was added"
+        );
         // Existing files in the new folder need discovery, not only future
         // watch events.
         self.sync_now();
-        Ok(())
     }
 
     /// Turns album mapping on or off for one source folder (R3.4).
