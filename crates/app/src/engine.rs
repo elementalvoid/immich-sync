@@ -13,7 +13,7 @@ use std::time::Duration;
 use gpui_kit::*;
 use sync_core::engine::{Activity, Engine, EngineConfig, EngineStatus, FolderStatus, Limits};
 use sync_core::store::{
-    AlbumScope, FailedItem, FolderCounts, ReviewDecision, ReviewItem, SourceFolder, StateStore,
+    AlbumScope, FailedItem, FolderCounts, ReviewItem, SourceFolder, StateStore,
 };
 
 use crate::connection::{
@@ -96,16 +96,6 @@ enum AlbumChange {
     Mapping(bool),
     /// Set the album scope.
     Scope(AlbumScope),
-}
-
-impl AlbumChange {
-    /// Applies the change to one folder row.
-    fn apply(self, folder: &mut SourceFolder) {
-        match self {
-            Self::Mapping(enabled) => folder.album_mapping = enabled,
-            Self::Scope(scope) => folder.album_scope = scope,
-        }
-    }
 }
 
 impl EngineModel {
@@ -220,26 +210,19 @@ impl EngineModel {
     /// Nothing is sent to the server, so this works while the client is signed
     /// out; the state write still runs on the worker runtime (N2).
     pub fn keep_review(&mut self, path: String, cx: &mut Context<Self>) {
-        let engine = self.engine.clone();
-        let store = self.store_model.read(cx).store();
+        let tracking = self.store_model.read(cx).tracking();
         let action_path = path.clone();
         let result = run_on_worker(
             cx,
             move || async move {
                 // N2: the store write belongs on the worker, not the UI thread.
-                match engine {
-                    Some(engine) => engine
-                        .keep_review_item(&action_path)
-                        .map(|_| ())
-                        .map_err(|error| error.to_string()),
-                    None => match store {
-                        Some(store) => store
-                            .decide_review(&action_path, ReviewDecision::Keep)
-                            .map(|_| ())
-                            .map_err(|error| error.to_string()),
-                        None => Err(STORE_OPENING.to_string()),
-                    },
-                }
+                let Some(tracking) = tracking else {
+                    return Err(STORE_OPENING.to_string());
+                };
+                tracking
+                    .keep_review(&action_path)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
             },
             move |model, result, cx| model.finish_review_action(result, &path, cx),
         );
@@ -330,26 +313,19 @@ impl EngineModel {
 
     /// Re-attempts one parked item by hand (R6.5).
     pub fn retry_failed(&mut self, path: String, cx: &mut Context<Self>) {
-        let engine = self.engine.clone();
-        let store = self.store_model.read(cx).store();
+        let tracking = self.store_model.read(cx).tracking();
         let result = run_on_worker(
             cx,
             move || async move {
                 // The store write runs on the worker runtime, so the UI thread
                 // never waits behind a worker's `BEGIN IMMEDIATE` (N2).
-                match engine {
-                    Some(engine) => engine
-                        .retry_failed(&path)
-                        .map(|_| ())
-                        .map_err(|error| error.to_string()),
-                    None => match store {
-                        Some(store) => store
-                            .retry_item(&path)
-                            .map(|_| ())
-                            .map_err(|error| error.to_string()),
-                        None => Err(STORE_OPENING.to_string()),
-                    },
-                }
+                let Some(tracking) = tracking else {
+                    return Err(STORE_OPENING.to_string());
+                };
+                tracking
+                    .retry_failed(&path)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
             },
             |model, result, cx| {
                 match result {
@@ -575,57 +551,20 @@ impl EngineModel {
         }
         // A newer edit supersedes an older result still in flight.
         self.generation = self.generation.wrapping_add(1);
-        let engine = self.engine.clone();
-        let store = self.store_model.read(cx).store();
+        let tracking = self.store_model.read(cx).tracking();
         let generation = self.generation;
         let result = run_on_worker(
             cx,
             move || async move {
                 // The store write runs on the worker runtime, so the UI thread
                 // never waits behind a worker's `BEGIN IMMEDIATE` (N2).
-                match engine {
-                    Some(engine) => engine
-                        .add_folder(&path, recursive)
-                        .map(|()| None)
-                        .map_err(|error| error.to_string()),
-                    None => match store {
-                        Some(store) => match store.folders() {
-                            // R3.4: a new folder never opts into album mapping,
-                            // but editing an existing one (the recursion
-                            // toggle) must keep the album settings it already
-                            // has. The lookup compares path keys (R2.4),
-                            // so a re-add spelled differently still edits the
-                            // row it already has.
-                            Ok(folders) => {
-                                let case = sync_core::paths::PathCase::for_platform();
-                                let existing = folders.into_iter().find(|folder| {
-                                    sync_core::paths::equal(
-                                        Path::new(&folder.path),
-                                        Path::new(&path),
-                                        case,
-                                    )
-                                });
-                                let album_mapping =
-                                    existing.as_ref().is_some_and(|folder| folder.album_mapping);
-                                let album_scope = existing
-                                    .map_or_else(AlbumScope::default, |folder| folder.album_scope);
-                                match store.add_folder(&SourceFolder {
-                                    path: path.clone(),
-                                    recursive,
-                                    album_mapping,
-                                    album_scope,
-                                }) {
-                                    Ok(()) => {
-                                        store.folders().map(Some).map_err(|error| error.to_string())
-                                    }
-                                    Err(error) => Err(error.to_string()),
-                                }
-                            }
-                            Err(error) => Err(error.to_string()),
-                        },
-                        None => Err(STORE_OPENING.to_string()),
-                    },
-                }
+                let Some(tracking) = tracking else {
+                    return Err(STORE_OPENING.to_string());
+                };
+                tracking
+                    .add_folder(&path, recursive)
+                    .map_err(|error| error.to_string())?;
+                tracking.folders().map_err(|error| error.to_string())
             },
             move |model, result, cx| {
                 if model.generation != generation {
@@ -633,11 +572,9 @@ impl EngineModel {
                 }
                 match result {
                     Ok(folders) => {
-                        if let Some(folders) = folders {
-                            model.store_model.update(cx, |store, cx| {
-                                store.set_folders(folders, cx);
-                            });
-                        }
+                        model.store_model.update(cx, |store, cx| {
+                            store.set_folders(folders, cx);
+                        });
                         model.problem = None;
                     }
                     Err(problem) => model.problem = Some(problem),
@@ -655,26 +592,19 @@ impl EngineModel {
     pub fn remove_folder(&mut self, path: String, cx: &mut Context<Self>) {
         // A newer edit supersedes an older result still in flight.
         self.generation = self.generation.wrapping_add(1);
-        let engine = self.engine.clone();
-        let store = self.store_model.read(cx).store();
+        let tracking = self.store_model.read(cx).tracking();
         let generation = self.generation;
         let result = run_on_worker(
             cx,
             move || async move {
                 // N2: the store write belongs on the worker, not the UI thread.
-                match engine {
-                    Some(engine) => engine
-                        .remove_folder(&path)
-                        .map(|()| None)
-                        .map_err(|error| error.to_string()),
-                    None => match store {
-                        Some(store) => match store.remove_folder(&path) {
-                            Ok(_) => store.folders().map(Some).map_err(|error| error.to_string()),
-                            Err(error) => Err(error.to_string()),
-                        },
-                        None => Ok(None),
-                    },
-                }
+                let Some(tracking) = tracking else {
+                    return Err(STORE_OPENING.to_string());
+                };
+                tracking
+                    .remove_folder(&path)
+                    .map_err(|error| error.to_string())?;
+                tracking.folders().map_err(|error| error.to_string())
             },
             move |model, result, cx| {
                 if model.generation != generation {
@@ -682,11 +612,9 @@ impl EngineModel {
                 }
                 match result {
                     Ok(folders) => {
-                        if let Some(folders) = folders {
-                            model.store_model.update(cx, |store, cx| {
-                                store.set_folders(folders, cx);
-                            });
-                        }
+                        model.store_model.update(cx, |store, cx| {
+                            store.set_folders(folders, cx);
+                        });
                         model.problem = None;
                     }
                     Err(problem) => model.problem = Some(problem),
@@ -722,53 +650,33 @@ impl EngineModel {
     fn change_album(&mut self, path: String, change: AlbumChange, cx: &mut Context<Self>) {
         // A newer edit supersedes an older result still in flight.
         self.generation = self.generation.wrapping_add(1);
-        let engine = self.engine.clone();
-        let store = self.store_model.read(cx).store();
+        let tracking = self.store_model.read(cx).tracking();
         let generation = self.generation;
         let result = run_on_worker(
             cx,
             move || async move {
                 // N2: the store write belongs on the worker, not the UI thread.
-                match engine {
-                    Some(engine) => match change {
-                        AlbumChange::Mapping(enabled) => engine.set_album_mapping(&path, enabled),
-                        AlbumChange::Scope(scope) => engine.set_album_scope(&path, scope),
-                    }
-                    .map(|()| None)
-                    .map_err(|error| error.to_string()),
-                    None => match store {
-                        Some(store) => match store.folders() {
-                            Ok(folders) => {
-                                match folders.into_iter().find(|folder| folder.path == path) {
-                                    Some(mut folder) => {
-                                        change.apply(&mut folder);
-                                        match store.add_folder(&folder) {
-                                            Ok(()) => store.folders().map(Some),
-                                            Err(error) => Err(error),
-                                        }
-                                        .map_err(|error| error.to_string())
-                                    }
-                                    None => Err("That folder is not in the client.".to_string()),
-                                }
-                            }
-                            Err(error) => Err(error.to_string()),
-                        },
-                        None => Err(STORE_OPENING.to_string()),
-                    },
+                let Some(tracking) = tracking else {
+                    return Err(STORE_OPENING.to_string());
+                };
+                match change {
+                    AlbumChange::Mapping(enabled) => tracking.set_album_mapping(&path, enabled),
+                    AlbumChange::Scope(scope) => tracking.set_album_scope(&path, scope),
                 }
+                .map_err(|error| error.to_string())?;
+                tracking.folders().map_err(|error| error.to_string())
             },
             move |model, result, cx| {
                 if model.generation != generation {
                     return;
                 }
                 match result {
-                    Ok(Some(folders)) => {
-                        model
-                            .store_model
-                            .update(cx, |store, cx| store.set_folders(folders, cx));
+                    Ok(folders) => {
+                        model.store_model.update(cx, |store, cx| {
+                            store.set_folders(folders, cx);
+                        });
                         model.problem = None;
                     }
-                    Ok(None) => model.problem = None,
                     Err(problem) => model.problem = Some(problem),
                 }
                 model.refresh_status(cx);
@@ -804,7 +712,7 @@ impl EngineModel {
             self.refresh_status(cx);
             return;
         }
-        let Some(store) = self.store_model.read(cx).store() else {
+        let Some(tracking) = self.store_model.read(cx).tracking() else {
             self.refresh_status(cx);
             return;
         };
@@ -832,7 +740,7 @@ impl EngineModel {
                     attempt_cap: settings.attempt_cap.max(1),
                     ..EngineConfig::default()
                 };
-                match Engine::new(store, session, config) {
+                match Engine::new(tracking, session, config) {
                     Ok(engine) => {
                         let engine = Arc::new(engine);
                         // R8.7: a pause set before the engine existed still
@@ -1026,23 +934,10 @@ impl EngineModel {
         self.store_model.read(cx).store()
     }
 
-    /// The current source folders, from the engine or the stored list.
+    /// The current source folders, from the store the client tracks them in.
     #[must_use]
     pub fn folders(&self, cx: &App) -> Vec<SourceFolder> {
-        match &self.engine {
-            Some(engine) => engine
-                .status()
-                .folders
-                .iter()
-                .map(|folder| SourceFolder {
-                    path: folder.path.clone(),
-                    recursive: folder.recursive,
-                    album_mapping: folder.album_mapping,
-                    album_scope: folder.album_scope,
-                })
-                .collect(),
-            None => self.store_model.read(cx).folders().to_vec(),
-        }
+        self.store_model.read(cx).folders().to_vec()
     }
 }
 

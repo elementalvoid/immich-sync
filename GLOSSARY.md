@@ -14,6 +14,10 @@ _Avoid_: sync root, watched folder, library
 One local file that the client tracks from discovery to upload result.
 _Avoid_: job, task, file record
 
+**Tracking**:
+The client's record of the source folders it holds and the decisions the user has made about their items. One module owns it, so a signed-out client and a running engine write the same rows by the same rules.
+_Avoid_: library, registry, folder list
+
 **Reconciliation scan**:
 A full read of a source folder. The client uses it to find changes that watch events missed.
 _Avoid_: rescan, poll

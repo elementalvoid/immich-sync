@@ -16,6 +16,7 @@ use sync_core::credential::MemoryCredentialStore;
 use sync_core::engine::{Engine, EngineConfig};
 use sync_core::hash::Sha1;
 use sync_core::store::{AlbumScope, ItemState, SourceFolder, StateStore};
+use sync_core::tracking::Tracking;
 
 use common::wait_until;
 
@@ -62,7 +63,10 @@ async fn start_engine(
     config: EngineConfig,
 ) -> Arc<Engine> {
     let session = signed_in(server).await;
-    let engine = Arc::new(Engine::new(store.clone(), session, config).expect("build the engine"));
+    let engine = Arc::new(
+        Engine::new(Arc::new(Tracking::new(store.clone())), session, config)
+            .expect("build the engine"),
+    );
     engine.start();
     engine
 }
