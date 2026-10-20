@@ -63,7 +63,8 @@ impl FolderFilter {
         self.selected.as_deref()
     }
 
-    /// Whether one folder is selected.    #[must_use]
+    /// Whether one folder is selected.
+    #[must_use]
     pub fn is_active(&self) -> bool {
         self.selected.is_some()
     }
@@ -118,22 +119,6 @@ impl FolderFilter {
         includes(selected, recursive, item, case)
     }
 
-    /// The items the filter keeps, in the order they arrived.
-    #[must_use]
-    pub fn kept<T: Clone>(
-        &self,
-        items: &[T],
-        folders: &[SourceFolder],
-        case: PathCase,
-        path: impl Fn(&T) -> &str,
-    ) -> Vec<T> {
-        items
-            .iter()
-            .filter(|item| self.keeps(path(item), folders, case))
-            .cloned()
-            .collect()
-    }
-
     /// The heading of an empty list.
     ///
     /// A filtered list names the folder it is empty for (`"No failed items in
@@ -169,6 +154,18 @@ mod tests {
         format!("{}:\\{}", 'C', rest.replace('/', "\\"))
     }
 
+    /// The items `filter` keeps, in the order they arrived.
+    fn kept_by<'a>(
+        filter: &FolderFilter,
+        items: &[&'a str],
+        folders: &[SourceFolder],
+        case: PathCase,
+    ) -> Vec<&'a str> {
+        let mut kept = items.to_vec();
+        kept.retain(|item| filter.keeps(item, folders, case));
+        kept
+    }
+
     #[test]
     fn a_recursive_folder_includes_its_subfolders() {
         assert!(includes("/photos", true, "/photos/a.jpg", LINUX));
@@ -202,19 +199,35 @@ mod tests {
     #[test]
     fn the_filter_keeps_every_item_until_a_folder_is_selected() {
         let folders = [folder("/photos", true), folder("/videos", false)];
-        let items = ["/photos/a.jpg", "/videos/b.mp4", "/elsewhere/c.jpg"];
+        let items = [
+            "/photos/a.jpg",
+            "/videos/b.mp4",
+            "/videos/sub/c.mp4",
+            "/elsewhere/d.jpg",
+        ];
         let mut filter = FolderFilter::new();
 
-        let kept = filter.kept(&items, &folders, LINUX, |item| item);
+        let kept = kept_by(&filter, &items, &folders, LINUX);
         assert_eq!(kept, items, "All folders keeps every item");
 
         filter.select("/photos");
-        let kept = filter.kept(&items, &folders, LINUX, |item| item);
+        let kept = kept_by(&filter, &items, &folders, LINUX);
         assert_eq!(kept, ["/photos/a.jpg"]);
         assert!(filter.is_active());
 
+        // `/videos` is a non-recursive source folder, so selecting it keeps its
+        // own files and drops the ones in its subfolder: the recursion comes
+        // from the folder list, not from the selection.
+        filter.select("/videos");
+        let kept = kept_by(&filter, &items, &folders, LINUX);
+        assert_eq!(
+            kept,
+            ["/videos/b.mp4"],
+            "a non-recursive folder keeps only its direct children"
+        );
+
         filter.clear();
-        let kept = filter.kept(&items, &folders, LINUX, |item| item);
+        let kept = kept_by(&filter, &items, &folders, LINUX);
         assert_eq!(kept, items, "clearing restores every item");
         assert!(!filter.is_active());
     }
@@ -256,7 +269,7 @@ mod tests {
             filter
         };
 
-        let kept = filter.kept(&["/gone/a.jpg", "/other/b.jpg"], &[], LINUX, |item| item);
+        let kept = kept_by(&filter, &["/gone/a.jpg", "/other/b.jpg"], &[], LINUX);
 
         assert_eq!(
             kept,

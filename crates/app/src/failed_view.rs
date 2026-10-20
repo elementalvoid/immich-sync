@@ -65,7 +65,7 @@ impl FailedView {
 }
 
 impl Render for FailedView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The tokens are copied, not borrowed from `cx`: building the rows
         // needs the context mutably for their click listeners.
         let palette = CardPalette::new(cx.theme());
@@ -76,13 +76,10 @@ impl Render for FailedView {
         let foreground = cx.theme().foreground;
         let muted = cx.theme().muted_foreground;
         let folders = self.engine.read(cx).folders(cx);
-        let items = self.engine.read(cx).failed_items().to_vec();
-        let items = self
-            .filter
-            .read(cx)
-            .kept(&items, &folders, PathCase::for_platform(), |item| {
-                item.path.as_str()
-            });
+        let mut items = self.engine.read(cx).failed_items().to_vec();
+        let case = PathCase::for_platform();
+        let filter = self.filter.read(cx);
+        items.retain(|item| filter.keeps(&item.path, &folders, case));
         let rows = rows(&items);
         let summary = summary(&items);
         let problem = self.engine.read(cx).problem().map(str::to_string);
@@ -122,7 +119,13 @@ impl Render for FailedView {
             .when_some(problem, |this, problem| {
                 this.child(div().text_sm().text_color(danger).child(problem))
             })
-            .child(folder_filter_bar("failed", &self.filter, &folders, cx))
+            .child(folder_filter_bar(
+                "failed",
+                &self.filter,
+                &folders,
+                window,
+                cx,
+            ))
             .child(
                 div()
                     .id("failed-summary")

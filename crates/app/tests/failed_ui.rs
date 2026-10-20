@@ -355,16 +355,17 @@ async fn the_failed_view_offers_every_source_folder_under_all_folders(cx: &mut T
         window.click("failed-folder-filter", cx);
         assert_eq!(
             window.find("failed-folder-option-0").label(),
-            Some("Show items from all folders")
+            Some("Show items from all folders, selected"),
+            "the option list marks the current choice, not only with colour"
         );
         assert_eq!(
             window.find("failed-folder-option-1").label(),
-            Some("Show only archive"),
-            "the unavailable folder is offered like any other"
+            Some(format!("Show only {}", archive.display()).as_str()),
+            "the unavailable folder is offered like any other, named by its full path"
         );
         assert_eq!(
             window.find("failed-folder-option-2").label(),
-            Some("Show only photos")
+            Some(format!("Show only {}", photos.display()).as_str())
         );
     })
     .expect("read the folder filter");
@@ -398,7 +399,8 @@ async fn choosing_a_folder_narrows_the_list_its_summary_and_its_empty_state(
         window.click("failed-folder-filter", cx);
         assert_eq!(
             window.find("failed-folder-option-2").label(),
-            Some("Show only Videos")
+            Some(format!("Show only {}", videos.display()).as_str()),
+            "labels stay short; the accessible name carries the full path"
         );
         window.click("failed-folder-option-2", cx);
         window.render_frame(cx);
@@ -455,6 +457,11 @@ async fn the_filter_and_its_clear_action_are_keyboard_reachable_and_named(cx: &m
         window.click("failed-folder-option-1", cx);
         window.render_frame(cx);
         assert_eq!(failed_rows(window), 1);
+        assert_eq!(
+            window.find("failed-folder-filter").focused(),
+            Some(true),
+            "choosing a folder keeps the keyboard focus on the trigger"
+        );
 
         // The clear action is named and a tab stop of its own.
         assert_eq!(
@@ -464,6 +471,11 @@ async fn the_filter_and_its_clear_action_are_keyboard_reachable_and_named(cx: &m
         tab_to(window, "failed-folder-clear", cx);
         window.click("failed-folder-clear", cx);
         window.render_frame(cx);
+        assert_eq!(
+            window.find("failed-folder-filter").focused(),
+            Some(true),
+            "clearing keeps the keyboard focus on the filter's trigger"
+        );
     })
     .expect("tab through the folder filter");
 

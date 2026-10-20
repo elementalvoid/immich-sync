@@ -505,7 +505,8 @@ async fn choosing_a_folder_narrows_the_review_its_summary_and_its_empty_state(
         window.click("review-folder-filter", cx);
         assert_eq!(
             window.find("review-folder-option-2").label(),
-            Some("Show only Videos")
+            Some(format!("Show only {}", videos.display()).as_str()),
+            "labels stay short; the accessible name carries the full path"
         );
         window.click("review-folder-option-2", cx);
         window.render_frame(cx);
@@ -562,6 +563,12 @@ async fn the_review_filter_and_its_clear_action_are_keyboard_reachable_and_named
         window.click("review-folder-option-1", cx);
         window.render_frame(cx);
 
+        assert_eq!(
+            window.find("review-folder-filter").focused(),
+            Some(true),
+            "choosing a folder keeps the keyboard focus on the trigger"
+        );
+
         // The clear action is named and a tab stop of its own.
         assert_eq!(
             window.find("review-folder-clear").label(),
@@ -570,6 +577,11 @@ async fn the_review_filter_and_its_clear_action_are_keyboard_reachable_and_named
         tab_to(window, "review-folder-clear", cx);
         window.click("review-folder-clear", cx);
         window.render_frame(cx);
+        assert_eq!(
+            window.find("review-folder-filter").focused(),
+            Some(true),
+            "clearing keeps the keyboard focus on the filter's trigger"
+        );
     })
     .expect("tab through the review filter");
 
