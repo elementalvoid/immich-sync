@@ -46,7 +46,7 @@ Acceptance: password login works. API-key login works on a server with password 
 
 ### R2 — Source folders and watch rules
 
-- R2.1 The user adds and removes source folders, typing the path or choosing it in the OS folder picker. Each folder has a recursive toggle.
+- R2.1 The user adds and removes source folders, typing the path or choosing it in the OS folder picker. A new folder's settings (recursive, album mapping, and album scope) are confirmed in a setup dialog before the client records it or starts its scan; Add records them together and Cancel writes nothing. Each folder has a recursive toggle.
 - R2.2 The client skips hidden files and folders, symlinks and junctions, temporary and partial files, and system files by default.
 - R2.3 The watcher reports changes while the client runs. A reconciliation scan runs at startup and every 30 minutes by default.
 - R2.4 The client compares paths case-insensitively on Windows. It supports long paths.
@@ -59,7 +59,7 @@ Acceptance: a file added while the client is stopped is found at startup. A file
 - R3.1 New files are hashed with SHA-1, checked with `POST /api/assets/bulk-upload-check` in batches, and uploaded with `POST /api/assets` and the `x-immich-checksum` header.
 - R3.2 `created` and `duplicate` both count as success.
 - R3.3 A sidecar file uploads as `sidecarData`. A live photo video uploads first, and the photo links it with `livePhotoVideoId`.
-- R3.4 Album mapping is opt-in per folder. The album scope is per folder: leaf folders or the whole source folder.
+- R3.4 Album mapping is opt-in per folder. The album scope is per folder: leaf folders or the whole source folder. A new folder's mapping and scope are confirmed with its other settings before it syncs.
 - R3.5 Only Immich operations with `x-immich-state: Stable` are used for sync correctness.
 - R3.6 Upload success means the server returned the asset id. Server-side processing continues asynchronously.
 
