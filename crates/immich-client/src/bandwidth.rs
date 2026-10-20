@@ -108,9 +108,9 @@ impl BandwidthLimit {
 
     /// A view of this limit with no rate, keeping the shared bucket and total.
     ///
-    /// A live photo's motion video streams at the network's pace (R3.3), but its
-    /// bytes are still the client's upload bytes, so they must land in the same
-    /// total (R10.2). Only the pacing is dropped.
+    /// A live photo's motion video streams unlimited (R7.1), but its bytes are
+    /// still the client's upload bytes, so they must land in the same total
+    /// (R10.2). Only the pacing is dropped.
     #[must_use]
     pub fn unthrottled(&self) -> Self {
         Self {

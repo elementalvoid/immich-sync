@@ -1042,12 +1042,7 @@ impl EngineInner {
 
     /// The folder entry that contains `path`.
     fn folder_index_for(&self, path: &Path) -> Option<usize> {
-        let case = PathCase::for_platform();
-        self.folders
-            .lock()
-            .expect("the folder lock")
-            .iter()
-            .position(|entry| is_within(Path::new(&entry.folder.path), path, case))
+        folder_index_in(&self.folders.lock().expect("the folder lock"), path)
     }
 
     /// The meter of the folder that owns `path` (R8.1).
@@ -1060,15 +1055,16 @@ impl EngineInner {
     /// while its bytes land once.
     ///
     /// A path no folder owns — its folder was removed while the item was
-    /// queued — is metered nowhere, but its upload still streams under the
-    /// client's limit (R7.1).
+    /// queued — is metered on no card, but its bytes still count in the
+    /// client's total (R10.2) and stream under the client's limit (R7.1).
     fn meter_for(&self, path: &Path) -> Arc<UploadMeter> {
-        let index = self.folder_index_for(path);
+        // One lock for the owner and its meter. Resolving the owner under one
+        // lock and reading the meter under another lets a removal shift the
+        // entries in between, and the upload is metered on the card of a
+        // folder that never owned it (R8.1).
         let folders = self.folders.lock().expect("the folder lock");
-        match index.and_then(|index| folders.get(index)) {
-            Some(entry) => Arc::clone(&entry.meter),
-            // None is a path no folder owns, or one whose folder went between
-            // the two locks: either way nobody meters it.
+        match folder_index_in(&folders, path) {
+            Some(index) => Arc::clone(&folders[index].meter),
             None => Arc::new(UploadMeter::new(&self.bandwidth)),
         }
     }
@@ -1444,6 +1440,14 @@ async fn attach_albums(inner: &Arc<EngineInner>, file: &Path, asset_id: &str) {
             );
         }
     }
+}
+
+/// The position in `folders` of the entry that contains `path` (R8.1).
+fn folder_index_in(folders: &[FolderEntry], path: &Path) -> Option<usize> {
+    let case = PathCase::for_platform();
+    folders
+        .iter()
+        .position(|entry| is_within(Path::new(&entry.folder.path), path, case))
 }
 
 /// The source folder that contains `path`, as stored.
@@ -2407,6 +2411,84 @@ mod tests {
             4_096,
             "R7.1: a removed folder does not drop its queued uploads to unlimited"
         );
+    }
+
+    /// A removal cannot shift the folder an upload is metered on (R8.1).
+    ///
+    /// `remove_folder` retains the list, so every entry above the removal moves
+    /// down one. A lookup that resolved its owner under one lock and read the
+    /// meter under another would meet that shift in between: with folders
+    /// `[a, b, c]`, resolving `b`'s file and then removing `a` leaves index 1
+    /// naming `c`, so the upload is metered on `c`'s card instead of `b`'s.
+    /// The list is shifted and restored under the lookup until it meets that
+    /// interleaving; one lock cannot be split, so the answer is `b`'s meter
+    /// throughout.
+    #[test]
+    fn a_removal_cannot_shift_the_folder_an_upload_is_metered_on() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let store =
+            Arc::new(StateStore::open(temp.path().join("state.db")).expect("open the state store"));
+        let mut dirs = Vec::new();
+        for name in ["a", "b", "c"] {
+            let dir = temp.path().join(name);
+            std::fs::create_dir_all(&dir).expect("create the folder");
+            store
+                .add_folder(&SourceFolder {
+                    path: dir.display().to_string(),
+                    recursive: true,
+                    album_mapping: false,
+                    album_scope: AlbumScope::default(),
+                })
+                .expect("add the folder");
+            dirs.push(dir);
+        }
+        // The session is never used: this test sends no request.
+        let session = crate::connection::Connection::new(
+            "http://127.0.0.1:1",
+            Arc::new(crate::credential::MemoryCredentialStore::new()),
+        )
+        .expect("a valid URL")
+        .shared();
+        let engine =
+            Engine::new(store, session, EngineConfig::default()).expect("build the engine");
+        let inner = Arc::clone(&engine.inner);
+        let metered = dirs[1].join("metered.jpg");
+        let b_meter = inner.meter_for(&metered);
+        assert_eq!(
+            inner.folder_index_for(&metered),
+            Some(1),
+            "the list is [a, b, c] and the middle entry owns the file"
+        );
+
+        let shifted = Arc::new(AtomicBool::new(false));
+        let churn = {
+            let inner = Arc::clone(&inner);
+            let shifted = Arc::clone(&shifted);
+            std::thread::spawn(move || {
+                for _ in 0..500 {
+                    // What `remove_folder`'s retain does to the list, and the
+                    // re-add that restores `a` in front of `b` so the shift
+                    // recurs instead of happening once.
+                    let removed = inner.folders.lock().expect("the folder lock").remove(0);
+                    // Out of the list long enough for a lookup to meet it.
+                    std::thread::sleep(Duration::from_micros(100));
+                    inner
+                        .folders
+                        .lock()
+                        .expect("the folder lock")
+                        .insert(0, removed);
+                }
+                shifted.store(true, Ordering::SeqCst);
+            })
+        };
+        while !shifted.load(Ordering::SeqCst) {
+            let meter = inner.meter_for(&metered);
+            assert!(
+                Arc::ptr_eq(&meter, &b_meter),
+                "R8.1: the upload was metered on another folder's card"
+            );
+        }
+        churn.join().expect("the churn thread finished");
     }
 
     #[test]

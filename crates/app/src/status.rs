@@ -95,7 +95,8 @@ pub struct CardContent {
     /// Whether the folder is readable; the counts line says so when it is not.
     pub available: bool,
     /// The upload line, on the global card (R8.1): the rate and the uploads on
-    /// the wire, or `Idle` when nothing is uploading.
+    /// the wire. `Idle` only when nothing is in flight *and* the rate is zero;
+    /// a rate still fading out is shown on its own.
     pub uploads: Option<String>,
     /// The connection line, on the global card.
     pub connection: Option<String>,

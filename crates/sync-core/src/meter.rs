@@ -70,12 +70,13 @@ impl UploadMeter {
         }
     }
 
-    /// The same folder's counters under no limit (R3.3).
+    /// The same folder's counters under no limit (R7.1: 0 means unlimited).
     ///
     /// A live photo's motion video is a request of the photo's own pipeline, and
     /// it has always streamed at the network's pace; what it must not do is
     /// leave the dashboard reading `Idle` while it is on the wire, so it counts
     /// in the folder's bytes and in its uploads in flight (R8.1).
+    #[must_use]
     pub(crate) fn unlimited(&self) -> Self {
         Self {
             // No rate, but the same counters: the bytes still land in the
