@@ -13,6 +13,7 @@ pub mod credential;
 pub mod engine;
 pub mod failure;
 pub mod hash;
+pub mod missing;
 pub mod pairing;
 pub mod paths;
 pub mod scan;

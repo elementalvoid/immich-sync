@@ -20,7 +20,7 @@
 //! The engine has no UI imports (N6, PLAN). The shell reads [`Engine::status`]
 //! for the dashboard and the tray.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -36,6 +36,7 @@ use crate::breaker::CircuitBreaker;
 use crate::connection::SharedSession;
 use crate::failure::{FailureClass, FailureKind, classify};
 use crate::hash::{Sha1, sha1_file};
+use crate::missing::{Fate, Host, SizeIndex, fate, is_gone, rename_target};
 use crate::pairing::FolderIndex;
 use crate::paths::{PathCase, is_within, path_key};
 use crate::scan::{ScanError, scan_folder};
@@ -2017,7 +2018,7 @@ async fn reconcile_files(inner: &Arc<EngineInner>, present: &[PathBuf], folders:
             // The filesystem, not the scan report, is the test: a file the
             // skip rules refused this pass, or one a non-recursive folder no
             // longer walks, is still there and is not missing.
-            if file_is_gone(&row.path) {
+            if is_gone(&row.path) {
                 gone.push(row);
             }
         }
@@ -2025,27 +2026,24 @@ async fn reconcile_files(inner: &Arc<EngineInner>, present: &[PathBuf], folders:
     if gone.is_empty() {
         return;
     }
-    // The files a rename could have moved to, indexed by size so no unrelated
-    // file is ever read (R5.2).
-    let mut by_size: HashMap<u64, Vec<PathBuf>> = HashMap::new();
-    for path in present {
-        let Ok(metadata) = std::fs::symlink_metadata(path) else {
-            continue;
-        };
-        if metadata.is_file() {
-            by_size
-                .entry(metadata.len())
-                .or_default()
-                .push(path.clone());
-        }
+    // A candidate hashed here is read whole, so the pass runs on the blocking
+    // pool where the scan's walk runs; its store writes are short.
+    let present = present.to_vec();
+    let inner = Arc::clone(inner);
+    let joined = tokio::task::spawn_blocking(move || reconcile_gone(&inner, gone, &present)).await;
+    if let Err(join) = joined {
+        tracing::warn!(error = %join, "the missing-file reconciliation did not finish");
     }
+}
+
+/// Runs the rename pass, then the twin-or-missing pass over what it left
+/// undecided (R5.1, R5.2).
+fn reconcile_gone(inner: &EngineInner, gone: Vec<ItemRecord>, present: &[PathBuf]) {
+    let index = SizeIndex::new(present);
+    let host = EngineHost { inner };
     let mut undecided = Vec::new();
     for row in gone {
-        let target = match by_size.get(&row.size) {
-            Some(paths) => rename_target(inner, &row, paths).await,
-            None => None,
-        };
-        let Some(target) = target else {
+        let Some(target) = rename_target(&row, &index, &host) else {
             undecided.push(row);
             continue;
         };
@@ -2085,8 +2083,8 @@ async fn reconcile_files(inner: &Arc<EngineInner>, present: &[PathBuf], folders:
         // A second copy of the same content, still on disk: the asset is held
         // by another item, so no decision is needed (the SPEC acceptance line
         // for a second instance).
-        if has_present_content_twin(inner, &row) {
-            match inner.store.retire_item(&row.path) {
+        match fate(&row, &host) {
+            Fate::Retired => match inner.store.retire_item(&row.path) {
                 Ok(true) => {
                     if row.state == ItemState::Missing {
                         // The retired item no longer waits for a decision, so
@@ -2102,72 +2100,54 @@ async fn reconcile_files(inner: &Arc<EngineInner>, present: &[PathBuf], folders:
                 Err(error) => {
                     tracing::warn!(path = %row.path, error = %error, "the twin copy could not be retired")
                 }
-            }
-            continue;
-        }
-        match inner.store.mark_missing(&row.path) {
-            Ok(true) => {
-                inner.note_review_missing(&row.path);
-                tracing::info!(path = %row.path, "R5.1: the file is missing and waits for a review");
-            }
-            Ok(false) => {}
-            Err(error) => {
-                tracing::warn!(path = %row.path, error = %error, "the missing file could not be recorded")
-            }
+            },
+            Fate::Missing => match inner.store.mark_missing(&row.path) {
+                Ok(true) => {
+                    inner.note_review_missing(&row.path);
+                    tracing::info!(path = %row.path, "R5.1: the file is missing and waits for a review");
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(path = %row.path, error = %error, "the missing file could not be recorded")
+                }
+            },
         }
     }
 }
 
-/// Whether the tracked path is no longer a file (R5.1).
-///
-/// A path that cannot be read, and one that is now a directory or a symlink, is
-/// no longer the file the item tracked. Both wait for a decision rather than
-/// silently changing the server (ADR 0002).
-fn file_is_gone(path: &str) -> bool {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) => !metadata.is_file(),
-        Err(_) => true,
-    }
+/// The engine's answer to what [`Host`] asks (R5.1, R5.2).
+struct EngineHost<'a> {
+    inner: &'a EngineInner,
 }
 
-/// The first present, untracked file whose size and content match `row`
-/// (R5.2).
-async fn rename_target(
-    inner: &Arc<EngineInner>,
-    row: &ItemRecord,
-    candidates: &[PathBuf],
-) -> Option<PathBuf> {
-    for path in candidates {
-        // A tracked path is another item's home, never a rename target: the
-        // item it holds is its own.
-        if inner
+impl Host for EngineHost<'_> {
+    fn is_tracked(&self, path: &Path) -> bool {
+        self.inner
             .store
             .item(&path.to_string_lossy())
             .ok()
             .flatten()
             .is_some()
-        {
-            continue;
-        }
-        let probe = path.clone();
-        let hashed = tokio::task::spawn_blocking(move || sha1_file(&probe)).await;
-        match hashed {
-            Ok(Ok(sha1)) if sha1 == row.sha1 => return Some(path.clone()),
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => {
+    }
+
+    fn has_present_twin(&self, row: &ItemRecord) -> bool {
+        has_present_content_twin(self.inner, row)
+    }
+
+    fn sha1(&self, path: &Path) -> Option<Sha1> {
+        match sha1_file(path) {
+            Ok(sha1) => Some(sha1),
+            Err(error) => {
                 tracing::debug!(path = %path.display(), error = %error, "a rename candidate could not be read");
-            }
-            Err(join) => {
-                tracing::debug!(path = %path.display(), error = %join, "a rename candidate could not be hashed");
+                None
             }
         }
     }
-    None
 }
 
 /// Whether another tracked item holds the same content and still has its file
 /// on disk (R5.2, the second-copy acceptance line).
-fn has_present_content_twin(inner: &Arc<EngineInner>, row: &ItemRecord) -> bool {
+fn has_present_content_twin(inner: &EngineInner, row: &ItemRecord) -> bool {
     let Ok(twins) = inner.store.content_twins(row.sha1, row.size, &row.path) else {
         return false;
     };
