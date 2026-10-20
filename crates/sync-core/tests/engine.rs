@@ -17,9 +17,10 @@ use sync_core::connection::{
     Attention, AuthMethod, Connection, ConnectionState, Secret, SharedSession, SignIn,
 };
 use sync_core::credential::MemoryCredentialStore;
-use sync_core::engine::{Activity, Engine, EngineConfig, ReviewError};
+use sync_core::engine::{Engine, EngineConfig, ReviewError};
 use sync_core::failure::FailureClass;
 use sync_core::hash::{Sha1, sha1_file};
+use sync_core::status::Activity;
 use sync_core::store::{
     AlbumScope, AttemptOutcome, AttemptRecord, FolderCounts, ItemRecord, ItemState, SourceFolder,
     StateStore,

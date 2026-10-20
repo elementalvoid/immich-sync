@@ -55,7 +55,7 @@ pub struct FolderStatus {
 
 /// Everything the dashboard and the tray read (R8.1, R8.2).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EngineStatus {
+pub struct Status {
     /// The global activity state.
     pub activity: Activity,
     /// One entry per source folder, in the stored order.
@@ -68,7 +68,7 @@ pub struct EngineStatus {
     pub last_error: Option<String>,
 }
 
-impl EngineStatus {
+impl Status {
     /// Derives the status from what the client knows (R8.1, R8.2).
     #[must_use]
     pub fn derive(inputs: StatusInputs) -> Self {
@@ -97,7 +97,7 @@ impl EngineStatus {
             .any(|folder| !folder.available || folder.last_error.is_some());
         let activity = if paused {
             Activity::Paused
-        } else if needs_the_user || connection == Connection::NeedsAttention {
+        } else if needs_the_user || connection == ConnectionHealth::NeedsAttention {
             Activity::NeedsAttention
         } else if counts.pending > 0 {
             Activity::Syncing
@@ -129,7 +129,7 @@ impl EngineStatus {
 
 /// What the status needs to know about the connection (R8.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Connection {
+pub enum ConnectionHealth {
     /// A session exists and the server answers.
     Ready,
     /// The client lost a session it had, so the user must act (R1.4).
@@ -138,7 +138,7 @@ pub enum Connection {
     NotConnected,
 }
 
-impl Connection {
+impl ConnectionHealth {
     /// Maps the state the session holds onto the status input.
     ///
     /// A client that has not signed in yet is not a problem to raise; a client
@@ -153,7 +153,7 @@ impl Connection {
     }
 }
 
-/// Everything [`EngineStatus::derive`] needs.
+/// Everything [`Status::derive`] needs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StatusInputs {
     /// One entry per source folder, in the order the cards show them.
@@ -161,7 +161,7 @@ pub struct StatusInputs {
     /// Whether the user holds new uploads (R8.7).
     pub paused: bool,
     /// The connection, as far as the status cares.
-    pub connection: Connection,
+    pub connection: ConnectionHealth,
     /// The store's global review count, when the caller can supply it.
     pub review_total: Option<u32>,
     /// The last failure, for the global card.

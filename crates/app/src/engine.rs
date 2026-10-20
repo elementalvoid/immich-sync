@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_kit::*;
-use sync_core::engine::{Activity, Engine, EngineConfig, EngineStatus, FolderStatus, Limits};
-use sync_core::status::{Connection, StatusInputs};
+use sync_core::engine::{Engine, EngineConfig, Limits};
+use sync_core::status::{Activity, ConnectionHealth, FolderStatus, Status, StatusInputs};
 use sync_core::store::{
     AlbumScope, FailedItem, FolderCounts, ReviewItem, SourceFolder, StateStore,
 };
@@ -45,7 +45,7 @@ pub struct EngineModel {
     /// The newest limit change for the running engine. One applier task per
     /// engine drains it, so two quick edits cannot land out of order.
     limits: Option<tokio::sync::watch::Sender<Limits>>,
-    status: EngineStatus,
+    status: Status,
     /// The parked items the failed-items view lists (R6.5), re-read off the UI
     /// thread.
     failed: Vec<FailedItem>,
@@ -178,7 +178,7 @@ impl EngineModel {
 
     /// The engine's latest status.
     #[must_use]
-    pub fn status(&self) -> &EngineStatus {
+    pub fn status(&self) -> &Status {
         &self.status
     }
 
@@ -299,6 +299,9 @@ impl EngineModel {
                 Ok(items) => {
                     if items != model.review {
                         model.review = items;
+                        // R5.4: the status counts this list, so it follows the
+                        // read that just landed instead of waiting for the poll.
+                        model.refresh_status(cx);
                         cx.notify();
                     }
                 }
@@ -821,11 +824,14 @@ impl EngineModel {
                         last_error: None,
                     })
                     .collect::<Vec<_>>();
-                EngineStatus::derive(StatusInputs {
+                Status::derive(StatusInputs {
                     folders,
                     paused: self.paused,
-                    connection: Connection::from_state(self.connection.read(cx).state()),
-                    review_total: None,
+                    connection: ConnectionHealth::from_state(self.connection.read(cx).state()),
+                    // R5.4: the cached list is the store's whole review,
+                    // including items under a removed source folder, so it is
+                    // the total the engine would have read.
+                    review_total: Some(u32::try_from(self.review.len()).unwrap_or(u32::MAX)),
                     last_error: None,
                 })
             }
@@ -857,11 +863,10 @@ impl EngineModel {
     /// while the only reason is parked failures; the connection state is the
     /// one reason that must speak even when the engine is not running yet.
     fn refresh_attention_notification(&mut self, cx: &mut Context<Self>) {
-        let connection_attention = matches!(
-            self.connection.read(cx).state(),
-            ConnectionState::NeedsAttention(_)
-        );
-        let attention = self.status.activity == Activity::NeedsAttention || connection_attention;
+        // The status already takes the connection as an input (R8.2), so one
+        // activity decides the episode; the reason still names the connection
+        // first.
+        let attention = self.status.activity == Activity::NeedsAttention;
         if !attention {
             self.notified_attention = false;
             return;
@@ -915,8 +920,8 @@ impl EngineModel {
 }
 
 /// The status before the engine has anything.
-fn empty_status() -> EngineStatus {
-    EngineStatus {
+fn empty_status() -> Status {
+    Status {
         activity: Activity::Idle,
         folders: Vec::new(),
         counts: FolderCounts::default(),

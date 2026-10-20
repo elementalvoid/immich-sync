@@ -40,7 +40,7 @@ use crate::pairing::FolderIndex;
 use crate::paths::{PathCase, is_within, path_key};
 use crate::scan::{ScanError, scan_folder};
 use crate::skip::{has_symlink_ancestor, skip_reason_below};
-use crate::status::{Connection, StatusInputs};
+use crate::status::{ConnectionHealth, FolderStatus, Status, StatusInputs};
 use crate::store::{
     AlbumScope, AttemptOutcome, AttemptRecord, FailedItem, FolderCounts, ItemRecord, ItemState,
     ReviewDecision, ReviewItem, SourceFolder, StateStore, StoreError,
@@ -52,9 +52,6 @@ use crate::upload::{
 };
 use crate::versions::Versioner;
 
-// The status types live in their own module; the engine re-exports them, so
-// its own interface stays one import for callers.
-pub use crate::status::{Activity, EngineStatus, FolderStatus};
 use crate::watch::FolderWatcher;
 
 /// How the engine decides what to do and when (SPEC R2.3, R3.1, R6, R7.2).
@@ -559,7 +556,7 @@ impl Engine {
 
     /// The live status the dashboard and the tray read (R8.1, R8.2).
     #[must_use]
-    pub fn status(&self) -> EngineStatus {
+    pub fn status(&self) -> Status {
         let folders: Vec<FolderStatus> = self
             .inner
             .folders
@@ -587,10 +584,10 @@ impl Engine {
                 None
             }
         };
-        EngineStatus::derive(StatusInputs {
+        Status::derive(StatusInputs {
             folders,
             paused: self.inner.gate.is_paused(),
-            connection: Connection::from_state(&self.inner.session.state()),
+            connection: ConnectionHealth::from_state(&self.inner.session.state()),
             review_total,
             last_error: self
                 .inner
@@ -2236,6 +2233,7 @@ fn mtime_ns(metadata: &std::fs::Metadata) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::status::Activity;
 
     #[test]
     fn the_default_config_matches_the_spec() {
@@ -2264,7 +2262,7 @@ mod tests {
 
     #[test]
     fn progress_is_zero_with_no_items_and_one_when_uploaded() {
-        let mut status = EngineStatus {
+        let mut status = Status {
             activity: Activity::Idle,
             folders: Vec::new(),
             counts: FolderCounts::default(),

@@ -1,7 +1,7 @@
 //! The derived status (SPEC R8.1, R8.2): one table for what the tray and the
 //! dashboard show, whether or not the engine runs.
 
-use sync_core::status::{Activity, Connection, EngineStatus, FolderStatus, StatusInputs};
+use sync_core::status::{Activity, ConnectionHealth, FolderStatus, Status, StatusInputs};
 use sync_core::store::{AlbumScope, FolderCounts};
 
 fn counts(pending: u32, uploaded: u32, failed: u32, review: u32) -> FolderCounts {
@@ -29,7 +29,7 @@ fn inputs(folders: Vec<FolderStatus>) -> StatusInputs {
     StatusInputs {
         folders,
         paused: false,
-        connection: Connection::Ready,
+        connection: ConnectionHealth::Ready,
         review_total: None,
         last_error: None,
     }
@@ -37,7 +37,7 @@ fn inputs(folders: Vec<FolderStatus>) -> StatusInputs {
 
 #[test]
 fn a_client_with_no_folders_is_idle() {
-    let status = EngineStatus::derive(inputs(Vec::new()));
+    let status = Status::derive(inputs(Vec::new()));
     assert_eq!(status.activity, Activity::Idle);
     assert_eq!(status.counts, FolderCounts::default());
     assert_eq!(status.progress(), 0.0);
@@ -45,7 +45,7 @@ fn a_client_with_no_folders_is_idle() {
 
 #[test]
 fn a_pending_item_means_syncing_and_drives_the_progress() {
-    let status = EngineStatus::derive(inputs(vec![folder("/photos", counts(3, 1, 0, 0))]));
+    let status = Status::derive(inputs(vec![folder("/photos", counts(3, 1, 0, 0))]));
     assert_eq!(status.activity, Activity::Syncing);
     assert_eq!(status.counts.pending, 3);
     assert_eq!(status.counts.uploaded, 1);
@@ -56,24 +56,21 @@ fn a_pending_item_means_syncing_and_drives_the_progress() {
 fn a_pause_wins_over_queued_work() {
     let mut given = inputs(vec![folder("/photos", counts(3, 0, 0, 0))]);
     given.paused = true;
-    assert_eq!(EngineStatus::derive(given).activity, Activity::Paused);
+    assert_eq!(Status::derive(given).activity, Activity::Paused);
 }
 
 #[test]
 fn a_lost_connection_needs_attention() {
     let mut given = inputs(vec![folder("/photos", FolderCounts::default())]);
-    given.connection = Connection::NeedsAttention;
-    assert_eq!(
-        EngineStatus::derive(given).activity,
-        Activity::NeedsAttention
-    );
+    given.connection = ConnectionHealth::NeedsAttention;
+    assert_eq!(Status::derive(given).activity, Activity::NeedsAttention);
 }
 
 #[test]
 fn a_client_that_never_signed_in_is_not_a_problem_to_raise() {
     let mut given = inputs(vec![folder("/photos", FolderCounts::default())]);
-    given.connection = Connection::NotConnected;
-    assert_eq!(EngineStatus::derive(given).activity, Activity::Idle);
+    given.connection = ConnectionHealth::NotConnected;
+    assert_eq!(Status::derive(given).activity, Activity::Idle);
 }
 
 #[test]
@@ -81,7 +78,7 @@ fn an_unavailable_folder_needs_attention() {
     let mut missing = folder("/photos", FolderCounts::default());
     missing.available = false;
     assert_eq!(
-        EngineStatus::derive(inputs(vec![missing])).activity,
+        Status::derive(inputs(vec![missing])).activity,
         Activity::NeedsAttention
     );
 }
@@ -91,7 +88,7 @@ fn a_folder_error_needs_attention() {
     let mut failed = folder("/photos", FolderCounts::default());
     failed.last_error = Some("the server refused the upload".to_string());
     assert_eq!(
-        EngineStatus::derive(inputs(vec![failed])).activity,
+        Status::derive(inputs(vec![failed])).activity,
         Activity::NeedsAttention
     );
 }
@@ -99,7 +96,7 @@ fn a_folder_error_needs_attention() {
 #[test]
 fn a_waiting_review_needs_attention_even_with_nothing_queued() {
     assert_eq!(
-        EngineStatus::derive(inputs(vec![folder("/photos", counts(0, 4, 0, 1))])).activity,
+        Status::derive(inputs(vec![folder("/photos", counts(0, 4, 0, 1))])).activity,
         Activity::NeedsAttention
     );
 }
@@ -109,7 +106,7 @@ fn a_waiting_review_needs_attention_even_with_nothing_queued() {
 #[test]
 fn a_parked_failure_needs_attention_without_a_folder_error() {
     assert_eq!(
-        EngineStatus::derive(inputs(vec![folder("/photos", counts(0, 4, 2, 0))])).activity,
+        Status::derive(inputs(vec![folder("/photos", counts(0, 4, 2, 0))])).activity,
         Activity::NeedsAttention
     );
 }
@@ -121,7 +118,7 @@ fn the_store_review_total_wins_over_the_folder_sum() {
         folder("/videos", counts(0, 1, 0, 0)),
     ]);
     given.review_total = Some(5);
-    let status = EngineStatus::derive(given);
+    let status = Status::derive(given);
     assert_eq!(
         status.counts.review, 5,
         "a review under a removed folder must still count"
@@ -130,7 +127,7 @@ fn the_store_review_total_wins_over_the_folder_sum() {
 
 #[test]
 fn the_counts_are_summed_across_folders() {
-    let status = EngineStatus::derive(inputs(vec![
+    let status = Status::derive(inputs(vec![
         folder("/photos", counts(1, 2, 3, 4)),
         folder("/videos", counts(10, 20, 30, 40)),
     ]));
