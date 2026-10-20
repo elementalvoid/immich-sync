@@ -4,10 +4,29 @@
 //! cannot observe, so those are checked by the probe and the GUI smoke job.
 //! The state-to-tooltip mapping is pure, so it is tested here.
 
+use std::path::Path;
+use std::sync::Arc;
+
 use gpui_kit::test::TestWindowExt as _;
-use gpui_kit::{Action, AppContext as _, MenuItem, TestAppContext, WindowBounds, px, size};
-use immich_sync::shell::{self, Hide, Pause, Resume, Show, SyncNow};
-use sync_core::connection::{Attention, ConnectionState};
+use gpui_kit::{
+    Action, AnyWindowHandle, AppContext as _, Bounds, MenuItem, Point, TestAppContext,
+    WindowBounds, WindowOptions, px, size,
+};
+use immich_sync::connection::ConnectionModel;
+use immich_sync::dashboard::Dashboard;
+use immich_sync::diagnostics::DiagnosticsModel;
+use immich_sync::diagnostics_view::DiagnosticsView;
+use immich_sync::engine::EngineModel;
+use immich_sync::failed_view::FailedView;
+use immich_sync::paths::AppPaths;
+use immich_sync::review_view::ReviewView;
+use immich_sync::settings_view::SettingsView;
+use immich_sync::shell::{self, AppShell, Hide, Pause, Resume, Show, SyncNow, ViewMode};
+use immich_sync::store::StoreModel;
+use immich_sync::upload::UploadModel;
+use immich_sync::upload_view::UploadView;
+use sync_core::connection::{Attention, ConnectionState, ServerProfile};
+use sync_core::credential::{MemoryCredentialStore, SharedCredentialStore};
 
 fn boot(cx: &mut TestAppContext) {
     // The saved-profile restore runs on the app's Tokio worker, whose result
@@ -255,26 +274,6 @@ fn the_needs_attention_tooltip_carries_the_reason() {
 // The filtered-open seam (#41). The folder detail (#43) will call
 // `AppShell::show_filtered` to open the failed-items or deletion-review view
 // with one source folder already selected.
-
-use std::path::Path;
-use std::sync::Arc;
-
-use gpui_kit::{AnyWindowHandle, Bounds, Point, WindowOptions};
-use immich_sync::connection::ConnectionModel;
-use immich_sync::dashboard::Dashboard;
-use immich_sync::diagnostics::DiagnosticsModel;
-use immich_sync::diagnostics_view::DiagnosticsView;
-use immich_sync::engine::EngineModel;
-use immich_sync::failed_view::FailedView;
-use immich_sync::paths::AppPaths;
-use immich_sync::review_view::ReviewView;
-use immich_sync::settings_view::SettingsView;
-use immich_sync::shell::{AppShell, ViewMode};
-use immich_sync::store::StoreModel;
-use immich_sync::upload::UploadModel;
-use immich_sync::upload_view::UploadView;
-use sync_core::connection::ServerProfile;
-use sync_core::credential::{MemoryCredentialStore, SharedCredentialStore};
 
 fn temporary_paths(dir: &Path) -> AppPaths {
     AppPaths {
