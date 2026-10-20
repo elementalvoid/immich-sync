@@ -24,7 +24,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use immich_client::{BandwidthLimit, BulkCheckItem, ClientError};
 use tokio::sync::{Mutex as AsyncMutex, Notify, Semaphore, mpsc};
@@ -36,6 +36,7 @@ use crate::breaker::CircuitBreaker;
 use crate::connection::SharedSession;
 use crate::failure::{FailureClass, FailureKind, classify};
 use crate::hash::{Sha1, sha1_file};
+use crate::meter::{UploadMeter, UploadTraffic};
 use crate::pairing::FolderIndex;
 use crate::paths::{PathCase, is_within, path_key};
 use crate::scan::{ScanError, scan_folder};
@@ -203,6 +204,9 @@ pub struct FolderStatus {
     pub counts: FolderCounts,
     /// The last failure under this folder, if any.
     pub last_error: Option<String>,
+    /// This folder's share of the upload traffic: the bytes its upload bodies
+    /// have moved and the requests on the wire right now (R8.1).
+    pub uploads: UploadTraffic,
 }
 
 /// Everything the dashboard and the tray read (R8.1, R8.2).
@@ -218,6 +222,10 @@ pub struct EngineStatus {
     pub counts: FolderCounts,
     /// The last failure the engine recorded, if any.
     pub last_error: Option<String>,
+    /// The upload traffic across every folder (R8.1): the rate the card shows
+    /// and how many uploads are on the wire. The bytes and the count are the
+    /// sum of the folders'.
+    pub uploads: UploadTraffic,
 }
 
 impl EngineStatus {
@@ -238,6 +246,10 @@ struct FolderEntry {
     available: bool,
     counts: FolderCounts,
     last_error: Option<String>,
+    /// This folder's upload meter (R8.1). Every upload the engine runs for a
+    /// file under this folder streams under its limit view and counts itself
+    /// here, so the bytes of two concurrent uploads can never be swapped.
+    meter: Arc<UploadMeter>,
 }
 
 /// The shared engine state. Tasks and the shell hold it through an `Arc`.
@@ -323,6 +335,9 @@ impl Engine {
         for path in store.requeue_unfinished()? {
             let _ = queue.send(PathBuf::from(path));
         }
+        // One limit for the whole client (R7.1), viewed once per folder so a
+        // card can read its own share of the bytes it meters (R8.1).
+        let bandwidth = BandwidthLimit::new(config.bandwidth_bytes_per_second);
         let mut entries = Vec::new();
         for folder in store.folders()? {
             let counts = store.folder_counts(&folder.path).unwrap_or_else(|error| {
@@ -331,6 +346,7 @@ impl Engine {
             });
             entries.push(FolderEntry {
                 available: Path::new(&folder.path).is_dir(),
+                meter: Arc::new(UploadMeter::new(&bandwidth)),
                 folder,
                 counts,
                 last_error: None,
@@ -354,7 +370,7 @@ impl Engine {
             versions,
             breaker,
             upload_slots: Mutex::new(Arc::new(Semaphore::new(config.concurrency.max(1)))),
-            bandwidth: BandwidthLimit::new(config.bandwidth_bytes_per_second),
+            bandwidth,
             concurrency: AtomicUsize::new(config.concurrency.max(1)),
             limits_lock: AsyncMutex::new(()),
             config,
@@ -621,6 +637,7 @@ impl Engine {
             });
             folders.push(FolderEntry {
                 available: Path::new(path).is_dir(),
+                meter: Arc::new(UploadMeter::new(&self.inner.bandwidth)),
                 folder,
                 counts,
                 last_error: None,
@@ -742,22 +759,32 @@ impl Engine {
     }
 
     /// The live status the dashboard and the tray read (R8.1, R8.2).
+    ///
+    /// This is also the meter's clock: the rate is measured from the status
+    /// polls, so the card needs no timer of its own (R8.1).
     #[must_use]
     pub fn status(&self) -> EngineStatus {
+        let now = Instant::now();
+        let mut uploads = UploadTraffic::default();
         let folders: Vec<FolderStatus> = self
             .inner
             .folders
             .lock()
             .expect("the folder lock")
             .iter()
-            .map(|entry| FolderStatus {
-                path: entry.folder.path.clone(),
-                recursive: entry.folder.recursive,
-                album_mapping: entry.folder.album_mapping,
-                album_scope: entry.folder.album_scope,
-                available: entry.available,
-                counts: entry.counts,
-                last_error: entry.last_error.clone(),
+            .map(|entry| {
+                let traffic = entry.meter.reading(now);
+                uploads.add(traffic);
+                FolderStatus {
+                    path: entry.folder.path.clone(),
+                    recursive: entry.folder.recursive,
+                    album_mapping: entry.folder.album_mapping,
+                    album_scope: entry.folder.album_scope,
+                    available: entry.available,
+                    counts: entry.counts,
+                    last_error: entry.last_error.clone(),
+                    uploads: traffic,
+                }
             })
             .collect();
         let mut counts = FolderCounts::default();
@@ -802,6 +829,7 @@ impl Engine {
                 .lock()
                 .expect("the error lock")
                 .clone(),
+            uploads,
         }
     }
 
@@ -1020,6 +1048,26 @@ impl EngineInner {
             .expect("the folder lock")
             .iter()
             .position(|entry| is_within(Path::new(&entry.folder.path), path, case))
+    }
+
+    /// The meter of the folder that owns `path` (R8.1).
+    ///
+    /// The owning folder is the first entry that contains the path, the same
+    /// rule the pending count uses, so a file under a folder and one of its
+    /// subfolders is metered once and both cards still add up. A path no
+    /// folder owns — its folder was removed while the item was queued — is
+    /// metered nowhere rather than against the wrong folder.
+    fn meter_for(&self, path: &Path) -> Arc<UploadMeter> {
+        let case = PathCase::for_platform();
+        self.folders
+            .lock()
+            .expect("the folder lock")
+            .iter()
+            .find(|entry| is_within(Path::new(&entry.folder.path), path, case))
+            .map_or_else(
+                || Arc::new(UploadMeter::detached()),
+                |entry| Arc::clone(&entry.meter),
+            )
     }
 
     /// Waits while the user holds uploads (R8.7).
@@ -1885,9 +1933,10 @@ async fn upload_with_retries(inner: &Arc<EngineInner>, item: &PreparedItem) -> U
         };
         let started_ns = now_ns();
         attempts += 1;
+        let meter = inner.meter_for(&item.path);
         let mut outcome = inner
             .uploader
-            .upload_prepared(item, &inner.gate, &inner.bandwidth)
+            .upload_prepared(item, &inner.gate, &meter)
             .await;
         // R4.2: an upload that reached the server is a new version of the file
         // when the item already has one, so the associations carry over before
@@ -2327,6 +2376,7 @@ mod tests {
             folders: Vec::new(),
             counts: FolderCounts::default(),
             last_error: None,
+            uploads: UploadTraffic::default(),
         };
         assert_eq!(status.progress(), 0.0);
         status.counts.uploaded = 3;
