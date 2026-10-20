@@ -391,6 +391,11 @@ async fn a_live_photos_motion_video_counts_as_an_upload_too() {
         bytes,
         "a video is an upload, and its body is metered like the photo's"
     );
+    assert_eq!(
+        engine.uploaded_bytes(),
+        bytes,
+        "R10.2: the client's own total counts the video too, so it agrees with the dashboard"
+    );
 }
 
 #[tokio::test]
@@ -420,5 +425,40 @@ async fn a_rebuilt_engine_starts_the_meter_over() {
         second.status().uploads,
         UploadTraffic::default(),
         "a rebuilt engine starts at zero instead of borrowing the old total"
+    );
+}
+
+#[tokio::test]
+async fn stopping_the_engine_releases_an_upload_on_the_wire() {
+    let server = MockImmich::start().await;
+    server.set_upload_delay(UPLOAD_DELAY);
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let _path = write_file(&photos, "big.bin", BIG_BYTES);
+    add_folder(&store, &photos, true);
+
+    let engine = start_engine(&server, &store).await;
+    assert!(
+        wait_until(
+            || engine.status().uploads.in_flight == 1,
+            Duration::from_secs(20)
+        )
+        .await,
+        "the upload never reached the wire"
+    );
+
+    // R8.1: the worker's future is dropped when its task is aborted, so its
+    // in-flight guard goes with it. A stale count would leave the dashboard
+    // reading one upload on the wire for the life of the shell.
+    engine.stop();
+    assert!(
+        wait_until(
+            || engine.status().uploads.in_flight == 0,
+            Duration::from_secs(5)
+        )
+        .await,
+        "a stopped engine still counts an upload on the wire: {:?}",
+        engine.status().uploads
     );
 }
