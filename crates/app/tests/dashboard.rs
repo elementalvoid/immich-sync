@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 
 use gpui_kit::component::Theme;
 use gpui_kit::component::ThemeMode;
-use gpui_kit::test::TestWindowExt as _;
+use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
 use gpui_kit::{
     AnyWindowHandle, App, AppContext as _, Bounds, ElementId, Entity, Hsla, Point, Role,
     TestAppContext, Window, WindowAppearance, WindowBounds, WindowOptions, px, size,
@@ -586,6 +586,12 @@ async fn folder_add_and_remove_controls_reach_the_store(cx: &mut TestAppContext)
         tab_to(window, "dashboard-folder-path", cx);
         window.input(photos.to_str().expect("a UTF-8 path"), cx);
         window.click("dashboard-add-folder", cx);
+        window.render_frame(cx);
+        assert!(
+            window.find("folder-panel").visible(),
+            "#40: Add folder opens the setup dialog instead of adding"
+        );
+        window.click("folder-panel-add", cx);
     })
     .expect("add the folder through the dashboard");
 
@@ -653,6 +659,9 @@ async fn add_folder_through_ui(
         tab_to(window, "dashboard-folder-path", cx);
         window.input(path.to_str().expect("a UTF-8 path"), cx);
         window.click("dashboard-add-folder", cx);
+        window.render_frame(cx);
+        // #40: the field opens the setup dialog; Add confirms its defaults.
+        window.click("folder-panel-add", cx);
     })
     .expect("add the folder through the dashboard");
     for _ in 0..600 {
@@ -918,7 +927,11 @@ async fn browsing_for_a_folder_fills_the_field_and_add_folder_adds_it(cx: &mut T
             window.try_find("dashboard-browse-notice").is_none(),
             "a chosen folder is not a notice"
         );
-        window.click("dashboard-add-folder", cx);
+        assert!(
+            window.find("folder-panel").visible(),
+            "#40: Browse opens the setup dialog instead of adding"
+        );
+        window.click("folder-panel-add", cx);
     })
     .expect("add the chosen folder");
 
@@ -962,6 +975,10 @@ async fn cancelling_the_folder_picker_changes_nothing(cx: &mut TestAppContext) {
         assert!(
             window.try_find("dashboard-browse-notice").is_none(),
             "a cancel is not an error"
+        );
+        assert!(
+            window.try_find("folder-panel").is_none(),
+            "#40: a cancelled pick opens no setup dialog"
         );
     })
     .expect("read the field after the cancel");
@@ -1021,8 +1038,14 @@ async fn a_picker_that_cannot_open_keeps_the_typed_path_usable(cx: &mut TestAppC
             Some(path_text.as_str()),
             "the typed path survives a failure"
         );
-        // And it is still usable: Add folder submits it.
+        assert!(
+            window.try_find("folder-panel").is_none(),
+            "a picker that could not open starts no setup"
+        );
+        // And it is still usable: Add folder opens the setup with it.
         window.click("dashboard-add-folder", cx);
+        window.render_frame(cx);
+        window.click("folder-panel-add", cx);
     })
     .expect("use the typed path after the failure");
 
@@ -1031,4 +1054,425 @@ async fn a_picker_that_cannot_open_keeps_the_typed_path_usable(cx: &mut TestAppC
         added.path, path_text,
         "#30: the typed path still reaches Add folder after a failed picker"
     );
+}
+
+/// Opens the setup dialog for the field's path with Enter (#40).
+fn open_setup_through_the_field(window: &mut Window, path: &str, cx: &mut App) {
+    window.render_frame(cx);
+    tab_to(window, "dashboard-folder-path", cx);
+    window.input(path, cx);
+    window.press("enter", cx);
+    window.render_frame(cx);
+    assert!(
+        window.find("folder-panel").visible(),
+        "#40: Enter opens the folder setup dialog"
+    );
+}
+
+/// Presses Add in the open setup dialog and renders the result (#40).
+fn add_in_setup(window: &mut Window, cx: &mut App) {
+    window.render_frame(cx);
+    window.click("folder-panel-add", cx);
+    window.render_frame(cx);
+}
+
+/// Waits for the setup dialog's Add request to come back with a reason.
+async fn wait_for_setup_problem(cx: &mut TestAppContext, window: AnyWindowHandle) {
+    cx.wait_for(window, std::time::Duration::from_secs(30), |window, _| {
+        window.try_find("folder-panel-problem").is_some()
+    })
+    .await;
+}
+
+/// The reason the open setup dialog shows.
+fn setup_problem(window: &Window) -> String {
+    window
+        .find("folder-panel-problem")
+        .label()
+        .expect("the setup dialog shows a reason")
+        .to_string()
+}
+
+#[gpui_kit::test]
+async fn enter_opens_the_setup_dialog_without_writing_anything(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the fixture folder");
+    let (window, store, _view) = open_live_dashboard(cx, temp.path());
+    wait_for_store(cx, &store).await;
+    let path = photos.display().to_string();
+
+    cx.update_window(window, |_, window, cx| {
+        open_setup_through_the_field(window, &path, cx);
+        assert_eq!(
+            window.find("folder-panel").role(),
+            Some(Role::Dialog),
+            "N5: the setup is one named dialog"
+        );
+        assert_eq!(
+            window.find("folder-panel").label(),
+            Some("Folder setup"),
+            "N5: the dialog has an accessible name"
+        );
+        // R2.1: the dialog shows the path it will record.
+        assert_eq!(
+            window.find("folder-panel-path").label(),
+            Some(format!("Folder path: {path}").as_str())
+        );
+        assert_eq!(
+            row_text_input(window, "dashboard-folder-path").value(),
+            Some(path.as_str()),
+            "opening the dialog leaves the typed path alone"
+        );
+        // R2.1, R3.4: the three settings start at the documented defaults.
+        assert_eq!(
+            window.find("folder-panel-recursive").checked(),
+            Some(true),
+            "Recursive defaults on"
+        );
+        assert_eq!(
+            window.find("folder-panel-album").checked(),
+            Some(false),
+            "Album mapping defaults off"
+        );
+        assert_eq!(
+            window.find("folder-panel-album-leaf").selected(),
+            Some(true),
+            "Album scope defaults to one album per folder"
+        );
+    })
+    .expect("open the setup dialog");
+
+    assert!(
+        cx.read(|cx| store.read(cx).folders().is_empty()),
+        "#40: opening the dialog starts no scan and records nothing"
+    );
+}
+
+#[gpui_kit::test]
+async fn add_writes_the_path_and_all_three_settings_in_one_request(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the fixture folder");
+    let (window, store, _view) = open_live_dashboard(cx, temp.path());
+    wait_for_store(cx, &store).await;
+    let path = photos.display().to_string();
+
+    cx.update_window(window, |_, window, cx| {
+        open_setup_through_the_field(window, &path, cx);
+        // R2.1, R3.4: change every setting from its default before Add.
+        window.click("folder-panel-recursive", cx);
+        window.click("folder-panel-album", cx);
+        window.render_frame(cx);
+        window.click("folder-panel-album-whole", cx);
+        window.render_frame(cx);
+        assert_eq!(window.find("folder-panel-recursive").checked(), Some(false));
+        assert_eq!(window.find("folder-panel-album").checked(), Some(true));
+        assert_eq!(
+            window.find("folder-panel-album-whole").selected(),
+            Some(true)
+        );
+        add_in_setup(window, cx);
+    })
+    .expect("add the folder with the confirmed settings");
+
+    let stored = wait_for_folder(cx, &store, |_| true).await;
+    assert_eq!(
+        stored,
+        sync_core::store::SourceFolder {
+            path: path.clone(),
+            recursive: false,
+            album_mapping: true,
+            album_scope: sync_core::store::AlbumScope::WholeFolder,
+        },
+        "#40: one write records the path and all three settings"
+    );
+
+    // R8.1: the card appears with the values the user chose, and the dialog
+    // that recorded it has closed.
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("folder-panel").is_none(),
+            "#40: a recorded folder closes the dialog"
+        );
+        assert_eq!(
+            row_text_input(window, "dashboard-folder-path").value(),
+            Some(""),
+            "#40: a recorded folder clears the field"
+        );
+        assert!(
+            window.find(("status-folder", 0_usize)).visible(),
+            "the new folder has a card"
+        );
+        assert_eq!(
+            window.find(("folder-recursive", 0_usize)).checked(),
+            Some(false)
+        );
+        assert_eq!(window.find(("folder-album", 0_usize)).checked(), Some(true));
+        assert_eq!(
+            window.find(("folder-album-whole", 0_usize)).selected(),
+            Some(true)
+        );
+    })
+    .expect("read the new folder's card");
+}
+
+#[gpui_kit::test]
+async fn cancel_and_escape_close_the_setup_and_write_nothing(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the fixture folder");
+    let (window, store, _view) = open_live_dashboard(cx, temp.path());
+    wait_for_store(cx, &store).await;
+    let path = photos.display().to_string();
+
+    cx.update_window(window, |_, window, cx| {
+        open_setup_through_the_field(window, &path, cx);
+        window.click("folder-panel-cancel", cx);
+    })
+    .expect("press Cancel");
+
+    // The panel reports its event, and the dashboard closes it, in the next
+    // update (the same cadence a frame has).
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("folder-panel").is_none(),
+            "#40: Cancel closes the dialog"
+        );
+        assert_eq!(
+            row_text_input(window, "dashboard-folder-path").value(),
+            Some(path.as_str()),
+            "#30: Cancel leaves the typed path usable"
+        );
+
+        // Escape does the same.
+        window.click("dashboard-add-folder", cx);
+        window.render_frame(cx);
+        assert!(window.find("folder-panel").visible());
+        window.press("escape", cx);
+    })
+    .expect("press Escape");
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("folder-panel").is_none(),
+            "#40: Escape cancels the dialog"
+        );
+    })
+    .expect("read the dialog after Escape");
+
+    assert!(
+        cx.read(|cx| store.read(cx).folders().is_empty()),
+        "#40: Cancel writes nothing"
+    );
+}
+
+#[gpui_kit::test]
+async fn an_empty_path_keeps_the_setup_open_with_its_reason(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let (window, store, _view) = open_live_dashboard(cx, temp.path());
+    wait_for_store(cx, &store).await;
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("dashboard-add-folder", cx);
+        window.render_frame(cx);
+        assert!(
+            window.find("folder-panel").visible(),
+            "#40: the dialog opens even with an empty path"
+        );
+        add_in_setup(window, cx);
+    })
+    .expect("open the dialog with an empty path");
+    wait_for_setup_problem(cx, window).await;
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(setup_problem(window), "Enter the path of a folder to add.");
+        assert!(
+            window.find("folder-panel").visible(),
+            "#40: a refused Add keeps the dialog open"
+        );
+    })
+    .expect("read the empty-path reason");
+
+    assert!(cx.read(|cx| store.read(cx).folders().is_empty()));
+}
+
+#[gpui_kit::test]
+async fn a_missing_path_keeps_the_setup_open_with_its_reason_and_writes_nothing(
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let missing = temp.path().join("not there");
+    let (window, store, _view) = open_live_dashboard(cx, temp.path());
+    wait_for_store(cx, &store).await;
+
+    cx.update_window(window, |_, window, cx| {
+        open_setup_through_the_field(window, &missing.display().to_string(), cx);
+        add_in_setup(window, cx);
+    })
+    .expect("open the dialog for a missing path");
+    wait_for_setup_problem(cx, window).await;
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(setup_problem(window), "That path does not exist.");
+        assert!(
+            window.find("folder-panel").visible(),
+            "#40: a missing path keeps the dialog open"
+        );
+    })
+    .expect("read the missing-path reason");
+
+    assert!(cx.read(|cx| store.read(cx).folders().is_empty()));
+}
+
+#[gpui_kit::test]
+async fn a_file_path_keeps_the_setup_open_with_its_reason_and_writes_nothing(
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let file = temp.path().join("photo.jpg");
+    std::fs::write(&file, b"not a folder").expect("create the fixture file");
+    let (window, store, _view) = open_live_dashboard(cx, temp.path());
+    wait_for_store(cx, &store).await;
+
+    cx.update_window(window, |_, window, cx| {
+        open_setup_through_the_field(window, &file.display().to_string(), cx);
+        add_in_setup(window, cx);
+    })
+    .expect("open the dialog for a file path");
+    wait_for_setup_problem(cx, window).await;
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(setup_problem(window), "That path is a file, not a folder.");
+        assert!(
+            window.find("folder-panel").visible(),
+            "#40: a file path keeps the dialog open"
+        );
+    })
+    .expect("read the file-path reason");
+
+    assert!(cx.read(|cx| store.read(cx).folders().is_empty()));
+}
+
+/// #40: the dialog must not upsert a folder the client already tracks.
+#[gpui_kit::test]
+async fn adding_a_tracked_folder_says_already_added_and_changes_nothing(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the fixture folder");
+    let seeded = sync_core::store::SourceFolder {
+        path: photos.display().to_string(),
+        recursive: false,
+        album_mapping: true,
+        album_scope: sync_core::store::AlbumScope::WholeFolder,
+    };
+    let paths = immich_sync::paths::AppPaths {
+        config_file: temp.path().join("config").join("settings.toml"),
+        state_db: temp.path().join("data").join("state.db"),
+        autostart_dir: temp.path().join("config").join("autostart"),
+    };
+    {
+        let store = sync_core::store::StateStore::open(&paths.state_db).expect("seed the store");
+        store.add_folder(&seeded).expect("seed the folder");
+    }
+    let (window, store, _view) = open_live_dashboard(cx, temp.path());
+    wait_for_store(cx, &store).await;
+
+    cx.update_window(window, |_, window, cx| {
+        open_setup_through_the_field(window, &seeded.path, cx);
+        add_in_setup(window, cx);
+    })
+    .expect("open the dialog for an already-added folder");
+    wait_for_setup_problem(cx, window).await;
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(setup_problem(window), "Already added.");
+        assert!(
+            window.find("folder-panel").visible(),
+            "#40: an already-added folder keeps the dialog open"
+        );
+    })
+    .expect("read the already-added reason");
+
+    assert_eq!(
+        cx.read(|cx| store.read(cx).folders().to_vec()),
+        vec![seeded],
+        "#40: the tracked folder keeps the settings it already had"
+    );
+}
+
+#[gpui_kit::test]
+async fn the_setup_dialog_names_its_controls_and_traps_focus(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the fixture folder");
+    let (window, store, _view) = open_live_dashboard(cx, temp.path());
+    wait_for_store(cx, &store).await;
+
+    cx.update_window(window, |_, window, cx| {
+        open_setup_through_the_field(window, &photos.display().to_string(), cx);
+        // N5: every control has an accessible name.
+        assert_eq!(
+            window.find("folder-panel-recursive").label(),
+            Some("Sync this folder recursively")
+        );
+        assert_eq!(
+            window.find("folder-panel-album").label(),
+            Some("Album mapping for this folder")
+        );
+        assert_eq!(
+            window.find("folder-panel-album-leaf").label(),
+            Some("Album scope for this folder: one album per folder")
+        );
+        assert_eq!(
+            window.find("folder-panel-album-whole").label(),
+            Some("Album scope for this folder: one album for this folder")
+        );
+        assert_eq!(
+            window.find("folder-panel-cancel").label(),
+            Some("Cancel adding the folder")
+        );
+        assert_eq!(
+            window.find("folder-panel-add").label(),
+            Some("Add the folder")
+        );
+
+        // N5: Tab stays inside the dialog and never reaches the dashboard
+        // controls behind the backdrop.
+        for _ in 0..12 {
+            window.press("tab", cx);
+            for behind in [
+                "dashboard-folder-path",
+                "dashboard-add-folder",
+                "dashboard-browse-folder",
+            ] {
+                assert_ne!(
+                    window.find(behind).focused(),
+                    Some(true),
+                    "focus escaped the dialog to {behind}"
+                );
+            }
+        }
+
+        // N5: the settings are keyboard reachable and answer the keyboard.
+        tab_to(window, "folder-panel-recursive", cx);
+        window.press("space", cx);
+        assert_eq!(
+            window.find("folder-panel-recursive").checked(),
+            Some(false),
+            "Space changes the focused switch"
+        );
+        tab_to(window, "folder-panel-add", cx);
+    })
+    .expect("read the setup dialog's names and focus");
+
+    assert!(cx.read(|cx| store.read(cx).folders().is_empty()));
 }

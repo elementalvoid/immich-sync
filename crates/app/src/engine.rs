@@ -19,11 +19,13 @@ use sync_core::store::{
 use crate::connection::{
     ConnectionModel, STORE_OPENING, WORKER_UNAVAILABLE, run_on_worker, worker,
 };
+use crate::folder_panel::{ALREADY_ADDED, already_tracked, confirmed};
 use crate::paths::AppPaths;
 use crate::settings::SettingsStore;
 use crate::status::DashboardModel;
 use crate::store::StoreModel;
 use sync_core::connection::{ConnectionState, SharedSession};
+use sync_core::paths::PathCase;
 
 /// How often the dashboard picks up the engine's live counts.
 const STATUS_POLL: Duration = Duration::from_millis(250);
@@ -73,6 +75,12 @@ pub struct EngineModel {
     failed_latch_seeded: bool,
     paused: bool,
     problem: Option<String>,
+    /// The newest folder-setup outcome, for the add dialog (#40).
+    folder_add: Option<FolderAddResult>,
+    /// Bumped by every setup-dialog add, kept apart from `generation` so an
+    /// unrelated folder edit cannot drop the result the dialog waits for, and
+    /// a slower earlier add cannot answer a newer dialog (#40).
+    add_generation: u64,
     /// Bumped by every folder edit, so an older edit result cannot overwrite a
     /// newer one.
     generation: u64,
@@ -106,6 +114,18 @@ impl AlbumChange {
             Self::Scope(scope) => folder.album_scope = scope,
         }
     }
+}
+
+/// The outcome of one folder-setup add (#40).
+///
+/// The request id lets the dialog that sent the add recognise its own result,
+/// so a slower earlier add cannot close a newer dialog.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FolderAddResult {
+    /// The request this result answers.
+    pub request: u64,
+    /// Why nothing was written, or `None` when the folder was added.
+    pub problem: Option<String>,
 }
 
 impl EngineModel {
@@ -176,6 +196,8 @@ impl EngineModel {
             failed_latch_seeded: false,
             paused: false,
             problem: None,
+            folder_add: None,
+            add_generation: 0,
             generation: 0,
             start_generation: 0,
             store_generation: 0,
@@ -195,6 +217,12 @@ impl EngineModel {
     #[must_use]
     pub fn problem(&self) -> Option<&str> {
         self.problem.as_deref()
+    }
+
+    /// The newest folder-setup outcome, if one has arrived (#40).
+    #[must_use]
+    pub fn folder_add_result(&self) -> Option<&FolderAddResult> {
+        self.folder_add.as_ref()
     }
 
     /// The parked items the failed-items view lists (R6.5).
@@ -649,6 +677,96 @@ impl EngineModel {
             self.problem = Some(WORKER_UNAVAILABLE.to_string());
             cx.notify();
         }
+    }
+
+    /// Adds a source folder with the settings the setup dialog confirmed
+    /// (#40, R2.1, R3.4).
+    ///
+    /// The request runs on the worker runtime (N2): it validates the path,
+    /// refuses a folder the client already tracks without touching its row,
+    /// and then writes the path and all three settings in one store write. The
+    /// returned id tags the result, so the dialog that sent the add can wait
+    /// for its own outcome and keep itself open on a refusal.
+    pub fn add_folder_settings(&mut self, draft: SourceFolder, cx: &mut Context<Self>) -> u64 {
+        self.add_generation = self.add_generation.wrapping_add(1);
+        let request = self.add_generation;
+        let engine = self.engine.clone();
+        let store = self.store_model.read(cx).store();
+        let result = run_on_worker(
+            cx,
+            move || async move {
+                // N2: the filesystem probe and the store write belong on the
+                // worker, not the UI thread.
+                let folder = confirmed(&draft)?;
+                match engine {
+                    Some(engine) => {
+                        engine
+                            .add_folder_settings(&folder)
+                            .map(|()| None)
+                            .map_err(|error| match error {
+                                sync_core::engine::EngineError::FolderExists(_) => {
+                                    ALREADY_ADDED.to_string()
+                                }
+                                other => other.to_string(),
+                            })
+                    }
+                    None => match store {
+                        Some(store) => match store.folders() {
+                            Ok(folders) => {
+                                let path = Path::new(&folder.path);
+                                if already_tracked(&folders, path, PathCase::for_platform()) {
+                                    Err(ALREADY_ADDED.to_string())
+                                } else {
+                                    // The store's insert still decides: it
+                                    // refuses a row another writer got there
+                                    // first (R2.4).
+                                    match store.insert_folder(&folder) {
+                                        Ok(true) => store
+                                            .folders()
+                                            .map(Some)
+                                            .map_err(|error| error.to_string()),
+                                        Ok(false) => Err(ALREADY_ADDED.to_string()),
+                                        Err(error) => Err(error.to_string()),
+                                    }
+                                }
+                            }
+                            Err(error) => Err(error.to_string()),
+                        },
+                        None => Err(STORE_OPENING.to_string()),
+                    },
+                }
+            },
+            move |model, result, cx| {
+                // A newer add supersedes an older result still in flight.
+                if model.add_generation != request {
+                    return;
+                }
+                let problem = match result {
+                    Ok(Some(folders)) => {
+                        model.store_model.update(cx, |store, cx| {
+                            store.set_folders(folders, cx);
+                        });
+                        None
+                    }
+                    Ok(None) => None,
+                    Err(problem) => Some(problem),
+                };
+                model.problem = problem.clone();
+                model.folder_add = Some(FolderAddResult { request, problem });
+                model.refresh_status(cx);
+                cx.notify();
+            },
+        );
+        if result.is_err() {
+            let problem = WORKER_UNAVAILABLE.to_string();
+            self.problem = Some(problem.clone());
+            self.folder_add = Some(FolderAddResult {
+                request,
+                problem: Some(problem),
+            });
+            cx.notify();
+        }
+        request
     }
 
     /// Removes a source folder; its items stay in the store (R2.1).
