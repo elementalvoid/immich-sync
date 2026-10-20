@@ -59,9 +59,9 @@ pub struct EngineModel {
     /// Decides which system notifications one observation raises (R5.4,
     /// R10.1). It owns the latches, so the model keeps none of them.
     notifier: Notifier,
-    /// Whether the parked list has been read at least once, so the notifier
-    /// seeds its failure latch on the first real read (R10.1).
-    failed_loaded: bool,
+    /// Whether a successful read of the parked list has landed. The notifier
+    /// owns the seeding of its failure latch (R10.1).
+    failed_read: bool,
     paused: bool,
     problem: Option<String>,
     /// Bumped by every folder edit, so an older edit result cannot overwrite a
@@ -152,7 +152,7 @@ impl EngineModel {
             review: Vec::new(),
             review_problem: None,
             notifier: Notifier::default(),
-            failed_loaded: false,
+            failed_read: false,
             paused: false,
             problem: None,
             generation: 0,
@@ -351,7 +351,7 @@ impl EngineModel {
                     // notifying: a relaunch must not announce the dead letter
                     // again. After that, a newly parked item raises a
                     // notification of its own.
-                    model.failed_loaded = true;
+                    model.failed_read = true;
                     model.publish_notifications(cx);
                 }
                 Err(error) => {
@@ -812,16 +812,11 @@ impl EngineModel {
             ConnectionState::NeedsAttention(attention) => Some(attention.message()),
             _ => None,
         };
-        let failed = self.failed_loaded.then_some(self.failed.as_slice());
+        let failed = self.failed_read.then_some(self.failed.as_slice());
         for notification in self
             .notifier
             .observe(&self.status, failed, reason.as_deref())
         {
-            tracing::info!(
-                tag = notification.tag.as_ref(),
-                body = notification.body.as_ref(),
-                "R10.1: a notification was raised"
-            );
             cx.show_system_notification(notification);
         }
     }

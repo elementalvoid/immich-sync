@@ -7,7 +7,8 @@ use sync_core::status::{Activity, Status};
 use sync_core::store::FailedItem;
 
 /// The latches behind the system notifications: what was already announced,
-/// so the status poll cannot repeat a notification.
+/// so a repeat observation cannot repeat a notification. `observe` runs on
+/// every status refresh and every parked-list read.
 #[derive(Default)]
 pub struct Notifier {
     /// The review count the last notification was based on (R5.4).
@@ -37,8 +38,12 @@ impl Notifier {
         connection_reason: Option<&str>,
     ) -> Vec<SystemNotification> {
         let mut notifications = Vec::new();
-        if let Some(notification) = new_review_notification(status.counts.review, self.review) {
-            notifications.push(notification);
+        if status.counts.review > self.review {
+            tracing::info!(
+                count = status.counts.review,
+                "R5.4: the deletion review raised a notification"
+            );
+            notifications.push(new_review_notification(status.counts.review));
         }
         self.review = status.counts.review;
         notifications.extend(self.attention(status, connection_reason));
@@ -58,6 +63,9 @@ impl Notifier {
             self.attention = false;
             return None;
         }
+        if self.attention {
+            return None;
+        }
         let reason = connection_reason.map(str::to_string).or_else(|| {
             // A parked failure has its own notification, so the generic one
             // stays quiet while that is the only reason.
@@ -69,9 +77,12 @@ impl Notifier {
             }
             status.last_error.clone()
         })?;
-        let notification = new_attention_notification(true, self.attention, &reason);
         self.attention = true;
-        notification
+        tracing::info!(
+            reason = %reason,
+            "R10.1: the client entered attention and raised a notification"
+        );
+        Some(new_attention_notification(&reason))
     }
 
     /// Raises one notification for the paths that parked since the last read
@@ -99,20 +110,20 @@ impl Notifier {
             return None;
         }
         self.failed.extend(fresh.iter().cloned());
+        tracing::info!(
+            count = fresh.len(),
+            "R10.1: a failed item raised a notification"
+        );
         Some(new_failure_notification(&fresh))
     }
 }
 
 /// The system notification a new deletion review item raises (R5.4, R10.1).
 ///
-/// `None` when the count did not rise, so the 250 ms status poll cannot post
-/// the same notification again. The tag is stable, so a later notification
-/// replaces the previous one where the platform supports it.
+/// The stable tag replaces a previous notification where the platform
+/// supports it.
 #[must_use]
-pub fn new_review_notification(count: u32, previous: u32) -> Option<SystemNotification> {
-    if count <= previous {
-        return None;
-    }
+pub fn new_review_notification(count: u32) -> SystemNotification {
     let body = match count {
         1 => "A file disappeared from a source folder. Review it to keep the server copy or move \
               it to the trash."
@@ -122,35 +133,27 @@ pub fn new_review_notification(count: u32, previous: u32) -> Option<SystemNotifi
              copies or move them to the trash."
         ),
     };
-    Some(SystemNotification {
+    SystemNotification {
         tag: "deletion-review".into(),
         title: "Immich Sync".into(),
         body: body.into(),
         actions: Vec::new(),
-    })
+    }
 }
 
 /// The system notification the first transition into attention raises
 /// (R10.1).
 ///
-/// `None` when the client is not in attention, the episode was already
-/// announced, or there is no user-facing reason; the stable tag replaces a
-/// previous episode's notification where the platform supports it.
+/// The stable tag replaces a previous episode's notification where the
+/// platform supports it.
 #[must_use]
-pub fn new_attention_notification(
-    attention: bool,
-    announced: bool,
-    reason: &str,
-) -> Option<SystemNotification> {
-    if !attention || announced || reason.is_empty() {
-        return None;
-    }
-    Some(SystemNotification {
+pub fn new_attention_notification(reason: &str) -> SystemNotification {
+    SystemNotification {
         tag: "needs-attention".into(),
         title: "Immich Sync".into(),
         body: format!("Needs attention: {reason}").into(),
         actions: Vec::new(),
-    })
+    }
 }
 
 /// The system notification a newly failed item raises (R10.1).
@@ -226,10 +229,10 @@ mod tests {
             .collect()
     }
 
-    /// R5.4: a review count that rises posts once, and the poll that follows
-    /// with the same count stays quiet.
+    /// R5.4: a review count that rises posts once, and the observation that
+    /// follows with the same count stays quiet.
     #[test]
-    fn a_review_rise_posts_once_and_the_next_observation_repeats_it() {
+    fn a_review_rise_posts_once_and_the_next_observation_stays_quiet() {
         let mut notifier = Notifier::default();
         assert!(
             notifier
@@ -374,16 +377,16 @@ mod tests {
         let posted = notifier.observe(
             &with_folder(status(Activity::NeedsAttention, 3, 1), "/photos", false),
             Some(&both),
-            Some("Needs attention: the server is unreachable."),
+            Some("the server is unreachable."),
         );
         assert_eq!(
             tags(&posted),
             ["deletion-review", "needs-attention", "failed-item"]
         );
-        assert!(
-            posted[1].body.contains("unreachable"),
-            "the connection reason wins: {}",
-            posted[1].body
+        assert_eq!(
+            posted[1].body.as_ref(),
+            "Needs attention: the server is unreachable.",
+            "the connection reason wins and is prefixed once"
         );
     }
 }
