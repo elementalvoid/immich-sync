@@ -12,6 +12,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+use gpui_kit::base::TextSelection;
 use gpui_kit::test::{ElementSnapshot, TestWindowExt as _};
 use gpui_kit::{
     AnyWindowHandle, App, AppContext as _, Bounds, ClipboardItem, ElementId, Point, ScrollDelta,
@@ -521,6 +522,114 @@ fn a_drag_across_lines_and_ctrl_c_copies_the_selection(cx: &mut TestAppContext) 
     assert_eq!(
         copied, "alpha first line\nbravo second line\ncharlie third line",
         "Ctrl+C copies every dragged line, in order"
+    );
+}
+
+#[gpui_kit::test]
+fn a_refresh_clears_the_old_selection_and_the_new_tail_still_copies(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    write_log(
+        &paths,
+        &[
+            "alpha first line",
+            "bravo second line",
+            "charlie third line",
+        ],
+    );
+    let store = SettingsStore::open(paths.config_file.clone());
+    let window = open_shell(cx, store, paths.clone());
+
+    cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string("SENTINEL".into())));
+    cx.update_window(window, |_, window, cx| {
+        show_logs(window, cx);
+        window.blur(cx);
+        window.render_frame(cx);
+        drag_across(window, cx, 0, 2);
+        assert!(
+            TextSelection::has_selection(window, cx),
+            "the drag selects the first tail"
+        );
+
+        write_log(
+            &paths,
+            &[
+                "delta after the refresh",
+                "echo after the refresh",
+                "foxtrot after the refresh",
+                "golf after the refresh",
+            ],
+        );
+        // Refresh from the keyboard: a click on the button would clear the
+        // selection on mouse-down, and the criterion must hold for the refresh
+        // itself, not for the pointer event that asked for it.
+        tab_to(window, "logs-refresh", cx);
+        window.press("enter", cx);
+        assert_eq!(
+            window.find(ElementId::Name("logs-line-0".into())).label(),
+            Some("delta after the refresh"),
+            "the keyboard refresh replaces the tail"
+        );
+        assert!(
+            !TextSelection::has_selection(window, cx),
+            "a refresh clears the selection the old tail held"
+        );
+
+        // The new tail must copy as the text now on screen, not the text the
+        // refreshed rows used to hold.
+        window.blur(cx);
+        window.render_frame(cx);
+        drag_across(window, cx, 0, 3);
+        window.press("ctrl-c", cx);
+    })
+    .expect("update the shell window");
+
+    cx.update_window(window, |_, window, cx| {
+        let copied = cx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(
+            copied.as_deref(),
+            Some(
+                "delta after the refresh\necho after the refresh\nfoxtrot after the refresh\ngolf after the refresh"
+            ),
+            "Ctrl+C copies the refreshed tail, in order"
+        );
+
+        // A blank line survives Copy all, which takes the tail the view holds
+        // rather than the selection layer's projection.
+        write_log(&paths, &["one", "", "three"]);
+        window.click("logs-refresh", cx);
+        window.click("logs-copy-all", cx);
+    })
+    .expect("update the shell window");
+
+    let copied = cx
+        .update(|cx| cx.read_from_clipboard().and_then(|item| item.text()))
+        .unwrap_or_default();
+    assert_eq!(
+        copied, "one\n\nthree",
+        "Copy all keeps the refreshed tail's blank line"
+    );
+}
+
+/// Drags from the middle of one tail row to the end of another, as a pointer
+/// gesture does, and renders the frame the selection needs.
+fn drag_across(window: &mut Window, cx: &mut App, from: usize, to: usize) {
+    let start = window
+        .find(ElementId::Name(format!("logs-line-{from}").into()))
+        .bounds();
+    let end = window
+        .find(ElementId::Name(format!("logs-line-{to}").into()))
+        .bounds();
+    window.drag(
+        point(
+            start.origin.x + px(2.),
+            start.origin.y + start.size.height / 2.,
+        ),
+        point(
+            end.origin.x + end.size.width - px(2.),
+            end.origin.y + end.size.height / 2.,
+        ),
+        cx,
     );
 }
 

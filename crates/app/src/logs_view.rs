@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use gpui_kit::base::{Disableable as _, SelectableText};
+use gpui_kit::base::{Disableable as _, SelectableText, TextSelection};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::Button;
 use gpui_kit::component::radio::Radio;
@@ -58,12 +58,20 @@ impl LogsView {
             _subscriptions: vec![subscription],
             lines_focus: cx.focus_handle(),
         };
-        view.refresh(cx);
+        view.read_tail(cx);
         view
     }
 
-    /// Re-reads the newest log file's name and the tail of its lines.
-    pub fn refresh(&mut self, cx: &mut Context<Self>) {
+    /// Re-reads the newest log file's name and the tail of its lines, and drops
+    /// any selection the old tail held so Ctrl+C cannot copy text that is no
+    /// longer on screen (#38).
+    pub fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.read_tail(cx);
+        TextSelection::clear(window, cx);
+    }
+
+    /// Replaces the tail the view holds with the newest log file's.
+    fn read_tail(&mut self, cx: &mut Context<Self>) {
         self.current_file = logging::newest_file(&self.directory)
             .ok()
             .flatten()
@@ -205,7 +213,7 @@ impl LogsView {
                         Button::new("logs-refresh")
                             .label("Refresh")
                             .accessibility_label("Refresh the log lines")
-                            .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                            .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx))),
                     )
                     .into_any_element(),
             ],
