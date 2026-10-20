@@ -31,15 +31,15 @@ use crate::store::{
 /// hypothetical: the shell edits folders while the client is signed out.
 pub trait Observer: Send + Sync {
     /// A folder was added or re-added, so it may need a watch and a scan.
-    fn folder_added(&self, folder: &SourceFolder);
+    fn folder_added(&self, _folder: &SourceFolder) {}
     /// A folder's own fields changed: the album mapping or its scope.
-    fn folder_changed(&self, folder: &SourceFolder);
+    fn folder_changed(&self, _folder: &SourceFolder) {}
     /// A folder was removed from the client.
-    fn folder_removed(&self, path: &str);
+    fn folder_removed(&self, _path: &str) {}
     /// One item left the deletion review by a decision (R5.3).
-    fn review_decided(&self, path: &str);
+    fn review_decided(&self, _path: &str) {}
     /// One parked item was queued again for a manual retry (R6.5).
-    fn item_requeued(&self, path: &str);
+    fn item_requeued(&self, _path: &str) {}
 }
 
 /// Why a folder change was refused.
@@ -66,6 +66,21 @@ pub struct Tracking {
     /// cannot slip between an add's lookup and its upsert. It is released
     /// before the observers run.
     writes: Mutex<()>,
+}
+
+/// The stored source folder a path names, compared by path key (R2.4).
+///
+/// One lookup for every caller that needs the row a notification is about,
+/// so the case rule lives here and nowhere else.
+pub(crate) fn stored_folder(
+    store: &StateStore,
+    path: &str,
+) -> Result<Option<SourceFolder>, StoreError> {
+    let key = path_key(Path::new(path));
+    Ok(store
+        .folders()?
+        .into_iter()
+        .find(|folder| path_key(Path::new(&folder.path)) == key))
 }
 
 impl Tracking {
@@ -129,12 +144,7 @@ impl Tracking {
         }
         let folder = {
             let _write = self.writes.lock().expect("the folder write lock");
-            let key = path_key(Path::new(path));
-            let existing = self
-                .store
-                .folders()?
-                .into_iter()
-                .find(|folder| path_key(Path::new(&folder.path)) == key);
+            let existing = stored_folder(&self.store, path)?;
             let folder = SourceFolder {
                 path: path.to_string(),
                 recursive,
@@ -254,12 +264,7 @@ impl Tracking {
     ) -> Result<SourceFolder, TrackingError> {
         let folder = {
             let _write = self.writes.lock().expect("the folder write lock");
-            let key = path_key(Path::new(path));
-            let mut folder = self
-                .store
-                .folders()?
-                .into_iter()
-                .find(|folder| path_key(Path::new(&folder.path)) == key)
+            let mut folder = stored_folder(&self.store, path)?
                 .ok_or_else(|| TrackingError::UnknownFolder(path.to_string()))?;
             change(&mut folder);
             // The store write lands before the observers hear about it: a store

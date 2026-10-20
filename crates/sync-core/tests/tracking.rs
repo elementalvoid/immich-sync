@@ -301,11 +301,6 @@ fn an_observer_may_edit_a_folder_from_its_callback() {
         fn folder_added(&self, folder: &SourceFolder) {
             let _ = self.0.set_album_mapping(&folder.path, true);
         }
-
-        fn folder_changed(&self, _folder: &SourceFolder) {}
-        fn folder_removed(&self, _path: &str) {}
-        fn review_decided(&self, _path: &str) {}
-        fn item_requeued(&self, _path: &str) {}
     }
 
     let temp = tempfile::tempdir().expect("create a temp dir");

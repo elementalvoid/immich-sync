@@ -44,7 +44,7 @@ use crate::store::{
     AlbumScope, AttemptOutcome, AttemptRecord, FailedItem, FolderCounts, ItemRecord, ItemState,
     ReviewDecision, ReviewItem, SourceFolder, StateStore, StoreError,
 };
-use crate::tracking::{Observer, Tracking, TrackingError};
+use crate::tracking::{Observer, Tracking, TrackingError, stored_folder};
 use crate::upload::{
     CheckOutcome, PreparedItem, UploadFailure, UploadGate, UploadOutcome, Uploader, check_outcome,
     hash_in_background, pending_sidecar,
@@ -832,14 +832,14 @@ impl Observer for EngineObserver {
         // waits here, so the last callback to run applies a state at least as
         // new as every write it waited behind. An "added" whose folder a later
         // change removed finds no row, and drops itself.
-        let Ok(stored) = inner.store.folders() else {
-            tracing::warn!(folder = %folder.path, "the folders could not be read");
-            return;
+        let stored = match stored_folder(&inner.store, &folder.path) {
+            Ok(stored) => stored,
+            Err(error) => {
+                tracing::warn!(folder = %folder.path, error = %error, "the folders could not be read");
+                return;
+            }
         };
-        let Some(stored) = stored
-            .into_iter()
-            .find(|row| path_key(Path::new(&row.path)) == key)
-        else {
+        let Some(stored) = stored else {
             return;
         };
         let available = Path::new(&stored.path).is_dir();
@@ -928,13 +928,7 @@ impl Observer for EngineObserver {
         };
         let key = path_key(Path::new(&folder.path));
         let mut folders = inner.folders.lock().expect("the folder lock");
-        let Ok(stored) = inner.store.folders() else {
-            return;
-        };
-        let Some(stored) = stored
-            .into_iter()
-            .find(|row| path_key(Path::new(&row.path)) == key)
-        else {
+        let Ok(Some(stored)) = stored_folder(&inner.store, &folder.path) else {
             return;
         };
         if let Some(entry) = folders
@@ -951,13 +945,10 @@ impl Observer for EngineObserver {
         };
         let key = path_key(Path::new(path));
         let mut folders = inner.folders.lock().expect("the folder lock");
-        let Ok(stored) = inner.store.folders() else {
+        let Ok(stored) = stored_folder(&inner.store, path) else {
             return;
         };
-        if stored
-            .iter()
-            .any(|row| path_key(Path::new(&row.path)) == key)
-        {
+        if stored.is_some() {
             // Re-added since: the add callback owns the entry.
             return;
         }

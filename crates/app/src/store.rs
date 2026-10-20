@@ -17,7 +17,7 @@ use crate::paths::AppPaths;
 
 /// What a fresh store hands the model: the database, the folders and decisions
 /// over it, and the folder list with its counts.
-struct Opened {
+struct OpenedStore {
     store: Arc<StateStore>,
     tracking: Arc<Tracking>,
     folders: Vec<SourceFolder>,
@@ -66,7 +66,7 @@ impl StoreModel {
                                 .iter()
                                 .map(|folder| store.folder_counts(&folder.path).unwrap_or_default())
                                 .collect();
-                            Ok(Opened {
+                            Ok(OpenedStore {
                                 store,
                                 tracking,
                                 folders,
@@ -207,7 +207,16 @@ impl StoreModel {
             .map(|folder| {
                 self.folders
                     .iter()
-                    .position(|old| old.path == folder.path)
+                    .position(|old| {
+                        // R2.4: the cache must keep a folder's counts across a
+                        // re-add that spells the path differently, the same
+                        // comparison the tracking write made.
+                        sync_core::paths::equal(
+                            Path::new(&old.path),
+                            Path::new(&folder.path),
+                            sync_core::paths::PathCase::for_platform(),
+                        )
+                    })
                     .and_then(|index| self.counts.get(index).copied())
                     .unwrap_or_default()
             })
@@ -291,7 +300,7 @@ impl StoreModel {
 ///
 /// A file the integrity check refuses cannot be migrated, so the rebuild is the
 /// one path that removes it and opens a fresh database.
-fn rebuild_store(path: &Path, folders: &[SourceFolder]) -> anyhow::Result<Opened> {
+fn rebuild_store(path: &Path, folders: &[SourceFolder]) -> anyhow::Result<OpenedStore> {
     let store = match StateStore::open(path) {
         Ok(store) => store,
         // Only a real corruption verdict justifies removing the file: a
@@ -327,7 +336,7 @@ fn rebuild_store(path: &Path, folders: &[SourceFolder]) -> anyhow::Result<Opened
         .iter()
         .map(|folder| store.folder_counts(&folder.path).unwrap_or_default())
         .collect();
-    Ok(Opened {
+    Ok(OpenedStore {
         store,
         tracking,
         folders,
@@ -361,7 +370,7 @@ fn remove_state_files(path: &Path) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Opened, rebuild_store};
+    use super::{OpenedStore, rebuild_store};
     use sync_core::store::{AlbumScope, SourceFolder, StoreError};
 
     fn folder(path: &str) -> SourceFolder {
@@ -381,7 +390,7 @@ mod tests {
         let path = temp.path().join("state.db");
         let folders = vec![folder("/photos")];
 
-        let Opened {
+        let OpenedStore {
             store,
             folders: restored,
             counts,
@@ -408,7 +417,7 @@ mod tests {
         std::fs::write(&path, b"this is not a SQLite database").expect("write garbage");
         let folders = vec![folder("/photos")];
 
-        let Opened {
+        let OpenedStore {
             store,
             folders: restored,
             ..

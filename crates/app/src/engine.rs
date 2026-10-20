@@ -216,9 +216,7 @@ impl EngineModel {
             cx,
             move || async move {
                 // N2: the store write belongs on the worker, not the UI thread.
-                let Some(tracking) = tracking else {
-                    return Err(STORE_OPENING.to_string());
-                };
+                let tracking = tracking.ok_or_else(|| STORE_OPENING.to_string())?;
                 tracking
                     .keep_review(&action_path)
                     .map(|_| ())
@@ -288,12 +286,12 @@ impl EngineModel {
     /// Re-reads the missing files from the store on the background executor
     /// (N2) and republishes them when they changed.
     pub fn refresh_review(&mut self, cx: &mut Context<Self>) {
-        let Some(store) = self.store_model.read(cx).store() else {
+        let Some(tracking) = self.store_model.read(cx).tracking() else {
             return;
         };
         let read = cx
             .background_executor()
-            .spawn(async move { store.review_items() });
+            .spawn(async move { tracking.review_items() });
         cx.spawn(async move |this, cx| {
             let read = read.await;
             let _ = this.update(cx, |model, cx| match read {
@@ -319,9 +317,7 @@ impl EngineModel {
             move || async move {
                 // The store write runs on the worker runtime, so the UI thread
                 // never waits behind a worker's `BEGIN IMMEDIATE` (N2).
-                let Some(tracking) = tracking else {
-                    return Err(STORE_OPENING.to_string());
-                };
+                let tracking = tracking.ok_or_else(|| STORE_OPENING.to_string())?;
                 tracking
                     .retry_failed(&path)
                     .map(|_| ())
@@ -344,12 +340,12 @@ impl EngineModel {
     /// Re-reads the parked items from the store on the background executor
     /// (N2) and republishes them when they changed.
     pub fn refresh_failed(&mut self, cx: &mut Context<Self>) {
-        let Some(store) = self.store_model.read(cx).store() else {
+        let Some(tracking) = self.store_model.read(cx).tracking() else {
             return;
         };
         let read = cx
             .background_executor()
-            .spawn(async move { store.failed_items() });
+            .spawn(async move { tracking.failed_items() });
         cx.spawn(async move |this, cx| {
             let read = read.await;
             let _ = this.update(cx, |model, cx| match read {
@@ -558,9 +554,7 @@ impl EngineModel {
             move || async move {
                 // The store write runs on the worker runtime, so the UI thread
                 // never waits behind a worker's `BEGIN IMMEDIATE` (N2).
-                let Some(tracking) = tracking else {
-                    return Err(STORE_OPENING.to_string());
-                };
+                let tracking = tracking.ok_or_else(|| STORE_OPENING.to_string())?;
                 tracking
                     .add_folder(&path, recursive)
                     .map_err(|error| error.to_string())?;
@@ -598,9 +592,7 @@ impl EngineModel {
             cx,
             move || async move {
                 // N2: the store write belongs on the worker, not the UI thread.
-                let Some(tracking) = tracking else {
-                    return Err(STORE_OPENING.to_string());
-                };
+                let tracking = tracking.ok_or_else(|| STORE_OPENING.to_string())?;
                 tracking
                     .remove_folder(&path)
                     .map_err(|error| error.to_string())?;
@@ -656,9 +648,7 @@ impl EngineModel {
             cx,
             move || async move {
                 // N2: the store write belongs on the worker, not the UI thread.
-                let Some(tracking) = tracking else {
-                    return Err(STORE_OPENING.to_string());
-                };
+                let tracking = tracking.ok_or_else(|| STORE_OPENING.to_string())?;
                 match change {
                     AlbumChange::Mapping(enabled) => tracking.set_album_mapping(&path, enabled),
                     AlbumChange::Scope(scope) => tracking.set_album_scope(&path, scope),
