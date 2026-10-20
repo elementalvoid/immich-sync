@@ -14,7 +14,6 @@ use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
-
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -97,12 +96,28 @@ impl BandwidthLimit {
     /// and one total; the second counter is how one part of the client reads
     /// its own share of the traffic without summing uploads or borrowing the
     /// bytes of another (R8.1).
+    #[must_use]
     pub fn tallying(&self, tally: Arc<AtomicU64>) -> Self {
         Self {
             bytes_per_second: Arc::clone(&self.bytes_per_second),
             bucket: Arc::clone(&self.bucket),
             moved: Arc::clone(&self.moved),
             tally: Some(tally),
+        }
+    }
+
+    /// A view of this limit with no rate, keeping the shared bucket and total.
+    ///
+    /// A live photo's motion video streams at the network's pace (R3.3), but its
+    /// bytes are still the client's upload bytes, so they must land in the same
+    /// total (R10.2). Only the pacing is dropped.
+    #[must_use]
+    pub fn unthrottled(&self) -> Self {
+        Self {
+            bytes_per_second: Arc::new(AtomicU64::new(0)),
+            bucket: Arc::clone(&self.bucket),
+            moved: Arc::clone(&self.moved),
+            tally: self.tally.clone(),
         }
     }
 

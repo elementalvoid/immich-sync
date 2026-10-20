@@ -78,10 +78,10 @@ impl UploadMeter {
     /// in the folder's bytes and in its uploads in flight (R8.1).
     pub(crate) fn unlimited(&self) -> Self {
         Self {
-            // No rate, but the same counters: the limit still has to charge the
-            // bytes it meters, or the folder would read as idle while the video
-            // is on the wire.
-            limit: BandwidthLimit::default().tallying(Arc::clone(&self.bytes)),
+            // No rate, but the same counters: the bytes still land in the
+            // folder's and the client's totals (R10.2), or the folder would
+            // read as idle while the video is on the wire.
+            limit: self.limit.unthrottled(),
             bytes: Arc::clone(&self.bytes),
             in_flight: Arc::clone(&self.in_flight),
             window: Mutex::new(RateWindow::default()),
@@ -165,8 +165,7 @@ impl RateWindow {
             self.samples.pop_front();
         }
         let baseline = self.samples.front().expect("a sample was just pushed").1;
-        // A rebuilt engine counts from zero again, which `saturating_sub` reads
-        // as no bytes rather than as an underflow.
+        // A total that ever went backwards must not underflow.
         let moved = total.saturating_sub(baseline);
         (moved as f64 / WINDOW.as_secs_f64()).round() as u64
     }
