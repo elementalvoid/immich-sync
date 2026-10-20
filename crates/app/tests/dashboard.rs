@@ -83,7 +83,90 @@ fn globals_and_idle_folders_map_without_an_error() {
 }
 
 #[gpui_kit::test]
+fn the_global_card_reads_the_upload_rate_and_the_count() {
+    use sync_core::meter::UploadTraffic;
+
+    let model = sample();
+    let global = model.global.content();
+    assert_eq!(
+        global.uploads.as_deref(),
+        Some("2.4 MiB/s · 3 uploading"),
+        "R8.1: the global card shows the rate and the uploads on the wire"
+    );
+    assert_eq!(
+        model.folders[0].content().uploads,
+        None,
+        "the line belongs to the global card, which is the one that sums the folders"
+    );
+
+    // A request that has started and moved no byte yet is still uploading.
+    let mut starting = model.global.clone();
+    starting.uploads = UploadTraffic {
+        bytes: 0,
+        bytes_per_second: 0,
+        in_flight: 2,
+    };
+    assert_eq!(
+        starting.content().uploads.as_deref(),
+        Some("0 B/s · 2 uploading")
+    );
+}
+
+#[gpui_kit::test]
+fn the_global_card_reads_idle_only_when_no_upload_is_moving() {
+    use sync_core::meter::UploadTraffic;
+
+    let mut card = sample().global;
+    card.uploads = UploadTraffic::default();
+    assert_eq!(card.content().uploads.as_deref(), Some("Idle"));
+
+    // The window still holds the last burst after the upload finished: no
+    // upload is running, but bytes did move, so the line shows the rate alone
+    // instead of hiding a sub-poll burst behind `Idle`.
+    card.uploads = UploadTraffic {
+        bytes: 1_048_576,
+        bytes_per_second: 524_288,
+        in_flight: 0,
+    };
+    assert_eq!(card.content().uploads.as_deref(), Some("512.0 KiB/s"));
+
+    // The burst faded out of the window: nothing is on the wire or moving.
+    card.uploads = UploadTraffic {
+        bytes: 1_048_576,
+        bytes_per_second: 0,
+        in_flight: 0,
+    };
+    assert_eq!(card.content().uploads.as_deref(), Some("Idle"));
+}
+
+#[gpui_kit::test]
+fn the_global_card_renders_the_upload_line(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let window = open_dashboard(cx, sample());
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window
+                .find((ElementId::from("status-global"), "uploads"))
+                .label(),
+            Some("2.4 MiB/s · 3 uploading"),
+            "the line is rendered and readable to assistive technology"
+        );
+        assert!(
+            window
+                .try_find(("status-folder", 0_usize))
+                .is_some_and(|card| card.visible()),
+            "the folder cards still render"
+        );
+    })
+    .expect("update the dashboard window");
+}
+
+#[gpui_kit::test]
 fn sample_data_covers_several_folders_and_states() {
+    use sync_core::meter::UploadTraffic;
+
     let model = sample();
 
     assert!(
@@ -103,6 +186,15 @@ fn sample_data_covers_several_folders_and_states() {
     assert!(
         states.len() >= 3,
         "the sample data exercises several states"
+    );
+
+    let mut summed = UploadTraffic::default();
+    for folder in &model.folders {
+        summed.add(folder.uploads);
+    }
+    assert_eq!(
+        model.global.uploads, summed,
+        "the fixture's global card is the sum of its folders"
     );
 }
 
@@ -127,9 +219,11 @@ fn folder_progress_survives_counts_above_a_u16() {
             available: true,
             counts,
             last_error: None,
+            uploads: sync_core::meter::UploadTraffic::default(),
         }],
         counts,
         last_error: None,
+        uploads: sync_core::meter::UploadTraffic::default(),
     };
 
     let model = DashboardModel::from_engine(&status, None);
@@ -501,6 +595,7 @@ fn engine_status_maps_to_the_global_card_and_one_card_per_folder() {
                     review: 2,
                 },
                 last_error: None,
+                uploads: sync_core::meter::UploadTraffic::default(),
             },
             FolderStatus {
                 path: "/mnt/unplugged".to_string(),
@@ -510,6 +605,7 @@ fn engine_status_maps_to_the_global_card_and_one_card_per_folder() {
                 available: false,
                 counts: FolderCounts::default(),
                 last_error: None,
+                uploads: sync_core::meter::UploadTraffic::default(),
             },
         ],
         counts: FolderCounts {
@@ -519,6 +615,11 @@ fn engine_status_maps_to_the_global_card_and_one_card_per_folder() {
             review: 2,
         },
         last_error: Some("unsupported_format: the file type".to_string()),
+        uploads: sync_core::meter::UploadTraffic {
+            bytes: 41_943_040,
+            bytes_per_second: 2_516_582,
+            in_flight: 2,
+        },
     };
 
     let model = DashboardModel::from_engine(&status, Some("Connected".to_string()));
@@ -540,6 +641,11 @@ fn engine_status_maps_to_the_global_card_and_one_card_per_folder() {
         model.global.content().review.as_deref(),
         Some("2 missing files to review")
     );
+    assert_eq!(
+        model.global.content().uploads.as_deref(),
+        Some("2.4 MiB/s · 2 uploading"),
+        "R8.1: the engine's reading reaches the global card's line"
+    );
     assert_eq!(model.folders.len(), 2, "one card per source folder");
 
     let pictures = &model.folders[0];
@@ -549,6 +655,11 @@ fn engine_status_maps_to_the_global_card_and_one_card_per_folder() {
     assert_eq!(
         pictures.content().counts,
         "7 uploaded · 3 pending · 1 failed"
+    );
+    assert_eq!(
+        pictures.content().uploads,
+        None,
+        "the upload line is the global card's"
     );
     assert_eq!(
         pictures.review_count, 2,

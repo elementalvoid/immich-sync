@@ -630,7 +630,7 @@ fn status_card(
                 .items_center()
                 .gap_3()
                 .child(
-                    Progress::new((id, "progress"))
+                    Progress::new((id.clone(), "progress"))
                         .flex_1()
                         .value(content.progress * 100.0)
                         .accessibility_label(format!("{title} progress")),
@@ -648,6 +648,21 @@ fn status_card(
                 .text_color(palette.meta)
                 .child(content.counts),
         )
+        .when_some(content.uploads.clone(), |this, uploads| {
+            // R8.1: the global card's rate and uploads in flight. Plain meta
+            // ink on the card surface, which is the pair the theme contrast
+            // test measures, and a label instead of a control: nothing new to
+            // operate or to skip.
+            this.child(
+                div()
+                    .id((id.clone(), "uploads"))
+                    .test_support()
+                    .aria_label(uploads.clone())
+                    .text_sm()
+                    .text_color(palette.meta)
+                    .child(uploads),
+            )
+        })
         .when_some(content.album.clone(), |this, album| {
             this.child(div().text_sm().text_color(palette.meta).child(album))
         });

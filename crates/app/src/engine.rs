@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use gpui_kit::*;
 use sync_core::engine::{Activity, Engine, EngineConfig, EngineStatus, FolderStatus, Limits};
+use sync_core::meter::UploadTraffic;
 use sync_core::store::{
     AlbumScope, FailedItem, FolderCounts, ReviewDecision, ReviewItem, SourceFolder, StateStore,
 };
@@ -920,6 +921,9 @@ impl EngineModel {
                         // The last known counts from the store (R8.1).
                         counts: *counts,
                         last_error: None,
+                        // The meter dies with the engine it belongs to; the
+                        // store-only status has nothing on the wire (R8.1).
+                        uploads: UploadTraffic::default(),
                     })
                     .collect::<Vec<_>>();
                 let paused = self.paused;
@@ -946,6 +950,7 @@ impl EngineModel {
                     folders,
                     counts,
                     last_error: None,
+                    uploads: UploadTraffic::default(),
                 }
             }
         };
@@ -1053,5 +1058,6 @@ fn empty_status() -> EngineStatus {
         folders: Vec::new(),
         counts: FolderCounts::default(),
         last_error: None,
+        uploads: UploadTraffic::default(),
     }
 }
