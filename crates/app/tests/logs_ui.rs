@@ -859,6 +859,64 @@ async fn a_new_log_line_reaches_the_view_without_a_click(cx: &mut TestAppContext
 }
 
 #[gpui_kit::test]
+async fn a_selection_pauses_the_tail_instead_of_replacing_the_rows_under_it(
+    cx: &mut TestAppContext,
+) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let mut lines = long_tail(6);
+    write_lines(&paths, &lines);
+    let store = SettingsStore::open(paths.config_file.clone());
+    let (window, _shell) = open_shell(cx, store, paths.clone());
+
+    show_logs(cx, window);
+    cx.update_window(window, |_, window, cx| {
+        window.blur(cx);
+        window.render_frame(cx);
+        drag_across(window, cx, 0, 2);
+        assert!(
+            TextSelection::has_selection(window, cx),
+            "the drag selects the followed tail"
+        );
+    })
+    .expect("update the shell window");
+    let before: Vec<(usize, String, f32)> = cx
+        .update_window(window, |_, window, _| shown_rows(window, lines.len()))
+        .expect("update the shell window");
+    assert!(!before.is_empty(), "the followed tail shows its rows");
+
+    for index in 0..2 {
+        lines.push(format!("line appended under the selection {index}"));
+    }
+    write_lines(&paths, &lines);
+    tick_live(cx, window);
+
+    let after = cx
+        .update_window(window, |_, window, _| shown_rows(window, lines.len()))
+        .expect("update the shell window");
+    assert_eq!(
+        after, before,
+        "a live replace must not overwrite the text under an existing selection"
+    );
+    cx.update_window(window, |_, window, cx| {
+        assert!(
+            TextSelection::has_selection(window, cx),
+            "the selection survives the poll"
+        );
+        assert!(
+            window.try_find("logs-paused").is_some(),
+            "a selection pauses the tail, so the jump control appears"
+        );
+        assert_eq!(
+            window.find("logs-jump-latest").label(),
+            Some("2 new lines · Jump to latest"),
+            "the arrival is counted, not shown"
+        );
+    })
+    .expect("update the shell window");
+}
+
+#[gpui_kit::test]
 async fn scrolling_up_pauses_the_tail_and_counts_the_lines_it_misses(cx: &mut TestAppContext) {
     let temp = tempfile::tempdir().expect("create a temp dir");
     let paths = temporary_paths(temp.path());
@@ -926,11 +984,24 @@ async fn scrolling_up_pauses_the_tail_and_counts_the_lines_it_misses(cx: &mut Te
         after, before,
         "the paused tail keeps every line exactly where the user left it"
     );
-    cx.update_window(window, |_, window, cx| {
+    cx.update_window(window, |_, window, _| {
         assert_eq!(
             window.find("logs-jump-latest").label(),
             Some("3 new lines · Jump to latest"),
             "the control counts the lines that arrived"
+        );
+    })
+    .expect("update the shell window");
+
+    // A poll with nothing written between ticks counts nothing: the window the
+    // count measures against advances with every read while the rows stay
+    // frozen, so the same arrival is not added again.
+    tick_live(cx, window);
+    cx.update_window(window, |_, window, cx| {
+        assert_eq!(
+            window.find("logs-jump-latest").label(),
+            Some("3 new lines · Jump to latest"),
+            "an idle poll does not count the same lines twice"
         );
         tab_to(window, "logs-jump-latest", cx);
     })
@@ -956,6 +1027,101 @@ async fn scrolling_up_pauses_the_tail_and_counts_the_lines_it_misses(cx: &mut Te
         format!("{}\n{}", lines[first], lines[second]),
         "the paused tail still copies the lines the drag covers"
     );
+}
+
+/// The timer's read decides whether to follow before the file read finishes.
+/// A scroll up while that read is in flight must keep the tail where the user
+/// put it, or the read that lands pulls the rows back to the end.
+#[gpui_kit::test]
+async fn a_scroll_up_during_the_read_is_not_undone_when_it_lands(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let mut lines = long_tail(60);
+    write_lines(&paths, &lines);
+    let store = SettingsStore::open(paths.config_file.clone());
+    // The Logs view alone: the only timer pending is its live poll, so the two
+    // ticks below are the poll and the read it starts.
+    let (window, logs) = open_logs_view(cx, store, paths.clone());
+    cx.update(|cx| logs.update(cx, |logs, cx| logs.set_visible(true, cx)));
+    settle(cx, window);
+    let (at_end, paused) = cx
+        .update_window(window, |_, window, _| {
+            (
+                window
+                    .find(ElementId::Name("logs-line-59".into()))
+                    .visible(),
+                window.try_find("logs-paused").is_some(),
+            )
+        })
+        .expect("update the Logs window");
+    assert!(at_end, "the view opens at the tail's end");
+    assert!(!paused, "nothing is paused yet");
+
+    for index in 0..3 {
+        lines.push(format!("line appended during the read {index}"));
+    }
+    write_lines(&paths, &lines);
+
+    // Expire the poll timer, then run the poll. The tail is still at its end,
+    // so the poll latches "follow" and its read is now in flight. The frame
+    // the settle painted can leave work queued, and a random pick of two
+    // runnables would not be the poll, so drain it first and pin the timer.
+    cx.run_until_parked();
+    let before_timer = cx.executor().now();
+    assert!(
+        cx.dispatcher.advance_clock_to_next_timer(),
+        "the live poll timer is pending"
+    );
+    assert_eq!(
+        cx.executor().now().duration_since(before_timer),
+        LIVE_TAIL_POLL,
+        "the next timer is the live poll, not another task's"
+    );
+    // One tick expires the timer, one completes the timer's own task and wakes
+    // the poll, and one runs the poll: it reads the viewport as "following"
+    // and starts the read. The read has landed by the fifth tick, so stop here.
+    assert!(cx.dispatcher.tick(false), "the poll timer expires");
+    assert!(cx.dispatcher.tick(false), "the timer wakes the poll");
+    assert!(cx.dispatcher.tick(false), "the poll starts its read");
+    cx.update_window(window, |_, window, _| {
+        assert!(
+            window
+                .try_find(ElementId::Name("logs-line-60".into()))
+                .is_none(),
+            "the read has not landed yet"
+        );
+    })
+    .expect("update the Logs window");
+
+    // Scroll up, away from the end of the tail, before that read lands.
+    cx.update_window(window, |_, window, cx| {
+        window.scroll(
+            "logs-lines",
+            ScrollDelta::Pixels(point(px(0.), px(240.))),
+            cx,
+        );
+    })
+    .expect("update the Logs window");
+
+    settle(cx, window);
+    cx.update_window(window, |_, window, _| {
+        assert!(
+            window.try_find("logs-paused").is_some(),
+            "the read that landed kept the tail where the user scrolled to"
+        );
+        assert!(
+            window
+                .try_find(ElementId::Name("logs-line-60".into()))
+                .is_none(),
+            "the read did not replace the rows the user scrolled away from"
+        );
+        assert_eq!(
+            window.find("logs-jump-latest").label(),
+            Some("3 new lines · Jump to latest"),
+            "the arrival is counted instead"
+        );
+    })
+    .expect("update the Logs window");
 }
 
 #[gpui_kit::test]

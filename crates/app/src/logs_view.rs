@@ -31,6 +31,10 @@ pub struct LogsView {
     directory: PathBuf,
     /// The bounded tail read when the view was shown, refreshed, or polled.
     lines: Vec<String>,
+    /// The last read the paused count measured against. It advances with every
+    /// read while the displayed rows stay frozen, so an idle poll cannot count
+    /// the same arrival twice.
+    counted: Vec<String>,
     /// The newest log file's name, read with the tail.
     current_file: Option<String>,
     /// Why the tail could not be read, when it could not.
@@ -61,6 +65,24 @@ pub struct LogsView {
     /// Discards a read a newer one has superseded, so two reads in flight
     /// cannot count the same new lines twice.
     read_generation: u64,
+    /// What the read in flight does when it lands. A read latches this before
+    /// its file read starts, and the apply re-reads the viewport for a poll.
+    follow: Follow,
+    /// The window the tail is painted in, where a selection is read from before
+    /// a live replace would drop the rows under it. Set by every render.
+    window: Option<AnyWindowHandle>,
+}
+
+/// What a tail read does when it lands.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Follow {
+    /// Follow only while the tail is still scrolled to its end when the read
+    /// lands, so a scroll during the read is not undone by the replace.
+    FromViewport,
+    /// Follow from the read on, whatever the viewport says: the user asked for
+    /// the tail, and the jump control clears the pause while the rows still
+    /// read as scrolled up.
+    Always,
 }
 
 impl LogsView {
@@ -80,6 +102,7 @@ impl LogsView {
             settings,
             directory,
             lines: Vec::new(),
+            counted: Vec::new(),
             current_file: None,
             read_problem: None,
             save_problem,
@@ -91,6 +114,8 @@ impl LogsView {
             live: None,
             visible: false,
             read_generation: 0,
+            follow: Follow::Always,
+            window: None,
         }
     }
 
@@ -109,7 +134,7 @@ impl LogsView {
             self.live = None;
             return;
         }
-        self.read_tail(cx);
+        self.read_tail(Follow::Always, cx);
         self.live = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(LIVE_TAIL_POLL).await;
@@ -131,13 +156,25 @@ impl LogsView {
     /// re-reads the file for as long as the surface is visible.
     ///
     /// Following is the scroll position, so the user returning to the end
-    /// resumes it and scrolling up pauses it, whatever moved the handle.
+    /// resumes it and scrolling up pauses it, whatever moved the handle. An
+    /// existing selection pauses it too: a live replace would overwrite the
+    /// text under it (#38's defect on the hot path).
     fn poll_live(&mut self, cx: &mut Context<Self>) {
         if !self.visible {
             return;
         }
-        self.paused = !self.at_bottom();
-        self.read_tail(cx);
+        self.paused = !self.at_bottom() || self.has_selection(cx);
+        self.read_tail(Follow::FromViewport, cx);
+    }
+
+    /// Whether the window holds any text selection. The check is window-wide,
+    /// the same scope Refresh's clear uses.
+    fn has_selection(&self, cx: &mut Context<Self>) -> bool {
+        self.window.is_some_and(|window| {
+            window
+                .update(cx, |_, window, cx| TextSelection::has_selection(window, cx))
+                .unwrap_or(false)
+        })
     }
 
     /// Re-reads the newest log file's name and the tail of its lines, follows
@@ -157,12 +194,14 @@ impl LogsView {
     /// control both ask for that.
     fn resume(&mut self, cx: &mut Context<Self>) {
         self.paused = false;
-        self.read_tail(cx);
+        self.read_tail(Follow::Always, cx);
     }
 
     /// Reads the newest file's name and its bounded tail on the background
-    /// executor (N2), then applies the result on the UI thread.
-    fn read_tail(&mut self, cx: &mut Context<Self>) {
+    /// executor (N2), then applies the result on the UI thread. `follow` says
+    /// what the apply does with a viewport the read did not wait for.
+    fn read_tail(&mut self, follow: Follow, cx: &mut Context<Self>) {
+        self.follow = follow;
         self.read_generation = self.read_generation.wrapping_add(1);
         let generation = self.read_generation;
         let directory = self.directory.clone();
@@ -184,6 +223,10 @@ impl LogsView {
         read: anyhow::Result<(Option<String>, Vec<String>)>,
         cx: &mut Context<Self>,
     ) {
+        // A read still in flight when the surface hides changes nothing.
+        if !self.visible {
+            return;
+        }
         // A newer read supersedes an older one, so a slow read cannot land over
         // it or count the same lines twice.
         if generation != self.read_generation {
@@ -199,22 +242,27 @@ impl LogsView {
                 return;
             }
         };
-        self.current_file = file;
         self.read_problem = None;
-        if !self.paused {
-            self.lines = tail;
+        // The timer's read decided before the file read finished, and the user
+        // may have scrolled since: replacing now would pull them back to the
+        // end. A read the user asked for follows whatever the viewport says.
+        if self.follow == Follow::FromViewport && !self.at_bottom() {
+            self.paused = true;
+        }
+        if self.paused {
+            self.new_lines = self
+                .new_lines
+                .saturating_add(gained_lines(&self.counted, &tail));
+            // The counted window advances while the rows stay frozen, so the
+            // next poll measures what arrived after this read. The current
+            // file's name stays with the rows: it names the file they show.
+            self.counted = tail;
+        } else {
+            self.current_file = file;
+            self.lines = tail.clone();
+            self.counted = tail;
             self.new_lines = 0;
             self.scroll.scroll_to_bottom();
-        } else {
-            let gained = gained_lines(&self.lines, &tail);
-            self.new_lines = if gained < tail.len() {
-                self.new_lines.saturating_add(gained)
-            } else {
-                // The fresh window no longer holds the tail on screen, so the
-                // window's length is the floor: adding a whole window every
-                // poll would count the same lines again and again.
-                gained
-            };
         }
         cx.notify();
     }
@@ -327,7 +375,7 @@ impl LogsView {
                     "logs-path-current",
                     "logs-path-current-value",
                     "Current file",
-                    "Reads from the newest file. Refresh to re-read it.",
+                    "Reads from the newest file. It follows the file while this surface is open.",
                     current,
                 )
                 .into_any_element(),
@@ -562,7 +610,10 @@ fn gained_lines(held: &[String], fresh: &[String]) -> usize {
 }
 
 impl Render for LogsView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The live poll reads the window's selection before it replaces the
+        // rows, and this is where a window reference is available.
+        self.window = Some(window.window_handle());
         let theme = cx.theme();
         let background = theme.background;
         let foreground = theme.foreground;
