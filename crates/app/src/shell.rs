@@ -427,6 +427,24 @@ impl AppShell {
         cx.notify();
     }
 
+    /// Opens a list view narrowed to one source folder (#41).
+    ///
+    /// The folder detail calls this to link into the failed items or the
+    /// deletion review for its folder (#43). A surface without a folder filter
+    /// ignores the folder and simply opens.
+    pub fn show_filtered(&mut self, mode: ViewMode, folder: String, cx: &mut Context<Self>) {
+        match mode {
+            ViewMode::Failed => self
+                .failed
+                .update(cx, |view, cx| view.select_folder(folder, cx)),
+            ViewMode::Review => self
+                .review
+                .update(cx, |view, cx| view.select_folder(folder, cx)),
+            _ => {}
+        }
+        self.show(mode, cx);
+    }
+
     /// The view switch. Every button is a keyboard reachable tab stop.
     fn switch(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
