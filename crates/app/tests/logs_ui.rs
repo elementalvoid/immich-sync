@@ -12,10 +12,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gpui_kit::test::TestWindowExt as _;
+use gpui_kit::test::{ElementSnapshot, TestWindowExt as _};
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, Bounds, ClipboardItem, Point, TestAppContext, Window,
-    WindowBounds, WindowOptions, point, px, size,
+    AnyWindowHandle, App, AppContext as _, Bounds, ClipboardItem, ElementId, Point, ScrollDelta,
+    TestAppContext, Window, WindowBounds, WindowOptions, point, px, size,
 };
 use immich_sync::autostart::{Autostart, UnavailableAutostart};
 use immich_sync::connection::{ConnectionModel, profile_from_settings};
@@ -229,6 +229,141 @@ fn refresh_reads_the_lines_written_since_the_view_opened(cx: &mut TestAppContext
             window.find("logs-line-1").label(),
             Some("second line"),
             "refresh reads the new line"
+        );
+    })
+    .expect("update the shell window");
+}
+
+/// One log line of the length a round asks for: short, medium, or long
+/// enough that the row has to truncate it.
+fn line_of(round: usize, index: usize) -> String {
+    let width = match (round + index) % 3 {
+        1 => 90,
+        2 => 400,
+        _ => 12,
+    };
+    format!("round {round} line {index} {}", "x".repeat(width))
+}
+
+/// The tail rows the harness can still see, with their index and snapshot. A
+/// row below the scroll box is not painted, so the harness cannot find it;
+/// every row it does find must be full height.
+fn tail_rows(window: &Window, count: usize) -> Vec<(usize, ElementSnapshot)> {
+    let mut rows = Vec::new();
+    for index in 0..count {
+        let id = ElementId::Name(format!("logs-line-{index}").into());
+        if let Some(snapshot) = window.try_find(id) {
+            rows.push((index, snapshot));
+        }
+    }
+    rows
+}
+
+/// Repeated refreshes with lines appended and truncated between them must
+/// always lay the newest tail out as single-line rows, however many lines the
+/// box has to scroll (#38).
+///
+/// The failing paint the issue reports is a row squashed into a thin strip: the
+/// box caps its height, so a flex column that lets its rows shrink squeezes
+/// every line into the cap instead of overflowing. A squashed row's bounds are
+/// shorter than the height one line of the same style needs, which is what this
+/// test measures: the height a one-line tail gives its row is the independent
+/// truth, and no row of any later tail may be shorter than it.
+#[gpui_kit::test]
+fn ten_refreshes_keep_every_row_at_full_height(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    write_log(&paths, &["the one line a fresh tail holds"]);
+    let store = SettingsStore::open(paths.config_file.clone());
+    let window = open_shell(cx, store, paths.clone());
+
+    let mut one_line = 0.;
+    cx.update_window(window, |_, window, cx| {
+        show_logs(window, cx);
+        one_line = window.find("logs-line-0").bounds().size.height.into();
+    })
+    .expect("update the shell window");
+    assert!(
+        one_line > 8.,
+        "one line of the tail is {one_line}px tall, tall enough for a line of text"
+    );
+
+    // Appends and truncations alternate, so a round that adds lines is followed
+    // by one that takes them away again.
+    for (round, count) in [3_usize, 21, 60, 5, 200, 1, 40, 12, 120, 8]
+        .into_iter()
+        .enumerate()
+    {
+        let lines: Vec<String> = (0..count).map(|index| line_of(round, index)).collect();
+        write_log(
+            &paths,
+            &lines.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        cx.update_window(window, |_, window, cx| {
+            window.click("logs-refresh", cx);
+            let rows = tail_rows(window, count);
+            assert!(
+                !rows.is_empty(),
+                "round {round}: {count} lines paint at least their first row"
+            );
+            for (position, (index, row)) in rows.iter().enumerate() {
+                assert_eq!(
+                    *index, position,
+                    "round {round}: the painted rows start at the top of the tail and leave no gap"
+                );
+                let bounds = row.bounds();
+                assert_eq!(
+                    row.label(),
+                    Some(lines[*index].as_str()),
+                    "round {round}: logs-line-{index} shows its own line"
+                );
+                assert!(
+                    f32::from(bounds.size.height) >= one_line - 0.5,
+                    "round {round}: logs-line-{index} is {}px tall, not the {one_line}px one \
+                     line needs: the row is squashed and its glyphs are clipped",
+                    f32::from(bounds.size.height)
+                );
+                if let Some((previous_index, previous)) = rows.get(position.wrapping_sub(1)) {
+                    assert!(
+                        bounds.origin.y
+                            >= previous.bounds().origin.y + previous.bounds().size.height,
+                        "round {round}: logs-line-{index} overlaps logs-line-{previous_index}"
+                    );
+                }
+            }
+            let box_bounds = window.find("logs-lines").bounds();
+            assert!(
+                f32::from(box_bounds.size.height) <= 24. * 16. + 0.5,
+                "round {round}: the tail keeps its 24rem cap"
+            );
+        })
+        .expect("update the shell window");
+    }
+
+    // The box that overflows scrolls: the lines a full tail holds beyond the
+    // first screenful are reachable, at full height, with the newest last.
+    let lines: Vec<String> = (0..200).map(|index| line_of(11, index)).collect();
+    write_log(
+        &paths,
+        &lines.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    cx.update_window(window, |_, window, cx| {
+        window.click("logs-refresh", cx);
+        window.scroll(
+            "logs-lines",
+            ScrollDelta::Pixels(point(px(0.), px(-4000.))),
+            cx,
+        );
+        window.render_frame(cx);
+        let newest = window.find(ElementId::Name("logs-line-199".into()));
+        assert_eq!(
+            newest.label(),
+            Some(lines[199].as_str()),
+            "scrolling the tail reaches the newest line"
+        );
+        assert!(
+            f32::from(newest.bounds().size.height) >= one_line - 0.5,
+            "the newest line of a full tail keeps the height one line needs"
         );
     })
     .expect("update the shell window");

@@ -318,6 +318,10 @@ impl LogsView {
                         .aria_label(line.clone())
                         .min_w_0()
                         .w_full()
+                        // The tail box caps its height, so a shrinkable row is
+                        // squeezed into the cap and its glyphs are clipped: the
+                        // tail must overflow and scroll instead (#38).
+                        .flex_shrink_0()
                         .truncate()
                         .font_family(theme.mono_font_family.clone())
                         .text_xs()
