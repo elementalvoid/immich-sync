@@ -583,3 +583,140 @@ async fn a_deleted_tag_is_created_again_on_the_next_run() {
     );
     restarted.stop();
 }
+
+/// R3.7: a refused tag call drops the cached id, so the next asset resolves
+/// the tag again instead of reusing an id the server no longer took.
+#[tokio::test]
+async fn a_refused_tag_call_resolves_the_tag_again_for_the_next_asset() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+    add_folder(&store, &photos);
+
+    // The run resolves the tag once at start, before any asset needs it.
+    let engine = start_engine(&server, &store, tagged_config()).await;
+    assert!(
+        wait_until(|| server.upsert_calls().len() == 1, Duration::from_secs(10)).await,
+        "R3.7: the start did not resolve the tag: {:?}",
+        server.upsert_calls()
+    );
+    server.fail(
+        Operation::TagAssets,
+        Fault::ServerMessage {
+            code: 500,
+            message: "the tag service is down".to_string(),
+        },
+    );
+
+    let first = write_file(&photos, "first.jpg", b"tagrefused first");
+    engine.sync_now();
+    assert!(
+        wait_until(|| succeeded(&store, &first), Duration::from_secs(20)).await,
+        "the first upload did not finish"
+    );
+    assert!(
+        wait_until(
+            || engine.tag_status().problem.is_some(),
+            Duration::from_secs(10)
+        )
+        .await,
+        "R3.7: the refused tag call was not recorded"
+    );
+
+    // The second asset must resolve the tag again: the refused call dropped
+    // the id the server answered for this run.
+    let second = write_file(&photos, "second.jpg", b"tagrefused second");
+    engine.sync_now();
+    assert!(
+        wait_until(|| succeeded(&store, &second), Duration::from_secs(20)).await,
+        "the second upload did not finish"
+    );
+    assert!(
+        wait_until(
+            || server.tags_of(&asset_of(&store, &second)).len() == 1,
+            Duration::from_secs(10)
+        )
+        .await,
+        "R3.7: the second asset never got the tag"
+    );
+    assert_eq!(
+        server.upsert_calls().len(),
+        2,
+        "R3.7: a refused tag call drops the cached id, so the next asset upserts again"
+    );
+    let attempts = server
+        .requests()
+        .iter()
+        .filter(|request| request.ends_with("/tags/assets"))
+        .count();
+    assert_eq!(attempts, 2, "R3.7: both tag attempts reached the server");
+    engine.stop();
+}
+
+/// R3.7: one settled permission refusal covers the run, so a folder of uploads
+/// costs one probe of the key, not one per asset.
+#[tokio::test]
+async fn a_settled_permission_refusal_is_not_probed_again_for_each_upload() {
+    let server = MockImmich::start().await;
+    server.set_api_key("test-key");
+    // The upload permission is granted, so the items upload: the tag alone is
+    // refused, which is the state the run has to remember.
+    server.set_api_key_permissions(&["asset.upload", "tag.create", "tag.asset"]);
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+    add_folder(&store, &photos);
+
+    let session = signed_in_with(&server, AuthMethod::ApiKey, "test-key").await;
+    let engine =
+        Arc::new(Engine::new(store.clone(), session, tagged_config()).expect("build the engine"));
+    engine.start();
+    assert!(
+        wait_until(
+            || engine.tag_status().problem.is_some(),
+            Duration::from_secs(10)
+        )
+        .await,
+        "R3.7: the start did not settle the key's refusal"
+    );
+    let reads = server.api_key_me_requests();
+    assert_eq!(
+        reads, 1,
+        "R3.7: the start probe is the run's one permission read"
+    );
+
+    let first = write_file(&photos, "first.jpg", b"refused first");
+    engine.sync_now();
+    assert!(
+        wait_until(|| succeeded(&store, &first), Duration::from_secs(20)).await,
+        "the first upload did not finish"
+    );
+    let second = write_file(&photos, "second.jpg", b"refused second");
+    engine.sync_now();
+    assert!(
+        wait_until(|| succeeded(&store, &second), Duration::from_secs(20)).await,
+        "the second upload did not finish"
+    );
+    // Each tag call runs right after its own item settles, on the same worker.
+    // The short window is what lets a repeated probe show up here instead of
+    // after the assertions.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        server.api_key_me_requests(),
+        reads,
+        "R3.7: a settled refusal is replayed, so two uploads cost no second probe"
+    );
+    assert!(
+        server.upsert_calls().is_empty(),
+        "R3.7: the refused key creates no tag: {:?}",
+        server.upsert_calls()
+    );
+    assert!(
+        server.tag_asset_calls().is_empty(),
+        "R3.7: the refused key tags no asset"
+    );
+    engine.stop();
+}

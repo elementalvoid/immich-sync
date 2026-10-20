@@ -12,7 +12,9 @@
 //! item's state: a tag failure never parks a successful upload (R3.7). One tag
 //! id is cached for the run, so the upsert runs once and a tag the user deleted
 //! in Immich is created again on the next run - or on the next attempt after a
-//! failure, because a tag failure clears the cache.
+//! failure, because a tag failure clears the cache. An API key that lacks a
+//! permission is refused once per run: the rest of the uploads replay that
+//! refusal instead of probing the key again.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,7 +37,9 @@ const REQUIRED_PERMISSIONS: [&str; 3] = ["tag.create", "tag.asset", "asset.updat
 /// What the Settings section shows about the sync tag (R3.7).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TagStatus {
-    /// Whether the running engine is applying the tag.
+    /// Whether the switch is on (R3.7). It is the setting, not whether the tag
+    /// is landing: it stays true while the API key is missing a permission and
+    /// nothing is applied.
     pub enabled: bool,
     /// Why the tag is not being applied, or why the last attempt failed.
     pub problem: Option<String>,
@@ -47,11 +51,11 @@ pub enum TagError {
     /// A request the tag needs was refused or could not be sent (R6.3).
     #[error(transparent)]
     Client(#[from] ClientError),
-    /// The API key is missing a permission the tag needs (R3.7).
-    #[error("the API key is missing the {permission} permission")]
+    /// The API key is missing permissions the tag needs (R3.7).
+    #[error("the API key is missing these permissions: {}", permissions.join(", "))]
     MissingPermission {
-        /// The permission the key lacks, as Immich names it.
-        permission: &'static str,
+        /// The permissions the key lacks, as Immich names them.
+        permissions: Vec<&'static str>,
     },
 }
 
@@ -73,6 +77,9 @@ pub struct Tagger {
     enabled: AtomicBool,
     /// Why the tag is not working, for the Settings section (R3.7).
     problem: Mutex<Option<String>>,
+    /// The permissions an API key was already refused, so the rest of the run
+    /// replays the refusal instead of probing the key for every asset (R3.7).
+    refused: Mutex<Option<Vec<&'static str>>>,
 }
 
 impl Tagger {
@@ -85,15 +92,21 @@ impl Tagger {
             tag_id: AsyncMutex::new(None),
             enabled: AtomicBool::new(false),
             problem: Mutex::new(None),
+            refused: Mutex::new(None),
         }
     }
 
     /// Turns the feature on or off and reports whether that changed it (R3.7).
     ///
     /// Turning it off stops new tagging. Assets that already carry the tag keep
-    /// it, and the tag itself is not deleted.
+    /// it, and the tag itself is not deleted. Either way the user made a new
+    /// decision, so the next resolve probes the key again.
     pub fn set_enabled(&self, enabled: bool) -> bool {
-        self.enabled.swap(enabled, Ordering::SeqCst) != enabled
+        if self.enabled.swap(enabled, Ordering::SeqCst) == enabled {
+            return false;
+        }
+        *self.refused.lock().expect("the tag refusal lock") = None;
+        true
     }
 
     /// Whether the feature is on right now.
@@ -120,7 +133,10 @@ impl Tagger {
         if !self.enabled() {
             return;
         }
-        self.record(&self.resolve().await.map(|_| ()));
+        // A new run or a new toggle probes the key, whatever the last one
+        // settled on.
+        *self.refused.lock().expect("the tag refusal lock") = None;
+        self.record(&self.resolve().await.map(|_| ()), None);
     }
 
     /// Adds the sync tag to one settled asset (R3.7).
@@ -137,9 +153,24 @@ impl Tagger {
         if !self.enabled() {
             return Ok(());
         }
+        // An API key's permissions do not change within a run, so one settled
+        // refusal is the answer for every later asset: it is replayed instead
+        // of probing the key and warning again (R3.7).
+        if let Some(refusal) = self.refusal() {
+            return Err(refusal);
+        }
         let outcome = self.apply(asset_id).await;
-        self.record(&outcome);
+        self.record(&outcome, Some(asset_id));
         outcome
+    }
+
+    /// The refusal the key already settled on, if any (R3.7).
+    fn refusal(&self) -> Option<TagError> {
+        self.refused
+            .lock()
+            .expect("the tag refusal lock")
+            .clone()
+            .map(|permissions| TagError::MissingPermission { permissions })
     }
 
     /// Applies the tag and drops the cached id when the call fails: a refused
@@ -210,18 +241,23 @@ impl Tagger {
                 async move { client.api_key_permissions(credential.auth()).await }
             })
             .await?;
-        match missing_permission(&key.permissions) {
-            Some(permission) => Err(TagError::MissingPermission { permission }),
-            None => Ok(()),
+        match missing_permissions(&key.permissions) {
+            permissions if permissions.is_empty() => Ok(()),
+            permissions => Err(TagError::MissingPermission { permissions }),
         }
     }
 
     /// Records the newest outcome for Settings, and logs a failure with its
     /// reason (R3.7, R10.3).
-    fn record(&self, outcome: &Result<(), TagError>) {
+    fn record(&self, outcome: &Result<(), TagError>, asset_id: Option<&str>) {
         let problem = outcome.as_ref().err().map(ToString::to_string);
+        if let Err(TagError::MissingPermission { permissions }) = outcome {
+            // The rest of the run replays this instead of asking again (R3.7).
+            *self.refused.lock().expect("the tag refusal lock") = Some(permissions.clone());
+        }
         if let Some(problem) = &problem {
             tracing::warn!(
+                asset_id,
                 reason = %problem,
                 "R3.7: the sync tag was not applied; the upload stands"
             );
@@ -230,20 +266,21 @@ impl Tagger {
     }
 }
 
-/// The first permission an API key needs for the sync tag and does not hold
-/// (R3.7).
+/// The permissions an API key needs for the sync tag and does not hold
+/// (R3.7), in the order of the requests.
 ///
 /// Immich's `all` grants every permission, so a key holding it is missing
-/// nothing. The order is the order of the requests: the upsert needs
-/// `tag.create`, the tagging call needs `tag.asset` and `asset.update`.
+/// nothing. Immich's key editor sets its permissions together, so one message
+/// names them all rather than making the user grant them one run at a time.
 #[must_use]
-fn missing_permission(granted: &[String]) -> Option<&'static str> {
+fn missing_permissions(granted: &[String]) -> Vec<&'static str> {
     if granted.iter().any(|permission| permission == "all") {
-        return None;
+        return Vec::new();
     }
     REQUIRED_PERMISSIONS
         .into_iter()
-        .find(|needed| !granted.iter().any(|permission| permission == *needed))
+        .filter(|needed| !granted.iter().any(|permission| permission == needed))
+        .collect()
 }
 
 #[cfg(test)]
@@ -259,28 +296,43 @@ mod tests {
 
     #[test]
     fn a_key_holding_all_is_missing_nothing() {
-        assert_eq!(missing_permission(&granted(&["all"])), None);
+        assert!(missing_permissions(&granted(&["all"])).is_empty());
     }
 
     #[test]
     fn a_key_with_the_three_permissions_is_missing_nothing() {
-        assert_eq!(
-            missing_permission(&granted(&["tag.create", "tag.asset", "asset.update"])),
-            None
+        assert!(
+            missing_permissions(&granted(&["tag.create", "tag.asset", "asset.update"])).is_empty()
         );
     }
 
     #[test]
-    fn the_first_missing_permission_is_the_one_named() {
+    fn every_missing_permission_is_named_in_request_order() {
         // Immich's `all` is the only value that covers the others; without it
-        // each permission is named alone.
+        // each missing permission is named, in the order the requests need
+        // them.
         assert_eq!(
-            missing_permission(&granted(&["asset.update", "tag.asset"])),
-            Some("tag.create")
+            missing_permissions(&granted(&["asset.update", "tag.asset"])),
+            vec!["tag.create"]
         );
         assert_eq!(
-            missing_permission(&granted(&["tag.create", "tag.asset"])),
-            Some("asset.update")
+            missing_permissions(&granted(&["tag.create", "tag.asset"])),
+            vec!["asset.update"]
+        );
+        assert_eq!(
+            missing_permissions(&granted(&["asset.upload"])),
+            vec!["tag.create", "tag.asset", "asset.update"]
+        );
+    }
+
+    #[test]
+    fn the_message_names_every_missing_permission() {
+        let error = TagError::MissingPermission {
+            permissions: vec!["tag.create", "asset.update"],
+        };
+        assert_eq!(
+            error.to_string(),
+            "the API key is missing these permissions: tag.create, asset.update"
         );
     }
 }
