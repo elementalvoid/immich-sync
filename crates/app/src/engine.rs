@@ -593,7 +593,7 @@ impl EngineModel {
         }
     }
 
-    /// Adds a source folder and starts discovering it (R2.1).
+    /// Adds or edits a source folder and starts discovering it (R2.1).
     pub fn add_folder(&mut self, path: String, recursive: bool, cx: &mut Context<Self>) {
         let path = path.trim().to_string();
         if path.is_empty() {
