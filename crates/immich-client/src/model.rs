@@ -229,6 +229,27 @@ pub(crate) struct AssetCopyRequest<'a> {
     pub(crate) stack: bool,
 }
 
+/// The `PUT /tags` request body (R3.7).
+///
+/// Immich's upsert takes tag names, not ids: a name the account already has
+/// comes back unchanged with its id, and a name it does not have is created.
+#[derive(Serialize)]
+pub(crate) struct TagUpsertRequest<'a> {
+    pub(crate) tags: &'a [String],
+}
+
+/// One tag the `PUT /tags` answer carries (R3.7).
+///
+/// The response is Immich's `TagResponseDto`, whose `value` is the full path of
+/// a nested tag. The client asks for a flat name, so this reads the `id` of the
+/// entry whose `name` it asked for.
+#[derive(Deserialize)]
+pub(crate) struct TagUpsertBody {
+    pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) name: String,
+}
+
 /// The `PUT /tags/assets` request body (R4.2).
 #[derive(Serialize)]
 pub(crate) struct BulkTagRequest<'a> {
