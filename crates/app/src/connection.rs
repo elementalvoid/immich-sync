@@ -46,7 +46,9 @@ pub(crate) const STORE_OPENING: &str = "The state database is still opening.";
 /// This is the one shape behind every worker-backed edit: the bounded result
 /// channel, `runtime.spawn` for the work, and `cx.spawn` for the result. `apply`
 /// keeps its caller's generation check; the caller reports a runtime that could
-/// not start, because each model names that failure in its own place.
+/// not start, because each model names that failure in its own place. A worker
+/// that drops its answer (a panic) runs no `apply` and the caller hears nothing,
+/// so a caller that must not wait forever uses [`run_on_worker_or_lost`].
 ///
 /// # Errors
 ///
@@ -63,17 +65,47 @@ where
     Work: FnOnce() -> Fut + Send + 'static,
     Apply: FnOnce(&mut T, R, &mut Context<T>) + 'static,
 {
+    run_on_worker_or_lost(cx, work, apply, |_, _| {})
+}
+
+/// Runs `work` on the shared HTTP runtime and applies its result on the UI
+/// thread, or runs `lost` when the worker dropped the answer instead.
+///
+/// A panicking worker takes the result channel down with it, so the answer can
+/// never arrive. `lost` is how a caller that a user is waiting on (a dialog)
+/// stops waiting: the caller records its own reason, because the worker is gone
+/// before it could name one.
+///
+/// # Errors
+///
+/// Returns the reason [`worker`] gave when the runtime could not start.
+pub(crate) fn run_on_worker_or_lost<T, R, Fut, Work, Apply, Lost>(
+    cx: &mut Context<T>,
+    work: Work,
+    apply: Apply,
+    lost: Lost,
+) -> Result<(), String>
+where
+    T: 'static,
+    R: Send + 'static,
+    Fut: std::future::Future<Output = R> + Send + 'static,
+    Work: FnOnce() -> Fut + Send + 'static,
+    Apply: FnOnce(&mut T, R, &mut Context<T>) + 'static,
+    Lost: FnOnce(&mut T, &mut Context<T>) + 'static,
+{
     let runtime = worker()?;
     let (results, incoming) = async_channel::bounded(1);
     runtime.spawn(async move {
         let result = work().await;
         let _ = results.send(result).await;
     });
-    cx.spawn(async move |this, cx| {
-        let Ok(result) = incoming.recv().await else {
-            return;
-        };
-        let _ = this.update(cx, |model, cx| apply(model, result, cx));
+    cx.spawn(async move |this, cx| match incoming.recv().await {
+        Ok(result) => {
+            let _ = this.update(cx, |model, cx| apply(model, result, cx));
+        }
+        Err(_) => {
+            let _ = this.update(cx, |model, cx| lost(model, cx));
+        }
     })
     .detach();
     Ok(())
@@ -401,6 +433,42 @@ mod tests {
     use std::time::Duration;
     use sync_core::connection::{Attention, AuthMethod, ConnectionState, Secret, SignIn};
     use sync_core::credential::{MemoryCredentialStore, SharedCredentialStore};
+
+    /// #40 (S1): a worker that drops its answer must still report to its
+    /// model, or a dialog that waits for the answer waits forever.
+    #[gpui_kit::test]
+    async fn a_dropped_answer_runs_the_lost_arm_and_applies_nothing(cx: &mut TestAppContext) {
+        #[derive(Default)]
+        struct Recorder {
+            applied: usize,
+            lost: usize,
+        }
+
+        let model = cx.update(|cx| cx.new(|_| Recorder::default()));
+        // The work runs on the shared HTTP runtime, a real thread.
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            model.update(cx, |_, cx| {
+                super::run_on_worker_or_lost(
+                    cx,
+                    || async { panic!("the worker dropped this answer") },
+                    |recorder: &mut Recorder, (): (), _| recorder.applied += 1,
+                    |recorder: &mut Recorder, _| recorder.lost += 1,
+                )
+                .expect("the worker runtime starts in tests")
+            });
+        });
+
+        wait_until(cx, |cx| model.read(cx).lost == 1).await;
+        cx.read(|cx| {
+            assert_eq!(model.read(cx).lost, 1, "the lost arm runs once");
+            assert_eq!(
+                model.read(cx).applied,
+                0,
+                "an answer that never arrived applies nothing"
+            );
+        });
+    }
 
     /// Starts the offline Immich double on its own runtime.
     fn mock_server() -> (tokio::runtime::Runtime, mock_immich::MockImmich) {

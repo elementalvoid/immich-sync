@@ -17,7 +17,8 @@ use sync_core::store::{
 };
 
 use crate::connection::{
-    ConnectionModel, STORE_OPENING, WORKER_UNAVAILABLE, run_on_worker, worker,
+    ConnectionModel, STORE_OPENING, WORKER_UNAVAILABLE, run_on_worker, run_on_worker_or_lost,
+    worker,
 };
 use crate::folder_panel::{ALREADY_ADDED, already_tracked, confirmed};
 use crate::paths::AppPaths;
@@ -692,7 +693,7 @@ impl EngineModel {
         let request = self.add_generation;
         let engine = self.engine.clone();
         let store = self.store_model.read(cx).store();
-        let result = run_on_worker(
+        let result = run_on_worker_or_lost(
             cx,
             move || async move {
                 // N2: the filesystem probe and the store write belong on the
@@ -755,17 +756,26 @@ impl EngineModel {
                 model.refresh_status(cx);
                 cx.notify();
             },
+            move |model, cx| model.folder_add_lost(request, cx),
         );
         if result.is_err() {
-            let problem = WORKER_UNAVAILABLE.to_string();
-            self.problem = Some(problem.clone());
-            self.folder_add = Some(FolderAddResult {
-                request,
-                problem: Some(problem),
-            });
-            cx.notify();
+            self.folder_add_lost(request, cx);
         }
         request
+    }
+
+    /// Records a setup-dialog add whose worker answer never arrived (#40).
+    ///
+    /// The dialog waits for its own request, so a lost answer would leave it
+    /// waiting with Cancel refused. The reason is the runtime that is gone, and
+    /// it belongs to the dialog: it names what the add could not do, the same
+    /// way a refusal does.
+    pub(crate) fn folder_add_lost(&mut self, request: u64, cx: &mut Context<Self>) {
+        self.folder_add = Some(FolderAddResult {
+            request,
+            problem: Some(WORKER_UNAVAILABLE.to_string()),
+        });
+        cx.notify();
     }
 
     /// Removes a source folder; its items stay in the store (R2.1).

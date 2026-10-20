@@ -1,10 +1,10 @@
 //! The folder panel: one source folder's settings, confirmed before it syncs
-//! (#40), and the shell the folder detail reuses (#43).
+//! (#40).
 //!
 //! The panel owns the draft, the reason the last Add did not write, and the
-//! modal host the folder detail will reuse. The dashboard owns which panel is
-//! open: it creates one when the add field or Browse asks for setup, and drops
-//! it when the panel reports that the folder was added or the user cancelled.
+//! modal host. The dashboard owns which panel is open: it creates one when the
+//! add field or Browse asks for setup, and drops it when the panel reports that
+//! the folder was added or the user cancelled.
 
 use std::path::Path;
 
@@ -92,9 +92,8 @@ pub(crate) fn already_tracked(folders: &[SourceFolder], path: &Path, case: PathC
 
 /// Which lifecycle the panel shows.
 ///
-/// The setup dialog is the draft. The folder detail (#43) adds the live mode
-/// to this enum and its own footer; the path, the three settings, and the
-/// modal host below are shared.
+/// The setup dialog is the draft. The path, the three settings, and the modal
+/// host below are shared with any later folder mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FolderPanelMode {
     /// A folder that is not tracked yet: Add records the draft and Cancel
@@ -172,7 +171,7 @@ impl FolderPanel {
     ///
     /// One request at a time: a second Add while the first is in flight is
     /// ignored, so a slow store cannot write the folder twice.
-    fn add(&mut self, cx: &mut Context<Self>) {
+    fn add(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.pending.is_some() {
             return;
         }
@@ -181,14 +180,20 @@ impl FolderPanel {
         let engine = self.engine.clone();
         let request = engine.update(cx, |engine, cx| engine.add_folder_settings(draft, cx));
         self.pending = Some(request);
+        // Cancel is disabled while the request runs, and a disabled control
+        // drops focus to the window root, which would stop the modal host
+        // receiving Escape. Keep the host focused so the dialog stays
+        // cancellable from the keyboard.
+        window.focus(&self.focus, cx);
         // A failed worker reports synchronously, before `pending` was set;
         // read the result back so that failure cannot be missed.
         self.engine_changed(&engine, cx);
         cx.notify();
     }
 
-    /// Cancels the draft. While an Add is in flight this is a no-op: the write
-    /// will land, so the dialog waits for the result instead of stranding it.
+    /// Cancels the draft. While an Add is in flight this is a no-op: its result
+    /// (a written folder or a refusal) must be shown, so the dialog waits for
+    /// it instead of closing under it.
     fn cancel(&mut self, cx: &mut Context<Self>) {
         if self.pending.is_some() {
             return;
@@ -339,7 +344,7 @@ impl FolderPanel {
                     .primary()
                     .label("Add")
                     .accessibility_label("Add the folder")
-                    .on_click(cx.listener(|this, _, _, cx| this.add(cx))),
+                    .on_click(cx.listener(|this, _, window, cx| this.add(window, cx))),
             )
     }
 
@@ -430,6 +435,7 @@ mod tests {
     // GPUI's glob imports its own `test` macro, so this module names what it
     // uses and keeps Rust's `#[test]`.
     use super::{PathProbe, already_tracked, confirmed, path_problem, probe};
+    use gpui_kit::TestAppContext;
     use std::path::Path;
     use sync_core::paths::PathCase;
     use sync_core::store::{AlbumScope, SourceFolder};
@@ -563,5 +569,84 @@ mod tests {
             Path::new(&win("Pictures/Other")),
             PathCase::Insensitive
         ));
+    }
+
+    /// #40 (S1): a worker answer that never arrives must not strand the setup
+    /// dialog. The panel stops waiting and shows the reason, so Cancel is no
+    /// longer refused and the dialog can be closed.
+    #[gpui_kit::test]
+    fn a_lost_worker_answer_ends_the_pending_add(cx: &mut TestAppContext) {
+        use crate::connection::{ConnectionModel, WORKER_UNAVAILABLE};
+        use crate::engine::EngineModel;
+        use crate::paths::AppPaths;
+        use crate::store::StoreModel;
+        use gpui_kit::test::TestWindowExt as _;
+        use gpui_kit::{AppContext as _, Bounds, Point, WindowBounds, WindowOptions, px, size};
+        use std::sync::Arc;
+        use sync_core::connection::ServerProfile;
+        use sync_core::credential::{MemoryCredentialStore, SharedCredentialStore};
+
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let paths = AppPaths {
+            config_file: temp.path().join("config").join("settings.toml"),
+            state_db: temp.path().join("data").join("state.db"),
+            autostart_dir: temp.path().join("config").join("autostart"),
+        };
+        // The add runs on the shared HTTP runtime, a real thread.
+        cx.executor().allow_parking();
+        let credentials: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+        let (window, panel, engine) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            let connection =
+                cx.new(|_| ConnectionModel::new(ServerProfile::default(), credentials));
+            let store = cx.new(|cx| StoreModel::open(&paths, cx));
+            let engine = cx.new(|cx| EngineModel::new(connection, store, &paths, cx));
+            let panel = cx.new(|cx| {
+                super::FolderPanel::setup(engine.clone(), "/no such folder".to_string(), cx)
+            });
+            let root = panel.clone();
+            let (window, _root) = gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Point::default(),
+                        size: size(px(1200.), px(800.)),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |_, _| root,
+            )
+            .expect("open the panel's window");
+            (window, panel, engine)
+        });
+
+        // Add starts a request and this test drops its answer, as a panicking
+        // worker drops it. Both happen in one update, so the real answer cannot
+        // land in between.
+        cx.update_window(window, |_, window, cx| {
+            panel.update(cx, |panel, cx| panel.add(window, cx));
+            let request = panel.read(cx).pending.expect("Add waits for its answer");
+            engine.update(cx, |engine, cx| engine.folder_add_lost(request, cx));
+        })
+        .expect("add and then lose the answer");
+
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                panel.read(cx).pending.is_none(),
+                "#40: a lost answer ends the wait instead of stranding the dialog"
+            );
+            assert_eq!(
+                window.find("folder-panel-problem").label(),
+                Some(WORKER_UNAVAILABLE),
+                "#40: the dialog shows why nothing was written"
+            );
+            assert_eq!(
+                engine.read(cx).problem(),
+                None,
+                "#40: the reason belongs to the dialog, not the engine"
+            );
+        })
+        .expect("read the dialog after the lost answer");
     }
 }

@@ -1299,8 +1299,16 @@ async fn cancel_while_an_add_is_pending_leaves_the_dialog_and_the_write(cx: &mut
 
     cx.update_window(window, |_, window, cx| {
         open_setup_through_the_field(window, &path, cx);
-        // Add and Cancel in one update: the worker cannot have answered yet.
+        // Focus Cancel, then press Add with the mouse: Cancel is disabled once
+        // the write runs, and the modal must keep the keyboard (Escape and the
+        // focus trap) instead of dropping focus to the window root.
+        tab_to(window, "folder-panel-cancel", cx);
         add_in_setup(window, cx);
+        assert_eq!(
+            window.find("folder-panel-trap").focused(),
+            Some(true),
+            "#40: a pending Add leaves focus on the modal host, which owns Escape"
+        );
         window.click("folder-panel-cancel", cx);
         window.press("escape", cx);
     })
