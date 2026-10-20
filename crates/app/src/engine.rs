@@ -751,7 +751,6 @@ impl EngineModel {
                     Ok(None) => None,
                     Err(problem) => Some(problem),
                 };
-                model.problem = problem.clone();
                 model.folder_add = Some(FolderAddResult { request, problem });
                 model.refresh_status(cx);
                 cx.notify();

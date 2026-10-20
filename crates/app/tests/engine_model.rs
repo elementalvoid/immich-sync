@@ -1198,4 +1198,9 @@ async fn an_add_before_the_store_opens_reports_that_reason(cx: &mut TestAppConte
         cx.read(|cx| store.read(cx).folders().is_empty()),
         "#40: a store-opening add writes nothing"
     );
+    assert_eq!(
+        cx.read(|cx| engine.read(cx).problem().map(str::to_string)),
+        None,
+        "#40: a refused add is the dialog's reason, not an engine problem"
+    );
 }
