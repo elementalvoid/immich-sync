@@ -11,14 +11,28 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use gpui_kit::*;
 use sync_core::store::{FolderCounts, SourceFolder, StateStore, StoreError};
+use sync_core::tracking::Tracking;
 
 use crate::paths::AppPaths;
+
+/// What a fresh store hands the model: the database, the folders and decisions
+/// over it, and the folder list with its counts.
+struct OpenedStore {
+    store: Arc<StateStore>,
+    tracking: Arc<Tracking>,
+    folders: Vec<SourceFolder>,
+    counts: Vec<FolderCounts>,
+}
 
 /// The state database, once it opened, and the folders it holds.
 pub struct StoreModel {
     /// The resolved paths, so a rebuild knows which file to replace.
     paths: AppPaths,
     store: Option<Arc<StateStore>>,
+    /// The folders and review decisions, over the same store. It exists as
+    /// soon as the store does, so a signed-out edit writes through the same
+    /// module a running engine uses.
+    tracking: Option<Arc<Tracking>>,
     folders: Vec<SourceFolder>,
     /// The last known counts per folder, in the same order as `folders`.
     counts: Vec<FolderCounts>,
@@ -42,6 +56,8 @@ impl StoreModel {
         let opened = cx.background_executor().spawn(async move {
             match StateStore::open(&path) {
                 Ok(store) => {
+                    let store = Arc::new(store);
+                    let tracking = Arc::new(Tracking::new(Arc::clone(&store)));
                     // The folder list and its counts are read here, off the UI
                     // thread, so the first dashboard frame is populated (N2).
                     match store.folders() {
@@ -50,7 +66,12 @@ impl StoreModel {
                                 .iter()
                                 .map(|folder| store.folder_counts(&folder.path).unwrap_or_default())
                                 .collect();
-                            Ok((Arc::new(store), folders, counts))
+                            Ok(OpenedStore {
+                                store,
+                                tracking,
+                                folders,
+                                counts,
+                            })
                         }
                         Err(error) => Err(error.to_string()),
                     }
@@ -63,10 +84,11 @@ impl StoreModel {
             let _ = this.update(cx, |model, cx| {
                 model.opening = false;
                 match opened {
-                    Ok((store, folders, counts)) => {
-                        model.store = Some(store);
-                        model.folders = folders;
-                        model.counts = counts;
+                    Ok(opened) => {
+                        model.store = Some(opened.store);
+                        model.tracking = Some(opened.tracking);
+                        model.folders = opened.folders;
+                        model.counts = opened.counts;
                         model.problem = None;
                         model.generation = model.generation.wrapping_add(1);
                     }
@@ -79,6 +101,7 @@ impl StoreModel {
         Self {
             paths: paths.clone(),
             store: None,
+            tracking: None,
             folders: Vec::new(),
             counts: Vec::new(),
             problem: None,
@@ -105,6 +128,7 @@ impl StoreModel {
         }
         let path = self.paths.state_db.clone();
         let previous = self.store.take();
+        let previous_tracking = self.tracking.take();
         let fallback = self.folders.clone();
         self.counts.clear();
         let rebuilt = cx.background_executor().spawn(async move {
@@ -115,19 +139,21 @@ impl StoreModel {
                 .as_ref()
                 .and_then(|store| store.folders().ok())
                 .unwrap_or(fallback);
-            // Drop this handle first: on Windows an open database file cannot
+            // Drop both handles first: on Windows an open database file cannot
             // be removed, and the rebuild must replace it.
             drop(previous);
+            drop(previous_tracking);
             rebuild_store(&path, &folders)
         });
         cx.spawn(async move |this, cx| {
             let rebuilt = rebuilt.await;
             let _ = this.update(cx, |model, cx| {
                 match rebuilt {
-                    Ok((store, folders, counts)) => {
-                        model.store = Some(store);
-                        model.folders = folders;
-                        model.counts = counts;
+                    Ok(opened) => {
+                        model.store = Some(opened.store);
+                        model.tracking = Some(opened.tracking);
+                        model.folders = opened.folders;
+                        model.counts = opened.counts;
                         model.problem = None;
                     }
                     Err(error) => model.problem = Some(format!("{error:#}")),
@@ -146,6 +172,12 @@ impl StoreModel {
     #[must_use]
     pub fn store(&self) -> Option<Arc<StateStore>> {
         self.store.clone()
+    }
+
+    /// The folders and review decisions, once the store opened.
+    #[must_use]
+    pub fn tracking(&self) -> Option<Arc<Tracking>> {
+        self.tracking.clone()
     }
 
     /// Whether the first open has finished, successfully or not.
@@ -175,7 +207,16 @@ impl StoreModel {
             .map(|folder| {
                 self.folders
                     .iter()
-                    .position(|old| old.path == folder.path)
+                    .position(|old| {
+                        // R2.4: the cache must keep a folder's counts across a
+                        // re-add that spells the path differently, the same
+                        // comparison the tracking write made.
+                        sync_core::paths::equal(
+                            Path::new(&old.path),
+                            Path::new(&folder.path),
+                            sync_core::paths::PathCase::for_platform(),
+                        )
+                    })
                     .and_then(|index| self.counts.get(index).copied())
                     .unwrap_or_default()
             })
@@ -259,10 +300,7 @@ impl StoreModel {
 ///
 /// A file the integrity check refuses cannot be migrated, so the rebuild is the
 /// one path that removes it and opens a fresh database.
-fn rebuild_store(
-    path: &Path,
-    folders: &[SourceFolder],
-) -> anyhow::Result<(Arc<StateStore>, Vec<SourceFolder>, Vec<FolderCounts>)> {
+fn rebuild_store(path: &Path, folders: &[SourceFolder]) -> anyhow::Result<OpenedStore> {
     let store = match StateStore::open(path) {
         Ok(store) => store,
         // Only a real corruption verdict justifies removing the file: a
@@ -291,12 +329,19 @@ fn rebuild_store(
             .add_folder(folder)
             .context("restore a source folder")?;
     }
+    let store = Arc::new(store);
+    let tracking = Arc::new(Tracking::new(Arc::clone(&store)));
     let folders = store.folders().context("read the restored folders")?;
     let counts = folders
         .iter()
         .map(|folder| store.folder_counts(&folder.path).unwrap_or_default())
         .collect();
-    Ok((Arc::new(store), folders, counts))
+    Ok(OpenedStore {
+        store,
+        tracking,
+        folders,
+        counts,
+    })
 }
 
 /// Removes the database file and its WAL sidecars.
@@ -325,7 +370,7 @@ fn remove_state_files(path: &Path) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::rebuild_store;
+    use super::{OpenedStore, rebuild_store};
     use sync_core::store::{AlbumScope, SourceFolder, StoreError};
 
     fn folder(path: &str) -> SourceFolder {
@@ -345,8 +390,12 @@ mod tests {
         let path = temp.path().join("state.db");
         let folders = vec![folder("/photos")];
 
-        let (store, restored, counts) =
-            rebuild_store(&path, &folders).expect("the rebuild creates the database");
+        let OpenedStore {
+            store,
+            folders: restored,
+            counts,
+            ..
+        } = rebuild_store(&path, &folders).expect("the rebuild creates the database");
 
         assert_eq!(restored, folders, "the folder choices come back");
         assert_eq!(counts.len(), 1, "the restored folder is counted");
@@ -368,8 +417,11 @@ mod tests {
         std::fs::write(&path, b"this is not a SQLite database").expect("write garbage");
         let folders = vec![folder("/photos")];
 
-        let (store, restored, _) =
-            rebuild_store(&path, &folders).expect("the rebuild replaces a corrupt database");
+        let OpenedStore {
+            store,
+            folders: restored,
+            ..
+        } = rebuild_store(&path, &folders).expect("the rebuild replaces a corrupt database");
 
         assert_eq!(
             restored, folders,
@@ -388,7 +440,9 @@ mod tests {
         let path = temp.path().join("state.db");
         std::fs::create_dir_all(&path).expect("put a directory where the database goes");
 
-        let error = rebuild_store(&path, &[]).expect_err("a directory is not a database");
+        let error = rebuild_store(&path, &[])
+            .err()
+            .expect("a directory is not a database");
 
         assert!(
             matches!(

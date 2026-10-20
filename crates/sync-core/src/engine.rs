@@ -44,6 +44,7 @@ use crate::store::{
     AlbumScope, AttemptOutcome, AttemptRecord, FailedItem, FolderCounts, ItemRecord, ItemState,
     ReviewDecision, ReviewItem, SourceFolder, StateStore, StoreError,
 };
+use crate::tracking::{Observer, Tracking, TrackingError, stored_folder};
 use crate::upload::{
     CheckOutcome, PreparedItem, UploadFailure, UploadGate, UploadOutcome, Uploader, check_outcome,
     hash_in_background, pending_sidecar,
@@ -144,6 +145,16 @@ pub enum EngineError {
     /// The path is not one of this engine's source folders.
     #[error("{0} is not a source folder of this client")]
     UnknownFolder(String),
+}
+
+impl From<TrackingError> for EngineError {
+    fn from(error: TrackingError) -> Self {
+        match error {
+            TrackingError::Store(error) => Self::Store(error),
+            TrackingError::EmptyFolder => Self::EmptyFolder,
+            TrackingError::UnknownFolder(path) => Self::UnknownFolder(path),
+        }
+    }
 }
 
 /// Why a deletion-review decision could not be recorded (R5.3, R5.5).
@@ -297,24 +308,30 @@ struct EngineInner {
 pub struct Engine {
     inner: Arc<EngineInner>,
     queue_rx: Mutex<Option<mpsc::UnboundedReceiver<PathBuf>>>,
+    /// The folders and review decisions this engine follows.
+    tracking: Arc<Tracking>,
+    /// The engine's own observer, so a stop detaches this one and no other.
+    observer: Arc<dyn Observer>,
 }
 
 impl Engine {
-    /// Builds the engine over the open state store and a live session.
+    /// Builds the engine over the shared tracking module and a live session.
     ///
     /// The queue is re-seeded with what a previous run left unfinished
     /// (R6.7); completed rows are never re-queued. The folders and their
     /// counts are read once here, so the dashboard has live data from the
-    /// first frame.
+    /// first frame. The engine attaches its observer immediately, so a folder
+    /// edit that lands while the engine starts still reaches it.
     ///
     /// # Errors
     ///
     /// Returns a [`StoreError`] when the folders or the queue cannot be read.
     pub fn new(
-        store: Arc<StateStore>,
+        tracking: Arc<Tracking>,
         session: SharedSession,
         config: EngineConfig,
     ) -> Result<Self, StoreError> {
+        let store = Arc::clone(tracking.store());
         // Re-queue what a previous run left unfinished before the counts are
         // read, so a row this run will work on is not seeded as parked (R6.7):
         // a `retry_wait` row otherwise counts as failed and then becomes
@@ -373,9 +390,15 @@ impl Engine {
             reconcile: Notify::new(),
             index_cache: Mutex::new(FolderIndex::default()),
         });
+        let observer: Arc<dyn Observer> = Arc::new(EngineObserver {
+            inner: Arc::downgrade(&inner),
+        });
+        tracking.attach(Arc::clone(&observer));
         Ok(Self {
             inner,
             queue_rx: Mutex::new(Some(queue_rx)),
+            tracking,
+            observer,
         })
     }
 
@@ -555,114 +578,15 @@ impl Engine {
 
     /// Adds a source folder and scans it (R2.1).
     ///
+    /// The folder row belongs to the tracking module; this engine hears about
+    /// the change through its observer, which installs the watch and asks for
+    /// a scan.
+    ///
     /// # Errors
     ///
     /// Returns [`EngineError`] when the path is blank or the store refuses it.
     pub fn add_folder(&self, path: &str, recursive: bool) -> Result<(), EngineError> {
-        let path = path.trim();
-        if path.is_empty() {
-            return Err(EngineError::EmptyFolder);
-        }
-        // R3.4: the store's upsert writes every column, so re-adding a folder
-        // (the app's recursive toggle does) must carry the album fields the
-        // folder already holds. A hardcoded `false` silently unmapped a folder
-        // the user had mapped, and the loss only showed after a restart. A
-        // brand-new folder still starts unmapped; the config window opts it in
-        // on purpose.
-        //
-        // The lock is held across the lookup and the upsert: a near-simultaneous
-        // album edit would otherwise slip between them and the re-add would
-        // write back the row it read before the edit. For a folder this engine
-        // already holds, that row is taken from the in-memory entry, which the
-        // album edits keep current; a folder new to this engine has no live
-        // entry and starts from the stored row.
-        let key = path_key(Path::new(path));
-        let mut folders = self.inner.folders.lock().expect("the folder lock");
-        let live = folders
-            .iter()
-            .find(|entry| path_key(Path::new(&entry.folder.path)) == key);
-        let (album_mapping, album_scope) = match live {
-            Some(entry) => (entry.folder.album_mapping, entry.folder.album_scope),
-            None => {
-                let stored = self
-                    .inner
-                    .store
-                    .folders()?
-                    .into_iter()
-                    .find(|folder| path_key(Path::new(&folder.path)) == key);
-                (
-                    stored.as_ref().is_some_and(|folder| folder.album_mapping),
-                    stored.map_or_else(AlbumScope::default, |folder| folder.album_scope),
-                )
-            }
-        };
-        let folder = SourceFolder {
-            path: path.to_string(),
-            recursive,
-            album_mapping,
-            album_scope,
-        };
-        self.inner.store.add_folder(&folder)?;
-        // R8.1: a folder new to this engine starts from what the store already
-        // holds for it; a zeroed card would never fill, because the rows are
-        // settled and `prepare` does not count them again.
-        if let Some(entry) = folders
-            .iter_mut()
-            .find(|entry| path_key(Path::new(&entry.folder.path)) == key)
-        {
-            // The whole row is taken, so the spelling the store just wrote is
-            // the one the live entry holds, and no field is left stale.
-            entry.folder = folder;
-            entry.available = Path::new(path).is_dir();
-        } else {
-            let counts = self.inner.store.folder_counts(path).unwrap_or_else(|error| {
-                tracing::warn!(folder = path, error = %error, "the folder counts could not be read");
-                FolderCounts::default()
-            });
-            folders.push(FolderEntry {
-                available: Path::new(path).is_dir(),
-                folder,
-                counts,
-                last_error: None,
-            });
-        }
-        drop(folders);
-        let mut watcher = self.inner.watcher.lock().expect("the watcher lock");
-        let mut watch_error = None;
-        if let Some(watcher) = watcher.as_mut()
-            && Path::new(path).is_dir()
-        {
-            // Re-adding an existing folder must move the watch to the new
-            // mode. A recursive watch also watches every subfolder, and
-            // re-watching the root alone leaves those behind, so the old
-            // watch is removed first (R2.1). A folder that was never watched
-            // (the folder did not exist, or the watcher is off) makes the
-            // unwatch a no-op, and a failed unwatch may leave the old watch
-            // running.
-            let unwatched = match watcher.unwatch(Path::new(path)) {
-                Ok(()) => true,
-                Err(error) => {
-                    tracing::warn!(folder = path, error = %error, "the old folder watch could not be removed");
-                    false
-                }
-            };
-            if let Err(error) = watcher.watch(Path::new(path), recursive) {
-                tracing::warn!(folder = path, error = %error, "the folder could not be watched");
-                // Only a removed old watch leaves the folder unwatched, so
-                // only then does the failure belong on the card (R2.1).
-                if unwatched {
-                    watch_error = Some(format!("the folder could not be watched: {error}"));
-                }
-            }
-        }
-        drop(watcher);
-        if let Some(error) = watch_error {
-            set_folder_error(&self.inner, path, error);
-        }
-        tracing::info!(folder = path, recursive, "a source folder was added");
-        // Existing files in the new folder need discovery, not only future
-        // watch events.
-        self.sync_now();
+        self.tracking.add_folder(path, recursive)?;
         Ok(())
     }
 
@@ -673,10 +597,11 @@ impl Engine {
     ///
     /// # Errors
     ///
-    /// Returns [`EngineError`] when the path is not one of this engine's
+    /// Returns [`EngineError`] when the path is not one of this client's
     /// source folders, or when the store refuses the change.
     pub fn set_album_mapping(&self, path: &str, enabled: bool) -> Result<(), EngineError> {
-        self.update_folder(path, |folder| folder.album_mapping = enabled)
+        self.tracking.set_album_mapping(path, enabled)?;
+        Ok(())
     }
 
     /// Sets the album scope for one source folder (R3.4).
@@ -685,38 +610,7 @@ impl Engine {
     ///
     /// The same as [`Self::set_album_mapping`].
     pub fn set_album_scope(&self, path: &str, scope: AlbumScope) -> Result<(), EngineError> {
-        self.update_folder(path, |folder| folder.album_scope = scope)
-    }
-
-    /// Writes one changed field of a source folder back to the store.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EngineError::UnknownFolder`] for a path this engine does not
-    /// hold, and [`EngineError::Store`] when the write fails.
-    fn update_folder(
-        &self,
-        path: &str,
-        change: impl FnOnce(&mut SourceFolder),
-    ) -> Result<(), EngineError> {
-        let key = path_key(Path::new(path));
-        let mut folders = self.inner.folders.lock().expect("the folder lock");
-        let entry = folders
-            .iter_mut()
-            .find(|entry| path_key(Path::new(&entry.folder.path)) == key)
-            .ok_or_else(|| EngineError::UnknownFolder(path.to_string()))?;
-        // Write the change before it reaches the cards: a store that refuses
-        // it must not leave the live status disagreeing with the store.
-        let mut folder = entry.folder.clone();
-        change(&mut folder);
-        self.inner.store.add_folder(&folder)?;
-        entry.folder = folder;
-        tracing::info!(
-            folder = %entry.folder.path,
-            album_mapping = entry.folder.album_mapping,
-            album_scope = entry.folder.album_scope.as_str(),
-            "the album mapping changed"
-        );
+        self.tracking.set_album_scope(path, scope)?;
         Ok(())
     }
 
@@ -726,18 +620,7 @@ impl Engine {
     ///
     /// Returns [`EngineError`] when the store refuses the change.
     pub fn remove_folder(&self, path: &str) -> Result<(), EngineError> {
-        self.inner.store.remove_folder(path)?;
-        let key = path_key(Path::new(path));
-        self.inner
-            .folders
-            .lock()
-            .expect("the folder lock")
-            .retain(|entry| path_key(Path::new(&entry.folder.path)) != key);
-        let mut watcher = self.inner.watcher.lock().expect("the watcher lock");
-        if let Some(watcher) = watcher.as_mut() {
-            let _ = watcher.unwatch(Path::new(path));
-        }
-        tracing::info!(folder = path, "a source folder was removed");
+        self.tracking.remove_folder(path)?;
         Ok(())
     }
 
@@ -805,12 +688,6 @@ impl Engine {
         }
     }
 
-    /// The shared state store, so the shell can show store-backed data.
-    #[must_use]
-    pub fn store(&self) -> &Arc<StateStore> {
-        &self.inner.store
-    }
-
     /// The session this engine sends its requests through (R1.4).
     #[must_use]
     pub fn session(&self) -> &SharedSession {
@@ -823,7 +700,7 @@ impl Engine {
     ///
     /// Returns a [`StoreError`] when the query fails.
     pub fn failed_items(&self) -> Result<Vec<FailedItem>, StoreError> {
-        self.inner.store.failed_items()
+        self.tracking.failed_items()
     }
 
     /// The missing files that wait for a decision, in path order (R5.3).
@@ -832,7 +709,7 @@ impl Engine {
     ///
     /// Returns a [`StoreError`] when the query fails.
     pub fn review_items(&self) -> Result<Vec<ReviewItem>, StoreError> {
-        self.inner.store.review_items()
+        self.tracking.review_items()
     }
 
     /// Keeps the server asset for one missing file and clears the item from
@@ -843,12 +720,7 @@ impl Engine {
     ///
     /// Returns a [`StoreError`] when the write fails.
     pub fn keep_review_item(&self, path: &str) -> Result<bool, StoreError> {
-        let kept = self.inner.store.decide_review(path, ReviewDecision::Keep)?;
-        if kept {
-            self.inner.note_review_decided(path);
-            tracing::info!(path, "R5.3: the server asset was kept");
-        }
-        Ok(kept)
+        self.tracking.keep_review(path)
     }
 
     /// Moves one missing file's asset to the trash and clears the item from
@@ -918,12 +790,7 @@ impl Engine {
     ///
     /// Returns a [`StoreError`] when the write fails.
     pub fn retry_failed(&self, path: &str) -> Result<bool, StoreError> {
-        let queued = self.inner.store.retry_item(path)?;
-        if queued {
-            tracing::info!(path, "a parked item was queued for a manual retry");
-            let _ = self.inner.queue.send(PathBuf::from(path));
-        }
-        Ok(queued)
+        self.tracking.retry_failed(path)
     }
 
     /// A copy of the folder entries' identity, for the watcher setup.
@@ -940,7 +807,169 @@ impl Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
+        // Detach first: a folder edit made while this engine stops must not
+        // wait on the state it is tearing down.
+        self.tracking.detach(&self.observer);
         self.stop();
+    }
+}
+
+/// The engine's side of a [`Tracking`] change: the live folder entries, the
+/// watcher, and the upload queue follow every write the shell makes.
+struct EngineObserver {
+    inner: Weak<EngineInner>,
+}
+
+impl Observer for EngineObserver {
+    fn folder_added(&self, folder: &SourceFolder) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        let key = path_key(Path::new(&folder.path));
+        let mut folders = inner.folders.lock().expect("the folder lock");
+        // The store is read under the lock that applies it. A change that
+        // races this one commits before its own callback, and that callback
+        // waits here, so the last callback to run applies a state at least as
+        // new as every write it waited behind. An "added" whose folder a later
+        // change removed finds no row, and drops itself.
+        let stored = match stored_folder(&inner.store, &folder.path) {
+            Ok(stored) => stored,
+            Err(error) => {
+                tracing::warn!(folder = %folder.path, error = %error, "the folders could not be read");
+                return;
+            }
+        };
+        let Some(stored) = stored else {
+            return;
+        };
+        let available = Path::new(&stored.path).is_dir();
+        match folders
+            .iter_mut()
+            .find(|entry| path_key(Path::new(&entry.folder.path)) == key)
+        {
+            Some(entry) => {
+                // The whole row is taken, so the spelling the store wrote is
+                // the one the live entry holds, and no field is left stale.
+                entry.folder = stored.clone();
+                entry.available = available;
+            }
+            None => {
+                // R8.1: a folder new to this engine starts from what the store
+                // already holds for it; a zeroed card would never fill, because
+                // the rows are settled and `prepare` does not count them again.
+                let counts = inner
+                    .store
+                    .folder_counts(&stored.path)
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(
+                            folder = %stored.path,
+                            error = %error,
+                            "the folder counts could not be read"
+                        );
+                        FolderCounts::default()
+                    });
+                folders.push(FolderEntry {
+                    available,
+                    folder: stored.clone(),
+                    counts,
+                    last_error: None,
+                });
+            }
+        }
+        drop(folders);
+        let mut watcher = inner.watcher.lock().expect("the watcher lock");
+        let mut watch_error = None;
+        if let Some(watcher) = watcher.as_mut()
+            && available
+        {
+            // Re-adding an existing folder must move the watch to the new
+            // mode. A recursive watch also watches every subfolder, and
+            // re-watching the root alone leaves those behind, so the old
+            // watch is removed first (R2.1). A folder that was never watched
+            // (the folder did not exist, or the watcher is off) makes the
+            // unwatch a no-op, and a failed unwatch may leave the old watch
+            // running.
+            let unwatched = match watcher.unwatch(Path::new(&stored.path)) {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!(
+                        folder = %stored.path,
+                        error = %error,
+                        "the old folder watch could not be removed"
+                    );
+                    false
+                }
+            };
+            if let Err(error) = watcher.watch(Path::new(&stored.path), stored.recursive) {
+                tracing::warn!(
+                    folder = %stored.path,
+                    error = %error,
+                    "the folder could not be watched"
+                );
+                // Only a removed old watch leaves the folder unwatched, so
+                // only then does the failure belong on the card (R2.1).
+                if unwatched {
+                    watch_error = Some(format!("the folder could not be watched: {error}"));
+                }
+            }
+        }
+        drop(watcher);
+        if let Some(error) = watch_error {
+            set_folder_error(&inner, &stored.path, error);
+        }
+        // Existing files in the new folder need discovery, not only future
+        // watch events.
+        inner.sync_now.notify_one();
+    }
+
+    fn folder_changed(&self, folder: &SourceFolder) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        let key = path_key(Path::new(&folder.path));
+        let mut folders = inner.folders.lock().expect("the folder lock");
+        let Ok(Some(stored)) = stored_folder(&inner.store, &folder.path) else {
+            return;
+        };
+        if let Some(entry) = folders
+            .iter_mut()
+            .find(|entry| path_key(Path::new(&entry.folder.path)) == key)
+        {
+            entry.folder = stored;
+        }
+    }
+
+    fn folder_removed(&self, path: &str) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        let key = path_key(Path::new(path));
+        let mut folders = inner.folders.lock().expect("the folder lock");
+        let Ok(stored) = stored_folder(&inner.store, path) else {
+            return;
+        };
+        if stored.is_some() {
+            // Re-added since: the add callback owns the entry.
+            return;
+        }
+        folders.retain(|entry| path_key(Path::new(&entry.folder.path)) != key);
+        drop(folders);
+        let mut watcher = inner.watcher.lock().expect("the watcher lock");
+        if let Some(watcher) = watcher.as_mut() {
+            let _ = watcher.unwatch(Path::new(path));
+        }
+    }
+
+    fn review_decided(&self, path: &str) {
+        if let Some(inner) = self.inner.upgrade() {
+            inner.note_review_decided(path);
+        }
+    }
+
+    fn item_requeued(&self, path: &str) {
+        if let Some(inner) = self.inner.upgrade() {
+            let _ = inner.queue.send(PathBuf::from(path));
+        }
     }
 }
 
@@ -2356,7 +2385,12 @@ mod tests {
         .expect("a valid URL")
         .shared();
         let engine = Arc::new(
-            Engine::new(store, session, EngineConfig::default()).expect("build the engine"),
+            Engine::new(
+                Arc::new(Tracking::new(store)),
+                session,
+                EngineConfig::default(),
+            )
+            .expect("build the engine"),
         );
         let inner = Arc::clone(&engine.inner);
 
@@ -2417,7 +2451,7 @@ mod tests {
         .shared();
         let engine = Arc::new(
             Engine::new(
-                store,
+                Arc::new(Tracking::new(store)),
                 session,
                 EngineConfig {
                     concurrency: 4,
@@ -2512,7 +2546,7 @@ mod tests {
             .await;
         let engine = Arc::new(
             Engine::new(
-                store.clone(),
+                Arc::new(Tracking::new(store.clone())),
                 connection.shared(),
                 EngineConfig {
                     scan_interval: Duration::from_secs(3600),
