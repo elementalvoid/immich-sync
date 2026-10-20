@@ -14,6 +14,7 @@ use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -67,6 +68,9 @@ pub struct BandwidthLimit {
     /// The bytes every metered body has handed to the server, shared by every
     /// clone, which is what the diagnostics throughput samples (R10.2).
     moved: Arc<AtomicU64>,
+    /// A second counter this view also charges, when it has one. See
+    /// [`BandwidthLimit::tallying`].
+    tally: Option<Arc<AtomicU64>>,
 }
 
 impl Default for BandwidthLimit {
@@ -83,6 +87,22 @@ impl BandwidthLimit {
             bytes_per_second: Arc::new(AtomicU64::new(bytes_per_second)),
             bucket: Arc::new(Mutex::new(Bucket::new())),
             moved: Arc::new(AtomicU64::new(0)),
+            tally: None,
+        }
+    }
+
+    /// A view of this limit whose bodies also count their bytes in `tally`.
+    ///
+    /// The rate and the bucket stay shared, so the client still has one budget
+    /// and one total; the second counter is how one part of the client reads
+    /// its own share of the traffic without summing uploads or borrowing the
+    /// bytes of another (R8.1).
+    pub fn tallying(&self, tally: Arc<AtomicU64>) -> Self {
+        Self {
+            bytes_per_second: Arc::clone(&self.bytes_per_second),
+            bucket: Arc::clone(&self.bucket),
+            moved: Arc::clone(&self.moved),
+            tally: Some(tally),
         }
     }
 
@@ -95,11 +115,15 @@ impl BandwidthLimit {
 
     /// Records `bytes` handed to the server. Separate from [`Self::debit`],
     /// which only charges a limited bucket: an unlimited upload still counts.
+    /// A view charges its own counter too (R8.1).
     fn account(&self, bytes: u64) {
         if bytes == 0 {
             return;
         }
         self.moved.fetch_add(bytes, Ordering::Relaxed);
+        if let Some(tally) = &self.tally {
+            tally.fetch_add(bytes, Ordering::Relaxed);
+        }
     }
 
     /// Changes the limit. An upload already on the wire reads the new value on
@@ -356,6 +380,57 @@ mod tests {
         limit.set(0);
         assert_eq!(limit.bytes_per_second(), 0);
         assert_eq!(limit.wait_for(1_000_000), Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn a_tallying_view_counts_the_bytes_its_own_bodies_move() {
+        use tokio::io::AsyncReadExt as _;
+
+        // Two folders over one client limit. Each folder's view counts its own
+        // body, and the shared total still counts both (R8.1).
+        let limit = BandwidthLimit::new(0);
+        let photos = Arc::new(AtomicU64::new(0));
+        let videos = Arc::new(AtomicU64::new(0));
+        let mut photos_body: &[u8] = b"0123456789";
+        let mut videos_body: &[u8] = b"abcdefghij";
+        let photos_view = limit.tallying(Arc::clone(&photos));
+        let (mut photos_reader, _progress) =
+            MeteredReader::new(&mut photos_body, photos_view.clone());
+        let (mut videos_reader, _progress) =
+            MeteredReader::new(&mut videos_body, limit.tallying(Arc::clone(&videos)));
+        let mut buf = [0_u8; 4];
+        assert_eq!(photos_reader.read(&mut buf).await.expect("read"), 4);
+        assert_eq!(videos_reader.read(&mut buf).await.expect("read"), 4);
+        assert_eq!(
+            photos.load(Ordering::Relaxed),
+            4,
+            "the photos body counted its own four bytes"
+        );
+        assert_eq!(
+            videos.load(Ordering::Relaxed),
+            4,
+            "the videos body counted its own four bytes"
+        );
+        assert_eq!(
+            limit.total_bytes_moved(),
+            8,
+            "the client's total still counts every body"
+        );
+
+        // A clone is the same view: the folder's uploads keep charging the one
+        // counter they were handed.
+        let (mut clone_reader, _progress) = MeteredReader::new(&mut photos_body, photos_view);
+        assert_eq!(clone_reader.read(&mut buf).await.expect("read"), 4);
+        assert_eq!(
+            photos.load(Ordering::Relaxed),
+            8,
+            "a cloned view keeps counting in the same tally"
+        );
+        assert_eq!(
+            videos.load(Ordering::Relaxed),
+            4,
+            "the other folder is untouched"
+        );
     }
 
     #[test]
