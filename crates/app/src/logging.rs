@@ -431,19 +431,27 @@ pub fn without_userinfo(url: &str) -> String {
     format!("{scheme}://<redacted>@{}", &rest[at + 1..])
 }
 
-/// The last `max_lines` lines of the newest log file in `directory`.
+/// The newest log file's name and its last `max_lines` lines.
 ///
-/// Reads at most [`TAIL_BYTES`] from the end of the file, so the Logs view
-/// never loads a whole log into memory.
+/// One call resolves the newest file and reads its end, because the Logs view's
+/// live tail polls this every second: the resolution is what follows a rotation
+/// onto the file that is being written. It reads at most [`TAIL_BYTES`] from the
+/// end of the file, so the view never loads a whole log into memory.
 ///
 /// # Errors
 ///
 /// Returns an error when the directory or the newest file cannot be read.
-pub fn tail(directory: &Path, max_lines: usize) -> anyhow::Result<Vec<String>> {
+pub fn newest_tail(
+    directory: &Path,
+    max_lines: usize,
+) -> anyhow::Result<(Option<String>, Vec<String>)> {
     let Some(path) = newest_file(directory)? else {
-        return Ok(Vec::new());
+        return Ok((None, Vec::new()));
     };
-    tail_lines(&path, max_lines, TAIL_BYTES)
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned());
+    Ok((name, tail_lines(&path, max_lines, TAIL_BYTES)?))
 }
 
 /// The last `max_lines` lines of one file, reading at most `max_bytes` from its
@@ -625,8 +633,31 @@ mod tests {
         let temp = tempfile::tempdir().expect("create a temp dir");
 
         assert_eq!(
-            tail(temp.path(), TAIL_LINES).expect("tail an empty dir"),
-            Vec::<String>::new()
+            newest_tail(temp.path(), TAIL_LINES).expect("tail an empty dir"),
+            (None, Vec::<String>::new())
+        );
+    }
+
+    #[test]
+    fn the_newest_tail_names_the_file_it_read() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let old = temp.path().join("immich-sync.log.2026-01-01");
+        numbered_log(&old, 1);
+        fs::File::options()
+            .write(true)
+            .open(&old)
+            .expect("open the old file")
+            .set_modified(SystemTime::now() - std::time::Duration::from_secs(60))
+            .expect("age the old file");
+        numbered_log(&temp.path().join("immich-sync.log.2026-01-02"), 2);
+
+        let (file, lines) = newest_tail(temp.path(), TAIL_LINES).expect("tail the newest file");
+
+        assert_eq!(file.as_deref(), Some("immich-sync.log.2026-01-02"));
+        assert_eq!(
+            lines,
+            ["line 0000", "line 0001"],
+            "the name goes with the tail it read"
         );
     }
 
