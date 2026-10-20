@@ -1052,22 +1052,25 @@ impl EngineInner {
 
     /// The meter of the folder that owns `path` (R8.1).
     ///
-    /// The owning folder is the first entry that contains the path, the same
-    /// rule the pending count uses, so a file under a folder and one of its
-    /// subfolders is metered once and both cards still add up. A path no
-    /// folder owns — its folder was removed while the item was queued — is
-    /// metered nowhere rather than against the wrong folder.
+    /// The owning folder is the first entry that contains the path, as
+    /// [`Self::folder_index_for`] decides, so the path is metered once.
+    ///
+    /// Note for #44: the pending count seeds from a pure prefix query, so a
+    /// file under a folder and one of its subfolders is counted on both cards
+    /// while its bytes land once.
+    ///
+    /// A path no folder owns — its folder was removed while the item was
+    /// queued — is metered nowhere, but its upload still streams under the
+    /// client's limit (R7.1).
     fn meter_for(&self, path: &Path) -> Arc<UploadMeter> {
-        let case = PathCase::for_platform();
-        self.folders
-            .lock()
-            .expect("the folder lock")
-            .iter()
-            .find(|entry| is_within(Path::new(&entry.folder.path), path, case))
-            .map_or_else(
-                || Arc::new(UploadMeter::detached()),
-                |entry| Arc::clone(&entry.meter),
-            )
+        let index = self.folder_index_for(path);
+        let folders = self.folders.lock().expect("the folder lock");
+        match index.and_then(|index| folders.get(index)) {
+            Some(entry) => Arc::clone(&entry.meter),
+            // None is a path no folder owns, or one whose folder went between
+            // the two locks: either way nobody meters it.
+            None => Arc::new(UploadMeter::new(&self.bandwidth)),
+        }
     }
 
     /// Waits while the user holds uploads (R8.7).
@@ -2359,6 +2362,51 @@ mod tests {
             "R2.3: default scan interval"
         );
         assert_eq!(config.watch_debounce, Duration::from_secs(2));
+    }
+
+    /// A file whose folder was removed while it was queued still streams under
+    /// the client's limit (R7.1).
+    ///
+    /// The fallback must not be a fresh unlimited meter: that would lift the
+    /// limit for exactly the uploads no card accounts for.
+    #[test]
+    fn a_removed_folders_file_still_streams_under_the_client_limit() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let store =
+            Arc::new(StateStore::open(temp.path().join("state.db")).expect("open the state store"));
+        let folder = temp.path().join("photos");
+        std::fs::create_dir_all(&folder).expect("create the folder");
+        store
+            .add_folder(&SourceFolder {
+                path: folder.display().to_string(),
+                recursive: true,
+                album_mapping: false,
+                album_scope: AlbumScope::default(),
+            })
+            .expect("add the folder");
+        // The session is never used: this test sends no request.
+        let session = crate::connection::Connection::new(
+            "http://127.0.0.1:1",
+            Arc::new(crate::credential::MemoryCredentialStore::new()),
+        )
+        .expect("a valid URL")
+        .shared();
+        let config = EngineConfig {
+            bandwidth_bytes_per_second: 4_096,
+            ..EngineConfig::default()
+        };
+        let engine = Engine::new(store, session, config).expect("build the engine");
+        engine
+            .remove_folder(&folder.display().to_string())
+            .expect("remove the folder");
+
+        let queued = folder.join("queued.jpg");
+        let meter = engine.inner.meter_for(&queued);
+        assert_eq!(
+            meter.limit().bytes_per_second(),
+            4_096,
+            "R7.1: a removed folder does not drop its queued uploads to unlimited"
+        );
     }
 
     #[test]
