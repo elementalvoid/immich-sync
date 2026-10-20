@@ -429,7 +429,7 @@ impl Render for FolderPanel {
 mod tests {
     // GPUI's glob imports its own `test` macro, so this module names what it
     // uses and keeps Rust's `#[test]`.
-    use super::{PathProbe, already_tracked, confirmed, path_problem};
+    use super::{PathProbe, already_tracked, confirmed, path_problem, probe};
     use std::path::Path;
     use sync_core::paths::PathCase;
     use sync_core::store::{AlbumScope, SourceFolder};
@@ -490,6 +490,39 @@ mod tests {
 
         let error = confirmed(&draft(&file.display().to_string())).expect_err("a file is refused");
         assert_eq!(error, "That path is a file, not a folder.");
+    }
+
+    /// #40 (R2.1): a directory this process cannot list is refused with its
+    /// own reason. The test skips itself when the process can still list a
+    /// mode-000 directory, which is what running as root does.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_folder_is_refused_with_its_own_reason() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let locked = temp.path().join("locked");
+        std::fs::create_dir(&locked).expect("create the folder");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+            .expect("lock the folder");
+
+        let probed = probe(&locked);
+        let refused = confirmed(&draft(&locked.display().to_string()));
+        // Restore the mode before the tempdir drops, so its cleanup can empty
+        // the directory.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))
+            .expect("unlock the folder");
+
+        if probed == PathProbe::Folder {
+            eprintln!(
+                "skipping an_unreadable_folder_is_refused_with_its_own_reason: \
+                 this process lists a mode-000 directory, so it is root"
+            );
+            return;
+        }
+        assert_eq!(probed, PathProbe::Unreadable);
+        let error = refused.expect_err("an unreadable folder is refused");
+        assert_eq!(error, "That folder cannot be read.");
     }
 
     #[test]
