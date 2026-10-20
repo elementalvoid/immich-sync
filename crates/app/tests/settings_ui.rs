@@ -34,6 +34,7 @@ use immich_sync::status;
 use immich_sync::store::StoreModel;
 use immich_sync::upload::UploadModel;
 use immich_sync::upload_view::UploadView;
+use mock_immich::{Fault, Operation};
 use sync_core::connection::{
     Attention, AuthMethod, ConnectionState, Secret, ServerProfile, SignIn,
 };
@@ -1814,7 +1815,7 @@ async fn a_limits_change_reaches_the_running_engine(cx: &mut TestAppContext) {
 
     // The shell hands the view the engine it must push changes to; this is
     // that same call.
-    cx.update(|cx| view.update(cx, |view, _| view.set_engine(engine_model.clone())));
+    cx.update(|cx| view.update(cx, |view, cx| view.set_engine(engine_model.clone(), cx)));
 
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
@@ -1988,7 +1989,7 @@ async fn the_tag_switch_persists_and_reaches_the_running_engine(cx: &mut TestApp
 
     // The shell hands the view the engine it must push changes to; this is
     // that same call.
-    cx.update(|cx| view.update(cx, |view, _| view.set_engine(engine_model.clone())));
+    cx.update(|cx| view.update(cx, |view, cx| view.set_engine(engine_model.clone(), cx)));
 
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
@@ -2046,7 +2047,8 @@ async fn the_tag_switch_persists_and_reaches_the_running_engine(cx: &mut TestApp
 }
 
 /// R3.7: an API key that lacks a permission gets its name in the Tagging
-/// section, through the engine's own probe.
+/// section, through the engine's own probe, and the section repaints itself
+/// when the probe answers: nothing else asks it to render in between.
 #[gpui_kit::test]
 async fn a_missing_tag_permission_is_named_in_the_tagging_section(cx: &mut TestAppContext) {
     let (_runtime, server) = mock_server();
@@ -2103,8 +2105,11 @@ async fn a_missing_tag_permission_is_named_in_the_tagging_section(cx: &mut TestA
         cx.read(|cx| engine_model.read(cx).is_running()),
         "the engine never started"
     );
-    cx.update(|cx| view.update(cx, |view, _| view.set_engine(engine_model.clone())));
+    cx.update(|cx| view.update(cx, |view, cx| view.set_engine(engine_model.clone(), cx)));
 
+    // Hold the probe open, so the frame the toggle itself produces cannot
+    // already hold its answer.
+    server.fail(Operation::ApiKeyMe, Fault::Slow(Duration::from_secs(1)));
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
         tab_to(window, "settings-tag-upload", cx);
@@ -2112,9 +2117,46 @@ async fn a_missing_tag_permission_is_named_in_the_tagging_section(cx: &mut TestA
     })
     .expect("turn the tag on");
 
-    // The permission probe runs on the engine's worker runtime; the notice
-    // lands when the model's poll publishes the engine's tag state.
-    let label = wait_for_label(cx, window, "settings-tag-problem").await;
+    // Let the setting land, then draw the frame its write produces: the switch
+    // is on and nothing is known against it yet (N2). `draw` without `refresh`
+    // re-renders only the views that notified, so this frame consumes that
+    // notification.
+    let saved = wait_for_settings(cx, &paths, |settings| settings.tag_uploaded_assets).await;
+    assert!(saved.tag_uploaded_assets, "R3.7: the setting persisted");
+    cx.update_window(window, |_, window, cx| {
+        window.draw(cx).clear(cx);
+        assert!(
+            window.try_find("settings-tag-problem").is_none(),
+            "the probe has not answered yet"
+        );
+    })
+    .expect("draw the frame the switch produced");
+
+    // The probe answers on the engine's worker runtime, and the model's poll
+    // publishes it (R3.7).
+    let mut settled = false;
+    for _ in 0..600 {
+        if cx.read(|cx| engine_model.read(cx).tag_status().problem.is_some()) {
+            settled = true;
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    assert!(settled, "the permission probe never settled");
+
+    // Nothing has asked the settings view to render since the frame above, so
+    // only its own observation of the engine can have put the notice on screen.
+    let label = cx
+        .update_window(window, |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window
+                .try_find("settings-tag-problem")
+                .and_then(|found| found.label().map(str::to_string))
+        })
+        .ok()
+        .flatten()
+        .expect("R3.7: the section never repainted the engine's tag problem");
     assert!(
         label.contains("asset.update"),
         "R3.7: the section names the missing permission: {label}"

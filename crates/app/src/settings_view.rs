@@ -25,7 +25,7 @@ use gpui_kit::component::switch::Switch;
 use gpui_kit::*;
 use sync_core::connection::{AuthMethod, ConnectionState, ServerProfile, SignIn};
 use sync_core::credential::Secret;
-use sync_core::tags::SYNC_TAG;
+use sync_core::tags::{SYNC_TAG, TagStatus};
 
 /// The number of bytes in a displayed megabyte. The stored limit stays bytes
 /// per second (SPEC R7.1); the UI shows MB/s with up to six decimals, which is
@@ -240,6 +240,10 @@ pub struct SettingsView {
     /// The engine the Limits card pushes a change to (R7.1, R7.2), once the
     /// shell has installed one. A view with no engine still saves the values.
     engine: Option<Entity<EngineModel>>,
+    /// The tag state the engine last published for the Tagging section (R3.7).
+    /// It is cached here because the engine notifies on every status poll, and
+    /// the section only changes when this value does.
+    tag: TagStatus,
     /// The last failed save or autostart change, shown with the load problem.
     action_error: Option<String>,
     /// A failure before the store opened, such as path resolution. It stays
@@ -340,6 +344,7 @@ impl SettingsView {
             auth_method: initial.auth_method,
             fields,
             engine: None,
+            tag: TagStatus::default(),
             action_error: None,
             environment_problem: None,
             settings_generation: 0,
@@ -422,7 +427,20 @@ impl SettingsView {
 
     /// Points the Limits card at the engine, so a change to either limit is
     /// applied to a running sync without a restart (R7.1, R7.2).
-    pub fn set_engine(&mut self, engine: Entity<EngineModel>) {
+    ///
+    /// The Tagging section follows the engine's tag state too (R3.7). The
+    /// engine notifies on every status poll, so the view repaints only when the
+    /// state it renders actually changes.
+    pub fn set_engine(&mut self, engine: Entity<EngineModel>, cx: &mut Context<Self>) {
+        self.tag = engine.read(cx).tag_status().clone();
+        self._subscriptions
+            .push(cx.observe(&engine, |this, engine, cx| {
+                let tag = engine.read(cx).tag_status().clone();
+                if tag != this.tag {
+                    this.tag = tag;
+                    cx.notify();
+                }
+            }));
         self.engine = Some(engine);
     }
 
@@ -1057,10 +1075,7 @@ impl SettingsView {
         let link = sync_tag_url(&settings.server_url);
         // R3.7: the engine ran the one permission probe; this section only
         // reports what it found, so opening Settings costs no request.
-        let problem = self.engine.as_ref().and_then(|engine| {
-            let tag = engine.read(cx).tag_status().clone();
-            tag.enabled.then_some(tag.problem).flatten()
-        });
+        let problem = self.tag.enabled.then(|| self.tag.problem.clone()).flatten();
         let mut rows = vec![
             div()
                 .id("settings-tag-upload-row")
