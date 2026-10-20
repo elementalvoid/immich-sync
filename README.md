@@ -1,21 +1,56 @@
 # Immich Sync
 
-A tray application that uploads files from folders you choose to one
-[Immich](https://immich.app/) server. It watches the folders, uploads changes as
-they happen, and scans again on a schedule so nothing is missed. Upload only: it
-never deletes server-side assets on its own, and a local file that disappears
-waits in a review list until you decide what happens to the server copy.
+Keep folders on your computer in sync with your [Immich](https://immich.app/)
+server. Upload only: it never deletes server-side assets on its own, and a local
+file that disappears waits in a review list until you decide what happens to the
+server copy.
 
-v1 ships for Windows 10/11 (x64) and Linux desktops (deb and AppImage). The
-Windows binaries are **unsigned** for v1, so the installer shows a SmartScreen
-warning (see [Troubleshooting](#troubleshooting)). macOS is not part of v1.
+[![CI](https://github.com/elementalvoid/immich-sync/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/elementalvoid/immich-sync/actions/workflows/ci.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-The requirements this build implements are in [SPEC.md](SPEC.md); the milestone
-plan is in [PLAN.md](PLAN.md).
+![The Immich Sync dashboard: a status card for all folders and one card per source folder](docs/screenshot.png)
+
+## What it does
+
+- **Watches the folders you add** and uploads new and changed files as they
+  happen, with a reconciliation scan at startup and every 30 minutes so nothing
+  is missed.
+- **Upload only.** It never deletes or changes an asset on the server by itself.
+  A tracked local file that disappears appears in **Review**, where you choose
+  **Keep** or **Trash**; a rename is recognised by content and is not a
+  deletion.
+- **Albums.** Put a folder's uploads into an album: one album per leaf folder,
+  or one album for the whole folder.
+- **Limits and retries.** Bandwidth and concurrency limits, backoff with a
+  per-file attempt cap, and a **Failed items** view with **Retry**.
+- **A tray that keeps working when the window is closed.** Its tooltip shows the
+  activity, connection state, review count, upload progress, and the last error;
+  its menu has Show, Pause, Resume, Sync now, and Quit.
+- **Built for support.** Logs, a Diagnostics view, and a one-click **Collect
+  bundle** archive that gathers the logs, versions, database health,
+  configuration, and sizing into a single `.zip`.
+- **Private by design.** Credentials live in the operating system's credential
+  store (Windows Credential Manager, Secret Service on Linux), never in the
+  settings file or the log. There is no telemetry: the client talks only to the
+  Immich server you enter.
+
+## Status
+
+v1 targets Windows 10/11 (x64) and Linux desktops and is developed against
+Immich v3.3.x. macOS is not part of v1.
+
+> **No packaged release is published yet.** The first release will appear on the
+> [releases page](https://github.com/elementalvoid/immich-sync/releases). Until
+> then, build from source — see
+> [Building from source](CONTRIBUTING.md#building-from-source). Windows builds
+> are unsigned for now, so SmartScreen warns on first launch.
 
 ## Install
 
-Download the packages from the
+Requirements: Windows 10/11 (x64), or a Linux desktop with a Vulkan-capable
+driver, and an Immich server reachable over HTTPS.
+
+When a release is published, download the packages from the
 [releases page](https://github.com/elementalvoid/immich-sync/releases). Each
 release carries, for version `<version>`:
 
@@ -39,8 +74,8 @@ release carries, for version `<version>`:
    uninstall entry in `HKLM` and shortcuts in the All Users Start Menu and on
    the public desktop. **Current user only** installs to
    `%LOCALAPPDATA%\Programs\Immich Sync`, with the entry in `HKCU` and
-   shortcuts for that account alone. A reinstall or upgrade preselects the
-   mode the previous install used.
+   shortcuts for that account alone. A reinstall or upgrade preselects the mode
+   the previous install used.
 4. The installer prompts for administrator elevation in **either** mode: it is
    built in a mode that always requests elevation, including for a current-user
    install. Declining the prompt cancels the install. It can start the app when
@@ -53,13 +88,6 @@ Uninstall from **Settings → Apps → Immich Sync**. That removes the installed
 copy and its shortcuts. Settings, state, and logs (see
 [Where everything lives](#where-everything-lives)) are kept; delete those
 folders yourself for a complete reset.
-
-**Upgrading from a build before the install-mode choice.** Earlier installers
-were always per-user and wrote their uninstall entry under `HKCU`, so Windows
-still lists that copy separately. Uninstall it by hand from
-**Settings → Apps → Immich Sync** before installing this build, or you will have
-two copies. Nothing is migrated automatically, and the old copy's settings,
-state, and logs carry over because they live in the per-user folders above.
 
 ### Linux (deb)
 
@@ -92,8 +120,6 @@ already has one.
 
 ## Verify the download
 
-### Checksums
-
 `SHA256SUMS` lists the SHA-256 of every package in the release. Put it in the
 same directory as the downloaded packages.
 
@@ -111,19 +137,10 @@ Get-FileHash .\immich-sync_<version>_x64-setup.exe -Algorithm SHA256
 
 Compare the printed hash with the line for that file in `SHA256SUMS`.
 
-### Build provenance
-
-Once the repository is public, each package also carries a build provenance
-attestation, and you can check that it was built by this repository's release
-workflow:
-
-```sh
-gh attestation verify immich-sync_<version>_amd64.deb --repo elementalvoid/immich-sync
-```
-
-While the repository is private the attestation steps are disabled (the
-`RELEASE_ATTEST` repository variable in the release workflow), so this command
-has nothing to verify yet. See [Releases](#releases) for how it is switched on.
+Release packages are built by this repository's release workflow, which also
+publishes a build provenance attestation once enabled. The process, and the
+`gh attestation verify` check, are documented in
+[CONTRIBUTING.md](CONTRIBUTING.md#releases).
 
 ## First run
 
@@ -151,7 +168,7 @@ a key from Immich's account settings.
 ### Add folders
 
 1. On the **Dashboard**, type or paste a folder path into **Add a folder to
-   sync** and click **Add folder**.
+   sync** (or click **Browse…** and pick it), then click **Add folder**.
 2. The folder is watched recursively, and a status card shows its activity
    (idle, syncing, paused, needs attention), upload progress, and item counts.
 3. **Album mapping** is off by default. Switch it on for a folder to put its
@@ -174,21 +191,23 @@ its card instead of producing one error per file.
   **Quit** exits the client. Starting the app again focuses the running
   instance instead of starting a second one.
 - **Views.** *Dashboard* (status and folders), *Upload* (send one file now to
-  test the pipeline), *Failed items* (files the client gave up on, with
-  **Retry**), *Review* (see below), *Settings*, *Logs*, *Diagnostics*.
+  test the pipeline; type the path or click **Browse…**), *Failed items* (files
+  the client gave up on, with **Retry**), *Review* (see below), *Settings*,
+  *Logs*, *Diagnostics*.
 - **Deletion review.** A tracked local file that disappears appears in
   **Review**; nothing changes on the server until you choose **Keep** or
   **Trash** for it. A rename is recognized by content and is not a deletion.
 - **Settings.** Changes save immediately. General holds **Autostart at login**
-  (off by default), Limits holds the bandwidth limit (0 means unlimited),
+  (off by default); Limits holds the bandwidth limit (0 means unlimited),
   concurrent uploads, the reconciliation scan interval, and the retry attempt
   cap.
-- **Diagnostics.** Client and server versions and permissions, the state database and its
-  integrity, the last error per class, throughput, and a **Rebuild** action that
-  starts the state over and rescans every folder.
-- **Logs.** The tail of the log file, selectable for copying, the level
-  control, and a **Copy all** control that copies every line shown. The log
-  never contains the password, API key, or session token.
+- **Diagnostics.** Client and server versions and permissions, the state
+  database and its integrity, the last error per class, throughput, a
+  **Collect bundle** action, and a **Rebuild** action that starts the state over
+  and rescans every folder.
+- **Logs.** The tail of the log file, selectable for copying, the level control,
+  and a **Copy all** control that copies every line shown. The log never
+  contains the password, API key, or session token.
 - The theme follows the system theme.
 
 ## Where everything lives
@@ -207,6 +226,19 @@ The log file is `immich-sync.log.<date>`, one file per day, five kept. The state
 database stays on this machine by design: never put it on a network share or in
 a cloud-sync folder. The **Settings** view's *Storage* card shows the resolved
 paths.
+
+## Privacy and security
+
+- **Credentials** are stored in the operating system's credential store and are
+  never written to the settings file or the log.
+- **No telemetry.** The only network traffic is to the Immich server you enter.
+- **Redacted logs.** The log pipeline redacts passwords, API keys, session
+  tokens, and URL userinfo. The **Collect bundle** archive re-serialises the
+  settings and leaves out server-supplied failure text, so no credential reaches
+  it.
+- **Upload only.** Nothing is deleted or modified on the server without your
+  explicit **Keep** or **Trash** decision in Review.
+- **Local state stays local.** The SQLite database is never uploaded anywhere.
 
 ## Troubleshooting
 
@@ -301,35 +333,17 @@ A collection that cannot read the logs, the state database, or the server still
 writes an archive; the view and the archive's `README.txt` both list what was
 missing.
 
-## Releases
+## Contributing
 
-For maintainers.
+Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for
+the development setup, the gates, the screenshot recipe, and the release
+process. Report security problems privately, as described in
+[SECURITY.md](SECURITY.md).
 
-- **Trigger.** Pushing a tag `v<version>` builds and publishes a GitHub release.
-  The version must equal `version` in `crates/app/Cargo.toml`; the workflow
-  fails the tag before building when it does not. **Run workflow** (manual
-  dispatch) builds the same packages without publishing a release.
-- **What is built.** `cargo-packager` (version pinned in the workflow) builds
-  the NSIS installer on `windows-latest` and the deb and AppImage on
-  `ubuntu-24.04`. The packager configuration lives in
-  `crates/app/Cargo.toml` under `[package.metadata.packager]`.
-- **Checksums.** A final job downloads both platforms' packages and generates
-  `SHA256SUMS` from the real files; nothing is hand-written.
-- **Provenance.** The workflow attests each platform's packages with
-  `actions/attest-build-provenance`, gated on the repository variable
-  `RELEASE_ATTEST`. Set `RELEASE_ATTEST` to `true` under **Settings → Secrets
-  and variables → Actions → Variables** once the repository is public (ticket
-  #16). While it is unset the attestation steps are skipped and the release
-  workflow stays green.
-- **Signing.** v1 is unsigned. Windows code signing is the public-release
-  ticket, and is the step that removes the SmartScreen warning above.
+## License
 
-## Development
-
-```sh
-cargo run -p immich-sync
-```
-
-The workspace gates are `cargo fmt --all -- --check`,
-`cargo clippy --workspace --all-targets -- -D warnings`, and
-`cargo test --workspace`; `.github/workflows/ci.yml` runs them on every push.
+Licensed under either of the [Apache License, Version 2.0](LICENSE-APACHE) or the
+[MIT license](LICENSE-MIT), at your option. Unless you explicitly state
+otherwise, any contribution intentionally submitted for inclusion in this
+project shall be dual-licensed as above, without any additional terms or
+conditions.
