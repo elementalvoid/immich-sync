@@ -31,13 +31,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use immich_client::{
-    AssetUpload, BandwidthLimit, BulkAction, BulkCheckItem, ClientError, RejectReason,
-};
+use immich_client::{AssetUpload, BulkAction, BulkCheckItem, ClientError, RejectReason};
 
 use crate::connection::SharedSession;
 use crate::failure::{FailureClass, FailureKind, classify};
 use crate::hash::{HashError, Sha1};
+use crate::meter::UploadMeter;
 use crate::pairing::FolderIndex;
 use crate::paths::PathCase;
 use crate::store::{ItemRecord, ItemState, SidecarDigest, StateStore};
@@ -261,6 +260,14 @@ impl Uploader {
     /// Every failure is returned as [`UploadOutcome::Failed`]; a local read
     /// failure leaves no row, because there is no hash to record.
     pub async fn upload_one(&self, path: &Path) -> UploadOutcome {
+        // The caller's own path: no limit, and no dashboard numbers (R7.4).
+        self.upload_one_metered(path, &UploadMeter::detached())
+            .await
+    }
+
+    /// [`Self::upload_one`] over a meter, so the engine's own one-file uploads
+    /// — a live photo's motion video — still count where they belong (R8.1).
+    async fn upload_one_metered(&self, path: &Path, meter: &UploadMeter) -> UploadOutcome {
         let path_text = path.to_string_lossy().into_owned();
         let metadata = match std::fs::metadata(path) {
             Ok(metadata) => metadata,
@@ -386,14 +393,12 @@ impl Uploader {
             CheckOutcome::Refused(error) => return self.failed(&mut item, &error, false),
         }
 
-        // This path is the caller's own, not the engine's: no limit is in
-        // force, so the body streams at the network's pace.
         self.send_upload(
             &mut item,
             &checksum,
             sidecar.as_ref(),
             live_photo_video.as_deref(),
-            &BandwidthLimit::default(),
+            meter,
         )
         .await
     }
@@ -405,12 +410,14 @@ impl Uploader {
     /// The gate is checked immediately before the request, so a pause stops
     /// the next upload even inside an already-dispatched worker (R8.7). The
     /// bandwidth limit is live, so the request streams under whatever limit is
-    /// set when its bytes are read (R7.1).
+    /// set when its bytes are read (R7.1). `meter` is the folder's: the body
+    /// counts its bytes there and the request counts itself in flight while it
+    /// is on the wire (R8.1).
     pub async fn upload_prepared(
         &self,
         prepared: &PreparedItem,
         gate: &UploadGate,
-        bandwidth: &BandwidthLimit,
+        meter: &UploadMeter,
     ) -> UploadOutcome {
         let path = prepared.path.to_string_lossy().into_owned();
         // R4.5: the digest a previous attempt recorded. The row keeps it while
@@ -453,7 +460,7 @@ impl Uploader {
             &prepared.sha1.base64(),
             sidecar,
             prepared.live_photo_video.as_deref(),
-            bandwidth,
+            meter,
         )
         .await
     }
@@ -500,7 +507,12 @@ impl Uploader {
     ///
     /// The store is the lookup, so a video uploaded by an earlier pass or an
     /// earlier run is found without sending it again.
-    async fn live_photo_video_id(&self, photo: &Path, video: &Path) -> Option<String> {
+    async fn live_photo_video_id(
+        &self,
+        photo: &Path,
+        video: &Path,
+        meter: &UploadMeter,
+    ) -> Option<String> {
         if let Ok(Some(row)) = self.store.item(&video.to_string_lossy())
             && row.state.is_terminal_success()
             && let Some(asset_id) = row.asset_id.clone()
@@ -510,8 +522,10 @@ impl Uploader {
         }
         // The video goes through the same pipeline, which resolves its own
         // pairing; a video has no video sibling, so the recursion stops here.
-        // The indirection is boxed only to break the async type cycle.
-        match Box::pin(self.upload_one(video)).await {
+        // The indirection is boxed only to break the async type cycle. It
+        // counts in the same folder as the photo, without that folder's limit,
+        // which is the pace this path has always streamed at (R3.3, R8.1).
+        match Box::pin(self.upload_one_metered(video, &meter.unlimited())).await {
             UploadOutcome::Created { asset_id } | UploadOutcome::Duplicate { asset_id } => {
                 Some(asset_id)
             }
@@ -538,14 +552,17 @@ impl Uploader {
         checksum: &str,
         sidecar: Option<&SidecarFile>,
         live_photo_video: Option<&Path>,
-        bandwidth: &BandwidthLimit,
+        meter: &UploadMeter,
     ) -> UploadOutcome {
         // R3.3: the motion video uploads first, so the link never names an
         // asset the server does not have. A video that fails is parked by its
         // own upload, and the photo still goes up without the link rather than
         // being lost with it.
         let live_photo_video_id = match live_photo_video {
-            Some(video) => self.live_photo_video_id(Path::new(&item.path), video).await,
+            Some(video) => {
+                self.live_photo_video_id(Path::new(&item.path), video, meter)
+                    .await
+            }
             None => None,
         };
         // Immich requires the file's own dates on the asset (R3.1). The
@@ -563,7 +580,12 @@ impl Uploader {
         let checksum = checksum.to_string();
         let client = self.session.client();
         let path = Path::new(&item.path);
-        match self
+        let bandwidth = meter.limit().clone();
+        // R8.1: the request counts as in flight from here until its answer is
+        // read, and the guard releases the count on every path out, including
+        // a future the engine drops when it stops.
+        let on_the_wire = meter.uploading();
+        let sent = self
             .session
             .request(|credential| {
                 let client = client.clone();
@@ -578,8 +600,9 @@ impl Uploader {
                 };
                 async move { client.upload_asset(credential.auth(), &upload).await }
             })
-            .await
-        {
+            .await;
+        drop(on_the_wire);
+        match sent {
             Ok(response) => {
                 let asset_id = response.asset_id;
                 item.asset_id = Some(asset_id.clone());

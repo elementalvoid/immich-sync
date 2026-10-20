@@ -4,12 +4,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
-use immich_client::BandwidthLimit;
 use mock_immich::{Fault, MockImmich, Operation};
 use sync_core::connection::{AuthMethod, Connection, Secret, SharedSession, SignIn};
 use sync_core::credential::MemoryCredentialStore;
 use sync_core::failure::{FailureClass, FailureKind};
 use sync_core::hash::Sha1;
+use sync_core::meter::UploadMeter;
 use sync_core::store::{ItemState, StateStore};
 use sync_core::upload::{PreparedItem, UploadGate, UploadOutcome, Uploader};
 
@@ -452,7 +452,7 @@ async fn a_failed_attempt_that_carried_no_sidecar_keeps_the_recorded_digest() {
         live_photo_video: None,
     };
     let outcome = uploader
-        .upload_prepared(&prepared, &UploadGate::new(), &BandwidthLimit::default())
+        .upload_prepared(&prepared, &UploadGate::new(), &UploadMeter::detached())
         .await;
     let UploadOutcome::Failed(failure) = &outcome else {
         panic!("expected the faulted attempt to fail, got {outcome:?}");
@@ -500,7 +500,7 @@ async fn a_paused_upload_leaves_the_sidecar_owed() {
         live_photo_video: None,
     };
     let outcome = uploader
-        .upload_prepared(&prepared, &gate, &BandwidthLimit::default())
+        .upload_prepared(&prepared, &gate, &UploadMeter::detached())
         .await;
 
     assert_eq!(outcome, UploadOutcome::Deferred);

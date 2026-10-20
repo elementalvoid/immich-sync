@@ -6,7 +6,9 @@
 
 use std::path::Path;
 
+use crate::diagnostics::format_rate;
 use sync_core::engine::{Activity, EngineStatus};
+use sync_core::meter::UploadTraffic;
 use sync_core::store::{AlbumScope, FolderCounts};
 
 /// The activity state of the client or one source folder (SPEC R8.2).
@@ -64,6 +66,10 @@ pub struct StatusCard {
     /// Whether the source folder is readable (R2.5); always `true` for the
     /// global card.
     pub available: bool,
+    /// The upload traffic this card reads (R8.1): the rate over the last two
+    /// seconds and the uploads on the wire. The global card's is the sum of
+    /// the folders'.
+    pub uploads: UploadTraffic,
     /// The connection state, on the global card (R8.1).
     pub connection: Option<String>,
     /// The last error, already classified by the engine.
@@ -88,6 +94,10 @@ pub struct CardContent {
     pub album: Option<String>,
     /// Whether the folder is readable; the counts line says so when it is not.
     pub available: bool,
+    /// The upload line, on the global card (R8.1): the rate and the uploads on
+    /// the wire. `Idle` only when nothing is in flight *and* the rate is zero;
+    /// a rate still fading out is shown on its own.
+    pub uploads: Option<String>,
     /// The connection line, on the global card.
     pub connection: Option<String>,
     pub error: Option<String>,
@@ -127,10 +137,35 @@ impl StatusCard {
                 }
             }),
             available: self.available,
+            // R8.1: the line sums the folders, so it belongs to the card that
+            // is the sum.
+            uploads: self.path.is_none().then(|| upload_line(self.uploads)),
             connection: self.connection.clone(),
             error: self.last_error.clone(),
         }
     }
+}
+
+/// The upload line a card shows (R8.1).
+///
+/// The engine's rate is a rolling average over two seconds, so the window still
+/// holds the last bytes after an upload finishes, and a burst shorter than one
+/// status poll has a rate with nothing on the wire. The line is `Idle` only when
+/// nothing is on the wire *and* no byte is moving; a rate on its own is shown
+/// alone rather than with a zero count.
+fn upload_line(uploads: UploadTraffic) -> String {
+    if uploads.in_flight == 0 {
+        return if uploads.bytes_per_second == 0 {
+            "Idle".to_string()
+        } else {
+            format_rate(uploads.bytes_per_second as f64)
+        };
+    }
+    format!(
+        "{} · {} uploading",
+        format_rate(uploads.bytes_per_second as f64),
+        uploads.in_flight
+    )
 }
 
 impl From<Activity> for ActivityState {
@@ -187,6 +222,7 @@ impl DashboardModel {
             counts: counts_from(status.counts),
             review_count: status.counts.review,
             available: true,
+            uploads: status.uploads,
             connection,
             last_error: status.last_error.clone(),
             recursive: false,
@@ -214,6 +250,7 @@ impl DashboardModel {
                 counts: counts_from(folder.counts),
                 review_count: folder.counts.review,
                 available: folder.available,
+                uploads: folder.uploads,
                 connection: None,
                 last_error: folder.last_error.clone(),
                 recursive: folder.recursive,
@@ -248,6 +285,11 @@ pub fn sample() -> DashboardModel {
             },
             review_count: 3,
             available: true,
+            uploads: UploadTraffic {
+                bytes: 41_943_040,
+                bytes_per_second: 2_516_582,
+                in_flight: 3,
+            },
             connection: Some("Connected".to_string()),
             last_error: None,
             recursive: false,
@@ -267,6 +309,11 @@ pub fn sample() -> DashboardModel {
                 },
                 review_count: 0,
                 available: true,
+                uploads: UploadTraffic {
+                    bytes: 41_943_040,
+                    bytes_per_second: 2_516_582,
+                    in_flight: 3,
+                },
                 connection: None,
                 last_error: None,
                 recursive: true,
@@ -285,6 +332,7 @@ pub fn sample() -> DashboardModel {
                 },
                 review_count: 3,
                 available: true,
+                uploads: UploadTraffic::default(),
                 connection: None,
                 last_error: None,
                 recursive: true,
@@ -303,6 +351,7 @@ pub fn sample() -> DashboardModel {
                 },
                 review_count: 0,
                 available: true,
+                uploads: UploadTraffic::default(),
                 connection: None,
                 last_error: Some(
                     "permission_denied: the API key cannot write to this album".to_string(),
@@ -323,6 +372,7 @@ pub fn sample() -> DashboardModel {
                 },
                 review_count: 0,
                 available: true,
+                uploads: UploadTraffic::default(),
                 connection: None,
                 last_error: None,
                 recursive: true,
@@ -330,5 +380,44 @@ pub fn sample() -> DashboardModel {
                 album_scope: AlbumScope::Leaf,
             },
         ],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::upload_line;
+    use sync_core::meter::UploadTraffic;
+
+    /// A burst shorter than the poll interval leaves a rate with no upload on
+    /// the wire: the window still holds its bytes, so the line must show the
+    /// rate rather than claim the client is idle (R8.1).
+    #[test]
+    fn a_short_burst_reads_as_a_rate_then_fades_to_idle() {
+        assert_eq!(
+            upload_line(UploadTraffic {
+                bytes: 1_048_576,
+                bytes_per_second: 524_288,
+                in_flight: 0,
+            }),
+            "512.0 KiB/s",
+            "the burst is still in the window, so the line shows its rate"
+        );
+        assert_eq!(
+            upload_line(UploadTraffic {
+                bytes: 1_048_576,
+                bytes_per_second: 0,
+                in_flight: 0,
+            }),
+            "Idle",
+            "once the window is empty the client reads idle"
+        );
+        assert_eq!(
+            upload_line(UploadTraffic {
+                bytes: 0,
+                bytes_per_second: 524_288,
+                in_flight: 2,
+            }),
+            "512.0 KiB/s · 2 uploading"
+        );
     }
 }

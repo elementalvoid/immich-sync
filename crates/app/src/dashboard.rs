@@ -1,11 +1,13 @@
 //! The dashboard view (SPEC R8.1): a global status card and one card per
 //! source folder.
 //!
-//! Keyboard navigation stays out until the form controls land in #3.
+//! A new folder is confirmed in the setup dialog (#40) before the client
+//! records and scans it; the dialog's panel lives in [`crate::folder_panel`].
 
 use std::path::PathBuf;
 
 use crate::engine::EngineModel;
+use crate::folder_panel::{FolderPanel, FolderPanelEvent};
 use crate::path_picker::{self, Picked};
 use crate::status::{ActivityState, DashboardModel, StatusCard};
 
@@ -35,6 +37,10 @@ pub struct Dashboard {
     paused: bool,
     /// The notice a failed Browse… left behind (#30).
     pick_notice: Option<String>,
+    /// The open folder setup dialog (#40). The dashboard owns whether it is
+    /// open; the panel owns the draft inside it.
+    panel: Option<Entity<FolderPanel>>,
+    panel_subscription: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -48,6 +54,8 @@ impl Dashboard {
             folder_input: None,
             paused: false,
             pick_notice: None,
+            panel: None,
+            panel_subscription: None,
             _subscriptions: Vec::new(),
         }
     }
@@ -73,7 +81,7 @@ impl Dashboard {
             window,
             |this, _, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
-                    this.add_folder(window, cx);
+                    this.open_setup_from_field(window, cx);
                 }
             },
         ));
@@ -84,6 +92,8 @@ impl Dashboard {
             folder_input: Some(folder_input),
             paused: false,
             pick_notice: None,
+            panel: None,
+            panel_subscription: None,
             _subscriptions: subscriptions,
         }
     }
@@ -167,10 +177,13 @@ impl Dashboard {
         self.pick_notice = None;
         match path_picker::picked(result) {
             Picked::Path(path) => {
+                let path = path.to_string_lossy().into_owned();
                 if let Some(input) = self.folder_input.clone() {
-                    let path = path.to_string_lossy().into_owned();
-                    input.update(cx, |state, cx| state.set_value(path, window, cx));
+                    input.update(cx, |state, cx| state.set_value(path.clone(), window, cx));
                 }
+                // R2.1: a chosen folder is confirmed in the setup dialog, not
+                // recorded straight away.
+                self.open_folder_setup(path, window, cx);
             }
             Picked::Cancelled => {}
             Picked::Failed(notice) => self.pick_notice = Some(notice),
@@ -178,16 +191,65 @@ impl Dashboard {
         cx.notify();
     }
 
-    /// Adds the path the field holds (R2.1).
-    fn add_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(input) = self.folder_input.clone() else {
+    /// Opens the setup dialog for the path the field holds (#40, R2.1).
+    fn open_setup_from_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let path = self
+            .folder_input
+            .as_ref()
+            .map(|input| input.read(cx).value().trim().to_string())
+            .unwrap_or_default();
+        self.open_folder_setup(path, window, cx);
+    }
+
+    /// Opens the folder setup dialog for `path` (#40).
+    ///
+    /// Nothing is written here: the panel writes the path and all three
+    /// settings in one request when the user presses Add, and a Cancel drops
+    /// the draft.
+    fn open_folder_setup(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        // One setup at a time: a delayed Enter (the input's `PressEnter` can
+        // arrive a frame after the raw key event) must not replace a dialog
+        // whose Add is already in flight.
+        if self.panel.is_some() {
+            return;
+        }
+        let Some(engine) = self.engine.clone() else {
             return;
         };
-        let path = input.read(cx).value().trim().to_string();
-        if let Some(engine) = &self.engine {
-            engine.update(cx, |model, cx| model.add_folder(path, true, cx));
+        let panel = cx.new(|cx| FolderPanel::setup(engine, path, cx));
+        let focus = panel.read(cx).focus_handle(cx);
+        let subscription = cx.subscribe_in(
+            &panel,
+            window,
+            |this, _panel, event: &FolderPanelEvent, window, cx| {
+                if matches!(event, FolderPanelEvent::Added) {
+                    this.clear_folder_input(window, cx);
+                }
+                this.close_folder_setup(window, cx);
+            },
+        );
+        self.panel = Some(panel);
+        self.panel_subscription = Some(subscription);
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    /// Closes the setup dialog and puts focus back on the folder field (#40).
+    fn close_folder_setup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.panel = None;
+        self.panel_subscription = None;
+        if let Some(input) = self.folder_input.clone() {
+            let focus = input.read(cx).focus_handle(cx);
+            window.focus(&focus, cx);
         }
-        input.update(cx, |state, cx| state.set_value("", window, cx));
+        cx.notify();
+    }
+
+    /// Clears the field once its folder is recorded (#40).
+    fn clear_folder_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(input) = self.folder_input.clone() {
+            input.update(cx, |state, cx| state.set_value("", window, cx));
+        }
     }
 
     /// Removes one source folder (R2.1).
@@ -259,6 +321,19 @@ impl Dashboard {
                                 .test_support()
                                 .track_focus(&focus)
                                 .aria_label("Source folder path")
+                                // The field's Enter opens the setup dialog. The
+                                // raw key event is handled here as well as
+                                // through the input's `PressEnter`, so the key
+                                // works whether or not the platform gives the
+                                // field its own key context.
+                                .on_key_down(cx.listener(
+                                    |this, event: &KeyDownEvent, window, cx| {
+                                        if event.keystroke.key == "enter" {
+                                            this.open_setup_from_field(window, cx);
+                                            cx.stop_propagation();
+                                        }
+                                    },
+                                ))
                                 .flex_1()
                                 .min_w_0()
                                 .child(Input::new(&input).aria_label("Source folder path")),
@@ -278,7 +353,7 @@ impl Dashboard {
                                 .label("Add folder")
                                 .accessibility_label("Add folder")
                                 .on_click(cx.listener(|this, _, window, cx| {
-                                    this.add_folder(window, cx);
+                                    this.open_setup_from_field(window, cx);
                                 })),
                         )
                     }),
@@ -498,6 +573,7 @@ impl Render for Dashboard {
                         }),
                 ),
             )
+            .when_some(self.panel.clone(), |this, panel| this.child(panel))
     }
 }
 
@@ -630,7 +706,7 @@ fn status_card(
                 .items_center()
                 .gap_3()
                 .child(
-                    Progress::new((id, "progress"))
+                    Progress::new((id.clone(), "progress"))
                         .flex_1()
                         .value(content.progress * 100.0)
                         .accessibility_label(format!("{title} progress")),
@@ -648,6 +724,21 @@ fn status_card(
                 .text_color(palette.meta)
                 .child(content.counts),
         )
+        .when_some(content.uploads.clone(), |this, uploads| {
+            // R8.1: the global card's rate and uploads in flight. Plain meta
+            // ink on the card surface, which is the pair the theme contrast
+            // test measures, and a label instead of a control: nothing new to
+            // operate or to skip.
+            this.child(
+                div()
+                    .id((id.clone(), "uploads"))
+                    .test_support()
+                    .aria_label(uploads.clone())
+                    .text_sm()
+                    .text_color(palette.meta)
+                    .child(uploads),
+            )
+        })
         .when_some(content.album.clone(), |this, album| {
             this.child(div().text_sm().text_color(palette.meta).child(album))
         });
