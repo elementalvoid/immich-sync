@@ -18,6 +18,7 @@ pub mod paths;
 pub mod scan;
 pub mod skip;
 pub mod store;
+pub mod tags;
 pub mod upload;
 pub mod versions;
 pub mod watch;

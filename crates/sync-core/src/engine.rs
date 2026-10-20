@@ -44,6 +44,7 @@ use crate::store::{
     AlbumScope, AttemptOutcome, AttemptRecord, FailedItem, FolderCounts, ItemRecord, ItemState,
     ReviewDecision, ReviewItem, SourceFolder, StateStore, StoreError,
 };
+use crate::tags::{TagStatus, Tagger};
 use crate::upload::{
     CheckOutcome, PreparedItem, UploadFailure, UploadGate, UploadOutcome, Uploader, check_outcome,
     hash_in_background, pending_sidecar,
@@ -90,6 +91,9 @@ pub struct EngineConfig {
     /// How long the queue waits between credential probes while the breaker is
     /// open (R6.6).
     pub breaker_cooldown: Duration,
+    /// Whether uploaded assets get the sync tag (R3.7). Off by default;
+    /// [`Engine::set_tag_uploads`] is the live path.
+    pub tag_uploaded_assets: bool,
 }
 
 impl Default for EngineConfig {
@@ -106,6 +110,7 @@ impl Default for EngineConfig {
             breaker_threshold: 5,
             attention_threshold: 3,
             breaker_cooldown: Duration::from_secs(10),
+            tag_uploaded_assets: false,
         }
     }
 }
@@ -250,6 +255,8 @@ struct EngineInner {
     albums: AlbumMapper,
     /// Carries a changed file's associations onto its new version (R4.2-R4.4).
     versions: Versioner,
+    /// Applies the sync tag to a settled asset (R3.7).
+    tags: Tagger,
     config: EngineConfig,
     gate: UploadGate,
     /// Trips after a run of connection failures (R6.6).
@@ -341,6 +348,10 @@ impl Engine {
         // them spends the one re-login the engine already shares.
         let albums = AlbumMapper::new(session.clone(), store.clone());
         let versions = Versioner::new(session.clone(), store.clone());
+        // R3.7: the sync tag is opt-in. The tagger starts with the stored
+        // setting and is moved live by `set_tag_uploads`.
+        let tags = Tagger::new(session.clone());
+        tags.set_enabled(config.tag_uploaded_assets);
         let breaker = CircuitBreaker::new(config.breaker_threshold, config.breaker_cooldown);
         // R1.4: the attention run is its own, shorter number. A refused batch
         // spends up to two failures, so the default of three keeps one batch
@@ -352,6 +363,7 @@ impl Engine {
             uploader,
             albums,
             versions,
+            tags,
             breaker,
             upload_slots: Mutex::new(Arc::new(Semaphore::new(config.concurrency.max(1)))),
             bandwidth: BandwidthLimit::new(config.bandwidth_bytes_per_second),
@@ -389,6 +401,18 @@ impl Engine {
         let Some(queue_rx) = queue_rx else {
             return;
         };
+        // R3.7: resolve the tag once at start, so an API key that is missing a
+        // permission reaches Settings before the first upload does, and so the
+        // tag exists for the first asset that needs it.
+        if self.inner.tags.enabled() {
+            let inner = Arc::clone(&self.inner);
+            let prepare = tokio::spawn(async move { inner.tags.prepare().await });
+            self.inner
+                .tasks
+                .lock()
+                .expect("the task list")
+                .push(prepare);
+        }
         let inner = Arc::clone(&self.inner);
         let dispatcher = tokio::spawn({
             let inner = Arc::clone(&inner);
@@ -551,6 +575,29 @@ impl Engine {
             concurrency = target,
             "the limits changed"
         );
+    }
+
+    /// The sync tag's live state, for the Settings section (R3.7).
+    ///
+    /// The engine model polls this with the rest of the status, so the view
+    /// never makes a second permission probe of its own.
+    #[must_use]
+    pub fn tag_status(&self) -> TagStatus {
+        self.inner.tags.status()
+    }
+
+    /// Turns the sync tag on or off while the engine runs (R3.7).
+    ///
+    /// Turning it on resolves the tag once, so an API key missing a permission
+    /// is reported to Settings before the first upload rather than after it.
+    /// Turning it off stops new tagging: assets that already carry the tag keep
+    /// it, and the tag itself is not deleted.
+    pub async fn set_tag_uploads(&self, enabled: bool) {
+        let changed = self.inner.tags.set_enabled(enabled);
+        if changed && enabled {
+            self.inner.tags.prepare().await;
+        }
+        tracing::info!(enabled, "R3.7: the sync tag setting changed");
     }
 
     /// Adds a source folder and scans it (R2.1).
@@ -1576,6 +1623,10 @@ async fn settle_duplicate(inner: &Arc<EngineInner>, item: &PreparedItem, asset_i
     // R3.4: a duplicate is a success (R3.2), and it still maps to its
     // folder's album.
     attach_albums(inner, &item.path, asset_id).await;
+    // R3.7: the sync tag follows the settled asset. It runs last and its
+    // failure is the tagger's own to record: a tag failure must not fail or
+    // park an upload the server accepted.
+    let _ = inner.tags.tag(asset_id).await;
 }
 
 /// Restores one trashed asset through the shared session (R5.3).
@@ -1830,6 +1881,9 @@ async fn spawn_upload(inner: &Arc<EngineInner>, item: PreparedItem) {
                 // after `finish_item`, so a later success cannot clear the error
                 // an album failure records against the folder.
                 attach_albums(&worker, &item.path, asset_id).await;
+                // R3.7: the sync tag follows the settled asset. A failure is
+                // recorded for Settings and never reaches the item's state.
+                let _ = worker.tags.tag(asset_id).await;
                 tracing::info!(path = %item.path.display(), asset_id = %asset_id, "the item finished");
             }
             UploadOutcome::Failed(failure) | UploadOutcome::DeadLetter(failure) => {
@@ -2310,6 +2364,10 @@ mod tests {
             "R2.3: default scan interval"
         );
         assert_eq!(config.watch_debounce, Duration::from_secs(2));
+        assert!(
+            !config.tag_uploaded_assets,
+            "R3.7: the sync tag is off by default"
+        );
     }
 
     #[test]
