@@ -10,6 +10,7 @@ pub mod diagnostics_view;
 pub mod engine;
 pub mod failed;
 pub mod failed_view;
+pub mod folder_panel;
 #[cfg(test)]
 mod git_revision;
 pub mod instance;

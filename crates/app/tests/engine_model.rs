@@ -1078,3 +1078,129 @@ async fn a_signed_out_re_add_of_a_mapped_folder_keeps_its_album_settings(cx: &mu
         "R3.4: the re-add must keep the stored scope"
     );
 }
+
+/// #40: the setup dialog's Add reaches the running engine. One write records
+/// the path and all three settings, and the folder's existing files upload
+/// without a manual Sync now.
+#[gpui_kit::test]
+async fn a_confirmed_folder_add_scans_the_folder_through_the_running_engine(
+    cx: &mut TestAppContext,
+) {
+    let (_runtime, server) = mock_server();
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the fixture folder");
+    std::fs::write(photos.join("existing.jpg"), b"existing").expect("write the fixture file");
+
+    let connection = signed_in(cx, &server);
+    let store = cx.update(|cx| cx.new(|cx| StoreModel::open(&paths, cx)));
+    wait_for_inputs(cx, &connection, &store).await;
+    let engine =
+        cx.update(|cx| cx.new(|cx| EngineModel::new(connection, store.clone(), &paths, cx)));
+    cx.update(|cx| engine.update(cx, |model, cx| model.start(cx)));
+    assert!(
+        pump_until(cx, |cx| cx.read(|cx| engine.read(cx).is_running())),
+        "the engine never started"
+    );
+
+    let confirmed = SourceFolder {
+        path: photos.display().to_string(),
+        recursive: false,
+        album_mapping: true,
+        album_scope: sync_core::store::AlbumScope::WholeFolder,
+    };
+    let request = cx.update(|cx| {
+        engine.update(cx, |model, cx| {
+            model.add_folder_settings(confirmed.clone(), cx)
+        })
+    });
+    assert!(
+        pump_until(cx, |cx| cx
+            .read(|cx| engine.read(cx).folder_add_result().is_some())),
+        "#40: the add result never reached the dialog"
+    );
+    let result = cx
+        .read(|cx| engine.read(cx).folder_add_result().cloned())
+        .expect("the add came back");
+    assert_eq!(result.request, request, "#40: the result is this request's");
+    assert_eq!(result.problem, None, "#40: the folder was added");
+    assert_eq!(
+        cx.read(|cx| {
+            store
+                .read(cx)
+                .store()
+                .expect("the store is open")
+                .folders()
+                .expect("read the folders")
+        }),
+        vec![confirmed.clone()],
+        "#40: one write records the path and all three settings"
+    );
+    assert_eq!(
+        cx.read(|cx| engine.read(cx).status().folders.len()),
+        1,
+        "R8.1: the engine's card holds the new folder"
+    );
+    assert!(
+        pump_until(cx, |_| server.upload_requests() >= 1),
+        "R2.1: a confirmed folder starts scanning and uploading its files"
+    );
+}
+
+/// #40: an Add that arrives before the state store opens comes back with that
+/// reason, so the dialog stays open and the user can try again.
+#[gpui_kit::test]
+async fn an_add_before_the_store_opens_reports_that_reason(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the fixture folder");
+
+    let connection = cx.update(|cx| {
+        let credentials: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+        cx.new(|_| ConnectionModel::new(ServerProfile::default(), credentials))
+    });
+    let store = cx.update(|cx| cx.new(|cx| StoreModel::open(&paths, cx)));
+    assert!(
+        cx.read(|cx| store.read(cx).store().is_none()),
+        "the store must still be opening when the add is sent"
+    );
+    let engine =
+        cx.update(|cx| cx.new(|cx| EngineModel::new(connection, store.clone(), &paths, cx)));
+    let draft = SourceFolder {
+        path: photos.display().to_string(),
+        recursive: true,
+        album_mapping: false,
+        album_scope: sync_core::store::AlbumScope::Leaf,
+    };
+    cx.update(|cx| {
+        engine.update(cx, |model, cx| {
+            model.add_folder_settings(draft, cx);
+        })
+    });
+    assert!(
+        pump_until(cx, |cx| cx
+            .read(|cx| engine.read(cx).folder_add_result().is_some())),
+        "#40: the store-opening result never reached the dialog"
+    );
+    let result = cx
+        .read(|cx| engine.read(cx).folder_add_result().cloned())
+        .expect("the add came back");
+    assert_eq!(
+        result.problem.as_deref(),
+        Some("The state database is still opening."),
+        "#40: the dialog shows why nothing was written"
+    );
+    assert!(
+        cx.read(|cx| store.read(cx).folders().is_empty()),
+        "#40: a store-opening add writes nothing"
+    );
+    assert_eq!(
+        cx.read(|cx| engine.read(cx).problem().map(str::to_string)),
+        None,
+        "#40: a refused add is the dialog's reason, not an engine problem"
+    );
+}
