@@ -20,6 +20,8 @@ fn folder(path: &str, counts: FolderCounts) -> FolderStatus {
         recursive: true,
         album_mapping: false,
         album_scope: AlbumScope::Leaf,
+        album_title: None,
+        album_rename: None,
         available: true,
         counts,
         last_error: None,

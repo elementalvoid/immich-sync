@@ -215,6 +215,33 @@ ALTER TABLE source_folder ADD COLUMN last_scan_ns INTEGER;
 ALTER TABLE source_folder ADD COLUMN last_upload_ns INTEGER;
 ";
 
+/// The twelfth schema (#47): the album title the user chose, and the rename it
+/// may still owe the server.
+///
+/// The title lives on the album row, keyed by the mapped folder's path key,
+/// rather than on the folder row: the album row is what survives the folder
+/// being removed and added again, so the title survives with it, and there is
+/// one stored title instead of two that could disagree. `title` is the user's
+/// choice and is `NULL` when the album takes the folder's name, which is also
+/// what every album written before this schema was called.
+///
+/// `album_id` loses its `NOT NULL`: a title is stored even while album mapping
+/// is off and no album exists yet, and the create then uses it. `rename_pending`
+/// is what a later scan, restart, or reconnect retries; `rename_problem` is why
+/// the last attempt did not reach the server.
+const SCHEMA_V12: &str = "
+CREATE TABLE album_next (
+    folder_key     TEXT PRIMARY KEY,
+    title          TEXT,
+    album_id       TEXT,
+    rename_pending INTEGER NOT NULL DEFAULT 0,
+    rename_problem TEXT
+);
+INSERT INTO album_next (folder_key, album_id) SELECT folder_key, album_id FROM album;
+DROP TABLE album;
+ALTER TABLE album_next RENAME TO album;
+";
+
 /// How long the one writer waits for a competing lock before failing.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -246,6 +273,27 @@ const TAG_BACKFILL_IDS: &str = "
     SELECT asset_id FROM sync_item WHERE asset_id IS NOT NULL
     UNION
     SELECT asset_id FROM version";
+
+/// Writes one album title, and what the write owes the server (#47).
+///
+/// An album that already exists must be renamed; one that does not yet exist
+/// takes the title when it is created, so nothing is pending. A row that
+/// already held the title keeps whatever it owed, so a folder write that
+/// carries the stored title (a recursive toggle, say) queues no rename, and a
+/// changed title drops the last failure because it was about the old name.
+const ALBUM_TITLE_UPSERT: &str = "
+    INSERT INTO album (folder_key, title, rename_pending) VALUES (?1, ?2, 0)
+    ON CONFLICT(folder_key) DO UPDATE SET
+        rename_pending = CASE
+            WHEN album.album_id IS NOT NULL AND album.title IS NOT excluded.title THEN 1
+            ELSE album.rename_pending
+        END,
+        rename_problem = CASE
+            WHEN album.title IS excluded.title THEN album.rename_problem
+            ELSE NULL
+        END,
+        title = excluded.title
+";
 
 /// The `sync_item` columns [`read_item`] expects, in the order it reads them.
 ///
@@ -415,6 +463,32 @@ pub struct SourceFolder {
     pub album_mapping: bool,
     /// What the folder maps to once album mapping is on (R3.4).
     pub album_scope: AlbumScope,
+    /// The title the user chose for this folder's own album, or `None` when the
+    /// album takes the folder's name (#47).
+    ///
+    /// It is stored on the album row rather than the folder row, so the folder
+    /// being removed and added again keeps it (#47). This field is the row's
+    /// title read back, never a second copy.
+    pub album_title: Option<String>,
+}
+
+/// One mapped folder's album: the title the user chose and the id the server
+/// answered (#47, R3.4).
+///
+/// The row is keyed by the mapped folder's path key, which is the album's
+/// identity (GLOSSARY); the title is what the album should be called.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Album {
+    /// The title the user chose, or `None` when the album takes the folder's
+    /// name (#47).
+    pub title: Option<String>,
+    /// The album the server holds, or `None` while none was created: a title is
+    /// stored before the album exists and used when it is created (#47).
+    pub album_id: Option<String>,
+    /// Whether the title still has to reach the server (#47).
+    pub rename_pending: bool,
+    /// Why the last rename attempt did not reach the server (#47).
+    pub rename_problem: Option<String>,
 }
 
 /// The per-folder item counts a dashboard card shows (R8.1).
@@ -1168,6 +1242,10 @@ impl StateStore {
     /// Adds a source folder, or updates its recursive flag, album mapping, and
     /// album scope when the same folder is added again (R2.1, R3.4).
     ///
+    /// A title the folder carries is written with the rest (#47). A folder with
+    /// no title leaves the stored one alone, so a caller that builds a row from
+    /// another surface cannot clear a title it never showed.
+    ///
     /// # Errors
     ///
     /// Returns [`StoreError`] when the write fails or the lock is poisoned.
@@ -1188,7 +1266,8 @@ impl StateStore {
     ///
     /// A folder the store already holds under the platform's path rule (R2.4)
     /// is not replaced and `false` comes back, so the setup dialog can show
-    /// "Already added" without disturbing the stored settings.
+    /// "Already added" without disturbing the stored settings, the album title
+    /// and its pending rename included (#47).
     ///
     /// # Errors
     ///
@@ -1221,6 +1300,20 @@ impl StateStore {
                 ],
             )
             .map_err(|source| self.query_error(source))?;
+        // A refused insert wrote no folder row, so the title it carried is not
+        // this folder's: writing it would queue a rename the user never asked
+        // for (#47, #40).
+        if written > 0 && folder.album_title.is_some() {
+            transaction
+                .execute(
+                    ALBUM_TITLE_UPSERT,
+                    params![
+                        path_key(Path::new(&folder.path)),
+                        folder.album_title.as_deref(),
+                    ],
+                )
+                .map_err(|source| self.query_error(source))?;
+        }
         transaction
             .commit()
             .map_err(|source| self.query_error(source))?;
@@ -1252,8 +1345,9 @@ impl StateStore {
         let writer = self.writer()?;
         let mut statement = writer
             .prepare(
-                "SELECT path, recursive, album_mapping, album_scope
-                 FROM source_folder ORDER BY path",
+                "SELECT f.path, f.recursive, f.album_mapping, f.album_scope, a.title
+                 FROM source_folder f LEFT JOIN album a ON a.folder_key = f.path_key
+                 ORDER BY f.path",
             )
             .map_err(|source| self.query_error(source))?;
         let rows = statement
@@ -1263,53 +1357,116 @@ impl StateStore {
             .map_err(|source| self.query_error(source))
     }
 
-    /// The album the server assigned for the mapped folder `folder_key`, when
-    /// this client already made one (R3.4).
+    /// The album row of the mapped folder `folder_key` (R3.4, #47), when this
+    /// client ever wrote one.
     ///
     /// The folder key is the identity, because the album scope is one album per
-    /// folder (GLOSSARY): the album name is a copy the mapping makes, so two
+    /// folder (GLOSSARY): the album title is a name the mapping gives, so two
     /// folders that share a name are two albums (R3.4).
     ///
     /// # Errors
     ///
     /// Returns [`StoreError`] when the query fails.
-    pub fn album(&self, folder_key: &str) -> Result<Option<String>, StoreError> {
+    pub fn album(&self, folder_key: &str) -> Result<Option<Album>, StoreError> {
         let writer = self.writer()?;
         writer
             .query_row(
-                "SELECT album_id FROM album WHERE folder_key = ?1",
+                "SELECT title, album_id, rename_pending, rename_problem
+                 FROM album WHERE folder_key = ?1",
                 [folder_key],
-                |row| row.get(0),
+                |row| {
+                    Ok(Album {
+                        title: row.get(0)?,
+                        album_id: row.get(1)?,
+                        rename_pending: row.get(2)?,
+                        rename_problem: row.get(3)?,
+                    })
+                },
             )
             .optional()
             .map_err(|source| self.query_error(source))
     }
 
-    /// Records the album the server assigned for the mapped folder
-    /// `folder_key`, so the next file in the same folder joins the same album
-    /// (R3.4).
+    /// Records the title the user chose for the mapped folder `folder_key`
+    /// (#47).
     ///
-    /// `name` is recorded for whoever reads the file directly; no query reads
-    /// it back.
+    /// An album that already exists must be renamed, so the row is marked
+    /// pending; one that does not exist yet takes the title when it is created,
+    /// so nothing is pending. Setting the title the row already holds owes the
+    /// server nothing, so a folder write that carries the stored title (a
+    /// recursive toggle, say) never queues a rename.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError`] when the write fails or the lock is poisoned.
-    pub fn remember_album(
+    pub fn set_album_title(&self, folder_key: &str, title: Option<&str>) -> Result<(), StoreError> {
+        let writer = self.writer()?;
+        writer
+            .execute(ALBUM_TITLE_UPSERT, params![folder_key, title])
+            .map_err(|source| self.query_error(source))?;
+        Ok(())
+    }
+
+    /// Records the album the server answered with for the mapped folder
+    /// `folder_key`, with the title it currently holds (#47, R3.4).
+    ///
+    /// This is both the create's answer and the rename's: the stored title
+    /// follows the server, and the rename it owed is done.
+    ///
+    /// `settled` is the title the request was based on. A row whose title has
+    /// changed since — the user typed again while the request was on the wire —
+    /// keeps the newer title and stays pending, so an answer cannot overwrite
+    /// an edit it never saw (#47).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the write fails or the lock is poisoned.
+    pub fn record_album(
         &self,
         folder_key: &str,
-        name: &str,
         album_id: &str,
+        settled: Option<&str>,
+        title: Option<&str>,
     ) -> Result<(), StoreError> {
         let writer = self.writer()?;
         // One statement, so the single write is atomic on its own and needs no
         // transaction around it.
         writer
             .execute(
-                "INSERT INTO album (folder_key, name, album_id) VALUES (?1, ?2, ?3)
+                "INSERT INTO album (folder_key, title, album_id) VALUES (?1, ?4, ?2)
                  ON CONFLICT(folder_key) DO UPDATE SET
-                     name = excluded.name, album_id = excluded.album_id",
-                params![folder_key, name, album_id],
+                     album_id = excluded.album_id,
+                     rename_problem = CASE
+                         WHEN album.title IS ?3 THEN NULL
+                         ELSE album.rename_problem
+                     END,
+                     rename_pending = CASE
+                         WHEN album.title IS ?3 THEN 0
+                         ELSE 1
+                     END,
+                     title = CASE
+                         WHEN album.title IS ?3 THEN excluded.title
+                         ELSE album.title
+                     END",
+                params![folder_key, album_id, settled, title],
+            )
+            .map_err(|source| self.query_error(source))?;
+        Ok(())
+    }
+
+    /// Records that the title of the album of `folder_key` did not reach the
+    /// server, and why (#47). The row stays pending, so a later scan, restart,
+    /// or reconnect tries again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the write fails or the lock is poisoned.
+    pub fn album_rename_failed(&self, folder_key: &str, reason: &str) -> Result<(), StoreError> {
+        let writer = self.writer()?;
+        writer
+            .execute(
+                "UPDATE album SET rename_pending = 1, rename_problem = ?2 WHERE folder_key = ?1",
+                params![folder_key, reason],
             )
             .map_err(|source| self.query_error(source))?;
         Ok(())
@@ -2277,7 +2434,8 @@ fn read_version(row: &rusqlite::Row<'_>) -> rusqlite::Result<Version> {
     })
 }
 
-/// Reads one `source_folder` row.
+/// Reads one `source_folder` row, with the album title the folder's own album
+/// row holds (#47).
 fn read_folder(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceFolder> {
     let scope_text: String = row.get(3)?;
     let album_scope = AlbumScope::parse(&scope_text).ok_or_else(|| {
@@ -2292,6 +2450,7 @@ fn read_folder(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceFolder> {
         recursive: row.get(1)?,
         album_mapping: row.get(2)?,
         album_scope,
+        album_title: row.get(4)?,
     })
 }
 
@@ -2425,6 +2584,7 @@ fn migrations() -> Migrations<'static> {
         M::up(SCHEMA_V9),
         M::up(SCHEMA_V10),
         M::up(SCHEMA_V11),
+        M::up(SCHEMA_V12),
     ])
 }
 
@@ -2634,6 +2794,7 @@ mod migration_tests {
                 recursive: true,
                 album_mapping: false,
                 album_scope: AlbumScope::Leaf,
+                album_title: None,
             }],
             "R3.4: a folder mapped before album mapping existed reads back off, at the default \
              scope, through the whole composed migration chain"
@@ -2683,6 +2844,7 @@ mod migration_tests {
                 recursive: true,
                 album_mapping: true,
                 album_scope: AlbumScope::WholeFolder,
+                album_title: None,
             }],
             "the folder row and its album settings survive the chain"
         );
@@ -2696,6 +2858,76 @@ mod migration_tests {
                 .record_folder_scan("/photos", 42)
                 .expect("record the scan"),
             "the migrated row accepts a scan time"
+        );
+    }
+
+    /// #47: a database written before the album title existed keeps the
+    /// albums it recorded, and they read as albums named after their folders.
+    #[test]
+    fn the_album_title_arrives_on_a_v11_database() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let path = temp.path().join("state.db");
+        {
+            let mut connection = Connection::open(&path).expect("open the raw database");
+            // Every schema before the album title, so the composed chain has to
+            // apply V12 over an album row V4 wrote.
+            Migrations::new(vec![
+                M::up(SCHEMA_V1),
+                M::up_with_hook(SCHEMA_V2, backfill_path_keys),
+                M::up(SCHEMA_V3),
+                M::up(SCHEMA_V4),
+                M::up(SCHEMA_V5),
+                M::up(SCHEMA_V6),
+                M::up(SCHEMA_V7),
+                M::up(SCHEMA_V8),
+                M::up(SCHEMA_V9),
+                M::up(SCHEMA_V10),
+                M::up(SCHEMA_V11),
+            ])
+            .to_latest(&mut connection)
+            .expect("create the eleventh schema");
+            connection
+                .execute(
+                    "INSERT INTO source_folder (path, path_key, recursive, album_mapping, album_scope)
+                     VALUES (?1, ?2, 1, 1, 'whole_folder')",
+                    params!["/photos", "/photos"],
+                )
+                .expect("insert the source folder");
+            connection
+                .execute(
+                    "INSERT INTO album (folder_key, name, album_id) VALUES (?1, ?2, ?3)",
+                    params!["/photos", "photos", "album-7"],
+                )
+                .expect("insert the album");
+            drop(connection);
+        }
+
+        let store = StateStore::open(&path).expect("a v11 database must migrate");
+        assert_eq!(
+            store.album("/photos").expect("read the album"),
+            Some(Album {
+                title: None,
+                album_id: Some("album-7".to_string()),
+                rename_pending: false,
+                rename_problem: None,
+            }),
+            "#47: an album named after its folder reads as no custom title, and its id survives"
+        );
+        assert_eq!(
+            store.folders().expect("read the folders")[0].album_title,
+            None,
+            "#47: a folder from before the title existed reads back with no title"
+        );
+        store
+            .set_album_title("/photos", Some("Holiday"))
+            .expect("the migrated row accepts a title");
+        assert!(
+            store
+                .album("/photos")
+                .expect("read the album")
+                .expect("the row")
+                .rename_pending,
+            "#47: the migrated album row can ask for its rename"
         );
     }
 
@@ -3116,6 +3348,7 @@ mod folder_time_tests {
             recursive: true,
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
+            album_title: None,
         }
     }
 

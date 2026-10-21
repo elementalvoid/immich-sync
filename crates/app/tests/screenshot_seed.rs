@@ -99,6 +99,9 @@ fn seed_capture_state() {
                 } else {
                     AlbumScope::Leaf
                 },
+                // #47: the capture shows one folder with a custom title and one
+                // that takes its folder name.
+                album_title: album_mapping.then(|| "Pictures 2024".to_string()),
             })
             .expect("add the capture folder");
     }

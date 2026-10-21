@@ -45,10 +45,10 @@ use crate::pairing::FolderIndex;
 use crate::paths::{PathCase, is_within, path_key};
 use crate::scan::{ScanError, scan_folder};
 use crate::skip::{has_symlink_ancestor, skip_reason_below};
-use crate::status::{ConnectionHealth, FolderStatus, Status, StatusInputs};
+use crate::status::{AlbumRename, ConnectionHealth, FolderStatus, Status, StatusInputs};
 use crate::store::{
-    AlbumScope, AttemptOutcome, AttemptRecord, FailedItem, FolderCounts, ItemRecord, ItemState,
-    ReviewDecision, ReviewItem, SourceFolder, StateStore, StoreError,
+    Album, AlbumScope, AttemptOutcome, AttemptRecord, FailedItem, FolderCounts, ItemRecord,
+    ItemState, ReviewDecision, ReviewItem, SourceFolder, StateStore, StoreError,
 };
 use crate::tags::{TagStatus, Tagger};
 use crate::tracking::{Observer, Tracking, TrackingError, stored_folder};
@@ -207,6 +207,10 @@ struct FolderEntry {
     /// file under this folder streams under its limit view and counts itself
     /// here, so the bytes of two concurrent uploads can never be swapped.
     meter: Arc<UploadMeter>,
+    /// The folder's album row: its id and the title the server does not hold
+    /// yet (#47). It is the store's row, refreshed where the row changes; the
+    /// status poll never reads the database.
+    album: Album,
 }
 
 /// The shared engine state. Tasks and the shell hold it through an `Arc`.
@@ -268,6 +272,8 @@ struct EngineInner {
     index_cache: Mutex<FolderIndex>,
     /// Wakes the scan loop when an absence needs reconciling.
     reconcile: Notify,
+    /// Wakes the album retry, which sends the titles the user changed (#47).
+    album_wake: Notify,
 }
 
 /// The folder sync engine (R2, R3, R6.7, R8.7).
@@ -320,6 +326,9 @@ impl Engine {
                 tracing::warn!(folder = %folder.path, error = %error, "the folder times could not be read");
                 crate::store::FolderTimes::default()
             });
+            // #47: the album row holds the title the user chose, so the
+            // status reads it from memory rather than the database.
+            let album = album_of_store(&store, &folder);
             entries.push(FolderEntry {
                 available: Path::new(&folder.path).is_dir(),
                 meter: Arc::new(UploadMeter::new(&bandwidth)),
@@ -328,6 +337,7 @@ impl Engine {
                 last_error: None,
                 last_scan_ns: times.last_scan_ns,
                 last_upload_ns: times.last_upload_ns,
+                album,
             });
         }
         let uploader = Uploader::new(session.clone(), store.clone());
@@ -376,6 +386,7 @@ impl Engine {
             last_error: Mutex::new(None),
             resume: Notify::new(),
             sync_now: Notify::new(),
+            album_wake: Notify::new(),
             watcher: Mutex::new(None),
             tasks: Mutex::new(Vec::new()),
             stopped: AtomicBool::new(false),
@@ -417,6 +428,13 @@ impl Engine {
             .expect("the task list")
             .push(backfill);
         self.inner.tag_wake.notify_one();
+        // #47: a title the user changed is sent by its own task, woken by the
+        // edit and by the scan, so no status poll sends a request.
+        let albums = tokio::spawn({
+            let inner = Arc::clone(&self.inner);
+            async move { album_retry_loop(inner).await }
+        });
+        self.inner.tasks.lock().expect("the task list").push(albums);
         let inner = Arc::clone(&self.inner);
         let dispatcher = tokio::spawn({
             let inner = Arc::clone(&inner);
@@ -692,6 +710,23 @@ impl Engine {
         Ok(())
     }
 
+    /// Sets the title of one source folder's own album (#47).
+    ///
+    /// The title is stored with the folder's album row even while album
+    /// mapping is off, and a blank one means the folder's name. An album that
+    /// already exists is renamed by the retry the write wakes, so a failed or
+    /// offline rename keeps the title and is tried again on the next scan,
+    /// restart, or reconnect; a session that is signed out stores it and sends
+    /// it once an engine runs.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::set_album_mapping`].
+    pub fn set_album_title(&self, path: &str, title: &str) -> Result<(), EngineError> {
+        self.tracking.set_album_title(path, title)?;
+        Ok(())
+    }
+
     /// Removes a source folder; its items stay in the store (R2.1).
     ///
     /// # Errors
@@ -722,6 +757,16 @@ impl Engine {
                     recursive: entry.folder.recursive,
                     album_mapping: entry.folder.album_mapping,
                     album_scope: entry.folder.album_scope,
+                    album_title: entry.folder.album_title.clone(),
+                    album_rename: entry.album.rename_pending.then(|| {
+                        entry
+                            .album
+                            .rename_problem
+                            .as_ref()
+                            .map_or(AlbumRename::Pending, |reason| {
+                                AlbumRename::Failed(reason.clone())
+                            })
+                    }),
                     available: entry.available,
                     counts: entry.counts,
                     last_error: entry.last_error.clone(),
@@ -926,6 +971,7 @@ impl Observer for EngineObserver {
                 // the one the live entry holds, and no field is left stale.
                 entry.folder = stored.clone();
                 entry.available = available;
+                entry.album = album_of_store(&inner.store, &stored);
             }
             None => {
                 // R8.1: a folder new to this engine starts from what the store
@@ -955,10 +1001,16 @@ impl Observer for EngineObserver {
                     // R8.1: every upload under this folder meters into this
                     // one, under the folder's view of the client limit (R7.1).
                     meter: Arc::new(UploadMeter::new(&inner.bandwidth)),
+                    // #47: a folder new to this engine starts from the title
+                    // the store already holds for it.
+                    album: album_of_store(&inner.store, &stored),
                 });
             }
         }
         drop(folders);
+        // #47: a title stored before an album existed, or before this engine
+        // ran, is sent now instead of at the next scan interval.
+        inner.album_wake.notify_one();
         let mut watcher = inner.watcher.lock().expect("the watcher lock");
         let mut watch_error = None;
         if let Some(watcher) = watcher.as_mut()
@@ -1017,8 +1069,14 @@ impl Observer for EngineObserver {
             .iter_mut()
             .find(|entry| path_key(Path::new(&entry.folder.path)) == key)
         {
+            entry.album = album_of_store(&inner.store, &stored);
             entry.folder = stored;
         }
+        drop(folders);
+        // #47: the change may be an album title, which the server has to be
+        // told about. A mapping or scope change queues nothing, so the retry
+        // finds no pending row and sends no request.
+        inner.album_wake.notify_one();
     }
 
     fn folder_removed(&self, path: &str) {
@@ -2147,6 +2205,65 @@ async fn tag_backfill_loop(inner: Arc<EngineInner>) {
     }
 }
 
+/// Sends the album titles the user changed, and keeps the folders' published
+/// state in step with the album rows (#47).
+///
+/// It is woken by a folder change and by the scan, never by a status poll, so a
+/// server that keeps refusing a rename is asked once per event instead of once
+/// per frame.
+async fn album_retry_loop(inner: Arc<EngineInner>) {
+    loop {
+        inner.album_wake.notified().await;
+        settle_album_titles(&inner).await;
+    }
+}
+
+/// Sends every album title that is still pending, then republishes what the
+/// album rows now hold (#47).
+async fn settle_album_titles(inner: &Arc<EngineInner>) {
+    inner.albums.settle_titles().await;
+    refresh_album_rows(inner);
+}
+
+/// Re-reads every folder's album row into its live entry (#47).
+///
+/// The retry writes the rows it settles, so the status a signed-in or
+/// signed-out client shows follows them without a database read per poll.
+fn refresh_album_rows(inner: &EngineInner) {
+    let folders = match inner.store.folders() {
+        Ok(folders) => folders,
+        Err(error) => {
+            tracing::warn!(error = %error, "the folders could not be read");
+            return;
+        }
+    };
+    let mut entries = inner.folders.lock().expect("the folder lock");
+    for folder in folders {
+        let key = path_key(Path::new(&folder.path));
+        let album = album_of_store(&inner.store, &folder);
+        if let Some(entry) = entries
+            .iter_mut()
+            .find(|entry| path_key(Path::new(&entry.folder.path)) == key)
+        {
+            entry.album = album;
+            entry.folder.album_title = folder.album_title;
+        }
+    }
+}
+
+/// The album row of one folder, or the default when it holds none or cannot be
+/// read (#47).
+fn album_of_store(store: &StateStore, folder: &SourceFolder) -> Album {
+    let key = path_key(Path::new(&folder.path));
+    match store.album(&key) {
+        Ok(album) => album.unwrap_or_default(),
+        Err(error) => {
+            tracing::warn!(folder = %folder.path, error = %error, "the album row could not be read");
+            Album::default()
+        }
+    }
+}
+
 /// The reconciliation scan loop: startup, the configured interval, and
 /// "Sync now" (R2.3).
 async fn scan_loop(inner: Arc<EngineInner>) {
@@ -2243,6 +2360,10 @@ async fn scan_once(inner: &Arc<EngineInner>) {
             let _ = inner.queue.send(file);
         }
     }
+    // #47: a scan is the one event that runs on a start, a reconnect, and the
+    // interval, so a title the server did not take is sent here rather than
+    // from the upload path or a timer of its own.
+    settle_album_titles(inner).await;
     tracing::info!(queued, "the reconciliation scan finished");
 }
 
@@ -2556,6 +2677,7 @@ mod tests {
                 recursive: true,
                 album_mapping: false,
                 album_scope: AlbumScope::default(),
+                album_title: None,
             })
             .expect("add the folder");
         // The session is never used: this test sends no request.
@@ -2609,6 +2731,7 @@ mod tests {
                     recursive: true,
                     album_mapping: false,
                     album_scope: AlbumScope::default(),
+                    album_title: None,
                 })
                 .expect("add the folder");
             dirs.push(dir);
@@ -2691,6 +2814,7 @@ mod tests {
                     recursive: true,
                     album_mapping: false,
                     album_scope: AlbumScope::default(),
+                    album_title: None,
                 })
                 .expect("add the folder");
             dirs.push(dir);
@@ -2966,6 +3090,7 @@ mod tests {
                 recursive: true,
                 album_mapping: false,
                 album_scope: AlbumScope::default(),
+                album_title: None,
             })
             .expect("add the folder");
         let mut connection = crate::connection::Connection::new(
