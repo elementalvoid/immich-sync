@@ -13,8 +13,9 @@
 //! id is cached for the run, so the upsert runs once and a tag the user deleted
 //! in Immich is created again on the next run - or on the next attempt after a
 //! failure, because a tag failure clears the cache. An API key that lacks a
-//! permission is refused once per run: the rest of the uploads replay that
-//! refusal instead of probing the key again.
+//! permission is refused once per credential: the rest of the uploads replay
+//! that refusal instead of probing the key again, until a sign-in or re-login
+//! moves the session to a credential that may hold the permission.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -77,9 +78,10 @@ pub struct Tagger {
     enabled: AtomicBool,
     /// Why the tag is not working, for the Settings section (R3.7).
     problem: Mutex<Option<String>>,
-    /// The permissions an API key was already refused, so the rest of the run
-    /// replays the refusal instead of probing the key for every asset (R3.7).
-    refused: Mutex<Option<Vec<&'static str>>>,
+    /// The permissions an API key was already refused and the session's auth
+    /// epoch when that happened, so a new credential probes the key again
+    /// instead of replaying a refusal that may no longer hold (R3.7).
+    refused: Mutex<Option<(u32, Vec<&'static str>)>>,
 }
 
 impl Tagger {
@@ -136,7 +138,8 @@ impl Tagger {
         // A new run or a new toggle probes the key, whatever the last one
         // settled on.
         *self.refused.lock().expect("the tag refusal lock") = None;
-        self.record(&self.resolve().await.map(|_| ()), None);
+        let epoch = self.session.auth_epoch();
+        self.record(epoch, &self.resolve().await.map(|_| ()), None);
     }
 
     /// Adds the sync tag to one settled asset (R3.7).
@@ -153,24 +156,37 @@ impl Tagger {
         if !self.enabled() {
             return Ok(());
         }
-        // An API key's permissions do not change within a run, so one settled
-        // refusal is the answer for every later asset: it is replayed instead
-        // of probing the key and warning again (R3.7).
+        // An API key's permissions do not change within a credential, so one
+        // settled refusal is the answer for every later asset: it is replayed
+        // instead of probing the key and warning again (R3.7). A sign-in or
+        // re-login makes a new credential, which may hold the permission.
+        // The epoch is read first: if the credential moves while the tag
+        // request runs, the refusal is filed under the old one and the next
+        // call probes again rather than replaying it.
+        let epoch = self.session.auth_epoch();
         if let Some(refusal) = self.refusal() {
             return Err(refusal);
         }
         let outcome = self.apply(asset_id).await;
-        self.record(&outcome, Some(asset_id));
+        self.record(epoch, &outcome, Some(asset_id));
         outcome
     }
 
     /// The refusal the key already settled on, if any (R3.7).
     fn refusal(&self) -> Option<TagError> {
-        self.refused
-            .lock()
-            .expect("the tag refusal lock")
-            .clone()
-            .map(|permissions| TagError::MissingPermission { permissions })
+        let epoch = self.session.auth_epoch();
+        let mut refused = self.refused.lock().expect("the tag refusal lock");
+        if refused
+            .as_ref()
+            .is_some_and(|(settled, _)| *settled != epoch)
+        {
+            *refused = None;
+        }
+        refused
+            .as_ref()
+            .map(|(_, permissions)| TagError::MissingPermission {
+                permissions: permissions.clone(),
+            })
     }
 
     /// Applies the tag and drops the cached id when the call fails: a refused
@@ -249,11 +265,16 @@ impl Tagger {
 
     /// Records the newest outcome for Settings, and logs a failure with its
     /// reason (R3.7, R10.3).
-    fn record(&self, outcome: &Result<(), TagError>, asset_id: Option<&str>) {
+    ///
+    /// `epoch` is the session's auth epoch the outcome was measured against, so
+    /// a credential change during the request makes the refusal stale.
+    fn record(&self, epoch: u32, outcome: &Result<(), TagError>, asset_id: Option<&str>) {
         let problem = outcome.as_ref().err().map(ToString::to_string);
         if let Err(TagError::MissingPermission { permissions }) = outcome {
-            // The rest of the run replays this instead of asking again (R3.7).
-            *self.refused.lock().expect("the tag refusal lock") = Some(permissions.clone());
+            // The rest of this credential's uploads replay this instead of
+            // asking again (R3.7); a new credential asks again.
+            *self.refused.lock().expect("the tag refusal lock") =
+                Some((epoch, permissions.clone()));
         }
         if let Some(problem) = &problem {
             tracing::warn!(

@@ -720,3 +720,94 @@ async fn a_settled_permission_refusal_is_not_probed_again_for_each_upload() {
     );
     engine.stop();
 }
+
+/// R3.7: a sign-in that fixes the key's permissions clears the refusal the old
+/// credential settled on, without a new engine: the next upload probes once and
+/// is tagged.
+#[tokio::test]
+async fn a_new_sign_in_clears_the_settled_permission_refusal() {
+    let server = MockImmich::start().await;
+    server.set_api_key("test-key");
+    // The upload permission is granted, so the item uploads: the tag alone is
+    // refused, which is the refusal the run has to remember.
+    server.set_api_key_permissions(&["asset.upload", "tag.create", "tag.asset"]);
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+    add_folder(&store, &photos);
+
+    let session = signed_in_with(&server, AuthMethod::ApiKey, "test-key").await;
+    let engine = Arc::new(
+        Engine::new(store.clone(), session.clone(), tagged_config()).expect("build the engine"),
+    );
+    engine.start();
+    assert!(
+        wait_until(
+            || engine.tag_status().problem.is_some(),
+            Duration::from_secs(10)
+        )
+        .await,
+        "R3.7: the start did not settle the key's refusal"
+    );
+    assert_eq!(
+        server.api_key_me_requests(),
+        1,
+        "R3.7: the start probe is the credential's one permission read"
+    );
+
+    // The user grants the missing permission and signs in again with the same
+    // key; the running engine keeps the tagger it was built with.
+    server.set_api_key_permissions(&["asset.upload", "tag.create", "tag.asset", "asset.update"]);
+    session
+        .sign_in(SignIn {
+            email: "sync@example.com".to_string(),
+            secret: Secret::new("test-key"),
+            method: AuthMethod::ApiKey,
+        })
+        .await;
+
+    let file = write_file(&photos, "regranted.jpg", b"regranted bytes");
+    engine.sync_now();
+    assert!(
+        wait_until(|| succeeded(&store, &file), Duration::from_secs(20)).await,
+        "the upload did not finish"
+    );
+    let asset = asset_of(&store, &file);
+    assert!(
+        wait_until(
+            || !server.tags_of(&asset).is_empty(),
+            Duration::from_secs(10)
+        )
+        .await,
+        "R3.7: the asset never got the tag after the key was fixed: {:?}",
+        server.tags_of(&asset)
+    );
+    let tag = server
+        .tag_id(SYNC_TAG)
+        .expect("R3.7: the fixed key created the sync tag");
+    assert_eq!(
+        server.tags_of(&asset),
+        vec![tag],
+        "R3.7: the asset carries the tag the fixed key created"
+    );
+    assert_eq!(
+        server.api_key_me_requests(),
+        2,
+        "R3.7: the new sign-in costs exactly one new permission probe"
+    );
+    assert_eq!(
+        server.upsert_calls().len(),
+        1,
+        "R3.7: the fixed key creates the tag once"
+    );
+    assert!(
+        wait_until(
+            || engine.tag_status().problem.is_none(),
+            Duration::from_secs(10)
+        )
+        .await,
+        "R3.7: the notice cleared once the tag landed"
+    );
+    engine.stop();
+}
