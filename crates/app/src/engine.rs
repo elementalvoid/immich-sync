@@ -1044,8 +1044,9 @@ impl EngineModel {
                         album_mapping: folder.album_mapping,
                         album_scope: folder.album_scope,
                         // #47: the signed-out detail still shows the title the
-                        // store holds. No rename can be pending without an
-                        // engine to send it, so it shows none.
+                        // store holds. The row may be pending here — the desired
+                        // title is stored either way, and the rename waits for
+                        // an engine — so this view shows no rename.
                         album_title: folder.album_title.clone(),
                         album_rename: None,
                         available: Path::new(&folder.path).is_dir(),

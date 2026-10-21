@@ -1250,7 +1250,8 @@ impl StateStore {
     ///
     /// A folder the store already holds under the platform's path rule (R2.4)
     /// is not replaced and `false` comes back, so the setup dialog can show
-    /// "Already added" without disturbing the stored settings.
+    /// "Already added" without disturbing the stored settings, the album title
+    /// and its pending rename included (#47).
     ///
     /// # Errors
     ///
@@ -1283,7 +1284,10 @@ impl StateStore {
                 ],
             )
             .map_err(|source| self.query_error(source))?;
-        if folder.album_title.is_some() {
+        // A refused insert wrote no folder row, so the title it carried is not
+        // this folder's: writing it would queue a rename the user never asked
+        // for (#47, #40).
+        if written > 0 && folder.album_title.is_some() {
             transaction
                 .execute(
                     ALBUM_TITLE_UPSERT,

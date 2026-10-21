@@ -408,6 +408,61 @@ fn inserting_a_tracked_folder_changes_nothing() {
 }
 
 #[test]
+fn inserting_a_tracked_folder_keeps_its_album_title() {
+    use sync_core::store::{Album, AlbumScope, SourceFolder};
+
+    // #47: the setup dialog can carry a title the tracked folder does not hold,
+    // and a refused insert must not queue a rename for it either.
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    let original = SourceFolder {
+        path: "/photos".to_string(),
+        recursive: true,
+        album_mapping: true,
+        album_scope: AlbumScope::WholeFolder,
+        album_title: Some("Holiday 2024".to_string()),
+    };
+    store
+        .add_folder(&original)
+        .expect("seed the tracked folder");
+    store
+        .record_album(
+            "/photos",
+            "album-7",
+            Some("Holiday 2024"),
+            Some("Holiday 2024"),
+        )
+        .expect("record the album the server made");
+
+    let changed = SourceFolder {
+        recursive: false,
+        album_title: Some("Another title".to_string()),
+        ..original.clone()
+    };
+    assert!(
+        !store
+            .insert_folder(&changed)
+            .expect("the insert is refused"),
+        "#40: an already-tracked folder reports that it was not inserted"
+    );
+    assert_eq!(
+        store.folders().expect("read the folders"),
+        vec![original],
+        "#40: the stored settings stay untouched"
+    );
+    assert_eq!(
+        store.album("/photos").expect("read the album row"),
+        Some(Album {
+            title: Some("Holiday 2024".to_string()),
+            album_id: Some("album-7".to_string()),
+            rename_pending: false,
+            rename_problem: None,
+        }),
+        "#47: a refused insert leaves the title, and its pending rename, alone"
+    );
+}
+
+#[test]
 fn a_recorded_album_id_survives_a_restart() {
     let temp = tempfile::tempdir().expect("create a temp dir");
     let path = temp.path().join("state.db");
