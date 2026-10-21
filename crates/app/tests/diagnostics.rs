@@ -975,7 +975,9 @@ async fn the_bundle_action_saves_an_archive_shows_its_path_and_copies_it(cx: &mu
     // dropped even on this thread: issue #49's missing log line. If the test
     // rebuilds the cache while its own sink is installed, every callsite is
     // enabled again. The production client installs one process-wide sink, so
-    // there is no second dispatcher that could poison the cache.
+    // there is no second dispatcher that could poison the cache. This first
+    // rebuild is insurance for what `open_shell` logs before the sign-in; the
+    // measured poison window is the store wait, guarded again below.
     tracing::callsite::rebuild_interest_cache();
     let (window, store, _engine, diagnostics) = open_shell(
         cx,
