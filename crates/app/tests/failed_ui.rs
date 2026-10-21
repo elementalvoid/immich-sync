@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, Bounds, Point, Role, TestAppContext, Window,
-    WindowBounds, WindowOptions, px, size,
+    AnyWindowHandle, App, AppContext as _, Bounds, Point, Role, SharedString, TestAppContext,
+    Window, WindowBounds, WindowOptions, px, size,
 };
 use immich_sync::connection::ConnectionModel;
 use immich_sync::engine::EngineModel;
@@ -21,7 +21,7 @@ use sync_core::connection::ServerProfile;
 use sync_core::credential::{MemoryCredentialStore, SharedCredentialStore};
 use sync_core::failure::FailureClass;
 use sync_core::hash::Sha1;
-use sync_core::store::{ItemRecord, ItemState, StateStore};
+use sync_core::store::{AlbumScope, ItemRecord, ItemState, SourceFolder, StateStore};
 
 /// The path layout the other app tests use, so the view gets a temp database.
 fn temporary_paths(dir: &Path) -> AppPaths {
@@ -66,7 +66,10 @@ fn parked(
 }
 
 /// Seeds the state database and opens the failed-items view over it.
-fn open_failed_view(cx: &mut TestAppContext, paths: &AppPaths) -> AnyWindowHandle {
+fn open_failed_view(
+    cx: &mut TestAppContext,
+    paths: &AppPaths,
+) -> (AnyWindowHandle, gpui_kit::Entity<FailedView>) {
     let paths = paths.clone();
     cx.update(|cx| {
         gpui_kit::init(cx);
@@ -80,8 +83,24 @@ fn open_failed_view(cx: &mut TestAppContext, paths: &AppPaths) -> AnyWindowHandl
             cx.new(|cx| FailedView::new(engine, window, cx))
         })
         .expect("open the failed-items window")
-        .0
     })
+}
+
+/// Adds one source folder to the state database, before the view opens.
+///
+/// The folder path does not have to exist: the client keeps an unavailable
+/// source folder in its list (R2.5).
+fn seed_folder(paths: &AppPaths, path: &Path, recursive: bool) {
+    let store = StateStore::open(&paths.state_db).expect("open the state database");
+    store
+        .add_folder(&SourceFolder {
+            path: path.display().to_string(),
+            recursive,
+            album_mapping: false,
+            album_scope: AlbumScope::Leaf,
+            album_title: None,
+        })
+        .expect("add the source folder");
 }
 
 /// Pumps the executor until the rendered view holds `count` rows.
@@ -115,15 +134,16 @@ fn tab(window: &mut Window, cx: &mut App) {
 }
 
 /// Tabs until `id` holds the keyboard focus.
-fn tab_to(window: &mut Window, id: &'static str, cx: &mut App) {
+fn tab_to(window: &mut Window, id: impl Into<SharedString>, cx: &mut App) {
+    let id: SharedString = id.into();
     for _ in 0..24 {
-        if window.find(id).focused() == Some(true) {
+        if window.find(id.clone()).focused() == Some(true) {
             return;
         }
         tab(window, cx);
     }
     assert_eq!(
-        window.find(id).focused(),
+        window.find(id.clone()).focused(),
         Some(true),
         "{id} is not keyboard reachable"
     );
@@ -164,7 +184,7 @@ async fn the_failed_view_names_every_row_and_its_retry_control(cx: &mut TestAppC
             ))
             .expect("write the unclassified row");
     }
-    let window = open_failed_view(cx, &paths);
+    let (window, _view) = open_failed_view(cx, &paths);
     wait_for_rows(cx, window, 3).await;
 
     cx.update_window(window, |_, window, cx| {
@@ -215,7 +235,7 @@ async fn every_retry_control_is_a_keyboard_reachable_tab_stop(cx: &mut TestAppCo
                 .expect("write the dead-letter row");
         }
     }
-    let window = open_failed_view(cx, &paths);
+    let (window, _view) = open_failed_view(cx, &paths);
     wait_for_rows(cx, window, 2).await;
 
     cx.update_window(window, |_, window, cx| {
@@ -245,7 +265,7 @@ async fn a_retry_click_requeues_the_item_and_clears_its_row(cx: &mut TestAppCont
             ))
             .expect("write the dead-letter row");
     }
-    let window = open_failed_view(cx, &paths);
+    let (window, _view) = open_failed_view(cx, &paths);
     wait_for_rows(cx, window, 1).await;
 
     cx.update_window(window, |_, window, cx| {
@@ -292,4 +312,235 @@ async fn a_retry_click_requeues_the_item_and_clears_its_row(cx: &mut TestAppCont
         );
     })
     .expect("read the empty state");
+}
+
+/// One parked row under `path`, so the folder it belongs to is decided by the
+/// path alone.
+fn failed_under(paths: &AppPaths, path: &Path) {
+    let store = StateStore::open(&paths.state_db).expect("open the state database");
+    store
+        .record(&parked(
+            &path.display().to_string(),
+            ItemState::DeadLetter,
+            Some(FailureClass::ServerTransient),
+            Some("the server answered 503"),
+            8,
+        ))
+        .expect("write the dead-letter row");
+}
+
+#[gpui_kit::test]
+async fn the_failed_view_offers_every_source_folder_under_all_folders(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+    // `archive` is not on disk: an unavailable source folder stays in the
+    // client's list (R2.5), so the filter must offer it too.
+    let archive = temp.path().join("archive");
+    seed_folder(&paths, &photos, true);
+    seed_folder(&paths, &archive, true);
+    failed_under(&paths, &photos.join("IMG_0001.jpg"));
+    let (window, _view) = open_failed_view(cx, &paths);
+    wait_for_rows(cx, window, 1).await;
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("failed-folder-filter").label(),
+            Some("Folder filter: All folders"),
+            "the filter starts on All folders and is named for the keyboard"
+        );
+
+        window.click("failed-folder-filter", cx);
+        assert_eq!(
+            window.find("failed-folder-options").role(),
+            Some(Role::List),
+            "the options are one list"
+        );
+        assert_eq!(
+            window.find("failed-folder-option-0").role(),
+            Some(Role::ListItem),
+            "each option is a list item of that list"
+        );
+        assert_eq!(
+            window.find("failed-folder-option-0").label(),
+            Some("Show items from all folders, selected"),
+            "the option list marks the current choice, not only with colour"
+        );
+        assert_eq!(
+            window.find("failed-folder-option-1").label(),
+            Some(format!("Show only {}", archive.display()).as_str()),
+            "the unavailable folder is offered like any other, named by its full path"
+        );
+        assert_eq!(
+            window.find("failed-folder-option-2").label(),
+            Some(format!("Show only {}", photos.display()).as_str())
+        );
+    })
+    .expect("read the folder filter");
+}
+
+#[gpui_kit::test]
+async fn choosing_a_folder_narrows_the_list_its_summary_and_its_empty_state(
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let camera_roll = temp.path().join("Camera Roll");
+    let videos = temp.path().join("Videos");
+    seed_folder(&paths, &camera_roll, true);
+    seed_folder(&paths, &videos, true);
+    failed_under(&paths, &camera_roll.join("IMG_0001.cr3"));
+    failed_under(&paths, &temp.path().join("outside.jpg"));
+    let (window, _view) = open_failed_view(cx, &paths);
+    wait_for_rows(cx, window, 2).await;
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("failed-summary").label(),
+            Some("2 files could not be uploaded."),
+            "All folders counts every item"
+        );
+
+        // Videos sorts after Camera Roll, so it is the second folder option.
+        window.click("failed-folder-filter", cx);
+        assert_eq!(
+            window.find("failed-folder-option-2").label(),
+            Some(format!("Show only {}", videos.display()).as_str()),
+            "labels stay short; the accessible name carries the full path"
+        );
+        window.click("failed-folder-option-2", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("failed-empty").label(),
+            Some("No failed items in Videos"),
+            "the empty state names the folder the filter shows"
+        );
+        assert_eq!(
+            window.find("failed-summary").label(),
+            Some("No failed items in Videos"),
+            "an empty filtered list is summarised for its folder, not for the whole client"
+        );
+        assert!(window.try_find("failed-row-0").is_none());
+
+        window.click("failed-folder-filter", cx);
+        window.click("failed-folder-option-1", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("failed-summary").label(),
+            Some("1 file could not be uploaded."),
+            "the summary counts the selected folder's items"
+        );
+        assert_eq!(failed_rows(window), 1);
+        assert_eq!(
+            window.find("failed-folder-chip").label(),
+            Some("Showing Camera Roll"),
+            "the active folder has a chip"
+        );
+    })
+    .expect("read the filtered failed-items view");
+}
+
+#[gpui_kit::test]
+async fn the_filter_and_its_clear_action_are_keyboard_reachable_and_named(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let camera_roll = temp.path().join("Camera Roll");
+    seed_folder(&paths, &camera_roll, true);
+    failed_under(&paths, &camera_roll.join("IMG_0001.cr3"));
+    failed_under(&paths, &temp.path().join("outside.jpg"));
+    let (window, _view) = open_failed_view(cx, &paths);
+    wait_for_rows(cx, window, 2).await;
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        // N5: the keyboard reaches the filter and its options.
+        tab_to(window, "failed-folder-filter", cx);
+        window.click("failed-folder-filter", cx);
+        window.render_frame(cx);
+        tab_to(window, "failed-folder-option-0", cx);
+        tab_to(window, "failed-folder-option-1", cx);
+        window.click("failed-folder-option-1", cx);
+        window.render_frame(cx);
+        assert_eq!(failed_rows(window), 1);
+        assert_eq!(
+            window.find("failed-folder-filter").focused(),
+            Some(true),
+            "choosing a folder keeps the keyboard focus on the trigger"
+        );
+
+        // The clear action is named and a tab stop of its own.
+        assert_eq!(
+            window.find("failed-folder-clear").label(),
+            Some("Clear the folder filter")
+        );
+        tab_to(window, "failed-folder-clear", cx);
+        window.click("failed-folder-clear", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("failed-folder-filter").focused(),
+            Some(true),
+            "clearing keeps the keyboard focus on the filter's trigger"
+        );
+    })
+    .expect("tab through the folder filter");
+
+    assert_eq!(
+        failed_count(cx, window),
+        2,
+        "clearing the filter restores every item"
+    );
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("failed-folder-filter").label(),
+            Some("Folder filter: All folders")
+        );
+    })
+    .expect("read the cleared filter");
+}
+
+#[gpui_kit::test]
+async fn the_view_opens_with_a_folder_already_selected(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let camera_roll = temp.path().join("Camera Roll");
+    let videos = temp.path().join("Videos");
+    seed_folder(&paths, &camera_roll, true);
+    seed_folder(&paths, &videos, true);
+    failed_under(&paths, &camera_roll.join("IMG_0001.cr3"));
+    failed_under(&paths, &videos.join("CLIP_0002.mp4"));
+    let (window, view) = open_failed_view(cx, &paths);
+    wait_for_rows(cx, window, 2).await;
+
+    // The seam the folder detail will call (#43).
+    let selected = camera_roll.display().to_string();
+    cx.update(|cx| {
+        view.update(cx, |view, cx| view.select_folder(selected.clone(), cx));
+    });
+    cx.update_window(window, |_, window, cx| window.render_frame(cx))
+        .expect("render the selected folder");
+
+    assert_eq!(failed_count(cx, window), 1, "the seam narrows the list");
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("failed-folder-chip").label(),
+            Some("Showing Camera Roll")
+        );
+    })
+    .expect("read the selected folder");
+}
+
+/// The rows the rendered view holds, counted from `window`'s element tree.
+fn failed_rows(window: &Window) -> usize {
+    (0..16)
+        .take_while(|index| window.try_find(format!("failed-row-{index}")).is_some())
+        .count()
 }

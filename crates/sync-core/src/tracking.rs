@@ -54,6 +54,9 @@ pub enum TrackingError {
     /// The path is not one of this client's source folders.
     #[error("{0} is not a source folder of this client")]
     UnknownFolder(String),
+    /// The client already tracks this source folder (R2.4).
+    #[error("{0} is already a source folder of this client")]
+    FolderExists(String),
 }
 
 /// The source folders and the user's decisions over their items.
@@ -149,12 +152,62 @@ impl Tracking {
                 path: path.to_string(),
                 recursive,
                 album_mapping: existing.as_ref().is_some_and(|folder| folder.album_mapping),
-                album_scope: existing.map_or_else(AlbumScope::default, |folder| folder.album_scope),
+                album_scope: existing
+                    .as_ref()
+                    .map_or_else(AlbumScope::default, |folder| folder.album_scope),
+                // #47: a re-add is not a title edit, so the stored title is
+                // carried instead of being written away.
+                album_title: existing.and_then(|folder| folder.album_title),
             };
             self.store.add_folder(&folder)?;
             folder
         };
         tracing::info!(folder = %folder.path, recursive, "a source folder was added");
+        self.notify(|observer| observer.folder_added(&folder));
+        Ok(folder)
+    }
+
+    /// Adds a source folder with the settings the user confirmed in the setup
+    /// panel, refusing one the client already holds (R2.1, R2.4, R3.4).
+    ///
+    /// Unlike [`Self::add_folder`], this is an insert: a path the client
+    /// already tracks is [`TrackingError::FolderExists`] and nothing is
+    /// written, so the panel can say "Already added" and leave the stored
+    /// settings alone. The comparison is the path key, so a case-only variant
+    /// cannot become a second folder on Windows (R2.4).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrackingError::EmptyFolder`] for a blank path,
+    /// [`TrackingError::FolderExists`] when the client already tracks the path,
+    /// and a [`StoreError`] when the write fails.
+    pub fn insert_folder(&self, folder: &SourceFolder) -> Result<SourceFolder, TrackingError> {
+        let path = folder.path.trim();
+        if path.is_empty() {
+            return Err(TrackingError::EmptyFolder);
+        }
+        let folder = SourceFolder {
+            path: path.to_string(),
+            ..folder.clone()
+        };
+        {
+            let _write = self.writes.lock().expect("the folder write lock");
+            if stored_folder(&self.store, path)?.is_some() {
+                return Err(TrackingError::FolderExists(path.to_string()));
+            }
+            // The store's insert still decides: it refuses a row another
+            // writer got there first.
+            if !self.store.insert_folder(&folder)? {
+                return Err(TrackingError::FolderExists(path.to_string()));
+            }
+        }
+        tracing::info!(
+            folder = %folder.path,
+            recursive = folder.recursive,
+            album_mapping = folder.album_mapping,
+            album_scope = folder.album_scope.as_str(),
+            "a source folder was added with its confirmed settings"
+        );
         self.notify(|observer| observer.folder_added(&folder));
         Ok(folder)
     }
@@ -203,6 +256,47 @@ impl Tracking {
         scope: AlbumScope,
     ) -> Result<SourceFolder, TrackingError> {
         self.update_folder(path, |folder| folder.album_scope = scope)
+    }
+
+    /// Sets the title of one source folder's own album (#47).
+    ///
+    /// A blank or whitespace-only title is stored as none, which means the
+    /// folder's name. The title is stored even while album mapping is off, and
+    /// the store decides whether it owes the server a rename, so the shell and
+    /// the engine write it by the same rule.
+    ///
+    /// The title is not a column of the folder row, so this writes the album
+    /// row alone. A folder-row write carries the title it was given and skips
+    /// one that is none, which would leave the stored title in place instead of
+    /// clearing it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrackingError::UnknownFolder`] for a path this client does
+    /// not hold, and a [`StoreError`] when the write fails.
+    pub fn set_album_title(&self, path: &str, title: &str) -> Result<SourceFolder, TrackingError> {
+        let title = title.trim();
+        let title = (!title.is_empty()).then(|| title.to_string());
+        let folder = {
+            let _write = self.writes.lock().expect("the folder write lock");
+            let folder = stored_folder(&self.store, path)?
+                .ok_or_else(|| TrackingError::UnknownFolder(path.to_string()))?;
+            self.store
+                .set_album_title(&path_key(Path::new(&folder.path)), title.as_deref())?;
+            SourceFolder {
+                album_title: title,
+                ..folder
+            }
+        };
+        tracing::info!(
+            folder = %folder.path,
+            album_title = folder.album_title.as_deref().unwrap_or(""),
+            "the album title changed"
+        );
+        // The write has landed before anyone hears about it, so the engine's
+        // retry reads the title it has to send.
+        self.notify(|observer| observer.folder_changed(&folder));
+        Ok(folder)
     }
 
     /// Keeps the server asset for one missing file and clears it from the
@@ -277,7 +371,8 @@ impl Tracking {
             folder = %folder.path,
             album_mapping = folder.album_mapping,
             album_scope = folder.album_scope.as_str(),
-            "the album mapping changed"
+            album_title = folder.album_title.as_deref().unwrap_or(""),
+            "the album settings changed"
         );
         self.notify(|observer| observer.folder_changed(&folder));
         Ok(folder)

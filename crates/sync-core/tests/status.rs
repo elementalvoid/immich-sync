@@ -1,6 +1,7 @@
 //! The derived status (SPEC R8.1, R8.2): one table for what the tray and the
 //! dashboard show, whether or not the engine runs.
 
+use sync_core::meter::UploadTraffic;
 use sync_core::status::{Activity, ConnectionHealth, FolderStatus, Status, StatusInputs};
 use sync_core::store::{AlbumScope, FolderCounts};
 
@@ -19,9 +20,14 @@ fn folder(path: &str, counts: FolderCounts) -> FolderStatus {
         recursive: true,
         album_mapping: false,
         album_scope: AlbumScope::Leaf,
+        album_title: None,
+        album_rename: None,
         available: true,
         counts,
         last_error: None,
+        last_scan_ns: None,
+        last_upload_ns: None,
+        uploads: UploadTraffic::default(),
     }
 }
 
@@ -132,4 +138,30 @@ fn the_counts_are_summed_across_folders() {
         folder("/videos", counts(10, 20, 30, 40)),
     ]));
     assert_eq!(status.counts, counts(11, 22, 33, 44));
+}
+
+/// R8.1: the global card's throughput is the sum of the folders', so the two
+/// cannot disagree about what is on the wire.
+#[test]
+fn the_upload_traffic_is_summed_across_folders() {
+    let mut photos = folder("/photos", FolderCounts::default());
+    photos.uploads = UploadTraffic {
+        bytes: 1_000,
+        bytes_per_second: 400,
+        in_flight: 1,
+    };
+    let mut videos = folder("/videos", FolderCounts::default());
+    videos.uploads = UploadTraffic {
+        bytes: 2_000,
+        bytes_per_second: 600,
+        in_flight: 2,
+    };
+    assert_eq!(
+        Status::derive(inputs(vec![photos, videos])).uploads,
+        UploadTraffic {
+            bytes: 3_000,
+            bytes_per_second: 1_000,
+            in_flight: 3,
+        }
+    );
 }

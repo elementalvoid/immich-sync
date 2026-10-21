@@ -97,6 +97,7 @@ fn seed(paths: &AppPaths, root: &Path) {
             recursive: true,
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
+            album_title: None,
         })
         .expect("add the source folder");
     for index in 0..SEEDED_ROWS {
@@ -251,13 +252,16 @@ fn visible_center(window: &Window, container: &ElementId) -> Point<gpui_kit::Pix
 
 /// Scrolls `container` with wheel events until `target` is visible.
 ///
-/// Fails when the target never becomes visible, which is exactly the clipping
-/// the ticket reports: the element exists but the user cannot reach it.
+/// `lines` is the wheel's vertical delta per event: negative scrolls towards
+/// the end of the content, positive back towards its start. Fails when the
+/// target never becomes visible, which is exactly the clipping the ticket
+/// reports: the element exists but the user cannot reach it.
 fn scroll_until_visible(
     window: &mut Window,
     cx: &mut App,
     container: &ElementId,
     target: &ElementId,
+    lines: f32,
 ) {
     window.render_frame(cx);
     for _ in 0..60 {
@@ -268,7 +272,7 @@ fn scroll_until_visible(
         window.dispatch_event(
             ScrollWheelEvent {
                 position,
-                delta: ScrollDelta::Lines(point(0., -4.)),
+                delta: ScrollDelta::Lines(point(0., lines)),
                 ..Default::default()
             }
             .to_platform_input(),
@@ -333,7 +337,7 @@ async fn every_long_surface_reaches_its_last_element_at_a_short_height(cx: &mut 
                      not prove scrolling"
                 );
             }
-            scroll_until_visible(window, cx, &container, &target);
+            scroll_until_visible(window, cx, &container, &target, -4.);
         })
         .expect("update the shell window");
     }
@@ -348,18 +352,41 @@ async fn the_log_tail_scrolls_inside_its_own_container(cx: &mut TestAppContext) 
     let store = SettingsStore::open(paths.config_file.clone());
     let (window, shell) = open_shell(cx, store, paths);
 
-    let last = ElementId::from(format!("logs-line-{}", SEEDED_LINES - 1));
+    let newest = ElementId::from(format!("logs-line-{}", SEEDED_LINES - 1));
+    let oldest = ElementId::from("logs-line-0");
     shell.update(cx, |shell, cx| shell.show(ViewMode::Logs, cx));
-    wait_for_element(cx, window, last.clone()).await;
+    wait_for_element(cx, window, newest.clone()).await;
     cx.update_window(window, |_, window, cx| {
         // The outer surface brings the tail card into view...
-        scroll_until_visible(window, cx, &"logs-view".into(), &"logs-lines".into());
-        // ...then the tail itself scrolls to the newest line.
+        scroll_until_visible(window, cx, &"logs-view".into(), &"logs-lines".into(), -4.);
+        // ...and the live tail opens at its newest line, so the oldest rows sit
+        // above the box's top edge.
+        let box_top = window.find("logs-lines").bounds().origin.y;
         assert!(
-            !window.find(last.clone()).visible(),
-            "the newest line starts below the tail card"
+            window.find(oldest.clone()).bounds().origin.y < box_top,
+            "the tail opens at its end, with its oldest line above the box"
         );
-        scroll_until_visible(window, cx, &"logs-lines".into(), &last);
+        // The tail's box scrolls on its own: a wheel event inside it moves its
+        // rows relative to the box, which a surface scroll could not do.
+        let before = f32::from(window.find(oldest.clone()).bounds().origin.y)
+            - f32::from(window.find("logs-lines").bounds().origin.y);
+        let box_bounds = window.find("logs-lines").bounds();
+        window.dispatch_event(
+            ScrollWheelEvent {
+                position: point(box_bounds.center().x, box_bounds.origin.y + px(20.)),
+                delta: ScrollDelta::Lines(point(0., 4.)),
+                ..Default::default()
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.render_frame(cx);
+        let after = f32::from(window.find(oldest.clone()).bounds().origin.y)
+            - f32::from(window.find("logs-lines").bounds().origin.y);
+        assert!(
+            after > before + 40.,
+            "a wheel event inside the tail scrolls the tail's own rows: {before} -> {after}"
+        );
     })
     .expect("update the shell window");
 }

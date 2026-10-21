@@ -199,3 +199,107 @@ async fn add_assets_to_an_unknown_album_is_not_found() {
 
     assert_eq!(response.status(), 404);
 }
+
+/// `PATCH /albums/{id}` with `UpdateAlbumDto.albumName` renames one album and
+/// keeps its assets (#47).
+#[tokio::test]
+async fn updating_an_album_renames_it_and_keeps_its_assets() {
+    let server = MockImmich::start().await;
+    let client = reqwest::Client::new();
+    let asset = upload_asset(&client, &server, 1).await;
+    let album: serde_json::Value = client
+        .post(format!("{}/api/albums", server.base_url()))
+        .json(&serde_json::json!({ "albumName": "Vacation", "assetIds": [asset] }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let album_id = album["id"].as_str().unwrap();
+
+    let response = client
+        .patch(format!("{}/api/albums/{album_id}", server.base_url()))
+        .json(&serde_json::json!({ "albumName": "Vacation 2024" }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["id"], album_id, "the same album is renamed");
+    assert_eq!(body["albumName"], "Vacation 2024");
+    assert_eq!(
+        server.album_for_asset(&asset).as_deref(),
+        Some("Vacation 2024"),
+        "the assets stay in the album"
+    );
+    assert_eq!(
+        server.album_names(),
+        vec!["Vacation 2024".to_string()],
+        "and its name is the one the request carried"
+    );
+    assert_eq!(
+        server.album_rename_calls(),
+        vec![mock_immich::AlbumRenameCall {
+            album_id: album_id.to_string(),
+            album_name: "Vacation 2024".to_string(),
+        }]
+    );
+    assert!(
+        server
+            .requests()
+            .contains(&format!("PATCH /api/albums/{album_id}")),
+        "{:?}",
+        server.requests()
+    );
+}
+
+/// #47: an album the server does not hold is a 404, which is what tells the
+/// client to create it again rather than retry the rename.
+#[tokio::test]
+async fn updating_an_unknown_album_is_not_found() {
+    let server = MockImmich::start().await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .patch(format!(
+            "{}/api/albums/99999999-9999-4999-8999-999999999999",
+            server.base_url()
+        ))
+        .json(&serde_json::json!({ "albumName": "Vacation 2024" }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 404);
+    assert!(server.album_names().is_empty());
+}
+
+/// #47: Immich's `UpdateAlbumDto` names the field `albumName`; a body without
+/// it renames nothing.
+#[tokio::test]
+async fn updating_an_album_without_a_name_is_refused() {
+    let server = MockImmich::start().await;
+    let client = reqwest::Client::new();
+    let album: serde_json::Value = client
+        .post(format!("{}/api/albums", server.base_url()))
+        .json(&serde_json::json!({ "albumName": "Vacation" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let album_id = album["id"].as_str().unwrap();
+
+    let response = client
+        .patch(format!("{}/api/albums/{album_id}", server.base_url()))
+        .json(&serde_json::json!({ "name": "Vacation 2024" }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 400);
+    assert_eq!(server.album_names(), vec!["Vacation".to_string()]);
+}

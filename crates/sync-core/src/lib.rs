@@ -6,6 +6,7 @@
 //! remaining engine tickets fill in discovery, the queue, and retry.
 
 pub mod albums;
+pub mod backfill;
 pub mod backoff;
 pub mod breaker;
 pub mod connection;
@@ -13,6 +14,7 @@ pub mod credential;
 pub mod engine;
 pub mod failure;
 pub mod hash;
+pub mod meter;
 pub mod missing;
 pub mod pairing;
 pub mod paths;
@@ -20,6 +22,7 @@ pub mod scan;
 pub mod skip;
 pub mod status;
 pub mod store;
+pub mod tags;
 pub mod tracking;
 pub mod upload;
 pub mod versions;

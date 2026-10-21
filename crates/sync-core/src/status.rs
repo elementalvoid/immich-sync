@@ -6,6 +6,7 @@
 //! no engine runs, so the two answers cannot drift apart.
 
 use crate::connection::ConnectionState;
+use crate::meter::UploadTraffic;
 use crate::store::{AlbumScope, FolderCounts};
 
 /// The activity state the tray and the dashboard show (R8.2).
@@ -34,6 +35,28 @@ impl Activity {
     }
 }
 
+/// Why a folder's album title is not on the server yet (#47).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AlbumRename {
+    /// The title is stored and still has to be sent, and no attempt has failed
+    /// yet.
+    Pending,
+    /// The last attempt failed with this reason, which the user can act on.
+    Failed(String),
+}
+
+impl AlbumRename {
+    /// The reason the user reads, or the pending note while nothing failed
+    /// (#47).
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::Pending => "it has not been sent yet",
+            Self::Failed(reason) => reason,
+        }
+    }
+}
+
 /// The live state of one source folder (R2.5, R8.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FolderStatus {
@@ -45,12 +68,27 @@ pub struct FolderStatus {
     pub album_mapping: bool,
     /// What the folder maps to once album mapping is on (R3.4).
     pub album_scope: AlbumScope,
+    /// The title the user chose for this folder's own album, or `None` when the
+    /// album takes the folder's name (#47).
+    pub album_title: Option<String>,
+    /// Set while the title still has to reach the server, with the reason it
+    /// has not yet (#47). `None` when the server holds the title.
+    pub album_rename: Option<AlbumRename>,
     /// Whether the folder is readable right now (R2.5).
     pub available: bool,
     /// The folder's live counts.
     pub counts: FolderCounts,
     /// The last failure under this folder, if any.
     pub last_error: Option<String>,
+    /// When a reconciliation scan last read this folder, ns since the Unix
+    /// epoch (R8.1, #43). `None` until one has.
+    pub last_scan_ns: Option<i64>,
+    /// When this folder last uploaded an asset, ns since the Unix epoch
+    /// (R8.1, #43). `None` until one has.
+    pub last_upload_ns: Option<i64>,
+    /// This folder's share of the upload traffic: the bytes its upload bodies
+    /// have moved and the requests on the wire right now (R8.1).
+    pub uploads: UploadTraffic,
 }
 
 /// Everything the dashboard and the tray read (R8.1, R8.2).
@@ -66,6 +104,10 @@ pub struct Status {
     pub counts: FolderCounts,
     /// The last failure the engine recorded, if any.
     pub last_error: Option<String>,
+    /// The upload traffic across every folder (R8.1): the rate the card shows
+    /// and how many uploads are on the wire. Like the counts, it is the sum of
+    /// the folders'.
+    pub uploads: UploadTraffic,
 }
 
 impl Status {
@@ -80,11 +122,13 @@ impl Status {
             last_error,
         } = inputs;
         let mut counts = FolderCounts::default();
+        let mut uploads = UploadTraffic::default();
         for folder in &folders {
             counts.pending += folder.counts.pending;
             counts.uploaded += folder.counts.uploaded;
             counts.failed += folder.counts.failed;
             counts.review += folder.counts.review;
+            uploads.add(folder.uploads);
         }
         // R5.4: a row under a removed source folder is still a decision the
         // user owes, so the store's own count wins when the caller has it.
@@ -113,6 +157,7 @@ impl Status {
             folders,
             counts,
             last_error,
+            uploads,
         }
     }
 

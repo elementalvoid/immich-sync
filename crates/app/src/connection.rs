@@ -40,13 +40,37 @@ pub(crate) const WORKER_UNAVAILABLE: &str = "The network runtime could not start
 /// The reason a store-backed edit cannot run yet.
 pub(crate) const STORE_OPENING: &str = "The state database is still opening.";
 
+/// The [`run_on_worker`] waits that have not finished yet.
+///
+/// A GPUI local task has to be dropped on the thread that spawned it: the
+/// pinned `gpui-pre` 0.3.8 asserts it on drop
+/// (`gpui-pre-scheduler/src/executor.rs:774`), and its test scheduler refuses
+/// activity from another thread once a test has ended
+/// (`gpui-pre-scheduler/src/test_scheduler.rs:583`). A detached wait is owned
+/// by the scheduler, which then drops its future on the HTTP runtime's thread
+/// when a worker answers late, and the process aborts instead of reporting
+/// anything (#50). Held here, the waits are dropped by the app, on the app's own
+/// thread, while it goes.
+///
+/// This narrows the window, it does not close it. A worker's wake can win the
+/// race against `Task::drop` setting the task's cancelled state, so a schedule
+/// that lands inside that window can still reach a finished scheduler. The
+/// window lives in `gpui-pre` 0.3.8's task and scheduler handshake, not in this
+/// module, and is left as it is rather than papered over (#50).
+#[derive(Default)]
+struct WorkerWaits(Vec<Task<()>>);
+
+impl Global for WorkerWaits {}
+
 /// Runs `work` on the shared HTTP runtime and applies its result on the UI
 /// thread (N2).
 ///
 /// This is the one shape behind every worker-backed edit: the bounded result
 /// channel, `runtime.spawn` for the work, and `cx.spawn` for the result. `apply`
 /// keeps its caller's generation check; the caller reports a runtime that could
-/// not start, because each model names that failure in its own place.
+/// not start, because each model names that failure in its own place. A worker
+/// that drops its answer (a panic) runs no `apply` and the caller hears nothing,
+/// so a caller that must not wait forever uses [`run_on_worker_or_lost`].
 ///
 /// # Errors
 ///
@@ -63,19 +87,55 @@ where
     Work: FnOnce() -> Fut + Send + 'static,
     Apply: FnOnce(&mut T, R, &mut Context<T>) + 'static,
 {
+    run_on_worker_or_lost(cx, work, apply, |_, _| {})
+}
+
+/// Runs `work` on the shared HTTP runtime and applies its result on the UI
+/// thread, or runs `lost` when the worker dropped the answer instead.
+///
+/// A panicking worker takes the result channel down with it, so the answer can
+/// never arrive. `lost` is how a caller that a user is waiting on (a dialog)
+/// stops waiting: the caller records its own reason, because the worker is gone
+/// before it could name one.
+///
+/// # Errors
+///
+/// Returns the reason [`worker`] gave when the runtime could not start.
+pub(crate) fn run_on_worker_or_lost<T, R, Fut, Work, Apply, Lost>(
+    cx: &mut Context<T>,
+    work: Work,
+    apply: Apply,
+    lost: Lost,
+) -> Result<(), String>
+where
+    T: 'static,
+    R: Send + 'static,
+    Fut: std::future::Future<Output = R> + Send + 'static,
+    Work: FnOnce() -> Fut + Send + 'static,
+    Apply: FnOnce(&mut T, R, &mut Context<T>) + 'static,
+    Lost: FnOnce(&mut T, &mut Context<T>) + 'static,
+{
     let runtime = worker()?;
     let (results, incoming) = async_channel::bounded(1);
     runtime.spawn(async move {
         let result = work().await;
         let _ = results.send(result).await;
     });
-    cx.spawn(async move |this, cx| {
-        let Ok(result) = incoming.recv().await else {
-            return;
-        };
-        let _ = this.update(cx, |model, cx| apply(model, result, cx));
-    })
-    .detach();
+    let wait = cx.spawn(async move |this, cx| match incoming.recv().await {
+        Ok(result) => {
+            let _ = this.update(cx, |model, cx| apply(model, result, cx));
+        }
+        Err(_) => {
+            let _ = this.update(cx, |model, cx| lost(model, cx));
+        }
+    });
+    // Kept, not detached: the app is the last owner, so a waiter still pending
+    // when the app goes is cancelled on the thread that spawned it instead of
+    // being woken from the worker's thread (#50).
+    cx.update_default_global(|waits: &mut WorkerWaits, _| {
+        waits.0.retain(|wait| !wait.is_ready());
+        waits.0.push(wait);
+    });
     Ok(())
 }
 
@@ -398,9 +458,150 @@ mod tests {
     use gpui_kit::AppContext as _;
     use gpui_kit::TestAppContext;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use sync_core::connection::{Attention, AuthMethod, ConnectionState, Secret, SignIn};
     use sync_core::credential::{MemoryCredentialStore, SharedCredentialStore};
+
+    /// The worker's answer, which reports itself once the helper drops it.
+    ///
+    /// The app is gone, so the wait that held the channel's receiver went with
+    /// it: `results.send` hands the value back rather than waking a waiter, and
+    /// the helper drops it on the runtime thread. That drop is the point the
+    /// test below watches, so it needs no fixed sleep.
+    struct Answered(std::sync::mpsc::Sender<()>);
+
+    impl Drop for Answered {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    /// #50: the app goes away while the worker is still running.
+    ///
+    /// GPUI's local tasks must be dropped on the thread that spawned them
+    /// (`gpui-pre` 0.3.8 asserts it,
+    /// `gpui-pre-scheduler/src/executor.rs:774`), and its test scheduler refuses
+    /// activity from another thread once the test has ended
+    /// (`gpui-pre-scheduler/src/test_scheduler.rs:583`). A waiter that is merely
+    /// detached is owned by the scheduler, so the worker's answer wakes it from
+    /// the runtime thread into a finished test and the process aborts (SIGABRT,
+    /// double panic).
+    ///
+    /// The teardown below is the order `#[gpui::test]` uses
+    /// (`gpui-pre-macros/src/test.rs:170-175`), including `end_test`. Before the
+    /// wait was held by the app this test aborted the process; it passes once
+    /// the app drops its waiters itself, on its own thread.
+    ///
+    /// The observation is the helper dropping the answer back on the runtime
+    /// thread once `results.send` has returned, never a fixed sleep: the wait
+    /// that held the receiver went with the app, so the send hands the answer
+    /// back instead of parking anything, and only a stuck worker can hit the
+    /// timeout.
+    #[test]
+    fn a_worker_answer_after_the_app_is_gone_does_not_abort() {
+        struct Model;
+
+        let applied = Arc::new(AtomicUsize::new(0));
+        let lost = Arc::new(AtomicUsize::new(0));
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (answer_sent, answered) = std::sync::mpsc::channel::<()>();
+        let cx = TestAppContext::single();
+        let scheduler = cx.dispatcher.scheduler().clone();
+        let model = cx.update(|cx| cx.new(|_| Model));
+        cx.update(|cx| {
+            model.update(cx, |_, cx| {
+                let applied = Arc::clone(&applied);
+                let lost = Arc::clone(&lost);
+                super::run_on_worker_or_lost(
+                    cx,
+                    move || async move {
+                        // The answer waits for the release below, so it cannot
+                        // land before the app is gone whatever the load is.
+                        let _ = held.recv();
+                        Answered(answer_sent)
+                    },
+                    move |_: &mut Model, _: Answered, _| {
+                        applied.fetch_add(1, Ordering::SeqCst);
+                    },
+                    move |_: &mut Model, _| {
+                        lost.fetch_add(1, Ordering::SeqCst);
+                    },
+                )
+                .expect("the worker runtime starts in tests");
+            });
+        });
+
+        // The gpui test harness teardown, in its own order.
+        cx.run_until_parked();
+        cx.update(|cx| {
+            cx.background_executor().forbid_parking();
+            cx.quit();
+        });
+        cx.run_until_parked();
+        let dispatcher = cx.dispatcher.clone();
+        drop(cx);
+        dispatcher.drain_tasks();
+        scheduler.end_test();
+        drop(dispatcher);
+
+        // The worker answers into an app that is gone and a scheduler that has
+        // ended: releasing a detached wait here wakes it from the runtime
+        // thread and aborts the process (#50).
+        drop(release);
+        // Progress-bounded, not a fixed sleep: this returns when the answer has
+        // been through `results.send` on the runtime thread, and 5 s only
+        // catches a worker that never gets there.
+        answered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the worker answered after the app was gone");
+        assert_eq!(
+            applied.load(Ordering::SeqCst),
+            0,
+            "nothing applies to a gone app"
+        );
+        assert_eq!(
+            lost.load(Ordering::SeqCst),
+            0,
+            "a cancelled wait reports nothing"
+        );
+    }
+
+    /// #40 (S1): a worker that drops its answer must still report to its
+    /// model, or a dialog that waits for the answer waits forever.
+    #[gpui_kit::test]
+    async fn a_dropped_answer_runs_the_lost_arm_and_applies_nothing(cx: &mut TestAppContext) {
+        #[derive(Default)]
+        struct Recorder {
+            applied: usize,
+            lost: usize,
+        }
+
+        let model = cx.update(|cx| cx.new(|_| Recorder::default()));
+        // The work runs on the shared HTTP runtime, a real thread.
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            model.update(cx, |_, cx| {
+                super::run_on_worker_or_lost(
+                    cx,
+                    || async { panic!("the worker dropped this answer") },
+                    |recorder: &mut Recorder, (): (), _| recorder.applied += 1,
+                    |recorder: &mut Recorder, _| recorder.lost += 1,
+                )
+                .expect("the worker runtime starts in tests")
+            });
+        });
+
+        wait_until(cx, |cx| model.read(cx).lost == 1).await;
+        cx.read(|cx| {
+            assert_eq!(model.read(cx).lost, 1, "the lost arm runs once");
+            assert_eq!(
+                model.read(cx).applied,
+                0,
+                "an answer that never arrived applies nothing"
+            );
+        });
+    }
 
     /// Starts the offline Immich double on its own runtime.
     fn mock_server() -> (tokio::runtime::Runtime, mock_immich::MockImmich) {

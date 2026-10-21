@@ -182,6 +182,7 @@ pub fn new_failure_notification(paths: &[String]) -> SystemNotification {
 mod tests {
     use super::Notifier;
     use gpui_kit::SystemNotification;
+    use sync_core::meter::UploadTraffic;
     use sync_core::status::{Activity, FolderStatus, Status};
     use sync_core::store::{AlbumScope, FailedItem, FolderCounts, ItemState};
 
@@ -196,6 +197,7 @@ mod tests {
                 review,
             },
             last_error: None,
+            uploads: UploadTraffic::default(),
         }
     }
 
@@ -205,9 +207,14 @@ mod tests {
             recursive: true,
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
+            album_title: None,
+            album_rename: None,
             available,
             counts: FolderCounts::default(),
             last_error: None,
+            last_scan_ns: None,
+            last_upload_ns: None,
+            uploads: UploadTraffic::default(),
         });
         status
     }

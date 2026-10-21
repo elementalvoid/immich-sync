@@ -8,7 +8,7 @@ use axum::body::Body;
 use axum::extract::{Multipart, Path, State as AxumState};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -32,11 +32,13 @@ pub enum Operation {
     GetAsset,
     Copy,
     CreateStack,
+    UpsertTags,
     TagAssets,
     DeleteAssets,
     RestoreAssets,
     CreateAlbum,
     AddAssetsToAlbum,
+    UpdateAlbum,
 }
 
 /// A fault the mock injects for a matching request.
@@ -97,6 +99,9 @@ struct Inner {
     create_album_requests: u64,
     /// How many `PUT /albums/{id}/assets` requests arrived.
     add_album_requests: u64,
+    /// How many `PATCH /albums/{id}` requests arrived, and the name each one
+    /// carried (#47). A test reads the wire shape here.
+    update_album_calls: Vec<AlbumRenameCall>,
     /// Immich's `passwordLogin.enabled` system config.
     password_login_disabled: bool,
     /// The key `x-api-key` must carry, once one is configured.
@@ -130,9 +135,34 @@ struct Inner {
     stacks: HashMap<String, Vec<String>>,
     /// The tag ids on each asset (R4.2).
     asset_tags: HashMap<String, Vec<String>>,
+    /// The tags the double holds, by id, with their names (R3.7).
+    tags: HashMap<String, String>,
+    /// The tag ids in creation order, so `tag_names` is deterministic.
+    tag_order: Vec<String>,
+    /// Every `PUT /tags` call, in order (R3.7). A test asserts the names the
+    /// client sent, not only the id it kept.
+    upsert_calls: Vec<TagUpsertCall>,
+    /// Every `PUT /tags/assets` call, in order (R3.7).
+    tag_asset_calls: Vec<TagAssetCall>,
     /// Every `DELETE /assets` call, in order (R5.3). A test asserts the
     /// request the client sent, not only the trash state it produced.
     delete_calls: Vec<DeleteCall>,
+}
+
+/// One `PUT /tags` call, as the double received it (R3.7).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TagUpsertCall {
+    /// The tag names in the body's `tags` field.
+    pub tags: Vec<String>,
+}
+
+/// One `PUT /tags/assets` call, as the double received it (R3.7).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TagAssetCall {
+    /// The tag ids the body named.
+    pub tag_ids: Vec<String>,
+    /// The asset ids the body named.
+    pub asset_ids: Vec<String>,
 }
 
 /// One `DELETE /assets` call, as the double received it (R5.3).
@@ -188,6 +218,19 @@ struct Album {
     id: String,
     name: String,
     asset_ids: Vec<String>,
+}
+
+/// One `PATCH /albums/{id}` call, as the double received it (#47).
+///
+/// The recorded call proves the endpoint, the album it named, and the body
+/// field the client sent; the album's new name alone cannot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AlbumRenameCall {
+    /// The album id in the path.
+    pub album_id: String,
+    /// The body's `albumName`. A body without it is refused before it is
+    /// recorded.
+    pub album_name: String,
 }
 
 /// One `POST /assets` request, as the server received it.
@@ -270,6 +313,41 @@ impl Inner {
         id
     }
 
+    /// Creates the tag `name`, or returns the id of the one already held.
+    fn upsert_tag(&mut self, name: &str) -> String {
+        if let Some(id) = self.tag_id(name) {
+            return id;
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        self.tags.insert(id.clone(), name.to_string());
+        self.tag_order.push(id.clone());
+        id
+    }
+
+    fn tag_id(&self, name: &str) -> Option<String> {
+        self.tags
+            .iter()
+            .find(|(_, known)| known.as_str() == name)
+            .map(|(id, _)| id.clone())
+    }
+
+    fn tag_names(&self) -> Vec<String> {
+        self.tag_order
+            .iter()
+            .filter_map(|id| self.tags.get(id).cloned())
+            .collect()
+    }
+
+    /// Models the user deleting the tag in Immich: the tag and the tags it
+    /// carried on assets are gone (R3.7).
+    fn delete_tag(&mut self, id: &str) {
+        self.tags.remove(id);
+        self.tag_order.retain(|known| known != id);
+        for tags in self.asset_tags.values_mut() {
+            tags.retain(|known| known != id);
+        }
+    }
+
     fn tag(&mut self, asset_ids: &[String], tag_ids: &[String]) -> usize {
         let mut count = 0;
         for asset_id in asset_ids {
@@ -305,6 +383,13 @@ impl Inner {
             },
         );
         id
+    }
+
+    /// Rename one album (#47). Returns `None` when the album is unknown.
+    fn rename_album(&mut self, album_id: &str, name: String) -> Option<String> {
+        let album = self.albums.get_mut(album_id)?;
+        album.name = name;
+        Some(album.name.clone())
     }
 
     /// Add the known, not-yet-listed assets to the album. Returns `None` when
@@ -702,6 +787,20 @@ impl MockImmich {
             .add_album_requests
     }
 
+    /// Every `PATCH /albums/{id}` call, in request order (#47).
+    ///
+    /// The recorded call is what proves the endpoint, the album, and the
+    /// `albumName` field; the album's new name alone cannot.
+    #[must_use]
+    pub fn album_rename_calls(&self) -> Vec<AlbumRenameCall> {
+        self.state
+            .inner
+            .lock()
+            .expect("mock state poisoned")
+            .update_album_calls
+            .clone()
+    }
+
     /// Every `PUT /assets/copy` call, in request order (R4.2).
     ///
     /// The recorded call is what proves the flags and the source and target
@@ -725,6 +824,67 @@ impl MockImmich {
             .expect("mock state poisoned")
             .stack_calls
             .clone()
+    }
+
+    /// The id of the tag with this name, when the double holds it (R3.7).
+    #[must_use]
+    pub fn tag_id(&self, name: &str) -> Option<String> {
+        self.state
+            .inner
+            .lock()
+            .expect("mock state poisoned")
+            .tag_id(name)
+    }
+
+    /// Every tag name the double holds, in creation order (R3.7).
+    #[must_use]
+    pub fn tag_names(&self) -> Vec<String> {
+        self.state
+            .inner
+            .lock()
+            .expect("mock state poisoned")
+            .tag_names()
+    }
+
+    /// Every `PUT /tags` call, in request order (R3.7).
+    #[must_use]
+    pub fn upsert_calls(&self) -> Vec<TagUpsertCall> {
+        self.state
+            .inner
+            .lock()
+            .expect("mock state poisoned")
+            .upsert_calls
+            .clone()
+    }
+
+    /// Every `PUT /tags/assets` call, in request order (R3.7).
+    #[must_use]
+    pub fn tag_asset_calls(&self) -> Vec<TagAssetCall> {
+        self.state
+            .inner
+            .lock()
+            .expect("mock state poisoned")
+            .tag_asset_calls
+            .clone()
+    }
+
+    /// Deletes one tag the way the user can in Immich (R3.7).
+    pub fn delete_tag(&self, id: &str) {
+        self.state
+            .inner
+            .lock()
+            .expect("mock state poisoned")
+            .delete_tag(id);
+    }
+
+    /// Deletes one album the way the user can in Immich (#47).
+    ///
+    /// The assets stay; only the album is gone, so a client that still holds its
+    /// id sees a 404 on the next call.
+    pub fn delete_album(&self, id: &str) {
+        let mut inner = self.state.inner.lock().expect("mock state poisoned");
+        inner.albums.remove(id);
+        inner.album_order.retain(|held| held != id);
     }
 
     /// The tag ids on one asset, in the order they were applied (R4.2).
@@ -791,8 +951,10 @@ impl MockImmich {
             .route("/assets/copy", put(copy_asset))
             .route("/assets/{id}", get(get_asset))
             .route("/stacks", post(create_stack))
+            .route("/tags", put(upsert_tags))
             .route("/tags/assets", put(tag_assets))
             .route("/albums", post(create_album))
+            .route("/albums/{id}", patch(update_album))
             .route("/albums/{id}/assets", put(add_assets_to_album))
             .with_state(Arc::clone(&state));
         let router = Router::new()
@@ -1518,6 +1680,36 @@ async fn create_stack(
         .into_response()
 }
 
+async fn upsert_tags(
+    AxumState(state): AxumState<Arc<State>>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if let Some(response) = guard(&state, Operation::UpsertTags).await {
+        return response;
+    }
+    let names = id_list(body.get("tags"));
+    let mut inner = state.inner.lock().expect("mock state poisoned");
+    inner.upsert_calls.push(TagUpsertCall {
+        tags: names.clone(),
+    });
+    let tags: Vec<Value> = names
+        .iter()
+        .map(|name| {
+            let id = inner.upsert_tag(name);
+            // Immich's TagResponseDto carries `name` and the full-path
+            // `value`; a flat tag has the same text in both.
+            json!({
+                "id": id,
+                "name": name,
+                "value": name,
+                "createdAt": TIMESTAMP,
+                "updatedAt": TIMESTAMP,
+            })
+        })
+        .collect();
+    Json(tags).into_response()
+}
+
 async fn tag_assets(
     AxumState(state): AxumState<Arc<State>>,
     Json(body): Json<serde_json::Value>,
@@ -1527,11 +1719,12 @@ async fn tag_assets(
     }
     let asset_ids = id_list(body.get("assetIds"));
     let tag_ids = id_list(body.get("tagIds"));
-    let count = state
-        .inner
-        .lock()
-        .expect("mock state poisoned")
-        .tag(&asset_ids, &tag_ids);
+    let mut inner = state.inner.lock().expect("mock state poisoned");
+    inner.tag_asset_calls.push(TagAssetCall {
+        tag_ids: tag_ids.clone(),
+        asset_ids: asset_ids.clone(),
+    });
+    let count = inner.tag(&asset_ids, &tag_ids);
     Json(json!({ "count": count })).into_response()
 }
 
@@ -1633,6 +1826,38 @@ async fn add_assets_to_album(
         .map(|id| json!({ "id": id, "success": added.contains(id) }))
         .collect();
     Json(results).into_response()
+}
+
+/// `PATCH /albums/{id}` with `UpdateAlbumDto.albumName` (#47).
+///
+/// The call is recorded before the fault runs, the way `create_album` counts
+/// its request, so a faulted request cannot hide from the assertion.
+async fn update_album(
+    AxumState(state): AxumState<Arc<State>>,
+    Path(album_id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let Some(name) = body.get("albumName").and_then(|value| value.as_str()) else {
+        return message(StatusCode::BAD_REQUEST, "albumName is required");
+    };
+    state
+        .inner
+        .lock()
+        .expect("mock state poisoned")
+        .update_album_calls
+        .push(AlbumRenameCall {
+            album_id: album_id.clone(),
+            album_name: name.to_string(),
+        });
+    if let Some(response) = guard(&state, Operation::UpdateAlbum).await {
+        return response;
+    }
+    let mut inner = state.inner.lock().expect("mock state poisoned");
+    if inner.rename_album(&album_id, name.to_string()).is_none() {
+        return message(StatusCode::NOT_FOUND, "Album not found");
+    }
+    let album = inner.albums.get(&album_id).expect("the album exists");
+    Json(album_response(album)).into_response()
 }
 
 fn id_list(value: Option<&Value>) -> Vec<String> {

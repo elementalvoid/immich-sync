@@ -7,7 +7,7 @@ use gpui_kit::*;
 use gpui_tray::{Icon, Tray};
 
 use crate::connection::ConnectionModel;
-use crate::dashboard::Dashboard;
+use crate::dashboard::{Dashboard, DashboardEvent};
 use crate::diagnostics::DiagnosticsModel;
 use crate::diagnostics_view::DiagnosticsView;
 use crate::engine::EngineModel;
@@ -282,8 +282,8 @@ pub fn open_main_window(cx: &mut App) -> anyhow::Result<()> {
         let dashboard = cx.new(|cx| Dashboard::with_engine(engine.clone(), window, cx));
         let settings = cx.new(|cx| SettingsView::from_environment(window, cx, connection.clone()));
         // The Limits card pushes a change straight to the running engine
-        // (R7.1, R7.2).
-        settings.update(cx, |view, _| view.set_engine(engine.clone()));
+        // (R7.1, R7.2), and the Tagging section follows its tag state (R3.7).
+        settings.update(cx, |view, cx| view.set_engine(engine.clone(), cx));
         let upload_view = cx.new(|cx| UploadView::new(upload.clone(), window, cx));
         let failed_view = cx.new(|cx| FailedView::new(engine.clone(), window, cx));
         let diagnostics_model = cx.new(|cx| {
@@ -335,6 +335,13 @@ pub enum ViewMode {
     Diagnostics,
 }
 
+/// The environment variable that pins a folder detail open (#43).
+///
+/// Set it to a source folder's stored path and the dashboard opens that
+/// folder's detail once the store has loaded it, so a screenshot run captures
+/// the dialog. A product run never sets it.
+pub const FORCE_DETAIL_ENV: &str = "IMMICH_SYNC_FOLDER_DETAIL";
+
 /// The environment variable that pins the visible surface.
 ///
 /// Set it to `dashboard`, `settings`, `upload`, `failed`, `review`, `logs`, or
@@ -377,6 +384,7 @@ pub struct AppShell {
     review: Entity<ReviewView>,
     _connection: Entity<ConnectionModel>,
     _connection_subscription: Subscription,
+    _dashboard_subscription: Subscription,
 }
 
 impl AppShell {
@@ -407,8 +415,23 @@ impl AppShell {
             dashboard.set_connection(Some(summary), cx);
         });
         let logs = cx.new(|cx| LogsView::new(settings.clone(), cx));
+        let mode = forced_view().unwrap_or(ViewMode::Dashboard);
+        // A pinned Logs surface is on screen from the first frame, so its live
+        // tail starts with it.
+        if mode == ViewMode::Logs {
+            logs.update(cx, |logs, cx| logs.set_visible(true, cx));
+        }
+        // #43: the folder detail cannot switch surfaces itself, so the
+        // dashboard reports the request and the shell opens it.
+        let dashboard_subscription = cx.subscribe(
+            &dashboard,
+            |this, _dashboard, event: &DashboardEvent, cx| {
+                let DashboardEvent::OpenView(mode, folder) = event;
+                this.show_filtered(*mode, folder.clone(), cx);
+            },
+        );
         Self {
-            mode: forced_view().unwrap_or(ViewMode::Dashboard),
+            mode,
             dashboard,
             settings,
             logs,
@@ -418,13 +441,58 @@ impl AppShell {
             review,
             _connection: connection,
             _connection_subscription: subscription,
+            _dashboard_subscription: dashboard_subscription,
         }
+    }
+
+    /// The visible surface.
+    #[must_use]
+    pub fn mode(&self) -> ViewMode {
+        self.mode
+    }
+
+    /// The dashboard, so a test can drive the folder detail it owns (#43).
+    #[must_use]
+    pub fn dashboard(&self) -> Entity<Dashboard> {
+        self.dashboard.clone()
     }
 
     /// Switches the visible surface.
     pub fn show(&mut self, mode: ViewMode, cx: &mut Context<Self>) {
-        self.mode = mode;
+        if self.mode != mode {
+            self.mode = mode;
+            // The live tail reads only while its surface is on screen, so the
+            // shell starts it on the way in and stops it on the way out
+            // (R10.3).
+            self.logs
+                .update(cx, |logs, cx| logs.set_visible(mode == ViewMode::Logs, cx));
+        }
         cx.notify();
+    }
+
+    /// Opens a list view narrowed to one source folder (#41).
+    ///
+    /// The folder detail calls this to link into the failed items or the
+    /// deletion review for its folder (#43). A surface without a folder filter
+    /// ignores the folder and simply opens.
+    pub fn show_filtered(&mut self, mode: ViewMode, folder: String, cx: &mut Context<Self>) {
+        match mode {
+            ViewMode::Failed => self
+                .failed
+                .update(cx, |view, cx| view.select_folder(folder, cx)),
+            ViewMode::Review => self
+                .review
+                .update(cx, |view, cx| view.select_folder(folder, cx)),
+            _ => {}
+        }
+        self.show(mode, cx);
+    }
+
+    /// The Logs surface. Its live tail runs only while [`Self::show`] has it
+    /// visible.
+    #[must_use]
+    pub fn logs(&self) -> Entity<LogsView> {
+        self.logs.clone()
     }
 
     /// The view switch. Every button is a keyboard reachable tab stop.

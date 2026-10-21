@@ -11,20 +11,24 @@ use std::time::Duration;
 
 use gpui_kit::*;
 use sync_core::engine::{Engine, EngineConfig, Limits};
+use sync_core::meter::UploadTraffic;
 use sync_core::status::{Activity, ConnectionHealth, FolderStatus, Status, StatusInputs};
 use sync_core::store::{
     AlbumScope, FailedItem, FolderCounts, ReviewItem, SourceFolder, StateStore,
 };
 
 use crate::connection::{
-    ConnectionModel, STORE_OPENING, WORKER_UNAVAILABLE, run_on_worker, worker,
+    ConnectionModel, STORE_OPENING, WORKER_UNAVAILABLE, run_on_worker, run_on_worker_or_lost,
+    worker,
 };
+use crate::folder_panel::{ALREADY_ADDED, confirmed_folder};
 use crate::notify::Notifier;
 use crate::paths::AppPaths;
 use crate::settings::SettingsStore;
 use crate::status::DashboardModel;
 use crate::store::StoreModel;
 use sync_core::connection::{ConnectionState, SharedSession};
+use sync_core::tags::TagStatus;
 
 /// How often the dashboard picks up the engine's live counts.
 const STATUS_POLL: Duration = Duration::from_millis(250);
@@ -36,16 +40,28 @@ const STATUS_POLL: Duration = Duration::from_millis(250);
 /// this only decides how soon a parked item or a missing file shows up.
 const FAILED_POLL_TICKS: u32 = 4;
 
+/// The live settings the app pushes to a running engine (R7.1, R7.2, R3.7).
+///
+/// One channel carries both, so a change to either reaches the engine in the
+/// order the view made it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LiveSettings {
+    limits: Limits,
+    tag_uploaded_assets: bool,
+}
+
 /// The app-scoped engine and the status the views render.
 pub struct EngineModel {
     connection: Entity<ConnectionModel>,
     store_model: Entity<StoreModel>,
     paths: AppPaths,
     engine: Option<Arc<Engine>>,
-    /// The newest limit change for the running engine. One applier task per
-    /// engine drains it, so two quick edits cannot land out of order.
-    limits: Option<tokio::sync::watch::Sender<Limits>>,
+    /// The newest live-settings change for the running engine. One applier task
+    /// per engine drains it, so two quick edits cannot land out of order.
+    live: Option<tokio::sync::watch::Sender<LiveSettings>>,
     status: Status,
+    /// The sync tag's live state, which the Settings section renders (R3.7).
+    tag: TagStatus,
     /// The parked items the failed-items view lists (R6.5), re-read off the UI
     /// thread.
     failed: Vec<FailedItem>,
@@ -64,9 +80,21 @@ pub struct EngineModel {
     failed_read: bool,
     paused: bool,
     problem: Option<String>,
+    /// The newest folder-setup outcome, for the add dialog (#40).
+    folder_add: Option<FolderAddResult>,
+    /// The newest folder-removal outcome, for the folder detail (#43).
+    folder_remove: Option<FolderRemoveResult>,
+    /// Bumped by every setup-dialog add, kept apart from `generation` so an
+    /// unrelated folder edit cannot drop the result the dialog waits for, and
+    /// a slower earlier add cannot answer a newer dialog (#40).
+    add_generation: u64,
     /// Bumped by every folder edit, so an older edit result cannot overwrite a
     /// newer one.
     generation: u64,
+    /// Bumped by every remove, kept apart from `generation` so a settings edit
+    /// during a pending Remove cannot drop the answer the detail waits for
+    /// (#43).
+    remove_generation: u64,
     /// Bumped by every engine start attempt, kept apart from `generation` so a
     /// folder edit cannot discard an engine that is already being built.
     start_generation: u64,
@@ -80,13 +108,40 @@ pub struct EngineModel {
     _poll: Task<()>,
 }
 
-/// What one album edit changes on a source folder (R3.4).
-#[derive(Clone, Copy)]
+/// What one album edit changes on a source folder (R3.4, #47).
+#[derive(Clone)]
 enum AlbumChange {
     /// Turn album mapping on or off.
     Mapping(bool),
     /// Set the album scope.
     Scope(AlbumScope),
+    /// Set the title of the folder's own album.
+    Title(String),
+}
+
+/// The outcome of one folder-setup add (#40).
+///
+/// The request id lets the dialog that sent the add recognise its own result,
+/// so a slower earlier add cannot close a newer dialog.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FolderAddResult {
+    /// The request this result answers.
+    pub request: u64,
+    /// Why nothing was written, or `None` when the folder was added.
+    pub problem: Option<String>,
+}
+
+/// The outcome of one folder removal (#43).
+///
+/// The request id lets the detail that asked recognise its own answer, so a
+/// status poll that lands while the write is still in flight cannot be read as
+/// the refusal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FolderRemoveResult {
+    /// The request this result answers.
+    pub request: u64,
+    /// Why nothing was removed, or `None` when the folder was.
+    pub problem: Option<String>,
 }
 
 impl EngineModel {
@@ -146,8 +201,9 @@ impl EngineModel {
             store_model,
             paths: paths.clone(),
             engine: None,
-            limits: None,
+            live: None,
             status: empty_status(),
+            tag: TagStatus::default(),
             failed: Vec::new(),
             review: Vec::new(),
             review_problem: None,
@@ -155,7 +211,11 @@ impl EngineModel {
             failed_read: false,
             paused: false,
             problem: None,
+            folder_add: None,
+            folder_remove: None,
+            add_generation: 0,
             generation: 0,
+            remove_generation: 0,
             start_generation: 0,
             store_generation: 0,
             rebuilding: false,
@@ -174,6 +234,18 @@ impl EngineModel {
     #[must_use]
     pub fn problem(&self) -> Option<&str> {
         self.problem.as_deref()
+    }
+
+    /// The newest folder-setup outcome, if one has arrived (#40).
+    #[must_use]
+    pub fn folder_add_result(&self) -> Option<&FolderAddResult> {
+        self.folder_add.as_ref()
+    }
+
+    /// The newest folder-removal outcome, if one has arrived (#43).
+    #[must_use]
+    pub fn folder_remove_result(&self) -> Option<&FolderRemoveResult> {
+        self.folder_remove.as_ref()
     }
 
     /// The parked items the failed-items view lists (R6.5).
@@ -458,9 +530,10 @@ impl EngineModel {
         // A start already in flight must not install its engine over the
         // store this rebuild replaces (R10.4).
         self.start_generation = self.start_generation.wrapping_add(1);
-        self.limits = None;
+        self.live = None;
         self.rebuilding = true;
         self.status = empty_status();
+        self.tag = TagStatus::default();
         self.store_model.update(cx, |store, cx| store.rebuild(cx));
         cx.notify();
     }
@@ -498,15 +571,67 @@ impl EngineModel {
     pub fn set_limits(&mut self, bandwidth_bytes_per_second: u64, concurrency: usize) {
         // The applier task wakes on the newest value, so a change that
         // overtakes this one cannot be overwritten by it.
-        if let Some(limits) = &self.limits {
-            let _ = limits.send(Limits {
+        if let Some(live) = &self.live {
+            let mut next = *live.borrow();
+            next.limits = Limits {
                 bandwidth_bytes_per_second,
                 concurrency: concurrency.max(1),
-            });
+            };
+            live.send_replace(next);
         }
     }
 
-    /// Adds a source folder and starts discovering it (R2.1).
+    /// The sync tag's live state, for the Settings section (R3.7).
+    ///
+    /// It comes from the engine, which did the one permission probe the view
+    /// must not repeat.
+    #[must_use]
+    pub fn tag_status(&self) -> &TagStatus {
+        &self.tag
+    }
+
+    /// Turns the sync tag on or off on the running engine without a restart
+    /// (R3.7). Before it starts this is a no-op: the settings file it reads at
+    /// start already holds the value the view wrote.
+    pub fn set_tag_uploads(&mut self, enabled: bool) {
+        if let Some(live) = &self.live {
+            let mut next = *live.borrow();
+            next.tag_uploaded_assets = enabled;
+            live.send_replace(next);
+        }
+    }
+
+    /// Asks the engine to tag every asset the client ever uploaded again
+    /// (R3.7: "Tag existing assets now").
+    ///
+    /// It goes through the engine, not the view: the marker is cleared on the
+    /// worker runtime (N2) and the engine's own backfill task picks the library
+    /// up, so the window stays responsive and the progress reaches the view on
+    /// the same status poll as the switch.
+    pub fn tag_existing_assets(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.engine.clone() else {
+            self.problem = Some("Sign in before tagging the existing assets.".to_string());
+            cx.notify();
+            return;
+        };
+        let result = run_on_worker(
+            cx,
+            move || async move { engine.retag_all().map_err(|error| error.to_string()) },
+            |model, result, cx| {
+                match result {
+                    Ok(()) => model.problem = None,
+                    Err(problem) => model.problem = Some(problem),
+                }
+                model.refresh_status(cx);
+            },
+        );
+        if result.is_err() {
+            self.problem = Some(WORKER_UNAVAILABLE.to_string());
+            cx.notify();
+        }
+    }
+
+    /// Adds or edits a source folder and starts discovering it (R2.1).
     pub fn add_folder(&mut self, path: String, recursive: bool, cx: &mut Context<Self>) {
         let path = path.trim().to_string();
         if path.is_empty() {
@@ -551,12 +676,110 @@ impl EngineModel {
         }
     }
 
-    /// Removes a source folder; its items stay in the store (R2.1).
-    pub fn remove_folder(&mut self, path: String, cx: &mut Context<Self>) {
-        // A newer edit supersedes an older result still in flight.
-        self.generation = self.generation.wrapping_add(1);
+    /// Adds a source folder with the settings the setup dialog confirmed
+    /// (#40, R2.1, R3.4).
+    ///
+    /// The request runs on the worker runtime (N2): it validates the path,
+    /// refuses a folder the client already tracks without touching its row,
+    /// and then writes the path and all three settings in one store write. The
+    /// returned id tags the result, so the dialog that sent the add can wait
+    /// for its own outcome and keep itself open on a refusal.
+    pub fn add_folder_settings(&mut self, draft: SourceFolder, cx: &mut Context<Self>) -> u64 {
+        self.add_generation = self.add_generation.wrapping_add(1);
+        let request = self.add_generation;
         let tracking = self.store_model.read(cx).tracking();
-        let generation = self.generation;
+        let result = run_on_worker_or_lost(
+            cx,
+            move || async move {
+                // N2: the filesystem probe and the store write belong on the
+                // worker, not the UI thread.
+                let folder = confirmed_folder(&draft)?;
+                // The tracking module decides, and it serves the engine and the
+                // signed-out client alike; the insert refuses a path the client
+                // already holds under the platform's path rule (R2.4).
+                let tracking = tracking.ok_or_else(|| STORE_OPENING.to_string())?;
+                tracking
+                    .insert_folder(&folder)
+                    .map_err(|error| match error {
+                        sync_core::tracking::TrackingError::FolderExists(_) => {
+                            ALREADY_ADDED.to_string()
+                        }
+                        other => other.to_string(),
+                    })?;
+                tracking.folders().map_err(|error| error.to_string())
+            },
+            move |model, result, cx| {
+                // A newer add supersedes an older result still in flight.
+                if model.add_generation != request {
+                    return;
+                }
+                let problem = match result {
+                    // The engine's card follows the tracking observer; the
+                    // cached list the signed-out views read is refreshed here,
+                    // because the insert wrote it.
+                    Ok(folders) => {
+                        model.store_model.update(cx, |store, cx| {
+                            store.set_folders(folders, cx);
+                        });
+                        None
+                    }
+                    Err(problem) => Some(problem),
+                };
+                model.folder_add = Some(FolderAddResult { request, problem });
+                model.refresh_status(cx);
+                cx.notify();
+            },
+            move |model, cx| model.folder_add_lost(request, cx),
+        );
+        if result.is_err() {
+            self.folder_add_lost(request, cx);
+        }
+        request
+    }
+
+    /// Records a setup-dialog add whose worker answer never arrived (#40).
+    ///
+    /// The dialog waits for its own request, so a lost answer would leave it
+    /// waiting with Cancel refused. The reason is the runtime that is gone, and
+    /// it belongs to the dialog: it names what the add could not do, the same
+    /// way a refusal does.
+    pub(crate) fn folder_add_lost(&mut self, request: u64, cx: &mut Context<Self>) {
+        // A newer add supersedes an older result still in flight.
+        if self.add_generation != request {
+            return;
+        }
+        self.folder_add = Some(FolderAddResult {
+            request,
+            problem: Some(WORKER_UNAVAILABLE.to_string()),
+        });
+        cx.notify();
+    }
+
+    /// A test seam: answers the next remove now, the way a worker that could
+    /// not start answers before the caller records its request (#43).
+    #[cfg(test)]
+    pub(crate) fn lose_next_remove_for_test(&mut self, cx: &mut Context<Self>) {
+        let request = self.remove_generation.wrapping_add(1);
+        self.problem = Some(WORKER_UNAVAILABLE.to_string());
+        self.folder_remove = Some(FolderRemoveResult {
+            request,
+            problem: self.problem.clone(),
+        });
+        cx.notify();
+    }
+
+    /// Removes a source folder; its items stay in the store (R2.1).
+    ///
+    /// The returned id tags the result, so the folder detail can wait for its
+    /// own answer and stay open with the reason when the store refuses (#43).
+    pub fn remove_folder(&mut self, path: String, cx: &mut Context<Self>) -> u64 {
+        // A newer edit supersedes an older result still in flight, and a newer
+        // remove supersedes an older one; the request tag is the remove's own,
+        // so an unrelated settings edit cannot drop it (#43).
+        self.generation = self.generation.wrapping_add(1);
+        self.remove_generation = self.remove_generation.wrapping_add(1);
+        let tracking = self.store_model.read(cx).tracking();
+        let request = self.remove_generation;
         let result = run_on_worker(
             cx,
             move || async move {
@@ -568,25 +791,37 @@ impl EngineModel {
                 tracking.folders().map_err(|error| error.to_string())
             },
             move |model, result, cx| {
-                if model.generation != generation {
+                if model.remove_generation != request {
                     return;
                 }
-                match result {
+                let problem = match result {
                     Ok(folders) => {
                         model.store_model.update(cx, |store, cx| {
                             store.set_folders(folders, cx);
                         });
                         model.problem = None;
+                        None
                     }
-                    Err(problem) => model.problem = Some(problem),
-                }
+                    Err(problem) => {
+                        model.problem = Some(problem.clone());
+                        Some(problem)
+                    }
+                };
+                model.folder_remove = Some(FolderRemoveResult { request, problem });
                 model.refresh_status(cx);
             },
         );
         if result.is_err() {
             self.problem = Some(WORKER_UNAVAILABLE.to_string());
+            // The dialog waits for its own answer, so a request that never ran
+            // still has to answer it: the reason is the missing worker (#43).
+            self.folder_remove = Some(FolderRemoveResult {
+                request,
+                problem: self.problem.clone(),
+            });
             cx.notify();
         }
+        request
     }
 
     /// Turns album mapping on or off for one source folder (R3.4).
@@ -600,6 +835,16 @@ impl EngineModel {
     /// Sets the album scope for one source folder (R3.4).
     pub fn set_album_scope(&mut self, path: String, scope: AlbumScope, cx: &mut Context<Self>) {
         self.change_album(path, AlbumChange::Scope(scope), cx);
+    }
+
+    /// Sets the title of one source folder's own album (#47).
+    ///
+    /// A blank or whitespace-only title means the folder's name. The write
+    /// lands while the client is signed out too: the title is stored with the
+    /// folder's album row and sent by the engine's retry once one runs, so the
+    /// view never depends on a connection to keep what the user typed.
+    pub fn set_album_title(&mut self, path: String, title: String, cx: &mut Context<Self>) {
+        self.change_album(path, AlbumChange::Title(title), cx);
     }
 
     /// Runs one album edit on the worker runtime and republishes the status.
@@ -621,6 +866,7 @@ impl EngineModel {
                 match change {
                     AlbumChange::Mapping(enabled) => tracking.set_album_mapping(&path, enabled),
                     AlbumChange::Scope(scope) => tracking.set_album_scope(&path, scope),
+                    AlbumChange::Title(title) => tracking.set_album_title(&path, &title),
                 }
                 .map_err(|error| error.to_string())?;
                 tracking.folders().map_err(|error| error.to_string())
@@ -697,6 +943,8 @@ impl EngineModel {
                     ),
                     // R6.1: the attempt cap is user-settable, 8 by default.
                     attempt_cap: settings.attempt_cap.max(1),
+                    // R3.7: the sync tag is opt-in and persisted.
+                    tag_uploaded_assets: settings.tag_uploaded_assets,
                     ..EngineConfig::default()
                 };
                 match Engine::new(tracking, session, config) {
@@ -733,22 +981,27 @@ impl EngineModel {
                         } else {
                             engine.resume();
                         }
-                        // One limits applier per engine (R7.1, R7.2). Its
-                        // channel lives in the model, so replacing the engine
-                        // drops the old sender and ends the old task.
+                        // One live-settings applier per engine (R7.1, R7.2,
+                        // R3.7). Its channel lives in the model, so replacing
+                        // the engine drops the old sender and ends the old
+                        // task.
                         if let Ok(runtime) = worker() {
                             let (changes, mut incoming) =
-                                tokio::sync::watch::channel(engine.limits());
+                                tokio::sync::watch::channel(LiveSettings {
+                                    limits: engine.limits(),
+                                    tag_uploaded_assets: engine.tag_status().enabled,
+                                });
                             let applier = Arc::clone(&engine);
                             runtime.spawn(async move {
                                 while incoming.changed().await.is_ok() {
                                     // Copy first: the borrow is not `Send`, so
                                     // it must not live across the await.
-                                    let limits = *incoming.borrow_and_update();
-                                    applier.set_limits(limits).await;
+                                    let live = *incoming.borrow_and_update();
+                                    applier.set_limits(live.limits).await;
+                                    applier.set_tag_uploads(live.tag_uploaded_assets).await;
                                 }
                             });
-                            model.limits = Some(changes);
+                            model.live = Some(changes);
                         }
                         model.engine = Some(engine);
                         model.problem = None;
@@ -770,6 +1023,12 @@ impl EngineModel {
 
     /// Republishes the engine's status, or a folder-only status before it runs.
     fn refresh_status(&mut self, cx: &mut Context<Self>) {
+        self.tag = match &self.engine {
+            // R3.7: the tag state rides the same refresh, so the Settings
+            // section sees the engine's one permission probe.
+            Some(engine) => engine.tag_status(),
+            None => TagStatus::default(),
+        };
         self.status = match &self.engine {
             Some(engine) => engine.status(),
             None => {
@@ -778,15 +1037,29 @@ impl EngineModel {
                     .folders()
                     .iter()
                     .zip(store.folder_counts())
-                    .map(|(folder, counts)| FolderStatus {
+                    .zip(store.folder_times())
+                    .map(|((folder, counts), times)| FolderStatus {
                         path: folder.path.clone(),
                         recursive: folder.recursive,
                         album_mapping: folder.album_mapping,
                         album_scope: folder.album_scope,
+                        // #47: the signed-out detail still shows the title the
+                        // store holds. The row may be pending here — the desired
+                        // title is stored either way, and the rename waits for
+                        // an engine — so this view shows no rename.
+                        album_title: folder.album_title.clone(),
+                        album_rename: None,
                         available: Path::new(&folder.path).is_dir(),
                         // The last known counts from the store (R8.1).
                         counts: *counts,
                         last_error: None,
+                        // #43: the last known scan and upload times, from the
+                        // store the engine writes them to.
+                        last_scan_ns: times.last_scan_ns,
+                        last_upload_ns: times.last_upload_ns,
+                        // The meter dies with the engine it belongs to; the
+                        // store-only status has nothing on the wire (R8.1).
+                        uploads: UploadTraffic::default(),
                     })
                     .collect::<Vec<_>>();
                 Status::derive(StatusInputs {
@@ -827,6 +1100,16 @@ impl EngineModel {
         self.store_model.read(cx).store()
     }
 
+    /// The configured Immich server URL, as the connection holds it (#44).
+    ///
+    /// It is the API base the settings file was saved with, and the folder
+    /// detail builds its asset links from it. Reading it here keeps the panel
+    /// from opening the settings file on the UI thread.
+    #[must_use]
+    pub fn server_url(&self, cx: &App) -> String {
+        self.connection.read(cx).profile().server_url.clone()
+    }
+
     /// The current source folders, from the store the client tracks them in.
     #[must_use]
     pub fn folders(&self, cx: &App) -> Vec<SourceFolder> {
@@ -841,5 +1124,6 @@ fn empty_status() -> Status {
         folders: Vec::new(),
         counts: FolderCounts::default(),
         last_error: None,
+        uploads: UploadTraffic::default(),
     }
 }

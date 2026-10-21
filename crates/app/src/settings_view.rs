@@ -25,6 +25,7 @@ use gpui_kit::component::switch::Switch;
 use gpui_kit::*;
 use sync_core::connection::{AuthMethod, ConnectionState, ServerProfile, SignIn};
 use sync_core::credential::Secret;
+use sync_core::tags::{BackfillStatus, SYNC_TAG, TagStatus};
 
 /// The number of bytes in a displayed megabyte. The stored limit stays bytes
 /// per second (SPEC R7.1); the UI shows MB/s with up to six decimals, which is
@@ -239,6 +240,10 @@ pub struct SettingsView {
     /// The engine the Limits card pushes a change to (R7.1, R7.2), once the
     /// shell has installed one. A view with no engine still saves the values.
     engine: Option<Entity<EngineModel>>,
+    /// The tag state the engine last published for the Tagging section (R3.7).
+    /// It is cached here because the engine notifies on every status poll, and
+    /// the section only changes when this value does.
+    tag: TagStatus,
     /// The last failed save or autostart change, shown with the load problem.
     action_error: Option<String>,
     /// A failure before the store opened, such as path resolution. It stays
@@ -339,6 +344,7 @@ impl SettingsView {
             auth_method: initial.auth_method,
             fields,
             engine: None,
+            tag: TagStatus::default(),
             action_error: None,
             environment_problem: None,
             settings_generation: 0,
@@ -421,7 +427,20 @@ impl SettingsView {
 
     /// Points the Limits card at the engine, so a change to either limit is
     /// applied to a running sync without a restart (R7.1, R7.2).
-    pub fn set_engine(&mut self, engine: Entity<EngineModel>) {
+    ///
+    /// The Tagging section follows the engine's tag state too (R3.7). The
+    /// engine notifies on every status poll, so the view repaints only when the
+    /// state it renders actually changes.
+    pub fn set_engine(&mut self, engine: Entity<EngineModel>, cx: &mut Context<Self>) {
+        self.tag = engine.read(cx).tag_status().clone();
+        self._subscriptions
+            .push(cx.observe(&engine, |this, engine, cx| {
+                let tag = engine.read(cx).tag_status().clone();
+                if tag != this.tag {
+                    this.tag = tag;
+                    cx.notify();
+                }
+            }));
         self.engine = Some(engine);
     }
 
@@ -655,6 +674,39 @@ impl SettingsView {
                 view.record(SAVE_PROBLEM, result, cx);
             },
         );
+    }
+
+    /// Saves the sync tag setting and moves the running engine to it (R3.7).
+    ///
+    /// The engine is moved only after the write lands, so a failed save cannot
+    /// leave the engine tagging while the file says off. Turning it off stops
+    /// new tagging and pauses the backfill at its next batch; nothing untags an
+    /// asset and the tag is not deleted. Turning it on again resumes the
+    /// backfill where it stopped.
+    fn toggle_tag_uploads(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.save_settings(
+            cx,
+            move |settings| settings.tag_uploaded_assets = enabled,
+            move |view, result, cx| {
+                if result.is_ok()
+                    && let Some(engine) = view.engine.clone()
+                {
+                    engine.update(cx, |model, _| model.set_tag_uploads(enabled));
+                }
+                view.record(SAVE_PROBLEM, result, cx);
+            },
+        );
+    }
+
+    /// Asks the running engine to tag every existing asset again (R3.7).
+    ///
+    /// The action goes through the engine model, which owns the engine and its
+    /// runtime: the view never opens the database or sends a request itself
+    /// (N2).
+    fn tag_existing_assets(&mut self, cx: &mut Context<Self>) {
+        if let Some(engine) = self.engine.clone() {
+            engine.update(cx, |model, cx| model.tag_existing_assets(cx));
+        }
     }
 
     /// Applies the autostart setting to the OS, then records it.
@@ -1024,6 +1076,164 @@ impl SettingsView {
         )
     }
 
+    /// The Tagging section: the one sync tag, its switch, and where Immich
+    /// shows it (SPEC R3.7).
+    fn tagging(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let theme = cx.theme();
+        let palette = CardPalette::new(theme);
+        // The switch shows the user's newest intent, so a queued or in-flight
+        // write is reflected before it lands (N2).
+        let settings = self.intended_settings();
+        let enabled = settings.tag_uploaded_assets;
+        let link = sync_tag_url(&settings.server_url);
+        // R3.7: the engine ran the one permission probe; this section only
+        // reports what it found, so opening Settings costs no request.
+        let problem = self.tag.enabled.then(|| self.tag.problem.clone()).flatten();
+        let mut rows = vec![
+            div()
+                .id("settings-tag-upload-row")
+                .test_support()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap_6()
+                .min_h(rems(2.25))
+                .child(field_text(
+                    "Tag uploaded assets",
+                    "Adds the tag to every asset the client uploads. Off by default.",
+                    &palette,
+                ))
+                .child(
+                    Switch::new("settings-tag-upload")
+                        .checked(enabled)
+                        .accessibility_label("Tag uploaded assets with immich-sync")
+                        .on_change(cx.listener(|this, enabled, _, cx| {
+                            this.toggle_tag_uploads(*enabled, cx);
+                        })),
+                )
+                .into_any_element(),
+            div()
+                .id("settings-tag-name-row")
+                .test_support()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap_6()
+                .min_h(rems(2.25))
+                .child(field_text(
+                    "Tag",
+                    "Fixed. The client always uses this name.",
+                    &palette,
+                ))
+                .child(
+                    div()
+                        .id("settings-tag-name")
+                        .test_support()
+                        .aria_label(SYNC_TAG)
+                        .font_family(theme.mono_font_family.clone())
+                        .text_sm()
+                        .child(SYNC_TAG),
+                )
+                .into_any_element(),
+            div()
+                .id("settings-tag-prerequisite")
+                .test_support()
+                .text_xs()
+                .text_color(palette.meta)
+                .child(
+                    "Immich hides tags until you enable Tags in your Immich preferences \
+                     (Account Settings, then Features).",
+                )
+                .into_any_element(),
+        ];
+        if let Some(url) = link {
+            rows.push(
+                div()
+                    .id("settings-tag-link-row")
+                    .test_support()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap_6()
+                    .min_h(rems(2.25))
+                    .child(field_text(
+                        "View in Immich",
+                        "Opens the tag's page in your browser.",
+                        &palette,
+                    ))
+                    .child(
+                        Button::new("settings-tag-link")
+                            .label("View in Immich")
+                            .accessibility_label("Open the sync tag's page in Immich")
+                            .on_click(cx.listener(move |_, _, _, cx| cx.open_url(&url))),
+                    )
+                    .into_any_element(),
+            );
+        }
+        if let Some(problem) = problem {
+            rows.push(
+                notice(
+                    "settings-tag-problem",
+                    format!("The sync tag is not being applied: {problem}"),
+                    theme.warning,
+                    &palette,
+                )
+                .into_any_element(),
+            );
+        }
+        // R3.7: the backfill's progress arrives on the engine's status poll, so
+        // the section has no timer of its own; the counts only change when a
+        // batch lands.
+        if let Some(progress) = backfill_text(&self.tag.backfill, enabled) {
+            rows.push(
+                div()
+                    .id("settings-tag-backfill")
+                    .test_support()
+                    .aria_label(progress.clone())
+                    .text_xs()
+                    .text_color(palette.meta)
+                    .child(progress)
+                    .into_any_element(),
+            );
+        }
+        if enabled && self.engine.is_some() {
+            rows.push(
+                div()
+                    .id("settings-tag-now-row")
+                    .test_support()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap_6()
+                    .min_h(rems(2.25))
+                    .child(field_text(
+                        "Tag existing assets now",
+                        "Tags every asset the client has uploaded, including the ones that were \
+                         uploaded before the switch was on.",
+                        &palette,
+                    ))
+                    .child(
+                        Button::new("settings-tag-now")
+                            .label("Tag existing assets now")
+                            .accessibility_label("Tag every existing asset with immich-sync")
+                            .on_click(cx.listener(|this, _, _, cx| this.tag_existing_assets(cx))),
+                    )
+                    .into_any_element(),
+            );
+        }
+        section(
+            "settings-tagging",
+            "Tagging",
+            "Adds one tag to the assets this client uploads, so they can be found through Immich's tag search.",
+            rows,
+            cx,
+        )
+    }
+
     /// The Storage section: the resolved locations, read-only (SPEC R9).
     fn storage(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let palette = CardPalette::new(cx.theme());
@@ -1145,6 +1355,7 @@ impl Render for SettingsView {
         let general = self.general(cx);
         let limits = self.limits(cx);
         let sync = self.sync(cx);
+        let tagging = self.tagging(cx);
         let storage = self.storage(cx);
 
         div()
@@ -1164,6 +1375,7 @@ impl Render for SettingsView {
             .child(general)
             .child(limits)
             .child(sync)
+            .child(tagging)
             .child(storage)
             .child(
                 div()
@@ -1257,6 +1469,59 @@ pub(crate) fn section(
         .into_any_element()
 }
 
+/// The backfill progress line the Tagging section shows (R3.7).
+///
+/// `None` when there is nothing to say: the switch is off, or the library has
+/// no asset to tag yet. The three states are the ones a user acts on: the run
+/// working through the library, the run stopped with the batches that already
+/// landed, and the run finished.
+#[must_use]
+pub fn backfill_text(status: &BackfillStatus, enabled: bool) -> Option<String> {
+    if !enabled || status.total == 0 {
+        return None;
+    }
+    let counts = format!(
+        "{} of {}",
+        group_digits(status.tagged),
+        group_digits(status.total)
+    );
+    Some(if status.completed {
+        format!("Existing assets tagged: {counts}")
+    } else if status.running {
+        format!("Tagging existing assets: {counts}")
+    } else {
+        format!("Tagging stopped: {counts}")
+    })
+}
+
+/// `48320` as `48,320`, so a library the size of a photo collection reads at a
+/// glance (R3.7).
+fn group_digits(value: u32) -> String {
+    let digits = value.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
+}
+
+/// The Immich web address of the sync tag's page (R3.7).
+///
+/// The configured value is the API base, so a trailing `/api` is dropped
+/// before the web page's path is added; a reverse-proxy prefix in front of it
+/// stays. Only an `http` or `https` base produces a URL, so the button cannot
+/// open a `file:` or `mailto:` target from a hand-edited settings file.
+#[must_use]
+pub fn sync_tag_url(server_url: &str) -> Option<String> {
+    Some(format!(
+        "{}/tags?path={SYNC_TAG}",
+        crate::asset_link::web_root(server_url)?
+    ))
+}
+
 /// A notice with a colored edge, named by `id`. The accessible name carries
 /// the message, so the visible copy is not announced a second time.
 pub(crate) fn notice(
@@ -1277,4 +1542,101 @@ pub(crate) fn notice(
         .text_xs()
         .text_color(palette.text)
         .child(Text::new_inaccessible(text.into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{backfill_text, group_digits, sync_tag_url};
+    use sync_core::tags::BackfillStatus;
+
+    /// R3.7: the Tagging section says where the backfill stands: working, at
+    /// rest, or finished, with the counts grouped.
+    #[test]
+    fn the_backfill_line_reports_progress_and_completion() {
+        let running = BackfillStatus {
+            tagged: 12_340,
+            total: 48_000,
+            running: true,
+            completed: false,
+        };
+        assert_eq!(
+            backfill_text(&running, true).as_deref(),
+            Some("Tagging existing assets: 12,340 of 48,000")
+        );
+        assert_eq!(
+            backfill_text(&running, false),
+            None,
+            "R3.7: the switch off hides the progress it paused"
+        );
+        assert_eq!(
+            backfill_text(
+                &BackfillStatus {
+                    tagged: 2,
+                    total: 4,
+                    running: false,
+                    completed: false,
+                },
+                true,
+            )
+            .as_deref(),
+            Some("Tagging stopped: 2 of 4"),
+            "R3.7: a stopped run keeps and shows what it reached"
+        );
+        assert_eq!(
+            backfill_text(
+                &BackfillStatus {
+                    tagged: 4,
+                    total: 4,
+                    running: false,
+                    completed: true,
+                },
+                true,
+            )
+            .as_deref(),
+            Some("Existing assets tagged: 4 of 4"),
+            "R3.7: the finished state"
+        );
+        assert_eq!(
+            backfill_text(&BackfillStatus::default(), true),
+            None,
+            "an empty library has nothing to report"
+        );
+    }
+
+    #[test]
+    fn the_count_is_grouped_in_thousands() {
+        assert_eq!(group_digits(0), "0");
+        assert_eq!(group_digits(999), "999");
+        assert_eq!(group_digits(1_000), "1,000");
+        assert_eq!(group_digits(48_320), "48,320");
+        assert_eq!(group_digits(1_234_567), "1,234,567");
+    }
+
+    #[test]
+    fn the_tag_url_drops_a_trailing_api_and_keeps_a_prefix() {
+        // R3.7: the configured server URL is the API base; the tag page lives
+        // on the web root beside it.
+        assert_eq!(
+            sync_tag_url("https://immich.example.com/api").as_deref(),
+            Some("https://immich.example.com/tags?path=immich-sync")
+        );
+        assert_eq!(
+            sync_tag_url("https://immich.example.com/immich/api/").as_deref(),
+            Some("https://immich.example.com/immich/tags?path=immich-sync"),
+            "a reverse-proxy path prefix stays"
+        );
+        assert_eq!(
+            sync_tag_url("https://immich.example.com").as_deref(),
+            Some("https://immich.example.com/tags?path=immich-sync")
+        );
+    }
+
+    #[test]
+    fn there_is_no_tag_url_without_a_web_url() {
+        assert_eq!(sync_tag_url("  "), None, "no server URL means no link");
+        // Only http(s) is ever opened, whatever a hand-edited file holds.
+        assert_eq!(sync_tag_url("file:///tmp/immich"), None);
+        assert_eq!(sync_tag_url("mailto:someone@example.com"), None);
+        assert_eq!(sync_tag_url("https:///api"), None, "no host to open");
+    }
 }

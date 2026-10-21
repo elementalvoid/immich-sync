@@ -265,6 +265,10 @@ fn default_settings_match_the_spec() {
         settings.attempt_cap, 8,
         "R6.1: the attempt cap defaults to 8"
     );
+    assert!(
+        !settings.tag_uploaded_assets,
+        "R3.7: the sync tag is off by default"
+    );
     assert!(settings.server_url.is_empty(), "R1.1: no server yet");
     assert!(settings.email.is_empty(), "R1.1: no account yet");
     assert_eq!(settings.auth_method, AuthMethod::Password);
@@ -321,6 +325,7 @@ fn settings_round_trip_across_a_restart() {
             settings.concurrency = 6;
             settings.scan_interval_minutes = 45;
             settings.attempt_cap = 3;
+            settings.tag_uploaded_assets = true;
             settings.server_url = "https://immich.example.com".to_string();
             settings.email = "sync@example.com".to_string();
             settings.auth_method = AuthMethod::ApiKey;
@@ -335,6 +340,10 @@ fn settings_round_trip_across_a_restart() {
     assert_eq!(settings.concurrency, 6);
     assert_eq!(settings.scan_interval_minutes, 45);
     assert_eq!(settings.attempt_cap, 3);
+    assert!(
+        settings.tag_uploaded_assets,
+        "R3.7: the tag setting persists"
+    );
     assert_eq!(settings.server_url, "https://immich.example.com");
     assert_eq!(settings.email, "sync@example.com");
     assert_eq!(settings.auth_method, AuthMethod::ApiKey);
@@ -350,6 +359,7 @@ fn settings_round_trip_across_a_restart() {
          concurrency = 6\n\
          scan_interval_minutes = 45\n\
          attempt_cap = 3\n\
+         tag_uploaded_assets = true\n\
          server_url = \"https://immich.example.com\"\n\
          email = \"sync@example.com\"\n\
          auth_method = \"api_key\"\n\

@@ -518,6 +518,7 @@ impl Connection {
             relogin_used: Arc::clone(&self.relogin_used),
             failure_run: Arc::clone(&self.failure_run),
             attention_threshold: Arc::clone(&self.attention_threshold),
+            auth_epoch: Arc::new(AtomicU32::new(0)),
             connection: Arc::new(tokio::sync::Mutex::new(self)),
         }
     }
@@ -600,6 +601,11 @@ pub struct SharedSession {
     /// How many failures in a row reach the user; see
     /// [`Self::set_attention_threshold`].
     attention_threshold: Arc<AtomicU32>,
+    /// How many sign-ins, restores, and re-logins this handle has made
+    /// (R1.4). A reader that settled an answer against a credential, such as
+    /// the sync tag's permission probe (R3.7), compares it to learn when that
+    /// answer is stale.
+    auth_epoch: Arc<AtomicU32>,
     snapshot: Arc<std::sync::Mutex<SessionSnapshot>>,
 }
 
@@ -661,6 +667,7 @@ impl SharedSession {
             }
         };
         self.mirror(&connection);
+        self.auth_epoch.fetch_add(1, Ordering::SeqCst);
         outcome
     }
 
@@ -681,6 +688,7 @@ impl SharedSession {
         let mut connection = self.connection.lock().await;
         let state = connection.sign_in(request).await;
         self.mirror(&connection);
+        self.auth_epoch.fetch_add(1, Ordering::SeqCst);
         state
     }
 
@@ -689,6 +697,7 @@ impl SharedSession {
         let mut connection = self.connection.lock().await;
         let state = connection.restore(profile).await;
         self.mirror(&connection);
+        self.auth_epoch.fetch_add(1, Ordering::SeqCst);
         state
     }
 
@@ -697,7 +706,17 @@ impl SharedSession {
         let mut connection = self.connection.lock().await;
         let outcome = connection.handle_unauthorized().await;
         self.mirror(&connection);
+        self.auth_epoch.fetch_add(1, Ordering::SeqCst);
         outcome
+    }
+
+    /// How many times an authentication established a credential on this
+    /// handle (R1.4). A sign-in reuses the running session, so a reader that
+    /// settled an answer against the previous credential compares this value
+    /// to know the answer is stale.
+    #[must_use]
+    pub fn auth_epoch(&self) -> u32 {
+        self.auth_epoch.load(Ordering::SeqCst)
     }
 
     /// Records that a request with the current credential succeeded, which

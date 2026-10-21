@@ -1,26 +1,41 @@
 //! The dashboard view (SPEC R8.1): a global status card and one card per
 //! source folder.
 //!
-//! Keyboard navigation stays out until the form controls land in #3.
+//! A new folder is confirmed in the setup dialog (#40) before the client
+//! records and scans it; the dialog's panel lives in [`crate::folder_panel`].
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use crate::asset_link::{self, LinkOpener};
 use crate::engine::EngineModel;
+use crate::folder_controls::{SettingsControls, SettingsIds, SettingsValues};
+use crate::folder_panel::{FolderOpener, FolderPanel, FolderPanelEvent};
 use crate::path_picker::{self, Picked};
+use crate::shell::ViewMode;
 use crate::status::{ActivityState, DashboardModel, StatusCard};
 
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::Colorize as _;
 use gpui_kit::component::Theme;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::progress::Progress;
-use gpui_kit::component::radio::Radio;
-use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tag::Tag;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use sync_core::store::AlbumScope;
+
+/// What the dashboard asks the shell to do (#43).
+///
+/// The dashboard cannot switch surfaces itself: the [`crate::shell::AppShell`]
+/// owns the visible view. It reports the request and the shell opens it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DashboardEvent {
+    /// Open one list view narrowed to one source folder (#41, #43).
+    OpenView(ViewMode, String),
+}
 
 /// The dashboard view: a status card per source folder, the global card, and
 /// the folder controls (R8.1).
@@ -35,8 +50,30 @@ pub struct Dashboard {
     paused: bool,
     /// The notice a failed Browse… left behind (#30).
     pick_notice: Option<String>,
+    /// The open folder panel: the setup dialog (#40) or a folder's live detail
+    /// (#43). The dashboard owns whether it is open; the panel owns the state
+    /// inside it.
+    panel: Option<Entity<FolderPanel>>,
+    panel_subscription: Option<Subscription>,
+    /// Where focus goes back to when the detail closes: the card's Details
+    /// anchor and the folder's stored path (#43).
+    detail_return: Option<(String, FocusHandle)>,
+    /// One focus anchor per folder card, keyed by the stored path so a removal
+    /// cannot shift a deleted folder's focus onto its neighbour (#43).
+    card_focus: HashMap<String, FocusHandle>,
+    /// What "Open folder" runs (#43). The product opens the platform's file
+    /// manager; a test injects a recorder.
+    folder_opener: FolderOpener,
+    /// What an asset link opens (#44). The product opens the default browser; a
+    /// test injects a recorder.
+    link_opener: LinkOpener,
+    /// A folder whose detail a capture run pins open (#43), so a screenshot of
+    /// the detail needs no pointer.
+    capture_detail: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
+
+impl EventEmitter<DashboardEvent> for Dashboard {}
 
 impl Dashboard {
     /// Builds the dashboard from a fixed view model, with no engine attached.
@@ -48,6 +85,13 @@ impl Dashboard {
             folder_input: None,
             paused: false,
             pick_notice: None,
+            panel: None,
+            panel_subscription: None,
+            detail_return: None,
+            card_focus: HashMap::new(),
+            folder_opener: Arc::new(crate::folder_panel::open_in_file_manager),
+            link_opener: asset_link::browser_opener(),
+            capture_detail: None,
             _subscriptions: Vec::new(),
         }
     }
@@ -63,20 +107,10 @@ impl Dashboard {
                 .placeholder("/home/you/Pictures")
                 .masked(false)
         });
-        let mut subscriptions = Vec::with_capacity(2);
-        subscriptions.push(cx.observe(&engine, |this, engine, cx| {
+        let subscriptions = vec![cx.observe(&engine, |this, engine, cx| {
             this.model = engine.read(cx).dashboard_model(cx);
             cx.notify();
-        }));
-        subscriptions.push(cx.subscribe_in(
-            &folder_input,
-            window,
-            |this, _, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
-                    this.add_folder(window, cx);
-                }
-            },
-        ));
+        })];
         let model = engine.read(cx).dashboard_model(cx);
         Self {
             model,
@@ -84,8 +118,29 @@ impl Dashboard {
             folder_input: Some(folder_input),
             paused: false,
             pick_notice: None,
+            panel: None,
+            panel_subscription: None,
+            detail_return: None,
+            card_focus: HashMap::new(),
+            folder_opener: Arc::new(crate::folder_panel::open_in_file_manager),
+            link_opener: asset_link::browser_opener(),
+            capture_detail: std::env::var(crate::shell::FORCE_DETAIL_ENV).ok(),
             _subscriptions: subscriptions,
         }
+    }
+
+    /// Replaces the action "Open folder" runs, so a test can assert the path
+    /// without starting the platform's file manager (#43). It applies to the
+    /// next detail the view opens.
+    pub fn set_folder_opener(&mut self, opener: impl Fn(&str) -> std::io::Result<()> + 'static) {
+        self.folder_opener = Arc::new(opener);
+    }
+
+    /// Replaces the action an asset link runs, so a test can assert the URL
+    /// without starting a browser (#44). It applies to the next detail the view
+    /// opens.
+    pub fn set_link_opener(&mut self, opener: impl Fn(&str, &App) + 'static) {
+        self.link_opener = Arc::new(opener);
     }
 
     /// Whether new uploads are held (R8.7).
@@ -167,10 +222,13 @@ impl Dashboard {
         self.pick_notice = None;
         match path_picker::picked(result) {
             Picked::Path(path) => {
+                let path = path.to_string_lossy().into_owned();
                 if let Some(input) = self.folder_input.clone() {
-                    let path = path.to_string_lossy().into_owned();
-                    input.update(cx, |state, cx| state.set_value(path, window, cx));
+                    input.update(cx, |state, cx| state.set_value(path.clone(), window, cx));
                 }
+                // R2.1: a chosen folder is confirmed in the setup dialog, not
+                // recorded straight away.
+                self.open_folder_setup(path, window, cx);
             }
             Picked::Cancelled => {}
             Picked::Failed(notice) => self.pick_notice = Some(notice),
@@ -178,16 +236,178 @@ impl Dashboard {
         cx.notify();
     }
 
-    /// Adds the path the field holds (R2.1).
-    fn add_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(input) = self.folder_input.clone() else {
+    /// Opens the setup dialog for the path the field holds (#40, R2.1).
+    fn open_setup_from_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let path = self
+            .folder_input
+            .as_ref()
+            .map(|input| input.read(cx).value().trim().to_string())
+            .unwrap_or_default();
+        self.open_folder_setup(path, window, cx);
+    }
+
+    /// Opens the folder setup dialog for `path` (#40).
+    ///
+    /// Nothing is written here: the panel writes the path and all three
+    /// settings in one request when the user presses Add, and a Cancel drops
+    /// the draft.
+    fn open_folder_setup(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        // One setup at a time: a second Add must not replace a dialog that is
+        // already open, whose request may still be in flight.
+        if self.panel.is_some() {
+            return;
+        }
+        let Some(engine) = self.engine.clone() else {
             return;
         };
-        let path = input.read(cx).value().trim().to_string();
-        if let Some(engine) = &self.engine {
-            engine.update(cx, |model, cx| model.add_folder(path, true, cx));
+        let panel = cx.new(|cx| FolderPanel::setup(engine, path, window, cx));
+        let focus = panel.read(cx).focus_handle(cx);
+        let subscription = cx.subscribe_in(
+            &panel,
+            window,
+            |this, _panel, event: &FolderPanelEvent, window, cx| {
+                this.panel_event(event, window, cx);
+            },
+        );
+        self.panel = Some(panel);
+        self.panel_subscription = Some(subscription);
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    /// Opens one folder's live detail (#43).
+    ///
+    /// Nothing is written: the settings write only when the user changes one,
+    /// through the same engine request the card makes.
+    fn open_folder_detail(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.panel.is_some() {
+            return;
         }
-        input.update(cx, |state, cx| state.set_value("", window, cx));
+        let Some(engine) = self.engine.clone() else {
+            return;
+        };
+        let opener = self.folder_opener.clone();
+        let link_opener = self.link_opener.clone();
+        let panel =
+            cx.new(|cx| FolderPanel::detail(engine, path.clone(), opener, link_opener, window, cx));
+        let focus = panel.read(cx).focus_handle(cx);
+        let subscription = cx.subscribe_in(
+            &panel,
+            window,
+            |this, _panel, event: &FolderPanelEvent, window, cx| {
+                this.panel_event(event, window, cx);
+            },
+        );
+        self.detail_return = Some((path.clone(), self.details_focus(&path, cx).tab_stop(false)));
+        self.panel = Some(panel);
+        self.panel_subscription = Some(subscription);
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    /// Opens the pinned detail once the store has loaded its folder (#43).
+    ///
+    /// The screenshot recipe sets [`crate::shell::FORCE_DETAIL_ENV`], so the
+    /// capture of the detail needs no pointer. It waits for the folder to be in
+    /// the model, because the store opens off the UI thread.
+    fn open_capture_detail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.capture_detail.clone() else {
+            return;
+        };
+        if self.panel.is_some()
+            || !self
+                .model
+                .folders
+                .iter()
+                .any(|card| card.path.as_deref() == Some(path.as_str()))
+        {
+            return;
+        }
+        self.capture_detail = None;
+        self.open_folder_detail(path, window, cx);
+    }
+
+    /// Applies one panel event: the setup lifecycle, the detail's close, or a
+    /// link into a filtered list view (#40, #43).
+    fn panel_event(
+        &mut self,
+        event: &FolderPanelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            FolderPanelEvent::Added => {
+                self.clear_folder_input(window, cx);
+                self.close_folder_setup(window, cx);
+            }
+            FolderPanelEvent::Cancelled => self.close_folder_setup(window, cx),
+            FolderPanelEvent::Closed => self.close_folder_detail(window, cx),
+            FolderPanelEvent::Open(mode, folder) => {
+                self.close_folder_detail(window, cx);
+                // #43 follow-up: the new surface opens without the keyboard,
+                // because focus moves into a view the dashboard does not own.
+                // Moving it into that view's folder filter needs a focus handle
+                // per view; recorded, not done here.
+                cx.emit(DashboardEvent::OpenView(*mode, folder.clone()));
+            }
+        }
+    }
+
+    /// The focus anchor of one card's Details control (#43).
+    ///
+    /// The anchor is kept per stored path, not per index a removal can shift.
+    /// It is created on demand, because a click handler is not inside a render
+    /// pass and cannot use a keyed window state.
+    fn details_focus(&mut self, path: &str, cx: &mut Context<Self>) -> FocusHandle {
+        self.card_focus
+            .entry(path.to_string())
+            .or_insert_with(|| cx.focus_handle())
+            .clone()
+    }
+
+    /// Closes the detail dialog and puts focus back on the folder's card
+    /// (#43), or on the folder field when the card is gone.
+    fn close_folder_detail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.panel = None;
+        self.panel_subscription = None;
+        if let Some((path, anchor)) = self.detail_return.take() {
+            if self
+                .model
+                .folders
+                .iter()
+                .any(|card| card.path.as_deref() == Some(path.as_str()))
+            {
+                // The anchor is not a tab stop of its own: its first tab stop is
+                // the card's Details control.
+                window.focus(&anchor, cx);
+                window.focus_next(cx);
+            } else if let Some(input) = self.folder_input.clone() {
+                // A successful Remove took the card with it, so the card's
+                // anchor renders nowhere: the keyboard goes to the folder field
+                // instead of landing on nothing (#43).
+                let focus = input.read(cx).focus_handle(cx);
+                window.focus(&focus, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Closes the setup dialog and puts focus back on the folder field (#40).
+    fn close_folder_setup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.panel = None;
+        self.panel_subscription = None;
+        if let Some(input) = self.folder_input.clone() {
+            let focus = input.read(cx).focus_handle(cx);
+            window.focus(&focus, cx);
+        }
+        cx.notify();
+    }
+
+    /// Clears the field once its folder is recorded (#40).
+    fn clear_folder_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(input) = self.folder_input.clone() {
+            input.update(cx, |state, cx| state.set_value("", window, cx));
+        }
     }
 
     /// Removes one source folder (R2.1).
@@ -259,6 +479,22 @@ impl Dashboard {
                                 .test_support()
                                 .track_focus(&focus)
                                 .aria_label("Source folder path")
+                                // Enter opens the setup dialog. This raw key
+                                // handler is the path that fires: the field
+                                // and this wrapper share one focus handle, so
+                                // the key reaches the wrapper whatever the
+                                // platform does with the input's own context.
+                                // The input's `PressEnter` used to open the
+                                // dialog a second time; a rendered test covers
+                                // the surviving path (#43).
+                                .on_key_down(cx.listener(
+                                    |this, event: &KeyDownEvent, window, cx| {
+                                        if event.keystroke.key == "enter" {
+                                            this.open_setup_from_field(window, cx);
+                                            cx.stop_propagation();
+                                        }
+                                    },
+                                ))
                                 .flex_1()
                                 .min_w_0()
                                 .child(Input::new(&input).aria_label("Source folder path")),
@@ -278,7 +514,7 @@ impl Dashboard {
                                 .label("Add folder")
                                 .accessibility_label("Add folder")
                                 .on_click(cx.listener(|this, _, window, cx| {
-                                    this.add_folder(window, cx);
+                                    this.open_setup_from_field(window, cx);
                                 })),
                         )
                     }),
@@ -294,83 +530,47 @@ impl Dashboard {
     }
 
     /// The recursion switch, the album mapping switch, and the album scope
-    /// choice for one folder card (R2.1, R3.4).
+    /// choice for one folder card (R2.1, R3.4), through the shared controls
+    /// the folder detail uses too (#43).
     ///
-    /// The scope stays choosable while the mapping is off: it is the folder's
-    /// stored scope (R3.4) and takes effect as soon as the mapping is on, and
-    /// the kit's `Radio` does not announce a disabled state, so a disabled
-    /// radio would read as an enabled one (N5).
+    /// Each control stops the click from reaching the card, which opens the
+    /// folder's detail (#43).
     fn folder_controls(
         &self,
         index: usize,
         card: &StatusCard,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
-        let muted = cx.theme().muted_foreground;
-        let title = card.title.clone();
         let path = card.path.clone().unwrap_or_default();
-        let leaf = card.album_scope == AlbumScope::Leaf;
-        div()
-            .flex()
-            .flex_row()
-            // The card is narrow; the controls wrap instead of clipping.
-            .flex_wrap()
-            .items_center()
-            .gap_2()
-            .child(div().text_xs().text_color(muted).child("Recursive"))
-            .child(
-                Switch::new(("folder-recursive", index))
-                    .checked(card.recursive)
-                    .accessibility_label(format!("Sync {title} recursively"))
-                    .on_click(cx.listener({
-                        let path = path.clone();
-                        move |this, recursive, _, cx| {
-                            this.set_folder_recursive(path.clone(), *recursive, cx);
-                        }
-                    })),
-            )
-            .child(div().text_xs().text_color(muted).child("Album mapping"))
-            .child(
-                Switch::new(("folder-album", index))
-                    .checked(card.album_mapping)
-                    .accessibility_label(format!("Album mapping for {title}"))
-                    .on_click(cx.listener({
-                        let path = path.clone();
-                        move |this, enabled, _, cx| {
-                            this.set_album_mapping(path.clone(), *enabled, cx);
-                        }
-                    })),
-            )
-            .child(
-                Radio::new(("folder-album-leaf", index))
-                    .label(AlbumScope::Leaf.label())
-                    .accessibility_label(format!("Album scope for {title}: one album per folder"))
-                    .checked(leaf)
-                    .on_change(cx.listener({
-                        let path = path.clone();
-                        move |this, checked, _, cx| {
-                            if *checked {
-                                this.set_album_scope(path.clone(), AlbumScope::Leaf, cx);
-                            }
-                        }
-                    })),
-            )
-            .child(
-                Radio::new(("folder-album-whole", index))
-                    .label(AlbumScope::WholeFolder.label())
-                    .accessibility_label(format!(
-                        "Album scope for {title}: one album for this folder"
-                    ))
-                    .checked(!leaf)
-                    .on_change(cx.listener({
-                        let path = path.clone();
-                        move |this, checked, _, cx| {
-                            if *checked {
-                                this.set_album_scope(path.clone(), AlbumScope::WholeFolder, cx);
-                            }
-                        }
-                    })),
-            )
+        let recursive_path = path.clone();
+        let mapping_path = path.clone();
+        SettingsControls::new(
+            SettingsIds {
+                recursive: ("folder-recursive", index).into(),
+                album_mapping: ("folder-album", index).into(),
+                album_leaf: ("folder-album-leaf", index).into(),
+                album_whole: ("folder-album-whole", index).into(),
+            },
+            card.title.clone(),
+            SettingsValues {
+                recursive: card.recursive,
+                album_mapping: card.album_mapping,
+                album_scope: card.album_scope,
+            },
+            cx.listener(move |this, recursive: &bool, _, cx| {
+                this.set_folder_recursive(recursive_path.clone(), *recursive, cx);
+                cx.stop_propagation();
+            }),
+            cx.listener(move |this, enabled: &bool, _, cx| {
+                this.set_album_mapping(mapping_path.clone(), *enabled, cx);
+                cx.stop_propagation();
+            }),
+            cx.listener(move |this, scope: &AlbumScope, _, cx| {
+                this.set_album_scope(path.clone(), *scope, cx);
+                cx.stop_propagation();
+            }),
+        )
+        .render(cx.theme().muted_foreground)
     }
 
     fn header(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -430,7 +630,11 @@ impl Dashboard {
 }
 
 impl Render for Dashboard {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // #43: a capture run pins a folder's detail open, so a screenshot of
+        // the dialog needs no pointer. The store opens off the UI thread, so
+        // the dialog waits until the folder is in the model.
+        self.open_capture_detail(window, cx);
         let background = cx.theme().background;
         let foreground = cx.theme().foreground;
         let muted = cx.theme().muted_foreground;
@@ -466,19 +670,26 @@ impl Render for Dashboard {
             .child(div().text_sm().text_color(muted).child("Source folders"))
             .child(
                 div().flex().flex_row().flex_wrap().gap_4().children(
+                    // The cards are copied out of the model, so the loop can
+                    // ask the view for a card's focus anchor (#43).
                     self.model
                         .folders
+                        .clone()
                         .iter()
                         .enumerate()
                         .map(|(index, folder)| {
+                            let path = folder.path.clone().unwrap_or_default();
+                            let title = folder.title.clone();
                             let remove = removed.then(|| {
-                                let path = folder.path.clone().unwrap_or_default();
-                                let title = folder.title.clone();
+                                let path = path.clone();
                                 Button::new(("folder-remove", index))
                                     .ghost()
                                     .label("Remove")
                                     .accessibility_label(format!("Remove {title}"))
                                     .on_click(cx.listener(move |this, _, _, cx| {
+                                        // #43: a card control never opens the
+                                        // detail the card itself opens.
+                                        cx.stop_propagation();
                                         this.remove_folder(path.clone(), cx);
                                     }))
                                     .into_any_element()
@@ -486,18 +697,65 @@ impl Render for Dashboard {
                             let album = removed.then(|| {
                                 self.folder_controls(index, folder, cx).into_any_element()
                             });
-                            div().w(rems(17.5)).flex().child(status_card(
-                                ("status-folder", index).into(),
-                                ("status-state-folder", index).into(),
-                                None,
-                                folder,
-                                album,
-                                remove,
-                                cx,
-                            ))
+                            let details_focus = self.details_focus(&path, cx);
+                            let details = removed.then(|| {
+                                let path = path.clone();
+                                div()
+                                    .id(("folder-details-anchor", index))
+                                    .test_support()
+                                    .track_focus(&details_focus)
+                                    .tab_stop(false)
+                                    .child(
+                                        Button::new(("folder-details", index))
+                                            .secondary()
+                                            .label("Details")
+                                            .accessibility_label(format!("Details for {title}"))
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                cx.stop_propagation();
+                                                this.open_folder_detail(path.clone(), window, cx);
+                                            })),
+                                    )
+                                    .into_any_element()
+                            });
+                            let footer = removed.then(|| {
+                                let remove = remove.unwrap_or_else(|| div().into_any_element());
+                                let details = details.unwrap_or_else(|| div().into_any_element());
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_2()
+                                    .child(details)
+                                    .child(remove)
+                                    .into_any_element()
+                            });
+                            div()
+                                .id(("folder-card", index))
+                                .test_support()
+                                .w(rems(17.5))
+                                .flex()
+                                // #43: the card opens the folder's detail; its
+                                // controls stop the click at themselves.
+                                .when(removed, |this| {
+                                    let path = path.clone();
+                                    this.on_click(cx.listener(move |this, _, window, cx| {
+                                        this.open_folder_detail(path.clone(), window, cx);
+                                    }))
+                                })
+                                .child(status_card(
+                                    ("status-folder", index).into(),
+                                    ("status-state-folder", index).into(),
+                                    None,
+                                    folder,
+                                    album,
+                                    footer,
+                                    cx,
+                                ))
                         }),
                 ),
             )
+            .when_some(self.panel.clone(), |this, panel| this.child(panel))
     }
 }
 
@@ -556,16 +814,16 @@ pub fn state_border(state: ActivityState, theme: &Theme) -> Hsla {
 }
 
 /// One status card. The text comes from [`StatusCard::content`], so the view
-/// does no formatting. `remove` is the per-folder remove control, when the
-/// dashboard is attached to an engine (R2.1), and `album` the per-folder album
-/// mapping controls (R3.4).
+/// does no formatting. `footer` is the card's controls row — Details and Remove
+/// on a folder card, when the dashboard is attached to an engine (#43, R2.1) —
+/// and `album` the per-folder settings controls (R3.4).
 fn status_card(
     id: ElementId,
     state_id: ElementId,
     connection_id: Option<ElementId>,
     card: &StatusCard,
     album: Option<AnyElement>,
-    remove: Option<AnyElement>,
+    footer: Option<AnyElement>,
     cx: &App,
 ) -> impl IntoElement {
     let theme = cx.theme();
@@ -630,7 +888,7 @@ fn status_card(
                 .items_center()
                 .gap_3()
                 .child(
-                    Progress::new((id, "progress"))
+                    Progress::new((id.clone(), "progress"))
                         .flex_1()
                         .value(content.progress * 100.0)
                         .accessibility_label(format!("{title} progress")),
@@ -648,6 +906,21 @@ fn status_card(
                 .text_color(palette.meta)
                 .child(content.counts),
         )
+        .when_some(content.uploads.clone(), |this, uploads| {
+            // R8.1: the global card's rate and uploads in flight. Plain meta
+            // ink on the card surface, which is the pair the theme contrast
+            // test measures, and a label instead of a control: nothing new to
+            // operate or to skip.
+            this.child(
+                div()
+                    .id((id.clone(), "uploads"))
+                    .test_support()
+                    .aria_label(uploads.clone())
+                    .text_sm()
+                    .text_color(palette.meta)
+                    .child(uploads),
+            )
+        })
         .when_some(content.album.clone(), |this, album| {
             this.child(div().text_sm().text_color(palette.meta).child(album))
         });
@@ -678,8 +951,8 @@ fn status_card(
     if let Some(album) = album {
         root = root.child(album);
     }
-    if let Some(remove) = remove {
-        root = root.child(div().flex().flex_row().justify_end().child(remove));
+    if let Some(footer) = footer {
+        root = root.child(footer);
     }
     root
 }
@@ -688,7 +961,12 @@ fn status_card(
 ///
 /// The wrapper owns the accessible name and the visible copy is inaccessible
 /// to assistive technology, so the state is announced once, not twice.
-fn state_tag(state: ActivityState, label: String, palette: &CardPalette, theme: &Theme) -> Tag {
+pub(crate) fn state_tag(
+    state: ActivityState,
+    label: String,
+    palette: &CardPalette,
+    theme: &Theme,
+) -> Tag {
     Tag::secondary()
         .bg(palette.pill_fill)
         .text_color(palette.pill_text)

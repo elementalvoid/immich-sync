@@ -17,7 +17,7 @@ use sync_core::connection::{
     Attention, AuthMethod, Connection, ConnectionState, Secret, SharedSession, SignIn,
 };
 use sync_core::credential::MemoryCredentialStore;
-use sync_core::engine::{Engine, EngineConfig, ReviewError};
+use sync_core::engine::{Engine, EngineConfig, EngineError, ReviewError};
 use sync_core::failure::FailureClass;
 use sync_core::hash::{Sha1, sha1_file};
 use sync_core::status::Activity;
@@ -63,6 +63,7 @@ fn add_folder(store: &StateStore, path: &Path, recursive: bool) {
             recursive,
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
+            album_title: None,
         })
         .expect("add the source folder");
 }
@@ -75,6 +76,7 @@ fn add_mapped_folder(store: &StateStore, path: &Path, recursive: bool, scope: Al
             recursive,
             album_mapping: true,
             album_scope: scope,
+            album_title: None,
         })
         .expect("add the mapped source folder");
 }
@@ -219,6 +221,53 @@ async fn a_folder_with_100_files_syncs_without_manual_action() {
         assert!(row.state.is_terminal_success(), "{path:?}: {:?}", row.state);
         assert!(row.asset_id.is_some(), "R3.6: the asset id was recorded");
     }
+    engine.stop();
+}
+
+/// #43: the folder detail shows when the folder last scanned and last
+/// uploaded. Both are written by the paths that already know the outcome, and
+/// the live status carries the same values the row holds.
+#[tokio::test]
+async fn a_folder_records_its_last_scan_and_upload() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let photo = write_file(&photos, "photo-001.jpg", b"one photo");
+    add_folder(&store, &photos, true);
+    let folder = photos.display().to_string();
+
+    let engine = start_engine(&server, &store, EngineConfig::default()).await;
+    assert!(
+        wait_for_progress(
+            || terminal_count(&store, std::slice::from_ref(&photo)),
+            || all_terminal(&store, std::slice::from_ref(&photo)),
+            Duration::from_secs(20),
+        )
+        .await,
+        "the fixture file never reached a terminal success state"
+    );
+
+    let times = store.folder_times(&folder).expect("read the folder times");
+    assert!(
+        times.last_scan_ns.is_some(),
+        "#43: the scan that found the file is recorded"
+    );
+    assert!(
+        times.last_upload_ns.is_some(),
+        "#43: the successful upload is recorded"
+    );
+
+    // R8.1: the dashboard reads the engine's status, so an open detail follows
+    // the same two times without another store read.
+    let status = engine.status();
+    let live = status
+        .folders
+        .iter()
+        .find(|live| live.path == folder)
+        .expect("the folder is in the live status");
+    assert_eq!(live.last_scan_ns, times.last_scan_ns);
+    assert_eq!(live.last_upload_ns, times.last_upload_ns);
     engine.stop();
 }
 
@@ -1084,6 +1133,7 @@ async fn adding_a_folder_through_the_engine_syncs_its_existing_files() {
             recursive: true,
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
+            album_title: None,
         }]
     );
 
@@ -1092,6 +1142,73 @@ async fn adding_a_folder_through_the_engine_syncs_its_existing_files() {
         .expect("remove the folder");
     assert!(engine.status().folders.is_empty());
     assert!(store.folders().expect("read the folders").is_empty());
+    engine.stop();
+}
+
+/// #40: the setup dialog writes a new folder's four settings together, and a
+/// folder the engine already tracks is refused without touching its row.
+#[tokio::test]
+async fn adding_a_folder_with_confirmed_settings_writes_every_choice_once() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let file = write_file(&photos, "existing.jpg", b"existing");
+    let config = EngineConfig {
+        watch: false,
+        ..EngineConfig::default()
+    };
+    let engine = start_engine(&server, &store, config).await;
+    let confirmed = SourceFolder {
+        path: photos.display().to_string(),
+        recursive: false,
+        album_mapping: true,
+        album_scope: AlbumScope::WholeFolder,
+        album_title: None,
+    };
+
+    engine
+        .add_folder_settings(&confirmed)
+        .expect("add the folder with the confirmed settings");
+
+    assert_eq!(
+        store.folders().expect("read the folders"),
+        vec![confirmed.clone()],
+        "#40: one write records the path and all three settings"
+    );
+    let card = engine.status().folders[0].clone();
+    assert_eq!(card.recursive, confirmed.recursive);
+    assert_eq!(card.album_mapping, confirmed.album_mapping);
+    assert_eq!(card.album_scope, confirmed.album_scope);
+    assert!(
+        wait_until(
+            || all_terminal(&store, std::slice::from_ref(&file)),
+            Duration::from_secs(15)
+        )
+        .await,
+        "R2.1: the confirmed folder starts scanning its existing files"
+    );
+
+    // The second add of the same folder is refused, and the first row stays.
+    let changed = SourceFolder {
+        recursive: true,
+        album_mapping: false,
+        album_scope: AlbumScope::Leaf,
+        album_title: None,
+        ..confirmed.clone()
+    };
+    let error = engine
+        .add_folder_settings(&changed)
+        .expect_err("the engine already tracks the folder");
+    assert!(
+        matches!(error, EngineError::FolderExists(_)),
+        "#40: an already-tracked folder is refused: {error}"
+    );
+    assert_eq!(
+        store.folders().expect("read the folders"),
+        vec![confirmed],
+        "#40: the refused add leaves the stored settings untouched"
+    );
     engine.stop();
 }
 

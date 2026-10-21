@@ -46,7 +46,7 @@ Acceptance: password login works. API-key login works on a server with password 
 
 ### R2 — Source folders and watch rules
 
-- R2.1 The user adds and removes source folders, typing the path or choosing it in the OS folder picker. Each folder has a recursive toggle.
+- R2.1 The user adds and removes source folders, typing the path or choosing it in the OS folder picker. A new folder's settings (recursive, album mapping, and album scope) are confirmed in a setup dialog before the client records it or starts its scan; Add records them together and Cancel writes nothing. Each folder has a recursive toggle.
 - R2.2 The client skips hidden files and folders, symlinks and junctions, temporary and partial files, and system files by default.
 - R2.3 The watcher reports changes while the client runs. A reconciliation scan runs at startup and every 30 minutes by default.
 - R2.4 The client compares paths case-insensitively on Windows. It supports long paths.
@@ -59,11 +59,14 @@ Acceptance: a file added while the client is stopped is found at startup. A file
 - R3.1 New files are hashed with SHA-1, checked with `POST /api/assets/bulk-upload-check` in batches, and uploaded with `POST /api/assets` and the `x-immich-checksum` header.
 - R3.2 `created` and `duplicate` both count as success.
 - R3.3 A sidecar file uploads as `sidecarData`. A live photo video uploads first, and the photo links it with `livePhotoVideoId`.
-- R3.4 Album mapping is opt-in per folder. The album scope is per folder: leaf folders or the whole source folder.
+- R3.4 Album mapping is opt-in per folder. The album scope is per folder: leaf folders or the whole source folder. A new folder's mapping, scope, and album title are confirmed with its other settings before it syncs. The title is the user's name for the album the folder itself holds (the whole-folder album, or the album for files directly in the source folder); a leaf subfolder's album keeps the subfolder's name. A blank title means the folder's name. The title is stored with the folder's album row even while mapping is off, and changing it renames the album with `PATCH /api/albums/{id}` (`UpdateAlbumDto.albumName`, Stable, `album.update`). A rename that cannot reach the server keeps the title and its reason, and is retried on the next scan, restart, or reconnect; an album deleted in Immich is created again with the title and its new id recorded. The title is never polled from Immich, and Immich does not require titles to be unique.
 - R3.5 Only Immich operations with `x-immich-state: Stable` are used for sync correctness.
 - R3.6 Upload success means the server returned the asset id. Server-side processing continues asynchronously.
+- R3.7 The sync tag is opt-in in Settings, off by default. When it is on, the client upserts the fixed tag `immich-sync` with `PUT /api/tags` (`x-immich-state: Stable`) and keeps the returned id for the run, so a tag deleted in Immich is created again on the next run. Every asset an upload settles with (`created` or `duplicate`, including a changed file's new version) gets the tag with `PUT /api/tags/assets`. Tagging runs after the upload is recorded, so a tag failure leaves the item uploaded and is reported in Settings instead. With an API key, tagging needs the `tag.create`, `tag.asset`, and `asset.update` permissions; Settings names a missing one. Turning the setting off stops new tagging and deletes no tag.
 
-Acceptance: a 100-file folder syncs. Duplicate content is not uploaded twice. A mapped folder creates the expected album. A sidecar lands with its asset. Unsupported formats produce a permanent error, not a retry loop.
+  Turning the tag on also backfills it onto every asset the client has ever uploaded: each item's current asset, every old version in the version chain, and every asset the server answered as a duplicate, each once. The ids go out in batches of a few hundred per `PUT /api/tags/assets` call, which is idempotent, so a repeated batch is safe and an asset the server no longer holds is filtered out instead of failing its batch. Settings shows the progress, for example "Tagging existing assets: 12,340 of 48,000", and a completed state. The state database records the cursor and count in one write per batch, and the completion once at the end, so a restart resumes from the last completed batch, a finished backfill is not repeated, and a restart after an interruption does not start the library over. "Tag existing assets now" clears the record and runs the whole library again. The backfill runs beside the upload pipeline, never on the UI thread. A transient batch failure is retried with the retry policy (R6.1); a permanent one records its reason, stops the backfill, and keeps the progress so a later attempt continues from it. Turning the setting off pauses the backfill and turning it on resumes it; the completion record survives the toggle.
+
+Acceptance: a 100-file folder syncs. Duplicate content is not uploaded twice. A mapped folder creates the expected album. A sidecar lands with its asset. Unsupported formats produce a permanent error, not a retry loop. With the sync tag on, a new upload and a duplicate both carry it, and a tag failure leaves both uploaded. Turning the tag on in a library that already has uploads tags every current asset, every old version, and every duplicate; the progress reaches a completed state; a restart does not repeat the finished backfill; "Tag existing assets now" re-runs it safely; an interrupted backfill resumes from its last completed batch; a permanent refusal shows its reason and keeps the progress that landed.
 
 ### R4 — Changed files
 
@@ -108,7 +111,7 @@ Acceptance: a sync at a 1 MB/s limit produces near-limit observed throughput. Ra
 
 ### R8 — Shell and user experience
 
-- R8.1 The config window is a dashboard with status cards: one global card and one per source folder.
+- R8.1 The config window is a dashboard with status cards: one global card and one per source folder. A source folder's card opens its detail: the full path, its live state, progress, and counts, its own upload activity, its settings, its full last error, the last successful upload and last reconciliation scan, the list of the assets it has uploaded, an Open folder action, links into the Failed and Review views filtered to that folder, and Remove behind a confirmation.
 - R8.2 The tray icon shows the activity state (idle, syncing, paused, needs attention), the review count, upload progress, and the last error in its tooltip.
 - R8.3 The tray menu offers Show, Pause, Resume, Sync now, and Quit.
 - R8.4 Closing the window hides it. Quit exits the client. A second launch focuses the first instance.
@@ -155,11 +158,12 @@ Acceptance: a clean Windows machine installs from the NSIS installer. A clean Li
 
 ## 5. Data model summary
 
-- `source_folder`: path, recursive flag, album mapping flag, album scope.
-- `album`: mapped folder path key, album name, album id.
+- `source_folder`: path, recursive flag, album mapping flag, album scope, last reconciliation scan, last successful upload.
+- `album`: mapped folder path key, album title, album id, rename pending flag and reason.
 - `sync_item`: path, size, mtime, SHA-1, current asset id, stack id, state, last error class.
 - `version`: item id, asset id, SHA-1, created at, current flag.
 - `attempt`: item id, start time, outcome, error class.
+- `tag_backfill`: completion time, the last completed batch's last asset id, tagged count.
 
 Item states: discovered, hashing, checking, pending, uploading, uploaded, duplicate, retry_wait, missing, review_keep, review_trash, failed_permanent, dead_letter.
 

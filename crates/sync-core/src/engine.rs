@@ -16,6 +16,8 @@
 //!    server is back (R6.1, R6.5, R6.6).
 //! 6. Pause holds new upload requests inside the acceptance window; an upload
 //!    already on the wire finishes (R8.7).
+//! 7. The sync tag follows every settled upload, and one task backfills it onto
+//!    the assets that were uploaded before the setting was turned on (R3.7).
 //!
 //! The engine has no UI imports (N6, PLAN). The shell reads [`Engine::status`]
 //! for the dashboard and the tray.
@@ -24,28 +26,31 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use immich_client::{BandwidthLimit, BulkCheckItem, ClientError};
 use tokio::sync::{Mutex as AsyncMutex, Notify, Semaphore, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::albums::AlbumMapper;
+use crate::backfill::{BACKFILL_BATCH, Backfill, BackfillPolicy};
 use crate::backoff::RetryPolicy;
 use crate::breaker::CircuitBreaker;
 use crate::connection::SharedSession;
 use crate::failure::{FailureClass, FailureKind, classify};
 use crate::hash::{Sha1, sha1_file};
+use crate::meter::UploadMeter;
 use crate::missing::{Fate, Host, SizeIndex, fate, is_gone, rename_target};
 use crate::pairing::FolderIndex;
 use crate::paths::{PathCase, is_within, path_key};
 use crate::scan::{ScanError, scan_folder};
 use crate::skip::{has_symlink_ancestor, skip_reason_below};
-use crate::status::{ConnectionHealth, FolderStatus, Status, StatusInputs};
+use crate::status::{AlbumRename, ConnectionHealth, FolderStatus, Status, StatusInputs};
 use crate::store::{
-    AlbumScope, AttemptOutcome, AttemptRecord, FailedItem, FolderCounts, ItemRecord, ItemState,
-    ReviewDecision, ReviewItem, SourceFolder, StateStore, StoreError,
+    Album, AlbumScope, AttemptOutcome, AttemptRecord, FailedItem, FolderCounts, ItemRecord,
+    ItemState, ReviewDecision, ReviewItem, SourceFolder, StateStore, StoreError,
 };
+use crate::tags::{TagStatus, Tagger};
 use crate::tracking::{Observer, Tracking, TrackingError, stored_folder};
 use crate::upload::{
     CheckOutcome, PreparedItem, UploadFailure, UploadGate, UploadOutcome, Uploader, check_outcome,
@@ -94,6 +99,13 @@ pub struct EngineConfig {
     /// How long the queue waits between credential probes while the breaker is
     /// open (R6.6).
     pub breaker_cooldown: Duration,
+    /// Whether uploaded assets get the sync tag (R3.7). Off by default;
+    /// [`Engine::set_tag_uploads`] is the live path.
+    pub tag_uploaded_assets: bool,
+    /// How many asset ids one backfill request carries (R3.7). Default
+    /// [`BACKFILL_BATCH`]; a test lowers it so a small library needs more than
+    /// one request.
+    pub tag_batch_size: usize,
 }
 
 impl Default for EngineConfig {
@@ -110,6 +122,8 @@ impl Default for EngineConfig {
             breaker_threshold: 5,
             attention_threshold: 3,
             breaker_cooldown: Duration::from_secs(10),
+            tag_uploaded_assets: false,
+            tag_batch_size: BACKFILL_BATCH,
         }
     }
 }
@@ -145,6 +159,9 @@ pub enum EngineError {
     /// The folder path was blank.
     #[error("the source folder path is empty")]
     EmptyFolder,
+    /// The client already tracks this source folder (#40, R2.1).
+    #[error("{0} is already a source folder of this client")]
+    FolderExists(String),
     /// The path is not one of this engine's source folders.
     #[error("{0} is not a source folder of this client")]
     UnknownFolder(String),
@@ -156,6 +173,7 @@ impl From<TrackingError> for EngineError {
             TrackingError::Store(error) => Self::Store(error),
             TrackingError::EmptyFolder => Self::EmptyFolder,
             TrackingError::UnknownFolder(path) => Self::UnknownFolder(path),
+            TrackingError::FolderExists(path) => Self::FolderExists(path),
         }
     }
 }
@@ -180,6 +198,19 @@ struct FolderEntry {
     available: bool,
     counts: FolderCounts,
     last_error: Option<String>,
+    /// When a scan last read this folder and when it last uploaded, for the
+    /// folder detail (#43). The store holds the same two values, so a restart
+    /// reads them back.
+    last_scan_ns: Option<i64>,
+    last_upload_ns: Option<i64>,
+    /// This folder's upload meter (R8.1). Every upload the engine runs for a
+    /// file under this folder streams under its limit view and counts itself
+    /// here, so the bytes of two concurrent uploads can never be swapped.
+    meter: Arc<UploadMeter>,
+    /// The folder's album row: its id and the title the server does not hold
+    /// yet (#47). It is the store's row, refreshed where the row changes; the
+    /// status poll never reads the database.
+    album: Album,
 }
 
 /// The shared engine state. Tasks and the shell hold it through an `Arc`.
@@ -192,6 +223,14 @@ struct EngineInner {
     albums: AlbumMapper,
     /// Carries a changed file's associations onto its new version (R4.2-R4.4).
     versions: Versioner,
+    /// Applies the sync tag to a settled asset (R3.7).
+    tags: Tagger,
+    /// Backfills the tag onto the library that was uploaded before the tag was
+    /// turned on (R3.7).
+    backfill: Backfill,
+    /// Wakes the backfill task: the setting was turned on or the user asked
+    /// for the library to be tagged again (R3.7).
+    tag_wake: Notify,
     config: EngineConfig,
     gate: UploadGate,
     /// Trips after a run of connection failures (R6.6).
@@ -233,6 +272,8 @@ struct EngineInner {
     index_cache: Mutex<FolderIndex>,
     /// Wakes the scan loop when an absence needs reconciling.
     reconcile: Notify,
+    /// Wakes the album retry, which sends the titles the user changed (#47).
+    album_wake: Notify,
 }
 
 /// The folder sync engine (R2, R3, R6.7, R8.7).
@@ -271,17 +312,32 @@ impl Engine {
         for path in store.requeue_unfinished()? {
             let _ = queue.send(PathBuf::from(path));
         }
+        // One limit for the whole client (R7.1), viewed once per folder so a
+        // card can read its own share of the bytes it meters (R8.1).
+        let bandwidth = BandwidthLimit::new(config.bandwidth_bytes_per_second);
         let mut entries = Vec::new();
         for folder in store.folders()? {
             let counts = store.folder_counts(&folder.path).unwrap_or_else(|error| {
                 tracing::warn!(folder = %folder.path, error = %error, "the folder counts could not be read");
                 FolderCounts::default()
             });
+            // #43: the folder detail keeps its timestamps across a restart.
+            let times = store.folder_times(&folder.path).unwrap_or_else(|error| {
+                tracing::warn!(folder = %folder.path, error = %error, "the folder times could not be read");
+                crate::store::FolderTimes::default()
+            });
+            // #47: the album row holds the title the user chose, so the
+            // status reads it from memory rather than the database.
+            let album = album_of_store(&store, &folder);
             entries.push(FolderEntry {
                 available: Path::new(&folder.path).is_dir(),
+                meter: Arc::new(UploadMeter::new(&bandwidth)),
                 folder,
                 counts,
                 last_error: None,
+                last_scan_ns: times.last_scan_ns,
+                last_upload_ns: times.last_upload_ns,
+                album,
             });
         }
         let uploader = Uploader::new(session.clone(), store.clone());
@@ -289,6 +345,20 @@ impl Engine {
         // them spends the one re-login the engine already shares.
         let albums = AlbumMapper::new(session.clone(), store.clone());
         let versions = Versioner::new(session.clone(), store.clone());
+        // R3.7: the sync tag is opt-in. The tagger starts with the stored
+        // setting and is moved live by `set_tag_uploads`.
+        let tags = Tagger::new(session.clone());
+        tags.set_enabled(config.tag_uploaded_assets);
+        // R3.7: the backfill reads its recorded progress at construction, so a
+        // restart publishes where the last run stopped before this one starts.
+        let backfill = Backfill::new(
+            store.clone(),
+            BackfillPolicy {
+                batch: config.tag_batch_size.max(1),
+                attempts: config.attempt_cap.max(1),
+                retry: config.retry,
+            },
+        )?;
         let breaker = CircuitBreaker::new(config.breaker_threshold, config.breaker_cooldown);
         // R1.4: the attention run is its own, shorter number. A refused batch
         // spends up to two failures, so the default of three keeps one batch
@@ -300,9 +370,12 @@ impl Engine {
             uploader,
             albums,
             versions,
+            tags,
+            backfill,
+            tag_wake: Notify::new(),
             breaker,
             upload_slots: Mutex::new(Arc::new(Semaphore::new(config.concurrency.max(1)))),
-            bandwidth: BandwidthLimit::new(config.bandwidth_bytes_per_second),
+            bandwidth,
             concurrency: AtomicUsize::new(config.concurrency.max(1)),
             limits_lock: AsyncMutex::new(()),
             config,
@@ -313,6 +386,7 @@ impl Engine {
             last_error: Mutex::new(None),
             resume: Notify::new(),
             sync_now: Notify::new(),
+            album_wake: Notify::new(),
             watcher: Mutex::new(None),
             tasks: Mutex::new(Vec::new()),
             stopped: AtomicBool::new(false),
@@ -343,6 +417,24 @@ impl Engine {
         let Some(queue_rx) = queue_rx else {
             return;
         };
+        // R3.7: the tag's backfill has one task of its own, woken by the
+        // setting and by "Tag existing assets now". The first run starts now,
+        // so an API key that is missing a permission reaches Settings before
+        // the first upload does.
+        let backfill = tokio::spawn(tag_backfill_loop(Arc::clone(&self.inner)));
+        self.inner
+            .tasks
+            .lock()
+            .expect("the task list")
+            .push(backfill);
+        self.inner.tag_wake.notify_one();
+        // #47: a title the user changed is sent by its own task, woken by the
+        // edit and by the scan, so no status poll sends a request.
+        let albums = tokio::spawn({
+            let inner = Arc::clone(&self.inner);
+            async move { album_retry_loop(inner).await }
+        });
+        self.inner.tasks.lock().expect("the task list").push(albums);
         let inner = Arc::clone(&self.inner);
         let dispatcher = tokio::spawn({
             let inner = Arc::clone(&inner);
@@ -507,7 +599,61 @@ impl Engine {
         );
     }
 
+    /// The sync tag's live state, for the Settings section (R3.7).
+    ///
+    /// The engine model polls this with the rest of the status, so the view
+    /// never makes a second permission probe of its own, and the backfill's
+    /// progress rides the same poll.
+    #[must_use]
+    pub fn tag_status(&self) -> TagStatus {
+        TagStatus {
+            backfill: self.inner.backfill.status(),
+            ..self.inner.tags.status()
+        }
+    }
+
+    /// Turns the sync tag on or off while the engine runs (R3.7).
+    ///
+    /// Turning it on wakes the backfill, which resolves the tag again before its
+    /// first batch: an API key missing a permission is reported to Settings
+    /// before the first upload, and a tag the user deleted and recreated in
+    /// Immich is upserted again, so the new id replaces the cached one.
+    /// Turning it off stops new tagging and pauses the backfill at its next
+    /// batch boundary: assets that already carry the tag keep it, and the tag
+    /// itself is not deleted.
+    pub async fn set_tag_uploads(&self, enabled: bool) {
+        let changed = self.inner.tags.set_enabled(enabled);
+        if changed && enabled {
+            self.inner.tag_wake.notify_one();
+        }
+        tracing::info!(enabled, "R3.7: the sync tag setting changed");
+    }
+
+    /// Tags every asset the client ever uploaded again (R3.7: "Tag existing
+    /// assets now").
+    ///
+    /// The recorded completion is cleared and the published progress starts
+    /// over, then the backfill picks the library up at its first batch. It is
+    /// safe on assets that already carry the tag, which is what makes it the
+    /// answer to a tag that was deleted in Immich or a permission that was
+    /// fixed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the backfill state cannot be cleared.
+    pub fn retag_all(&self) -> Result<(), StoreError> {
+        self.inner.backfill.restart()?;
+        self.inner.tag_wake.notify_one();
+        tracing::info!("R3.7: the library was asked to be tagged again");
+        Ok(())
+    }
+
     /// Adds a source folder and scans it (R2.1).
+    ///
+    /// This is an upsert: a path the client already tracks has its recursive
+    /// flag set and keeps its album settings, which is what a card's Recursive
+    /// switch writes. Use [`Self::add_folder_settings`] to record a new folder
+    /// and refuse one that already exists.
     ///
     /// The folder row belongs to the tracking module; this engine hears about
     /// the change through its observer, which installs the watch and asks for
@@ -518,6 +664,25 @@ impl Engine {
     /// Returns [`EngineError`] when the path is blank or the store refuses it.
     pub fn add_folder(&self, path: &str, recursive: bool) -> Result<(), EngineError> {
         self.tracking.add_folder(path, recursive)?;
+        Ok(())
+    }
+
+    /// Adds a source folder with the settings the setup panel confirmed
+    /// (#40, R2.1, R3.4).
+    ///
+    /// Unlike [`Self::add_folder`], this is an insert: a folder the client
+    /// already tracks is [`EngineError::FolderExists`] and nothing is written,
+    /// so the panel can say "Already added" and leave the stored settings
+    /// alone. The tracking module decides, so the answer is the same whether
+    /// or not this engine runs (R2.4).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::EmptyFolder`] for a blank path,
+    /// [`EngineError::FolderExists`] when the client already tracks the path,
+    /// and [`EngineError::Store`] when the write fails.
+    pub fn add_folder_settings(&self, folder: &SourceFolder) -> Result<(), EngineError> {
+        self.tracking.insert_folder(folder)?;
         Ok(())
     }
 
@@ -545,6 +710,23 @@ impl Engine {
         Ok(())
     }
 
+    /// Sets the title of one source folder's own album (#47).
+    ///
+    /// The title is stored with the folder's album row even while album
+    /// mapping is off, and a blank one means the folder's name. An album that
+    /// already exists is renamed by the retry the write wakes, so a failed or
+    /// offline rename keeps the title and is tried again on the next scan,
+    /// restart, or reconnect; a session that is signed out stores it and sends
+    /// it once an engine runs.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::set_album_mapping`].
+    pub fn set_album_title(&self, path: &str, title: &str) -> Result<(), EngineError> {
+        self.tracking.set_album_title(path, title)?;
+        Ok(())
+    }
+
     /// Removes a source folder; its items stay in the store (R2.1).
     ///
     /// # Errors
@@ -556,22 +738,42 @@ impl Engine {
     }
 
     /// The live status the dashboard and the tray read (R8.1, R8.2).
+    ///
+    /// This is also the meter's clock: the rate is measured from the status
+    /// polls, so the card needs no timer of its own (R8.1).
     #[must_use]
     pub fn status(&self) -> Status {
+        let now = Instant::now();
         let folders: Vec<FolderStatus> = self
             .inner
             .folders
             .lock()
             .expect("the folder lock")
             .iter()
-            .map(|entry| FolderStatus {
-                path: entry.folder.path.clone(),
-                recursive: entry.folder.recursive,
-                album_mapping: entry.folder.album_mapping,
-                album_scope: entry.folder.album_scope,
-                available: entry.available,
-                counts: entry.counts,
-                last_error: entry.last_error.clone(),
+            .map(|entry| {
+                let traffic = entry.meter.reading(now);
+                FolderStatus {
+                    path: entry.folder.path.clone(),
+                    recursive: entry.folder.recursive,
+                    album_mapping: entry.folder.album_mapping,
+                    album_scope: entry.folder.album_scope,
+                    album_title: entry.folder.album_title.clone(),
+                    album_rename: entry.album.rename_pending.then(|| {
+                        entry
+                            .album
+                            .rename_problem
+                            .as_ref()
+                            .map_or(AlbumRename::Pending, |reason| {
+                                AlbumRename::Failed(reason.clone())
+                            })
+                    }),
+                    available: entry.available,
+                    counts: entry.counts,
+                    last_error: entry.last_error.clone(),
+                    last_scan_ns: entry.last_scan_ns,
+                    last_upload_ns: entry.last_upload_ns,
+                    uploads: traffic,
+                }
             })
             .collect();
         // R5.4: the review is counted from the store, not summed over the
@@ -597,6 +799,12 @@ impl Engine {
                 .expect("the error lock")
                 .clone(),
         })
+    }
+
+    /// The shared state store, so the shell can show store-backed data.
+    #[must_use]
+    pub fn store(&self) -> &Arc<StateStore> {
+        self.tracking.store()
     }
 
     /// The session this engine sends its requests through (R1.4).
@@ -763,6 +971,7 @@ impl Observer for EngineObserver {
                 // the one the live entry holds, and no field is left stale.
                 entry.folder = stored.clone();
                 entry.available = available;
+                entry.album = album_of_store(&inner.store, &stored);
             }
             None => {
                 // R8.1: a folder new to this engine starts from what the store
@@ -779,15 +988,29 @@ impl Observer for EngineObserver {
                         );
                         FolderCounts::default()
                     });
+                // #43: a folder new to this engine starts from the times
+                // the store already holds for it.
+                let times = inner.store.folder_times(&stored.path).unwrap_or_default();
                 folders.push(FolderEntry {
                     available,
                     folder: stored.clone(),
                     counts,
                     last_error: None,
+                    last_scan_ns: times.last_scan_ns,
+                    last_upload_ns: times.last_upload_ns,
+                    // R8.1: every upload under this folder meters into this
+                    // one, under the folder's view of the client limit (R7.1).
+                    meter: Arc::new(UploadMeter::new(&inner.bandwidth)),
+                    // #47: a folder new to this engine starts from the title
+                    // the store already holds for it.
+                    album: album_of_store(&inner.store, &stored),
                 });
             }
         }
         drop(folders);
+        // #47: a title stored before an album existed, or before this engine
+        // ran, is sent now instead of at the next scan interval.
+        inner.album_wake.notify_one();
         let mut watcher = inner.watcher.lock().expect("the watcher lock");
         let mut watch_error = None;
         if let Some(watcher) = watcher.as_mut()
@@ -846,8 +1069,14 @@ impl Observer for EngineObserver {
             .iter_mut()
             .find(|entry| path_key(Path::new(&entry.folder.path)) == key)
         {
+            entry.album = album_of_store(&inner.store, &stored);
             entry.folder = stored;
         }
+        drop(folders);
+        // #47: the change may be an album title, which the server has to be
+        // told about. A mapping or scope change queues nothing, so the retry
+        // finds no pending row and sends no request.
+        inner.album_wake.notify_one();
     }
 
     fn folder_removed(&self, path: &str) {
@@ -952,14 +1181,28 @@ impl EngineInner {
             .map(|entry| PathBuf::from(&entry.folder.path))
     }
 
-    /// The folder entry that contains `path`.
-    fn folder_index_for(&self, path: &Path) -> Option<usize> {
-        let case = PathCase::for_platform();
-        self.folders
-            .lock()
-            .expect("the folder lock")
-            .iter()
-            .position(|entry| is_within(Path::new(&entry.folder.path), path, case))
+    /// The meter of the folder that owns `path` (R8.1).
+    ///
+    /// The owning folder is the first entry that contains the path, as
+    /// [`folder_index_in`] decides, so the path is metered once.
+    ///
+    /// Note for #44: the pending count seeds from a pure prefix query, so a
+    /// file under a folder and one of its subfolders is counted on both cards
+    /// while its bytes land once.
+    ///
+    /// A path no folder owns — its folder was removed while the item was
+    /// queued — is metered on no card, but its bytes still count in the
+    /// client's total (R10.2) and stream under the client's limit (R7.1).
+    fn meter_for(&self, path: &Path) -> Arc<UploadMeter> {
+        // One lock for the owner and its meter. Resolving the owner under one
+        // lock and reading the meter under another lets a removal shift the
+        // entries in between, and the upload is metered on the card of a
+        // folder that never owned it (R8.1).
+        let folders = self.folders.lock().expect("the folder lock");
+        match folder_index_in(&folders, path) {
+            Some(index) => Arc::clone(&folders[index].meter),
+            None => Arc::new(UploadMeter::new(&self.bandwidth)),
+        }
     }
 
     /// Waits while the user holds uploads (R8.7).
@@ -982,33 +1225,37 @@ impl EngineInner {
     /// A missing row whose file came back leaves the review the same way
     /// (R5.1), so the tray's count follows it down.
     fn note_pending(&self, path: &Path, previous: Option<ItemState>) {
-        if let Some(index) = self.folder_index_for(path) {
-            let mut folders = self.folders.lock().expect("the folder lock");
-            let counts = &mut folders[index].counts;
-            match previous {
-                Some(ItemState::RetryWait) => counts.failed = counts.failed.saturating_sub(1),
-                Some(ItemState::Missing) => counts.review = counts.review.saturating_sub(1),
-                _ => {}
-            }
-            counts.pending += 1;
+        // #48: one guard for the owner and its counts. Resolving the owner under
+        // one lock and indexing the live list under another lets a removal move
+        // the entries in between, so the file is counted on another folder's
+        // card, or past the end of the shortened list.
+        let mut folders = self.folders.lock().expect("the folder lock");
+        let Some(entry) = folder_entry_owning(&mut folders, path) else {
+            return;
+        };
+        let counts = &mut entry.counts;
+        match previous {
+            Some(ItemState::RetryWait) => counts.failed = counts.failed.saturating_sub(1),
+            Some(ItemState::Missing) => counts.review = counts.review.saturating_sub(1),
+            _ => {}
         }
+        counts.pending += 1;
     }
 
     /// Records that one item left the review by a decision (R5.3, R5.4).
     fn note_review_decided(&self, path: &str) {
-        if let Some(index) = self.folder_index_for(Path::new(path)) {
-            let mut folders = self.folders.lock().expect("the folder lock");
-            let counts = &mut folders[index].counts;
-            counts.review = counts.review.saturating_sub(1);
+        let mut folders = self.folders.lock().expect("the folder lock");
+        if let Some(entry) = folder_entry_owning(&mut folders, Path::new(path)) {
+            entry.counts.review = entry.counts.review.saturating_sub(1);
         }
     }
 
     /// Records that one item entered the review, raising the tray count
     /// (R5.4).
     fn note_review_missing(&self, path: &str) {
-        if let Some(index) = self.folder_index_for(Path::new(path)) {
-            let mut folders = self.folders.lock().expect("the folder lock");
-            folders[index].counts.review += 1;
+        let mut folders = self.folders.lock().expect("the folder lock");
+        if let Some(entry) = folder_entry_owning(&mut folders, Path::new(path)) {
+            entry.counts.review += 1;
         }
     }
 
@@ -1020,26 +1267,46 @@ impl EngineInner {
 
     /// Records one finished item against its folder and releases its claim.
     fn finish_item(&self, item: &PreparedItem, outcome: &UploadOutcome) {
-        let folder_index = self.folder_index_for(&item.path);
-        if let Some(index) = folder_index {
+        // #43: the owning folder is resolved once, by path, and the store write
+        // and the live update both name it that way. `remove_folder` retains
+        // the list, so an index cannot survive between the two.
+        let folder_path = {
+            let folders = self.folders.lock().expect("the folder lock");
+            folder_index_in(&folders, &item.path).map(|index| folders[index].folder.path.clone())
+        };
+        // #43: Created and Duplicate are both terminal successes (R3.2), and
+        // the folder detail shows when this folder last uploaded one. The store
+        // write runs before the folder lock is taken, so it can never hold the
+        // lock the status read needs (N2).
+        let uploaded_ns = match outcome {
+            UploadOutcome::Created { .. } | UploadOutcome::Duplicate { .. } => folder_path
+                .as_deref()
+                .map(|folder| record_folder_time(self, folder, FolderMoment::Upload)),
+            _ => None,
+        };
+        if let Some(folder) = folder_path.as_deref() {
             let mut folders = self.folders.lock().expect("the folder lock");
-            let entry = &mut folders[index];
-            match outcome {
-                UploadOutcome::Created { .. } | UploadOutcome::Duplicate { .. } => {
-                    entry.counts.pending = entry.counts.pending.saturating_sub(1);
-                    entry.counts.uploaded += 1;
-                    // R8.2: a later success clears the parked error, so a
-                    // transient failure does not read as attention for a full
-                    // scan interval.
-                    entry.last_error = None;
+            if let Some(entry) = folder_entry_mut(&mut folders, folder) {
+                match outcome {
+                    UploadOutcome::Created { .. } | UploadOutcome::Duplicate { .. } => {
+                        entry.counts.pending = entry.counts.pending.saturating_sub(1);
+                        entry.counts.uploaded += 1;
+                        // R8.2: a later success clears the parked error, so a
+                        // transient failure does not read as attention for a full
+                        // scan interval.
+                        entry.last_error = None;
+                        if let Some(at_ns) = uploaded_ns {
+                            entry.last_upload_ns = Some(at_ns);
+                        }
+                    }
+                    UploadOutcome::Failed(failure) | UploadOutcome::DeadLetter(failure) => {
+                        entry.counts.pending = entry.counts.pending.saturating_sub(1);
+                        entry.counts.failed += 1;
+                        entry.last_error = Some(failure_text(failure));
+                    }
+                    // Deferred keeps the item queued and its pending count.
+                    UploadOutcome::Deferred => {}
                 }
-                UploadOutcome::Failed(failure) | UploadOutcome::DeadLetter(failure) => {
-                    entry.counts.pending = entry.counts.pending.saturating_sub(1);
-                    entry.counts.failed += 1;
-                    entry.last_error = Some(failure_text(failure));
-                }
-                // Deferred keeps the item queued and its pending count.
-                UploadOutcome::Deferred => {}
             }
             // R8.2: the tray card reads the global copy, so a success that
             // recovers every folder must clear it too.
@@ -1057,9 +1324,9 @@ impl EngineInner {
     /// Records a transient failure that is about to be retried, so the
     /// dashboard shows why the item is waiting (R8.2) without finishing it.
     fn note_retrying(&self, item: &PreparedItem, failure: &UploadFailure) {
-        if let Some(index) = self.folder_index_for(&item.path) {
-            let mut folders = self.folders.lock().expect("the folder lock");
-            folders[index].last_error = Some(failure_text(failure));
+        let mut folders = self.folders.lock().expect("the folder lock");
+        if let Some(entry) = folder_entry_owning(&mut folders, &item.path) {
+            entry.last_error = Some(failure_text(failure));
         }
     }
 
@@ -1335,10 +1602,20 @@ async fn attach_albums(inner: &Arc<EngineInner>, file: &Path, asset_id: &str) {
     }
 }
 
+/// The position in `folders` of the entry that contains `path` (R8.1).
+fn folder_index_in(folders: &[FolderEntry], path: &Path) -> Option<usize> {
+    let case = PathCase::for_platform();
+    folders
+        .iter()
+        .position(|entry| is_within(Path::new(&entry.folder.path), path, case))
+}
+
 /// The source folder that contains `path`, as stored.
 fn folder_entry_for(inner: &EngineInner, path: &Path) -> Option<SourceFolder> {
-    let index = inner.folder_index_for(path)?;
+    // #48: the owner is resolved under the guard that clones it, so a removal
+    // cannot hand back another folder's entry.
     let folders = inner.folders.lock().expect("the folder lock");
+    let index = folder_index_in(&folders, path)?;
     folders.get(index).map(|entry| entry.folder.clone())
 }
 
@@ -1516,6 +1793,10 @@ async fn settle_duplicate(inner: &Arc<EngineInner>, item: &PreparedItem, asset_i
     // R3.4: a duplicate is a success (R3.2), and it still maps to its
     // folder's album.
     attach_albums(inner, &item.path, asset_id).await;
+    // R3.7: the sync tag follows the settled asset. It runs last and its
+    // failure is the tagger's own to record: a tag failure must not fail or
+    // park an upload the server accepted.
+    let _ = inner.tags.tag(asset_id).await;
 }
 
 /// Restores one trashed asset through the shared session (R5.3).
@@ -1770,6 +2051,9 @@ async fn spawn_upload(inner: &Arc<EngineInner>, item: PreparedItem) {
                 // after `finish_item`, so a later success cannot clear the error
                 // an album failure records against the folder.
                 attach_albums(&worker, &item.path, asset_id).await;
+                // R3.7: the sync tag follows the settled asset. A failure is
+                // recorded for Settings and never reaches the item's state.
+                let _ = worker.tags.tag(asset_id).await;
                 tracing::info!(path = %item.path.display(), asset_id = %asset_id, "the item finished");
             }
             UploadOutcome::Failed(failure) | UploadOutcome::DeadLetter(failure) => {
@@ -1825,9 +2109,10 @@ async fn upload_with_retries(inner: &Arc<EngineInner>, item: &PreparedItem) -> U
         };
         let started_ns = now_ns();
         attempts += 1;
+        let meter = inner.meter_for(&item.path);
         let mut outcome = inner
             .uploader
-            .upload_prepared(item, &inner.gate, &inner.bandwidth)
+            .upload_prepared(item, &inner.gate, &meter)
             .await;
         // R4.2: an upload that reached the server is a new version of the file
         // when the item already has one, so the associations carry over before
@@ -1905,6 +2190,81 @@ pub(crate) fn now_ns() -> i64 {
     }
 }
 
+/// Runs the sync tag's backfill whenever the setting or "Tag existing assets
+/// now" asks for it (R3.7).
+///
+/// One task owns the whole backfill, so a library of any size costs one loop and
+/// one request per batch instead of a task per asset, and uploads keep the pool
+/// they would have without it. Each wake resolves the tag again, which is what a
+/// deleted and recreated tag needs, and then walks the library from the cursor
+/// the state database recorded.
+async fn tag_backfill_loop(inner: Arc<EngineInner>) {
+    loop {
+        inner.tag_wake.notified().await;
+        inner.tags.prepare().await;
+        inner.backfill.run(&inner.tags).await;
+    }
+}
+
+/// Sends the album titles the user changed, and keeps the folders' published
+/// state in step with the album rows (#47).
+///
+/// It is woken by a folder change and by the scan, never by a status poll, so a
+/// server that keeps refusing a rename is asked once per event instead of once
+/// per frame.
+async fn album_retry_loop(inner: Arc<EngineInner>) {
+    loop {
+        inner.album_wake.notified().await;
+        settle_album_titles(&inner).await;
+    }
+}
+
+/// Sends every album title that is still pending, then republishes what the
+/// album rows now hold (#47).
+async fn settle_album_titles(inner: &Arc<EngineInner>) {
+    inner.albums.settle_titles().await;
+    refresh_album_rows(inner);
+}
+
+/// Re-reads every folder's album row into its live entry (#47).
+///
+/// The retry writes the rows it settles, so the status a signed-in or
+/// signed-out client shows follows them without a database read per poll.
+fn refresh_album_rows(inner: &EngineInner) {
+    let folders = match inner.store.folders() {
+        Ok(folders) => folders,
+        Err(error) => {
+            tracing::warn!(error = %error, "the folders could not be read");
+            return;
+        }
+    };
+    let mut entries = inner.folders.lock().expect("the folder lock");
+    for folder in folders {
+        let key = path_key(Path::new(&folder.path));
+        let album = album_of_store(&inner.store, &folder);
+        if let Some(entry) = entries
+            .iter_mut()
+            .find(|entry| path_key(Path::new(&entry.folder.path)) == key)
+        {
+            entry.album = album;
+            entry.folder.album_title = folder.album_title;
+        }
+    }
+}
+
+/// The album row of one folder, or the default when it holds none or cannot be
+/// read (#47).
+fn album_of_store(store: &StateStore, folder: &SourceFolder) -> Album {
+    let key = path_key(Path::new(&folder.path));
+    match store.album(&key) {
+        Ok(album) => album.unwrap_or_default(),
+        Err(error) => {
+            tracing::warn!(folder = %folder.path, error = %error, "the album row could not be read");
+            Album::default()
+        }
+    }
+}
+
 /// The reconciliation scan loop: startup, the configured interval, and
 /// "Sync now" (R2.3).
 async fn scan_loop(inner: Arc<EngineInner>) {
@@ -1966,6 +2326,9 @@ async fn scan_once(inner: &Arc<EngineInner>) {
         match report {
             Ok(Ok(report)) => {
                 set_folder_available(inner, &folder.path, true);
+                // #43: the folder detail shows when the folder last scanned;
+                // this is the one pass that read it.
+                note_folder_scanned(inner, &folder.path);
                 reports.push((folder, report));
             }
             Ok(Err(ScanError::Missing(path))) => {
@@ -1998,6 +2361,10 @@ async fn scan_once(inner: &Arc<EngineInner>) {
             let _ = inner.queue.send(file);
         }
     }
+    // #47: a scan is the one event that runs on a start, a reconnect, and the
+    // interval, so a title the server did not take is sent here rather than
+    // from the upload path or a timer of its own.
+    settle_album_titles(inner).await;
     tracing::info!(queued, "the reconciliation scan finished");
 }
 
@@ -2158,6 +2525,20 @@ fn has_present_content_twin(inner: &EngineInner, row: &ItemRecord) -> bool {
     })
 }
 
+/// Records that a reconciliation scan just read `path`, and publishes it
+/// (#43).
+///
+/// The folder is named by its path key throughout: `remove_folder` retains the
+/// list, so an index resolved under one lock can name another folder by the
+/// time it is used again.
+fn note_folder_scanned(inner: &EngineInner, path: &str) {
+    let at_ns = record_folder_time(inner, path, FolderMoment::Scan);
+    let mut folders = inner.folders.lock().expect("the folder lock");
+    if let Some(entry) = folder_entry_mut(&mut folders, path) {
+        entry.last_scan_ns = Some(at_ns);
+    }
+}
+
 /// Marks one folder available or missing (R2.5).
 fn set_folder_available(inner: &EngineInner, path: &str, available: bool) {
     let key = path_key(Path::new(path));
@@ -2174,6 +2555,64 @@ fn set_folder_available(inner: &EngineInner, path: &str, available: bool) {
     if available {
         clear_global_error_if_recovered(inner, &folders);
     }
+}
+
+/// Which of a folder's two timestamps a write records (#43).
+#[derive(Clone, Copy)]
+enum FolderMoment {
+    /// A reconciliation scan read the folder.
+    Scan,
+    /// The folder uploaded an asset.
+    Upload,
+}
+
+/// The live entry that owns `path`, resolved and borrowed under one guard
+/// (#48).
+///
+/// The caller supplies the guard, so `remove_folder`'s `retain` cannot run
+/// between the lookup and the write and move the write onto another entry.
+fn folder_entry_owning<'a>(
+    folders: &'a mut [FolderEntry],
+    path: &Path,
+) -> Option<&'a mut FolderEntry> {
+    let index = folder_index_in(folders, path)?;
+    folders.get_mut(index)
+}
+
+/// The live entry whose folder's exact path key is `path`, for a caller already
+/// holding the folder lock (#43).
+///
+/// Unlike [`folder_entry_owning`], this matches the folder's own path key, not
+/// containment of `path`.
+fn folder_entry_mut<'a>(folders: &'a mut [FolderEntry], path: &str) -> Option<&'a mut FolderEntry> {
+    let key = path_key(Path::new(path));
+    folders
+        .iter_mut()
+        .find(|entry| path_key(Path::new(&entry.folder.path)) == key)
+}
+
+/// Writes one folder timestamp to the store and returns when it happened
+/// (#43).
+///
+/// The folder is named by its path key, so a removal that shifts the live list
+/// can never record the time on another folder's row (R2.1). The write runs
+/// without the folder lock, so a slow store never holds the lock the status
+/// read needs (N2). The caller publishes the returned time on the live entry,
+/// because the observation stands even when the write failed.
+fn record_folder_time(inner: &EngineInner, path: &str, moment: FolderMoment) -> i64 {
+    let at_ns = now_ns();
+    let stored = match moment {
+        FolderMoment::Scan => inner.store.record_folder_scan(path, at_ns),
+        FolderMoment::Upload => inner.store.record_folder_upload(path, at_ns),
+    };
+    if let Err(error) = stored {
+        tracing::warn!(
+            folder = %path,
+            error = %error,
+            "the folder time could not be recorded"
+        );
+    }
+    at_ns
 }
 
 /// Clears the global last-error once no folder holds one, so the tray card
@@ -2213,6 +2652,7 @@ fn mtime_ns(metadata: &std::fs::Metadata) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::meter::UploadTraffic;
     use crate::status::Activity;
 
     #[test]
@@ -2230,6 +2670,382 @@ mod tests {
             "R2.3: default scan interval"
         );
         assert_eq!(config.watch_debounce, Duration::from_secs(2));
+        assert!(
+            !config.tag_uploaded_assets,
+            "R3.7: the sync tag is off by default"
+        );
+    }
+
+    /// A file whose folder was removed while it was queued still streams under
+    /// the client's limit (R7.1).
+    ///
+    /// The fallback must not be a fresh unlimited meter: that would lift the
+    /// limit for exactly the uploads no card accounts for.
+    #[test]
+    fn a_removed_folders_file_still_streams_under_the_client_limit() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let store =
+            Arc::new(StateStore::open(temp.path().join("state.db")).expect("open the state store"));
+        let folder = temp.path().join("photos");
+        std::fs::create_dir_all(&folder).expect("create the folder");
+        store
+            .add_folder(&SourceFolder {
+                path: folder.display().to_string(),
+                recursive: true,
+                album_mapping: false,
+                album_scope: AlbumScope::default(),
+                album_title: None,
+            })
+            .expect("add the folder");
+        // The session is never used: this test sends no request.
+        let session = crate::connection::Connection::new(
+            "http://127.0.0.1:1",
+            Arc::new(crate::credential::MemoryCredentialStore::new()),
+        )
+        .expect("a valid URL")
+        .shared();
+        let config = EngineConfig {
+            bandwidth_bytes_per_second: 4_096,
+            ..EngineConfig::default()
+        };
+        let engine =
+            Engine::new(Arc::new(Tracking::new(store)), session, config).expect("build the engine");
+        engine
+            .remove_folder(&folder.display().to_string())
+            .expect("remove the folder");
+
+        let queued = folder.join("queued.jpg");
+        let meter = engine.inner.meter_for(&queued);
+        assert_eq!(
+            meter.limit().bytes_per_second(),
+            4_096,
+            "R7.1: a removed folder does not drop its queued uploads to unlimited"
+        );
+    }
+
+    /// A removal cannot shift the folder an upload is metered on (R8.1).
+    ///
+    /// `remove_folder` retains the list, so every entry above the removal moves
+    /// down one. A lookup that resolved its owner under one lock and read the
+    /// meter under another would meet that shift in between: with folders
+    /// `[a, b, c]`, resolving `b`'s file and then removing `a` leaves index 1
+    /// naming `c`, so the upload is metered on `c`'s card instead of `b`'s.
+    /// The list is shifted and restored under the lookup until it meets that
+    /// interleaving; one lock cannot be split, so the answer is `b`'s meter
+    /// throughout.
+    #[test]
+    fn a_removal_cannot_shift_the_folder_an_upload_is_metered_on() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let store =
+            Arc::new(StateStore::open(temp.path().join("state.db")).expect("open the state store"));
+        let mut dirs = Vec::new();
+        for name in ["a", "b", "c"] {
+            let dir = temp.path().join(name);
+            std::fs::create_dir_all(&dir).expect("create the folder");
+            store
+                .add_folder(&SourceFolder {
+                    path: dir.display().to_string(),
+                    recursive: true,
+                    album_mapping: false,
+                    album_scope: AlbumScope::default(),
+                    album_title: None,
+                })
+                .expect("add the folder");
+            dirs.push(dir);
+        }
+        // The session is never used: this test sends no request.
+        let session = crate::connection::Connection::new(
+            "http://127.0.0.1:1",
+            Arc::new(crate::credential::MemoryCredentialStore::new()),
+        )
+        .expect("a valid URL")
+        .shared();
+        let engine = Engine::new(
+            Arc::new(Tracking::new(store)),
+            session,
+            EngineConfig::default(),
+        )
+        .expect("build the engine");
+        let inner = Arc::clone(&engine.inner);
+        let metered = dirs[1].join("metered.jpg");
+        let b_meter = inner.meter_for(&metered);
+        assert_eq!(
+            folder_index_in(&inner.folders.lock().expect("the folder lock"), &metered),
+            Some(1),
+            "the list is [a, b, c] and the middle entry owns the file"
+        );
+
+        let shifted = Arc::new(AtomicBool::new(false));
+        let churn = {
+            let inner = Arc::clone(&inner);
+            let shifted = Arc::clone(&shifted);
+            std::thread::spawn(move || {
+                for _ in 0..500 {
+                    // What `remove_folder`'s retain does to the list, and the
+                    // re-add that restores `a` in front of `b` so the shift
+                    // recurs instead of happening once.
+                    let removed = inner.folders.lock().expect("the folder lock").remove(0);
+                    // Out of the list long enough for a lookup to meet it.
+                    std::thread::sleep(Duration::from_micros(100));
+                    inner
+                        .folders
+                        .lock()
+                        .expect("the folder lock")
+                        .insert(0, removed);
+                }
+                shifted.store(true, Ordering::SeqCst);
+            })
+        };
+        while !shifted.load(Ordering::SeqCst) {
+            let meter = inner.meter_for(&metered);
+            assert!(
+                Arc::ptr_eq(&meter, &b_meter),
+                "R8.1: the upload was metered on another folder's card"
+            );
+        }
+        churn.join().expect("the churn thread finished");
+    }
+
+    /// #43: a scan time lands on the folder the scan read, never on whichever
+    /// entry occupies its index after a removal.
+    ///
+    /// `remove_folder` retains the list, so every entry above the removal moves
+    /// down one. `note_folder_scanned` resolved the folder's index, released
+    /// the lock, and let `record_folder_time` read that index again: with
+    /// folders `[a, b, c]`, a scan of `b` that meets the removal of `a` in
+    /// between writes the time on `c`'s row. The list is shifted under the
+    /// lookup until it meets that interleaving; the write is keyed by path, so
+    /// no other folder can carry the time.
+    #[test]
+    fn a_removal_cannot_shift_the_folder_a_scan_time_is_recorded_on() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let store =
+            Arc::new(StateStore::open(temp.path().join("state.db")).expect("open the state store"));
+        let mut dirs = Vec::new();
+        for name in ["a", "b", "c"] {
+            let dir = temp.path().join(name);
+            std::fs::create_dir_all(&dir).expect("create the folder");
+            store
+                .add_folder(&SourceFolder {
+                    path: dir.display().to_string(),
+                    recursive: true,
+                    album_mapping: false,
+                    album_scope: AlbumScope::default(),
+                    album_title: None,
+                })
+                .expect("add the folder");
+            dirs.push(dir);
+        }
+        // The session is never used: this test sends no request.
+        let session = crate::connection::Connection::new(
+            "http://127.0.0.1:1",
+            Arc::new(crate::credential::MemoryCredentialStore::new()),
+        )
+        .expect("a valid URL")
+        .shared();
+        let engine = Engine::new(
+            Arc::new(Tracking::new(Arc::clone(&store))),
+            session,
+            EngineConfig::default(),
+        )
+        .expect("build the engine");
+        let inner = Arc::clone(&engine.inner);
+        let scanned = dirs[1].display().to_string();
+        let untouched: Vec<String> = [&dirs[0], &dirs[2]]
+            .iter()
+            .map(|dir| dir.display().to_string())
+            .collect();
+        assert_eq!(
+            folder_index_in(
+                &inner.folders.lock().expect("the folder lock"),
+                &dirs[1].join("photo.jpg")
+            ),
+            Some(1),
+            "the list is [a, b, c] and the middle entry was scanned"
+        );
+
+        let shifted = Arc::new(AtomicBool::new(false));
+        let churn = {
+            let inner = Arc::clone(&inner);
+            let shifted = Arc::clone(&shifted);
+            std::thread::spawn(move || {
+                for _ in 0..500 {
+                    // What `remove_folder`'s retain does to the list, and the
+                    // re-add that restores `a` in front of `b` so the shift
+                    // recurs instead of happening once.
+                    let removed = inner.folders.lock().expect("the folder lock").remove(0);
+                    // Out of the list long enough for a lookup to meet it.
+                    std::thread::sleep(Duration::from_micros(100));
+                    inner
+                        .folders
+                        .lock()
+                        .expect("the folder lock")
+                        .insert(0, removed);
+                }
+                shifted.store(true, Ordering::SeqCst);
+            })
+        };
+        while !shifted.load(Ordering::SeqCst) {
+            note_folder_scanned(&inner, &scanned);
+            // The live entries are the second write: the old path resolved the
+            // index again after the store write, so a shift during that write
+            // publishes the time on another folder's entry.
+            let folders = inner.folders.lock().expect("the folder lock");
+            for entry in folders.iter().filter(|entry| entry.folder.path != scanned) {
+                assert_eq!(
+                    entry.last_scan_ns, None,
+                    "#43: a removal shifted the scan time onto {}",
+                    entry.folder.path
+                );
+            }
+        }
+        churn.join().expect("the churn thread finished");
+        for path in &untouched {
+            assert_eq!(
+                store
+                    .folder_times(path)
+                    .expect("read the folder times")
+                    .last_scan_ns,
+                None,
+                "#43: a removal shifted the stored scan time onto another folder"
+            );
+        }
+        assert!(
+            store
+                .folder_times(&scanned)
+                .expect("read the folder times")
+                .last_scan_ns
+                .is_some(),
+            "#43: the folder the scan read keeps its own time"
+        );
+    }
+
+    /// A removal cannot move a folder's counts onto another folder (#48).
+    ///
+    /// The count paths resolved the owning index under one folder guard and
+    /// indexed the live list under a second. `remove_folder` retains the list,
+    /// so with folders `[a, b, c]` a removal of `a` in between moves `c` down to
+    /// index 1 and the file's counts land on `b`'s card; the same shift with two
+    /// folders indexes past the end and panics on the worker thread. The list is
+    /// shifted and restored under the bookkeeping until it meets that
+    /// interleaving; one guard cannot be split, so only the folder that owns the
+    /// file is ever counted.
+    #[test]
+    fn a_removal_cannot_shift_the_counts_onto_another_folder() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let store =
+            Arc::new(StateStore::open(temp.path().join("state.db")).expect("open the state store"));
+        let mut dirs = Vec::new();
+        for name in ["a", "b", "c"] {
+            let dir = temp.path().join(name);
+            std::fs::create_dir_all(&dir).expect("create the folder");
+            store
+                .add_folder(&SourceFolder {
+                    path: dir.display().to_string(),
+                    recursive: true,
+                    album_mapping: false,
+                    album_scope: AlbumScope::default(),
+                    album_title: None,
+                })
+                .expect("add the folder");
+            dirs.push(dir);
+        }
+        // The session is never used: this test sends no request.
+        let session = crate::connection::Connection::new(
+            "http://127.0.0.1:1",
+            Arc::new(crate::credential::MemoryCredentialStore::new()),
+        )
+        .expect("a valid URL")
+        .shared();
+        let engine = Engine::new(
+            Arc::new(Tracking::new(store)),
+            session,
+            EngineConfig::default(),
+        )
+        .expect("build the engine");
+        let inner = Arc::clone(&engine.inner);
+        let counted = dirs[2].join("photo.jpg");
+        let counted_key = path_key(&counted);
+        let owner_path = dirs[2].display().to_string();
+        assert_eq!(
+            folder_index_in(&inner.folders.lock().expect("the folder lock"), &counted),
+            Some(2),
+            "the list is [a, b, c] and the last entry owns the file"
+        );
+        let item = PreparedItem {
+            path: counted.clone(),
+            size: 1,
+            mtime_ns: 0,
+            sha1: Sha1::from_slice(&[0; 20]).expect("a full digest"),
+            sidecar: None,
+            live_photo_video: None,
+        };
+        let failure = UploadFailure {
+            class: None,
+            kind: FailureKind::Transient,
+            message: "the connection dropped".to_string(),
+            retry_after: None,
+            connection: true,
+        };
+
+        let shifted = Arc::new(AtomicBool::new(false));
+        let churn = {
+            let inner = Arc::clone(&inner);
+            let shifted = Arc::clone(&shifted);
+            std::thread::spawn(move || {
+                for _ in 0..500 {
+                    // What `remove_folder`'s retain does to the list, and the
+                    // re-add that restores `a` in front of `b` so the shift
+                    // recurs instead of happening once.
+                    let removed = inner.folders.lock().expect("the folder lock").remove(0);
+                    // Out of the list long enough for a lookup to meet it.
+                    std::thread::sleep(Duration::from_micros(100));
+                    inner
+                        .folders
+                        .lock()
+                        .expect("the folder lock")
+                        .insert(0, removed);
+                }
+                shifted.store(true, Ordering::SeqCst);
+            })
+        };
+        let mut queued = 0;
+        // Keep churning until at least one file reached the owner, so a
+        // descheduled main thread cannot leave the counts unexercised.
+        while !shifted.load(Ordering::SeqCst) || queued == 0 {
+            inner.note_pending(&counted, None);
+            inner.note_review_missing(&counted_key);
+            inner.note_retrying(&item, &failure);
+            queued += 1;
+            let folders = inner.folders.lock().expect("the folder lock");
+            for entry in folders
+                .iter()
+                .filter(|entry| entry.folder.path != owner_path)
+            {
+                assert_eq!(
+                    entry.counts,
+                    FolderCounts::default(),
+                    "#48: a removal shifted the counts onto {}",
+                    entry.folder.path
+                );
+                assert_eq!(
+                    entry.last_error, None,
+                    "#48: a removal shifted the retry reason onto {}",
+                    entry.folder.path
+                );
+            }
+        }
+        churn.join().expect("the churn thread finished");
+        let folders = inner.folders.lock().expect("the folder lock");
+        let owner = folders
+            .iter()
+            .find(|entry| entry.folder.path == owner_path)
+            .expect("the owner is still listed");
+        assert_eq!(
+            (owner.counts.pending, owner.counts.review),
+            (queued, queued),
+            "R8.1: the owner counted every file handed to it"
+        );
     }
 
     #[test]
@@ -2247,6 +3063,7 @@ mod tests {
             folders: Vec::new(),
             counts: FolderCounts::default(),
             last_error: None,
+            uploads: UploadTraffic::default(),
         };
         assert_eq!(status.progress(), 0.0);
         status.counts.uploaded = 3;
@@ -2421,6 +3238,7 @@ mod tests {
                 recursive: true,
                 album_mapping: false,
                 album_scope: AlbumScope::default(),
+                album_title: None,
             })
             .expect("add the folder");
         let mut connection = crate::connection::Connection::new(

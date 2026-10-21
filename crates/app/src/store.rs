@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use gpui_kit::*;
-use sync_core::store::{FolderCounts, SourceFolder, StateStore, StoreError};
+use sync_core::store::{FolderCounts, FolderTimes, SourceFolder, StateStore, StoreError};
 use sync_core::tracking::Tracking;
 
 use crate::paths::AppPaths;
@@ -22,6 +22,7 @@ struct OpenedStore {
     tracking: Arc<Tracking>,
     folders: Vec<SourceFolder>,
     counts: Vec<FolderCounts>,
+    times: Vec<FolderTimes>,
 }
 
 /// The state database, once it opened, and the folders it holds.
@@ -36,6 +37,9 @@ pub struct StoreModel {
     folders: Vec<SourceFolder>,
     /// The last known counts per folder, in the same order as `folders`.
     counts: Vec<FolderCounts>,
+    /// The last known scan and upload times per folder, in the same order as
+    /// `folders` (#43).
+    times: Vec<FolderTimes>,
     problem: Option<String>,
     /// Whether the first open is still running: until it lands, it owns the
     /// store and a rebuild must not touch it.
@@ -66,11 +70,16 @@ impl StoreModel {
                                 .iter()
                                 .map(|folder| store.folder_counts(&folder.path).unwrap_or_default())
                                 .collect();
+                            let times = folders
+                                .iter()
+                                .map(|folder| store.folder_times(&folder.path).unwrap_or_default())
+                                .collect();
                             Ok(OpenedStore {
                                 store,
                                 tracking,
                                 folders,
                                 counts,
+                                times,
                             })
                         }
                         Err(error) => Err(error.to_string()),
@@ -89,6 +98,7 @@ impl StoreModel {
                         model.tracking = Some(opened.tracking);
                         model.folders = opened.folders;
                         model.counts = opened.counts;
+                        model.times = opened.times;
                         model.problem = None;
                         model.generation = model.generation.wrapping_add(1);
                     }
@@ -104,6 +114,7 @@ impl StoreModel {
             tracking: None,
             folders: Vec::new(),
             counts: Vec::new(),
+            times: Vec::new(),
             problem: None,
             opening: true,
             generation: 0,
@@ -154,6 +165,7 @@ impl StoreModel {
                         model.tracking = Some(opened.tracking);
                         model.folders = opened.folders;
                         model.counts = opened.counts;
+                        model.times = opened.times;
                         model.problem = None;
                     }
                     Err(error) => model.problem = Some(format!("{error:#}")),
@@ -199,30 +211,47 @@ impl StoreModel {
         &self.counts
     }
 
+    /// The last known scan and upload times per folder, in the same order as
+    /// [`Self::folders`] (#43).
+    #[must_use]
+    pub fn folder_times(&self) -> &[FolderTimes] {
+        &self.times
+    }
+
     /// Replaces the cached folder list after an add or a remove, keeping the
     /// counts of the folders that are still there.
     pub fn set_folders(&mut self, folders: Vec<SourceFolder>, cx: &mut Context<Self>) {
+        // R2.4: the cache must keep a folder's counts and times across a
+        // re-add that spells the path differently, the same comparison the
+        // tracking write made.
+        let cached = |folder: &SourceFolder| {
+            self.folders.iter().position(|old| {
+                sync_core::paths::equal(
+                    Path::new(&old.path),
+                    Path::new(&folder.path),
+                    sync_core::paths::PathCase::for_platform(),
+                )
+            })
+        };
         let counts = folders
             .iter()
             .map(|folder| {
-                self.folders
-                    .iter()
-                    .position(|old| {
-                        // R2.4: the cache must keep a folder's counts across a
-                        // re-add that spells the path differently, the same
-                        // comparison the tracking write made.
-                        sync_core::paths::equal(
-                            Path::new(&old.path),
-                            Path::new(&folder.path),
-                            sync_core::paths::PathCase::for_platform(),
-                        )
-                    })
+                cached(folder)
                     .and_then(|index| self.counts.get(index).copied())
+                    .unwrap_or_default()
+            })
+            .collect();
+        let times = folders
+            .iter()
+            .map(|folder| {
+                cached(folder)
+                    .and_then(|index| self.times.get(index).copied())
                     .unwrap_or_default()
             })
             .collect();
         self.folders = folders;
         self.counts = counts;
+        self.times = times;
         cx.notify();
     }
 
@@ -336,11 +365,16 @@ fn rebuild_store(path: &Path, folders: &[SourceFolder]) -> anyhow::Result<Opened
         .iter()
         .map(|folder| store.folder_counts(&folder.path).unwrap_or_default())
         .collect();
+    let times = folders
+        .iter()
+        .map(|folder| store.folder_times(&folder.path).unwrap_or_default())
+        .collect();
     Ok(OpenedStore {
         store,
         tracking,
         folders,
         counts,
+        times,
     })
 }
 
@@ -379,6 +413,7 @@ mod tests {
             recursive: true,
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
+            album_title: None,
         }
     }
 

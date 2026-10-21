@@ -23,8 +23,12 @@ A full read of a source folder. The client uses it to find changes that watch ev
 _Avoid_: rescan, poll
 
 **Album mapping**:
-A per-folder rule that copies a mapped folder's name to the name of one Immich album. One album belongs to one folder: two folders that share a name are two albums.
+A per-folder rule that creates one Immich album for the folder. The album's title defaults to the folder's name and can be changed. One album belongs to one folder: two folders that share a name are two albums.
 _Avoid_: folder sync, album mode
+
+**Album title**:
+The user-visible name of one mapped album. It defaults to the folder's name and can be changed after the album exists; changing it renames the Immich album.
+_Avoid_: album name, title override
 
 **Album scope**:
 The user's choice for one mapped source folder: one album for the whole source folder, or one album per folder that directly contains files.
@@ -76,11 +80,31 @@ _Avoid_: speed cap, throttle
 The user-set maximum number of uploads that may run at one time.
 _Avoid_: parallelism, workers
 
+**Upload throughput**:
+The rate at which upload bodies move bytes to the server, measured over a short rolling window.
+_Avoid_: speed, transfer rate
+
+**Upload in flight**:
+An upload request that has started and has not finished. Hashing, indexing, and the server duplicate check are not uploads in flight.
+_Avoid_: active upload, running transfer
+
+**Sync tag**:
+The one Immich tag, `immich-sync`, that the client adds to the assets it syncs so they can be found with Immich's tag search. The user turns it on in Settings; the client then tags new uploads and backfills the tag onto the assets it uploaded before.
+_Avoid_: upload tag, source tag
+
+**Backfill**:
+The pass that adds the sync tag to the assets the client uploaded before the setting was turned on: every current asset, every old version, and every duplicate, a batch of ids per request. Its progress and completion are recorded, so a restart resumes it instead of starting over.
+_Avoid_: re-tag, scan
+
 ### Immich
 
 **Asset**:
 One media object on the Immich server.
 _Avoid_: photo, file, media
+
+**Asset link**:
+The Immich web address of one uploaded asset, opened in the default browser.
+_Avoid_: photo URL, deep link
 
 **Album**:
 An Immich collection of assets. It is the closest server-side match for a local folder.
@@ -123,8 +147,16 @@ The status icon in the notification area. It shows sync state and it opens the c
 _Avoid_: system tray, notification icon
 
 **Folder status**:
-The sync state of one source folder. The dashboard shows one card per source folder.
+The sync state of one source folder. The dashboard shows one card per source folder, and the folder detail renders the same status in full.
 _Avoid_: folder state, folder progress
+
+**Folder setup**:
+The dialog that confirms a new source folder's recursion and album settings. The client records and scans the folder only when the user confirms.
+_Avoid_: add dialog, onboarding
+
+**Folder detail**:
+The enlarged view of one source folder: its full path, live state and counts, its own upload activity, settings, timestamps, and the list of the assets it has uploaded, with links into the Failed and Review views filtered to it. Its Remove needs a confirmation, because the folder's uploaded assets stay on the server.
+_Avoid_: folder modal, folder popup
 
 ### Diagnostics
 
@@ -139,3 +171,7 @@ _Avoid_: Immich version, API version
 **Debug bundle**:
 One archive Diagnostics collects for a support message: the logs, versions, database information, configuration, and sizing.
 _Avoid_: support bundle, log bundle, diagnostics archive
+
+**Live tail**:
+The Logs view's automatic reading of new lines from the newest log file. Following pauses while the user reads older lines or holds a selection.
+_Avoid_: auto-refresh, follow mode

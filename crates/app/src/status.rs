@@ -6,7 +6,9 @@
 
 use std::path::Path;
 
-use sync_core::status::{Activity, Status};
+use crate::diagnostics::format_rate;
+use sync_core::meter::UploadTraffic;
+use sync_core::status::{Activity, AlbumRename, Status};
 use sync_core::store::{AlbumScope, FolderCounts};
 
 /// The activity state of the client or one source folder (SPEC R8.2).
@@ -61,13 +63,29 @@ pub struct StatusCard {
     pub album_mapping: bool,
     /// The album scope for this folder (R3.4).
     pub album_scope: AlbumScope,
+    /// The title the user chose for this folder's own album, or `None` when the
+    /// album takes the folder's name (#47). Always `None` on the global card.
+    pub album_title: Option<String>,
+    /// Why the album title is not on the server yet (#47). `None` when the
+    /// server holds it, and on the global card, which has no album.
+    pub album_rename: Option<AlbumRename>,
     /// Whether the source folder is readable (R2.5); always `true` for the
     /// global card.
     pub available: bool,
+    /// The upload traffic this card reads (R8.1): the rate over the last two
+    /// seconds and the uploads on the wire. The global card's is the sum of
+    /// the folders'.
+    pub uploads: UploadTraffic,
     /// The connection state, on the global card (R8.1).
     pub connection: Option<String>,
     /// The last error, already classified by the engine.
     pub last_error: Option<String>,
+    /// When this folder last uploaded an asset, ns since the Unix epoch (#43).
+    /// `None` on the global card, which is not a folder.
+    pub last_upload_ns: Option<i64>,
+    /// When a reconciliation scan last read this folder, ns since the Unix
+    /// epoch (#43). `None` on the global card.
+    pub last_scan_ns: Option<i64>,
 }
 
 /// The text one status card renders.
@@ -88,6 +106,10 @@ pub struct CardContent {
     pub album: Option<String>,
     /// Whether the folder is readable; the counts line says so when it is not.
     pub available: bool,
+    /// The upload line, on the global card (R8.1): the rate and the uploads on
+    /// the wire. `Idle` only when nothing is in flight *and* the rate is zero;
+    /// a rate still fading out is shown on its own.
+    pub uploads: Option<String>,
     /// The connection line, on the global card.
     pub connection: Option<String>,
     pub error: Option<String>,
@@ -127,10 +149,38 @@ impl StatusCard {
                 }
             }),
             available: self.available,
+            // R8.1: the line sums the folders, so it belongs to the card that
+            // is the sum.
+            uploads: self.path.is_none().then(|| upload_line(self.uploads)),
             connection: self.connection.clone(),
             error: self.last_error.clone(),
         }
     }
+}
+
+/// The upload line a card shows (R8.1).
+///
+/// The folder detail shows the same line for one folder (#44), so the two
+/// phrasings cannot drift apart.
+///
+/// The engine's rate is a rolling average over two seconds, so the window still
+/// holds the last bytes after an upload finishes, and a burst shorter than one
+/// status poll has a rate with nothing on the wire. The line is `Idle` only when
+/// nothing is on the wire *and* no byte is moving; a rate on its own is shown
+/// alone rather than with a zero count.
+pub(crate) fn upload_line(uploads: UploadTraffic) -> String {
+    if uploads.in_flight == 0 {
+        return if uploads.bytes_per_second == 0 {
+            "Idle".to_string()
+        } else {
+            format_rate(uploads.bytes_per_second as f64)
+        };
+    }
+    format!(
+        "{} · {} uploading",
+        format_rate(uploads.bytes_per_second as f64),
+        uploads.in_flight
+    )
 }
 
 impl From<Activity> for ActivityState {
@@ -187,11 +237,16 @@ impl DashboardModel {
             counts: counts_from(status.counts),
             review_count: status.counts.review,
             available: true,
+            uploads: status.uploads,
             connection,
             last_error: status.last_error.clone(),
+            last_upload_ns: None,
+            last_scan_ns: None,
             recursive: false,
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
+            album_title: None,
+            album_rename: None,
         };
         let folders = status
             .folders
@@ -214,11 +269,17 @@ impl DashboardModel {
                 counts: counts_from(folder.counts),
                 review_count: folder.counts.review,
                 available: folder.available,
+                uploads: folder.uploads,
                 connection: None,
                 last_error: folder.last_error.clone(),
+                // #43: the folder detail shows both, relative and exact.
+                last_upload_ns: folder.last_upload_ns,
+                last_scan_ns: folder.last_scan_ns,
                 recursive: folder.recursive,
                 album_mapping: folder.album_mapping,
                 album_scope: folder.album_scope,
+                album_title: folder.album_title.clone(),
+                album_rename: folder.album_rename.clone(),
             })
             .collect();
         Self { global, folders }
@@ -248,11 +309,20 @@ pub fn sample() -> DashboardModel {
             },
             review_count: 3,
             available: true,
+            uploads: UploadTraffic {
+                bytes: 41_943_040,
+                bytes_per_second: 2_516_582,
+                in_flight: 3,
+            },
             connection: Some("Connected".to_string()),
             last_error: None,
+            last_upload_ns: None,
+            last_scan_ns: None,
             recursive: false,
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
+            album_title: None,
+            album_rename: None,
         },
         folders: vec![
             StatusCard {
@@ -267,11 +337,20 @@ pub fn sample() -> DashboardModel {
                 },
                 review_count: 0,
                 available: true,
+                uploads: UploadTraffic {
+                    bytes: 41_943_040,
+                    bytes_per_second: 2_516_582,
+                    in_flight: 3,
+                },
                 connection: None,
                 last_error: None,
+                last_upload_ns: Some(1_700_000_000_000_000_000),
+                last_scan_ns: Some(1_700_000_060_000_000_000),
                 recursive: true,
                 album_mapping: true,
                 album_scope: AlbumScope::WholeFolder,
+                album_title: None,
+                album_rename: None,
             },
             StatusCard {
                 title: "DCIM".to_string(),
@@ -285,11 +364,16 @@ pub fn sample() -> DashboardModel {
                 },
                 review_count: 3,
                 available: true,
+                uploads: UploadTraffic::default(),
                 connection: None,
                 last_error: None,
+                last_upload_ns: Some(1_700_000_000_000_000_000),
+                last_scan_ns: None,
                 recursive: true,
                 album_mapping: true,
                 album_scope: AlbumScope::Leaf,
+                album_title: None,
+                album_rename: None,
             },
             StatusCard {
                 title: "Videos".to_string(),
@@ -303,13 +387,18 @@ pub fn sample() -> DashboardModel {
                 },
                 review_count: 0,
                 available: true,
+                uploads: UploadTraffic::default(),
                 connection: None,
                 last_error: Some(
                     "permission_denied: the API key cannot write to this album".to_string(),
                 ),
+                last_upload_ns: Some(1_700_000_000_000_000_000),
+                last_scan_ns: Some(1_700_000_060_000_000_000),
                 recursive: false,
                 album_mapping: true,
                 album_scope: AlbumScope::WholeFolder,
+                album_title: None,
+                album_rename: None,
             },
             StatusCard {
                 title: "Archive".to_string(),
@@ -323,12 +412,56 @@ pub fn sample() -> DashboardModel {
                 },
                 review_count: 0,
                 available: true,
+                uploads: UploadTraffic::default(),
                 connection: None,
                 last_error: None,
+                last_upload_ns: None,
+                last_scan_ns: None,
                 recursive: true,
                 album_mapping: false,
                 album_scope: AlbumScope::Leaf,
+                album_title: None,
+                album_rename: None,
             },
         ],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::upload_line;
+    use sync_core::meter::UploadTraffic;
+
+    /// A burst shorter than the poll interval leaves a rate with no upload on
+    /// the wire: the window still holds its bytes, so the line must show the
+    /// rate rather than claim the client is idle (R8.1).
+    #[test]
+    fn a_short_burst_reads_as_a_rate_then_fades_to_idle() {
+        assert_eq!(
+            upload_line(UploadTraffic {
+                bytes: 1_048_576,
+                bytes_per_second: 524_288,
+                in_flight: 0,
+            }),
+            "512.0 KiB/s",
+            "the burst is still in the window, so the line shows its rate"
+        );
+        assert_eq!(
+            upload_line(UploadTraffic {
+                bytes: 1_048_576,
+                bytes_per_second: 0,
+                in_flight: 0,
+            }),
+            "Idle",
+            "once the window is empty the client reads idle"
+        );
+        assert_eq!(
+            upload_line(UploadTraffic {
+                bytes: 0,
+                bytes_per_second: 524_288,
+                in_flight: 2,
+            }),
+            "512.0 KiB/s · 2 uploading"
+        );
     }
 }

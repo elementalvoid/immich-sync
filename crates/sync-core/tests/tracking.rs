@@ -93,6 +93,66 @@ fn a_blank_path_is_refused_and_writes_nothing() {
 }
 
 #[test]
+fn an_insert_writes_the_confirmed_settings_and_tells_the_observer() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let tracking = tracking_in(&temp);
+    let observer = Arc::new(Recorded::default());
+    tracking.attach(observer.clone());
+    let path = temp.path().join("photos").display().to_string();
+    let confirmed = SourceFolder {
+        path: format!("  {path}  "),
+        recursive: false,
+        album_mapping: true,
+        album_scope: AlbumScope::WholeFolder,
+        album_title: None,
+    };
+
+    // #40: the setup panel's one write records the path and all three
+    // settings, and the engine hears about it like any other add.
+    tracking
+        .insert_folder(&confirmed)
+        .expect("insert the folder");
+
+    let folders = tracking.folders().expect("read the folders");
+    assert_eq!(
+        folders,
+        vec![SourceFolder { path, ..confirmed }],
+        "the row keeps the confirmed settings, with the path trimmed"
+    );
+    assert_eq!(
+        observer.events(),
+        vec![format!("added {}", folders[0].path)]
+    );
+}
+
+#[test]
+fn an_insert_refuses_a_folder_the_client_already_holds() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let tracking = tracking_in(&temp);
+    let path = temp.path().join("photos").display().to_string();
+    tracking.add_folder(&path, true).expect("add the folder");
+
+    // #40: "Already added" leaves the tracked row alone, so a draft that
+    // differs would show up here if the insert had upserted it. The path key
+    // decides (R2.4), so a trailing separator names the same folder.
+    let refused = tracking.insert_folder(&SourceFolder {
+        path: format!("{path}/"),
+        recursive: false,
+        album_mapping: false,
+        album_scope: AlbumScope::Leaf,
+        album_title: None,
+    });
+
+    assert!(
+        matches!(refused, Err(TrackingError::FolderExists(_))),
+        "{refused:?}"
+    );
+    let folders = tracking.folders().expect("read the folders");
+    assert_eq!(folders.len(), 1, "the insert must not make a second row");
+    assert!(folders[0].recursive, "the insert must not edit the row");
+}
+
+#[test]
 fn a_re_add_under_a_different_spelling_keeps_the_album_settings() {
     let temp = tempfile::tempdir().expect("create a temp dir");
     let tracking = tracking_in(&temp);

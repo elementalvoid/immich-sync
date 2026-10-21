@@ -6,7 +6,7 @@ use sync_core::failure::FailureClass;
 use sync_core::hash::Sha1;
 use sync_core::store::{
     AlbumScope, AttemptOutcome, AttemptRecord, ItemRecord, ItemState, NewVersion, ReviewDecision,
-    SidecarDigest, SourceFolder, StateStore, StoreError,
+    SidecarDigest, SourceFolder, StateStore, StoreError, TagBackfill,
 };
 
 /// `sha1("hello world")`, hex.
@@ -277,6 +277,7 @@ fn source_folders_persist_with_their_recursive_flag() {
             recursive: false,
             album_mapping: false,
             album_scope: AlbumScope::default(),
+            album_title: None,
         })
         .expect("add the folder");
     store
@@ -285,6 +286,7 @@ fn source_folders_persist_with_their_recursive_flag() {
             recursive: true,
             album_mapping: false,
             album_scope: AlbumScope::default(),
+            album_title: None,
         })
         .expect("re-adding updates the flag");
 
@@ -295,6 +297,7 @@ fn source_folders_persist_with_their_recursive_flag() {
             recursive: true,
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
+            album_title: None,
         }],
         "R3.4: album mapping is off until the user opts in, and the scope defaults to leaf"
     );
@@ -318,6 +321,7 @@ fn a_re_added_folder_keeps_the_album_mapping_the_user_chose() {
         recursive: true,
         album_mapping: true,
         album_scope: AlbumScope::WholeFolder,
+        album_title: None,
     };
     store.add_folder(&mapped).expect("add the mapped folder");
     store
@@ -338,13 +342,134 @@ fn a_re_added_folder_keeps_the_album_mapping_the_user_chose() {
 }
 
 #[test]
-fn a_remembered_album_id_survives_a_restart() {
+fn inserting_a_new_folder_writes_every_setting() {
+    use sync_core::store::{AlbumScope, SourceFolder};
+
+    // #40: the setup dialog confirms all four values, and the store records
+    // them in one insert.
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    let folder = SourceFolder {
+        path: "/photos".to_string(),
+        recursive: false,
+        album_mapping: true,
+        album_scope: AlbumScope::WholeFolder,
+        album_title: None,
+    };
+
+    assert!(
+        store.insert_folder(&folder).expect("insert the folder"),
+        "a folder the store does not hold is inserted"
+    );
+    assert_eq!(
+        store.folders().expect("read the folders"),
+        vec![folder],
+        "#40: the insert keeps the settings the user confirmed"
+    );
+}
+
+#[test]
+fn inserting_a_tracked_folder_changes_nothing() {
+    use sync_core::store::{AlbumScope, SourceFolder};
+
+    // #40: the setup dialog must not overwrite a folder the client already
+    // tracks, even when the dialog carries different settings.
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    let original = SourceFolder {
+        path: "/photos".to_string(),
+        recursive: false,
+        album_mapping: true,
+        album_scope: AlbumScope::WholeFolder,
+        album_title: None,
+    };
+    store
+        .add_folder(&original)
+        .expect("seed the tracked folder");
+
+    let changed = SourceFolder {
+        recursive: true,
+        album_mapping: false,
+        album_scope: AlbumScope::Leaf,
+        album_title: None,
+        ..original.clone()
+    };
+    assert!(
+        !store
+            .insert_folder(&changed)
+            .expect("the insert is refused"),
+        "#40: an already-tracked folder reports that it was not inserted"
+    );
+    assert_eq!(
+        store.folders().expect("read the folders"),
+        vec![original],
+        "#40: the stored settings stay untouched"
+    );
+}
+
+#[test]
+fn inserting_a_tracked_folder_keeps_its_album_title() {
+    use sync_core::store::{Album, AlbumScope, SourceFolder};
+
+    // #47: the setup dialog can carry a title the tracked folder does not hold,
+    // and a refused insert must not queue a rename for it either.
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    let original = SourceFolder {
+        path: "/photos".to_string(),
+        recursive: true,
+        album_mapping: true,
+        album_scope: AlbumScope::WholeFolder,
+        album_title: Some("Holiday 2024".to_string()),
+    };
+    store
+        .add_folder(&original)
+        .expect("seed the tracked folder");
+    store
+        .record_album(
+            "/photos",
+            "album-7",
+            Some("Holiday 2024"),
+            Some("Holiday 2024"),
+        )
+        .expect("record the album the server made");
+
+    let changed = SourceFolder {
+        recursive: false,
+        album_title: Some("Another title".to_string()),
+        ..original.clone()
+    };
+    assert!(
+        !store
+            .insert_folder(&changed)
+            .expect("the insert is refused"),
+        "#40: an already-tracked folder reports that it was not inserted"
+    );
+    assert_eq!(
+        store.folders().expect("read the folders"),
+        vec![original],
+        "#40: the stored settings stay untouched"
+    );
+    assert_eq!(
+        store.album("/photos").expect("read the album row"),
+        Some(Album {
+            title: Some("Holiday 2024".to_string()),
+            album_id: Some("album-7".to_string()),
+            rename_pending: false,
+            rename_problem: None,
+        }),
+        "#47: a refused insert leaves the title, and its pending rename, alone"
+    );
+}
+
+#[test]
+fn a_recorded_album_id_survives_a_restart() {
     let temp = tempfile::tempdir().expect("create a temp dir");
     let path = temp.path().join("state.db");
     {
         let store = StateStore::open(&path).expect("open a fresh store");
         store
-            .remember_album("/photos/2023/Holiday", "Holiday", "album-7")
+            .record_album("/photos/2023/Holiday", "album-7", None, None)
             .expect("record the album the server assigned");
     }
 
@@ -352,7 +477,10 @@ fn a_remembered_album_id_survives_a_restart() {
     // the same folder.
     let store = StateStore::open(&path).expect("reopen the store");
     assert_eq!(
-        store.album("/photos/2023/Holiday").expect("read the album"),
+        store
+            .album("/photos/2023/Holiday")
+            .expect("read the album")
+            .and_then(|album| album.album_id),
         Some("album-7".to_string())
     );
     assert_eq!(
@@ -362,10 +490,13 @@ fn a_remembered_album_id_survives_a_restart() {
         None
     );
     store
-        .remember_album("/photos/2023/Holiday", "Holiday", "album-8")
+        .record_album("/photos/2023/Holiday", "album-8", None, None)
         .expect("the server replaced the album");
     assert_eq!(
-        store.album("/photos/2023/Holiday").expect("read the album"),
+        store
+            .album("/photos/2023/Holiday")
+            .expect("read the album")
+            .and_then(|album| album.album_id),
         Some("album-8".to_string()),
         "the last id the server gave wins"
     );
@@ -375,27 +506,185 @@ fn a_remembered_album_id_survives_a_restart() {
 fn two_folders_with_the_same_name_keep_two_album_ids() {
     let temp = tempfile::tempdir().expect("create a temp dir");
     let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
-    // R3.4: the album belongs to the folder. The name is a copy of the folder
-    // name, so the same name twice must not merge two folders into one album.
+    // R3.4: the album belongs to the folder, so the same name twice must not
+    // merge two folders into one album.
     store
-        .remember_album("/photos/2023/Holiday", "Holiday", "album-1")
+        .record_album("/photos/2023/Holiday", "album-1", None, None)
         .expect("record the first folder's album");
     store
-        .remember_album("/photos/2024/Holiday", "Holiday", "album-2")
+        .record_album("/photos/2024/Holiday", "album-2", None, None)
         .expect("record the second folder's album");
 
     assert_eq!(
         store
             .album("/photos/2023/Holiday")
-            .expect("read the first album"),
+            .expect("read the first album")
+            .and_then(|album| album.album_id),
         Some("album-1".to_string())
     );
     assert_eq!(
         store
             .album("/photos/2024/Holiday")
-            .expect("read the second album"),
+            .expect("read the second album")
+            .and_then(|album| album.album_id),
         Some("album-2".to_string()),
         "one album per folder, whatever the folder names agree on"
+    );
+}
+
+/// #47: the title is stored with the folder's album row even before an album
+/// exists, and it reads back through the folder.
+#[test]
+fn an_album_title_is_stored_before_the_album_exists() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    // Album mapping is off: no album was ever created for the folder.
+    store
+        .add_folder(&SourceFolder {
+            path: "/photos".to_string(),
+            recursive: true,
+            album_mapping: false,
+            album_scope: AlbumScope::Leaf,
+            album_title: None,
+        })
+        .expect("add the source folder");
+    store
+        .set_album_title("/photos", Some("Holiday 2024"))
+        .expect("store the title");
+
+    assert_eq!(
+        store.folders().expect("read the folders")[0].album_title,
+        Some("Holiday 2024".to_string()),
+        "#47: the folder carries the title it was given"
+    );
+    assert_eq!(
+        store.album("/photos").expect("read the album"),
+        Some(sync_core::store::Album {
+            title: Some("Holiday 2024".to_string()),
+            album_id: None,
+            rename_pending: false,
+            rename_problem: None,
+        }),
+        "#47: no album exists yet, so nothing is pending; the create takes the title"
+    );
+
+    // A write of the folder row that carries the stored title (a recursive
+    // toggle, say) must not queue a rename.
+    store
+        .add_folder(&SourceFolder {
+            path: "/photos".to_string(),
+            recursive: false,
+            album_mapping: false,
+            album_scope: AlbumScope::Leaf,
+            album_title: Some("Holiday 2024".to_string()),
+        })
+        .expect("toggle the folder");
+    assert!(
+        !store
+            .album("/photos")
+            .expect("read the album")
+            .expect("the album row")
+            .rename_pending,
+        "#47: an unchanged title owes the server nothing"
+    );
+}
+
+/// #47: a title the server does not hold yet is pending, and the reason the
+/// last attempt failed is kept until a later attempt lands.
+#[test]
+fn a_title_change_for_an_existing_album_is_pending_until_the_server_answers() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    store
+        .record_album("/photos", "album-1", None, None)
+        .expect("record the album");
+
+    store
+        .set_album_title("/photos", Some("Holiday"))
+        .expect("store the new title");
+    assert_eq!(
+        store.album("/photos").expect("read the album"),
+        Some(sync_core::store::Album {
+            title: Some("Holiday".to_string()),
+            album_id: Some("album-1".to_string()),
+            rename_pending: true,
+            rename_problem: None,
+        }),
+        "#47: the album exists, so the title has to be sent"
+    );
+
+    store
+        .album_rename_failed("/photos", "the server could not be reached")
+        .expect("record the failure");
+    let failed = store.album("/photos").expect("read").expect("the row");
+    assert!(failed.rename_pending, "#47: a failure keeps the retry");
+    assert_eq!(
+        failed.rename_problem.as_deref(),
+        Some("the server could not be reached"),
+        "#47: the reason is kept for the user"
+    );
+
+    // The server answered with the name the client meant.
+    store
+        .record_album("/photos", "album-1", Some("Holiday"), Some("Holiday"))
+        .expect("record the answer");
+    let done = store.album("/photos").expect("read").expect("the row");
+    assert!(!done.rename_pending, "#47: the rename is done");
+    assert_eq!(done.rename_problem, None, "and its failure is cleared");
+}
+
+/// #47: an answer for a title the user has already replaced keeps the newer
+/// title. The request was about the old one, so the row stays pending.
+#[test]
+fn a_late_answer_does_not_overwrite_a_newer_title() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    store
+        .record_album("/photos", "album-1", None, None)
+        .expect("record the album");
+    store
+        .set_album_title("/photos", Some("Holiday"))
+        .expect("store the first title");
+    store
+        .set_album_title("/photos", Some("Holiday 2025"))
+        .expect("the user typed again");
+
+    // The answer for the first title lands after the second was stored.
+    store
+        .record_album("/photos", "album-1", Some("Holiday"), Some("Holiday"))
+        .expect("record the late answer");
+
+    let album = store.album("/photos").expect("read").expect("the row");
+    assert_eq!(
+        album.title.as_deref(),
+        Some("Holiday 2025"),
+        "#47: the newer title is not overwritten by an answer about the older one"
+    );
+    assert!(album.rename_pending, "#47: and it still has to be sent");
+}
+
+/// #47: clearing the title back to the folder's name is a change like any
+/// other, so the album has to be renamed back.
+#[test]
+fn clearing_the_title_asks_the_server_for_the_folder_name() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    store
+        .record_album("/photos", "album-1", Some("Holiday"), Some("Holiday"))
+        .expect("record the album");
+
+    store
+        .set_album_title("/photos", None)
+        .expect("clear the title");
+
+    let album = store.album("/photos").expect("read").expect("the row");
+    assert_eq!(
+        album.title, None,
+        "#47: a blank title means the folder name"
+    );
+    assert!(
+        album.rename_pending,
+        "#47: the server still holds the old name"
     );
 }
 
@@ -1187,8 +1476,8 @@ fn the_sqlite_info_reports_the_schema_the_size_and_the_table_counts() {
 
     let empty = store.sqlite_info().expect("read the sqlite info");
     assert_eq!(
-        empty.migration_version, 9,
-        "the schema stands at the ninth migration"
+        empty.migration_version, 12,
+        "the schema stands at the twelfth migration (#47 added the album title)"
     );
     assert!(empty.size_bytes > 0, "a migrated database occupies pages");
     assert_eq!(empty.integrity, "ok", "a fresh database is sound");
@@ -1214,6 +1503,7 @@ fn the_sqlite_info_reports_the_schema_the_size_and_the_table_counts() {
             recursive: true,
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
+            album_title: None,
         })
         .expect("add the folder");
 
@@ -1249,6 +1539,7 @@ fn the_sizing_reports_the_tracked_bytes_and_the_state_counts() {
             recursive: true,
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
+            album_title: None,
         })
         .expect("add the source folder");
 
@@ -1372,6 +1663,7 @@ fn a_reset_empties_every_state_table_and_leaves_the_database_sound() {
             recursive: true,
             album_mapping: true,
             album_scope: AlbumScope::Leaf,
+            album_title: None,
         })
         .expect("add the folder");
 
@@ -1404,5 +1696,310 @@ fn recording_a_version_for_an_unknown_item_is_an_error() {
     assert!(
         matches!(error, StoreError::UnknownItem(_)),
         "the error says which item is missing: {error}"
+    );
+}
+
+/// R3.7: the backfill enumerates every asset the client ever uploaded, once
+/// each and in id order, so a cursor can resume the run.
+#[test]
+fn the_tag_backfill_enumerates_every_uploaded_asset_once() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    // An edited file: the chain holds both assets and the item points at the
+    // newest, so the old version is enumerated and the current one only once.
+    store
+        .record(&record("edited.jpg", ItemState::Uploaded))
+        .expect("write the row");
+    for (asset, at) in [("asset-b", 1), ("asset-c", 2)] {
+        store
+            .record_version(&NewVersion {
+                path: "edited.jpg".to_string(),
+                asset_id: asset.to_string(),
+                sha1: hello_world_sha1(),
+                created_at_ns: at,
+                stack_id: None,
+            })
+            .expect("seed the version chain");
+    }
+    // A duplicate: the row holds the asset the server already had.
+    store
+        .record(&ItemRecord {
+            asset_id: Some("asset-d".to_string()),
+            state: ItemState::Duplicate,
+            ..record("duplicate.jpg", ItemState::Duplicate)
+        })
+        .expect("write the duplicate row");
+    // A row no upload settled contributes no id.
+    store
+        .record(&ItemRecord {
+            asset_id: None,
+            state: ItemState::Pending,
+            ..record("pending.jpg", ItemState::Pending)
+        })
+        .expect("write the pending row");
+
+    assert_eq!(
+        store.tag_backfill_total().expect("count the library"),
+        3,
+        "R3.7: the current asset, the old version, and the duplicate, once each"
+    );
+    assert_eq!(
+        store
+            .tag_backfill_batch(None, 2)
+            .expect("read the first batch"),
+        vec!["asset-b".to_string(), "asset-c".to_string()],
+        "R3.7: a batch is the ids after the cursor, in id order, without a repeat"
+    );
+    assert_eq!(
+        store
+            .tag_backfill_batch(Some("asset-c"), 2)
+            .expect("read the next batch"),
+        vec!["asset-d".to_string()],
+        "the cursor continues after the last id of the previous batch"
+    );
+    assert!(
+        store
+            .tag_backfill_batch(Some("asset-d"), 2)
+            .expect("read past the end")
+            .is_empty(),
+        "past the last id the batch is empty, which is how the run finishes"
+    );
+}
+
+/// R3.7: the backfill records the last completed batch and its completion, so
+/// a restart resumes instead of starting over and "tag now" clears it.
+#[test]
+fn the_tag_backfill_marker_survives_a_reopen_and_the_restart_clears_it() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let path = temp.path().join("state.db");
+    {
+        let store = StateStore::open(&path).expect("open a fresh store");
+        assert_eq!(
+            store.tag_backfill().expect("read the state"),
+            TagBackfill::default(),
+            "a library nothing was tagged in has no marker and no cursor"
+        );
+        store
+            .record_tag_batch("asset-c", 2)
+            .expect("record a completed batch");
+    }
+
+    let store = StateStore::open(&path).expect("reopen the store");
+    assert_eq!(
+        store.tag_backfill().expect("read the state"),
+        TagBackfill {
+            completed_ns: None,
+            cursor: Some("asset-c".to_string()),
+            tagged: 2,
+        },
+        "R3.7: the last completed batch survives a restart"
+    );
+    store
+        .finish_tag_backfill(42)
+        .expect("record the completion");
+    assert_eq!(
+        store.tag_backfill().expect("read the state").completed_ns,
+        Some(42),
+        "R3.7: a finished backfill is recorded so a restart does not repeat it"
+    );
+
+    store
+        .restart_tag_backfill()
+        .expect("clear the backfill state");
+    assert_eq!(
+        store.tag_backfill().expect("read the state"),
+        TagBackfill::default(),
+        "R3.7: \"tag existing assets now\" clears the marker, the cursor and the count"
+    );
+    assert_eq!(
+        store.tag_backfill_total().expect("count the library"),
+        0,
+        "the total counts the assets the state holds"
+    );
+}
+
+/// Writes one uploaded item with one current version, the shape the folder
+/// detail lists (#44).
+fn seed_asset(store: &StateStore, path: &str, asset_id: &str, size: u64, created_at_ns: i64) {
+    let mut row = record(path, ItemState::Uploaded);
+    row.size = size;
+    row.asset_id = Some(asset_id.to_string());
+    store.record(&row).expect("write the item");
+    store
+        .record_version(&NewVersion {
+            path: path.to_string(),
+            asset_id: asset_id.to_string(),
+            sha1: hello_world_sha1(),
+            created_at_ns,
+            stack_id: None,
+        })
+        .expect("record the version");
+}
+
+/// #44: the folder detail's page is one row per current asset of the folder's
+/// own tree, newest first. An edited file appears once, with its latest asset;
+/// an older version stays in the chain and is not listed.
+#[test]
+fn the_folder_asset_page_lists_one_current_asset_per_item_newest_first() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    let photos = temp.path().join("photos");
+    let folder = photos.display().to_string();
+    let at = |index: i64| 1_700_000_000_000_000_000 + index;
+
+    seed_asset(
+        &store,
+        &photos.join("a.jpg").display().to_string(),
+        "asset-a",
+        10,
+        at(1),
+    );
+    seed_asset(
+        &store,
+        &photos.join("b.jpg").display().to_string(),
+        "asset-b",
+        20,
+        at(2),
+    );
+    // Edited once: the old asset stays recorded, the new one is current.
+    seed_asset(
+        &store,
+        &photos.join("edited.jpg").display().to_string(),
+        "asset-old",
+        30,
+        at(3),
+    );
+    store
+        .record_version(&NewVersion {
+            path: photos.join("edited.jpg").display().to_string(),
+            asset_id: "asset-new".to_string(),
+            sha1: hello_world_sha1(),
+            created_at_ns: at(5),
+            stack_id: Some("stack-1".to_string()),
+        })
+        .expect("record the edited file's latest version");
+    // A subfolder, which the folder's recursion setting decides on.
+    seed_asset(
+        &store,
+        &photos.join("sub").join("c.jpg").display().to_string(),
+        "asset-c",
+        40,
+        at(4),
+    );
+    // A sibling whose path merely shares the prefix must not count.
+    let other = temp.path().join("photos2");
+    seed_asset(
+        &store,
+        &other.join("d.jpg").display().to_string(),
+        "asset-d",
+        50,
+        at(6),
+    );
+    // A file still in flight has no asset and no version yet.
+    let mut pending = record(
+        &photos.join("pending.jpg").display().to_string(),
+        ItemState::Pending,
+    );
+    pending.asset_id = None;
+    store.record(&pending).expect("write the pending row");
+
+    let rows = store
+        .folder_assets(&folder, true, 50, 0)
+        .expect("read the folder's assets");
+    let listed: Vec<(String, String, u64)> = rows
+        .iter()
+        .map(|row| (row.path.clone(), row.asset_id.clone(), row.size))
+        .collect();
+    assert_eq!(
+        listed,
+        vec![
+            (
+                photos.join("edited.jpg").display().to_string(),
+                "asset-new".to_string(),
+                30
+            ),
+            (
+                photos.join("sub").join("c.jpg").display().to_string(),
+                "asset-c".to_string(),
+                40
+            ),
+            (
+                photos.join("b.jpg").display().to_string(),
+                "asset-b".to_string(),
+                20
+            ),
+            (
+                photos.join("a.jpg").display().to_string(),
+                "asset-a".to_string(),
+                10
+            ),
+        ],
+        "#44: newest first, one current asset per item, the folder's tree only"
+    );
+    assert_eq!(
+        rows[0].created_at_ns,
+        at(5),
+        "#44: the row carries when its current version was uploaded"
+    );
+
+    // R2.1: a folder that does not recurse lists its direct children only.
+    let direct = store
+        .folder_assets(&folder, false, 50, 0)
+        .expect("read the folder's own files");
+    assert_eq!(
+        direct.len(),
+        3,
+        "#44: a non-recursive folder leaves its subfolders' assets out"
+    );
+    assert!(
+        direct
+            .iter()
+            .all(|row| Path::new(&row.path).parent() == Some(photos.as_path())),
+        "no subfolder row belongs to a non-recursive folder"
+    );
+}
+
+/// #44: paging never repeats a row and never loses one, so Load more appends
+/// the next page of the same order.
+#[test]
+fn the_folder_asset_page_pages_without_repeating_or_losing_rows() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    let photos = temp.path().join("photos");
+    let folder = photos.display().to_string();
+    let names: Vec<String> = (0..5).map(|index| format!("{index}.jpg")).collect();
+    for (index, name) in names.iter().enumerate() {
+        let index = i64::try_from(index).expect("a small index");
+        seed_asset(
+            &store,
+            &photos.join(name).display().to_string(),
+            &format!("asset-{index}"),
+            1,
+            1_700_000_000_000_000_000 + index,
+        );
+    }
+
+    let mut listed: Vec<String> = Vec::new();
+    let mut offset = 0;
+    loop {
+        let page = store
+            .folder_assets(&folder, true, 2, offset)
+            .expect("read one page");
+        let full = page.len() == 2;
+        listed.extend(page.into_iter().map(|row| row.path));
+        if !full {
+            break;
+        }
+        offset += 2;
+    }
+
+    let expected: Vec<String> = names
+        .iter()
+        .rev()
+        .map(|name| photos.join(name).display().to_string())
+        .collect();
+    assert_eq!(
+        listed, expected,
+        "#44: the pages are the one order, once each"
     );
 }

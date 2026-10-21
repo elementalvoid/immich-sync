@@ -3,21 +3,27 @@
 //!
 //! The rows come from [`crate::review`], so the view does no formatting. Every
 //! control is a keyboard-reachable tab stop with its own accessible name (N5),
-//! and the surface follows the theme tokens like the failed-items view.
+//! and the surface follows the theme tokens like the failed-items view. The
+//! folder filter narrows the list, its summary, and its empty state (#41).
 
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use sync_core::paths::PathCase;
 
 use crate::dashboard::CardPalette;
 use crate::engine::EngineModel;
+use crate::folder_filter::FolderFilter;
+use crate::folder_filter_view::folder_filter_bar;
 use crate::review::{ReviewRow, rows, summary};
 
 /// The deletion review surface.
 pub struct ReviewView {
     engine: Entity<EngineModel>,
-    _subscription: Subscription,
+    /// The source folder the list shows (#41).
+    filter: Entity<FolderFilter>,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl ReviewView {
@@ -27,11 +33,28 @@ impl ReviewView {
     /// asks for a fresh read instead of showing a stale cache.
     pub fn new(engine: Entity<EngineModel>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
         engine.update(cx, |engine, cx| engine.refresh_review(cx));
-        let subscription = cx.observe(&engine, |_, _, cx| cx.notify());
+        let filter = cx.new(|_| FolderFilter::new());
+        let subscriptions = vec![
+            cx.observe(&engine, |_, _, cx| cx.notify()),
+            cx.observe(&filter, |_, _, cx| cx.notify()),
+        ];
         Self {
             engine,
-            _subscription: subscription,
+            filter,
+            _subscriptions: subscriptions,
         }
+    }
+
+    /// Shows one source folder only (#41).
+    ///
+    /// This is the seam the folder detail calls to open this view on a folder
+    /// (#43); the filter's clear control undoes it.
+    pub fn select_folder(&mut self, path: String, cx: &mut Context<Self>) {
+        // The view observes the filter, so the selection repaints it.
+        self.filter.update(cx, |filter, cx| {
+            filter.select(path);
+            cx.notify();
+        });
     }
 
     /// Leaves the server asset alone and clears the row (R5.3).
@@ -48,7 +71,7 @@ impl ReviewView {
 }
 
 impl Render for ReviewView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The tokens are copied, not borrowed from `cx`: building the rows
         // needs the context mutably for their click listeners.
         let palette = CardPalette::new(cx.theme());
@@ -59,10 +82,25 @@ impl Render for ReviewView {
         let background = cx.theme().background;
         let foreground = cx.theme().foreground;
         let muted = cx.theme().muted_foreground;
-        let items = self.engine.read(cx).review_items().to_vec();
+        let folders = self.engine.read(cx).folders(cx);
+        let mut items = self.engine.read(cx).review_items().to_vec();
+        let case = PathCase::for_platform();
+        let filter = self.filter.read(cx);
+        items.retain(|item| filter.keeps(&item.path, &folders, case));
         let rows = rows(&items);
-        let summary = summary(&items);
         let problem = self.engine.read(cx).review_problem().map(str::to_string);
+        // R5.3, #41: the empty state names the folder the filter shows.
+        let empty = self
+            .filter
+            .read(cx)
+            .empty_heading("No missing files", "Every tracked file is present");
+        // #41 review: an empty filtered list must not be summarised as if the
+        // whole client were empty, so the summary says what the list says.
+        let summary = if rows.is_empty() && self.filter.read(cx).is_active() {
+            empty.clone()
+        } else {
+            summary(&items)
+        };
 
         div()
             .id("review-view")
@@ -104,6 +142,13 @@ impl Render for ReviewView {
                         .child(problem),
                 )
             })
+            .child(folder_filter_bar(
+                "review",
+                &self.filter,
+                &folders,
+                window,
+                cx,
+            ))
             .child(
                 div()
                     .id("review-summary")
@@ -124,7 +169,7 @@ impl Render for ReviewView {
                     .flex_col()
                     .gap_3()
                     .when(rows.is_empty(), |this| {
-                        this.child(empty_card(&palette, radius, border))
+                        this.child(empty_card("review-empty", &empty, &palette, radius, border))
                     })
                     .children(rows.iter().enumerate().map(|(index, row)| {
                         row_card(row, index, &palette, radius, border, warning, cx)
@@ -219,7 +264,14 @@ fn row_card(
 }
 
 /// The empty state: the view is a normal place to be, not a broken one.
-fn empty_card(palette: &CardPalette, radius: Pixels, border: Hsla) -> impl IntoElement + use<> {
+fn empty_card(
+    id: &'static str,
+    heading: &str,
+    palette: &CardPalette,
+    radius: Pixels,
+    border: Hsla,
+) -> impl IntoElement + use<> {
+    let heading = heading.to_string();
     div()
         .flex()
         .flex_col()
@@ -232,9 +284,13 @@ fn empty_card(palette: &CardPalette, radius: Pixels, border: Hsla) -> impl IntoE
         .border_color(border)
         .child(
             div()
+                .id(id)
+                .test_support()
+                .role(Role::Status)
+                .aria_label(heading.clone())
                 .text_base()
                 .font_weight(FontWeight::MEDIUM)
-                .child("Every tracked file is present"),
+                .child(heading),
         )
         .child(
             div()

@@ -4,10 +4,29 @@
 //! cannot observe, so those are checked by the probe and the GUI smoke job.
 //! The state-to-tooltip mapping is pure, so it is tested here.
 
-use gpui_kit::test::TestWindowExt as _;
-use gpui_kit::{Action, AppContext as _, MenuItem, TestAppContext, WindowBounds, px, size};
-use immich_sync::shell::{self, Hide, Pause, Resume, Show, SyncNow};
-use sync_core::connection::{Attention, ConnectionState};
+use std::path::Path;
+use std::sync::Arc;
+
+use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
+use gpui_kit::{
+    Action, AnyWindowHandle, AppContext as _, Bounds, MenuItem, Point, TestAppContext,
+    WindowBounds, WindowOptions, px, size,
+};
+use immich_sync::connection::ConnectionModel;
+use immich_sync::dashboard::Dashboard;
+use immich_sync::diagnostics::DiagnosticsModel;
+use immich_sync::diagnostics_view::DiagnosticsView;
+use immich_sync::engine::EngineModel;
+use immich_sync::failed_view::FailedView;
+use immich_sync::paths::AppPaths;
+use immich_sync::review_view::ReviewView;
+use immich_sync::settings_view::SettingsView;
+use immich_sync::shell::{self, AppShell, Hide, Pause, Resume, Show, SyncNow, ViewMode};
+use immich_sync::store::StoreModel;
+use immich_sync::upload::UploadModel;
+use immich_sync::upload_view::UploadView;
+use sync_core::connection::{Attention, ConnectionState, ServerProfile};
+use sync_core::credential::{MemoryCredentialStore, SharedCredentialStore};
 
 fn boot(cx: &mut TestAppContext) {
     // The saved-profile restore runs on the app's Tokio worker, whose result
@@ -249,4 +268,236 @@ fn the_needs_attention_tooltip_carries_the_reason() {
         tooltip.contains("refused the session again"),
         "a second 401 must be visible without the window open: {tooltip}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The filtered-open seam (#41). The folder detail (#43) will call
+// `AppShell::show_filtered` to open the failed-items or deletion-review view
+// with one source folder already selected.
+
+fn temporary_paths(dir: &Path) -> AppPaths {
+    AppPaths {
+        config_file: dir.join("config").join("settings.toml"),
+        state_db: dir.join("data").join("state.db"),
+        autostart_dir: dir.join("config").join("autostart"),
+    }
+}
+
+/// Opens a shell over a temporary state database, the way `open_main_window`
+/// builds it, and returns the shell entity so a test can drive it.
+fn open_shell(
+    cx: &mut TestAppContext,
+    paths: &AppPaths,
+) -> (AnyWindowHandle, gpui_kit::Entity<AppShell>) {
+    let paths = paths.clone();
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        let connection = cx.new(|_| {
+            let store: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+            ConnectionModel::new(ServerProfile::default(), store)
+        });
+        let store_model = cx.new(|cx| StoreModel::open(&paths, cx));
+        let engine =
+            cx.new(|cx| EngineModel::new(connection.clone(), store_model.clone(), &paths, cx));
+        let upload = cx.new(|cx| UploadModel::new(connection.clone(), store_model.clone(), cx));
+        let bundle_dir = paths.state_db.parent().expect("a state dir").to_path_buf();
+        gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: Point::default(),
+                    size: size(px(1200.), px(800.)),
+                })),
+                ..Default::default()
+            },
+            cx,
+            |window, cx| {
+                let dashboard = cx.new(|cx| Dashboard::with_engine(engine.clone(), window, cx));
+                let settings =
+                    cx.new(|cx| SettingsView::from_environment(window, cx, connection.clone()));
+                let upload_view = cx.new(|cx| UploadView::new(upload.clone(), window, cx));
+                let failed = cx.new(|cx| FailedView::new(engine.clone(), window, cx));
+                let diagnostics_model = cx.new(|cx| {
+                    DiagnosticsModel::new(
+                        store_model.clone(),
+                        engine.clone(),
+                        connection.clone(),
+                        bundle_dir,
+                        cx,
+                    )
+                });
+                let diagnostics = cx.new(|cx| DiagnosticsView::new(diagnostics_model, cx));
+                let review = cx.new(|cx| ReviewView::new(engine.clone(), window, cx));
+                cx.new(|cx| {
+                    AppShell::new(
+                        dashboard,
+                        settings,
+                        upload_view,
+                        failed,
+                        diagnostics,
+                        review,
+                        connection,
+                        cx,
+                    )
+                })
+            },
+        )
+        .expect("open the shell window")
+    })
+}
+
+/// #43: the folder detail's Failed and Review links open the matching view with
+/// that folder already selected, through the shell's own surface switch.
+#[gpui_kit::test]
+async fn the_folder_detail_links_open_a_filtered_view(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let camera_roll = temp.path().join("Camera Roll");
+    std::fs::create_dir_all(&camera_roll).expect("create the source folder");
+    let selected = camera_roll.display().to_string();
+    {
+        let store = sync_core::store::StateStore::open(&paths.state_db).expect("open the store");
+        store
+            .add_folder(&sync_core::store::SourceFolder {
+                path: selected.clone(),
+                recursive: true,
+                album_mapping: false,
+                album_scope: sync_core::store::AlbumScope::Leaf,
+                album_title: None,
+            })
+            .expect("add the source folder");
+    }
+    let (window, shell) = open_shell(cx, &paths);
+
+    // The card appears once the store has opened, off the UI thread.
+    cx.wait_for(window, std::time::Duration::from_secs(30), |window, _| {
+        window.try_find(("folder-details", 0_usize)).is_some()
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        window.click(("folder-details", 0_usize), cx);
+    })
+    .expect("open the folder detail");
+    cx.wait_for(window, std::time::Duration::from_secs(10), |window, _| {
+        window.try_find("folder-panel").is_some()
+    })
+    .await;
+
+    cx.update_window(window, |_, window, cx| {
+        window.click("folder-detail-failed", cx);
+    })
+    .expect("follow the failed link");
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            shell.read(cx).mode(),
+            ViewMode::Failed,
+            "#43: the Failed link opens the failed-items view"
+        );
+        assert_eq!(
+            window.find("failed-folder-chip").label(),
+            Some("Showing Camera Roll"),
+            "the failed-items view opens filtered to the detail's folder"
+        );
+        assert!(
+            window.try_find("folder-panel").is_none(),
+            "the detail closes as the view opens"
+        );
+    })
+    .expect("read the failed view");
+
+    // The same detail, the other link.
+    cx.update_window(window, |_, _, cx| {
+        shell.update(cx, |shell, cx| shell.show(ViewMode::Dashboard, cx));
+    })
+    .expect("back to the dashboard");
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(("folder-details", 0_usize), cx);
+    })
+    .expect("open the folder detail again");
+    cx.wait_for(window, std::time::Duration::from_secs(10), |window, _| {
+        window.try_find("folder-panel").is_some()
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        window.click("folder-detail-review", cx);
+    })
+    .expect("follow the review link");
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            shell.read(cx).mode(),
+            ViewMode::Review,
+            "#43: the Review link opens the deletion review"
+        );
+        assert_eq!(
+            window.find("review-folder-chip").label(),
+            Some("Showing Camera Roll"),
+            "the review opens filtered to the detail's folder"
+        );
+    })
+    .expect("read the review");
+}
+
+#[gpui_kit::test]
+fn show_filtered_opens_either_view_on_one_source_folder(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let camera_roll = temp.path().join("Camera Roll");
+    std::fs::create_dir_all(&camera_roll).expect("create the source folder");
+    let (window, shell) = open_shell(cx, &paths);
+    let selected = camera_roll.display().to_string();
+
+    // The filter's state is what the seam sets, so the chip is readable on the
+    // first frame; the store read that fills the lists is covered by the two
+    // views' own tests.
+    cx.update(|cx| {
+        shell.update(cx, |shell, cx| {
+            shell.show_filtered(ViewMode::Failed, selected.clone(), cx);
+        });
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("failed-folder-chip").label(),
+            Some("Showing Camera Roll"),
+            "#43's seam opens the failed-items view on the folder it names"
+        );
+        assert_eq!(
+            window.find("failed-folder-filter").label(),
+            Some("Folder filter: Camera Roll")
+        );
+    })
+    .expect("read the filtered failed-items view");
+
+    cx.update(|cx| {
+        shell.update(cx, |shell, cx| {
+            shell.show_filtered(ViewMode::Review, selected.clone(), cx);
+        });
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("review-folder-chip").label(),
+            Some("Showing Camera Roll"),
+            "the same seam opens the deletion review on the same folder"
+        );
+    })
+    .expect("read the filtered review");
+
+    // The seam carries a folder, so a surface without a folder filter ignores
+    // it and simply opens.
+    cx.update(|cx| {
+        shell.update(cx, |shell, cx| {
+            shell.show_filtered(ViewMode::Dashboard, selected, cx);
+        });
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("status-global").is_some(),
+            "a surface without a folder filter still opens"
+        );
+    })
+    .expect("read the dashboard");
 }

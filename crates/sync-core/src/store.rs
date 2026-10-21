@@ -183,8 +183,117 @@ SELECT id, asset_id, sha1, mtime_ns, 1 FROM sync_item WHERE asset_id IS NOT NULL
 /// the count and the review list.
 const SCHEMA_V9: &str = "CREATE INDEX sync_item_state ON sync_item(state);";
 
+/// The tenth schema (issue #46): how far the sync tag's backfill got (R3.7).
+///
+/// One row, so the state cannot disagree with itself. `cursor` is the last
+/// asset id a completed `PUT /tags/assets` batch carried, and the next run
+/// continues after it instead of tagging the whole library again; `tagged` is
+/// how many assets the recorded pass has tagged; `completed_ns` is the marker
+/// that keeps a restart from starting a finished backfill over.
+///
+/// The table starts empty and every write creates its row, so a build that
+/// upgraded and one that never had a backfill read the same defaults.
+const SCHEMA_V10: &str = "
+CREATE TABLE tag_backfill (
+    id           INTEGER PRIMARY KEY CHECK (id = 1),
+    completed_ns INTEGER,
+    cursor       TEXT,
+    tagged       INTEGER NOT NULL DEFAULT 0
+);
+";
+
+/// The eleventh schema (#43): when a source folder last reconciled and last
+/// uploaded, for its detail view.
+///
+/// The folder detail shows both as a relative time and an exact timestamp, and
+/// only the store outlives the process that observed them, so they live on the
+/// folder row. They are written where the outcome is already known — a scan
+/// that read the folder, an upload that reached a terminal success — and never
+/// read from a network path (R9.2).
+const SCHEMA_V11: &str = "
+ALTER TABLE source_folder ADD COLUMN last_scan_ns INTEGER;
+ALTER TABLE source_folder ADD COLUMN last_upload_ns INTEGER;
+";
+
+/// The twelfth schema (#47): the album title the user chose, and the rename it
+/// may still owe the server.
+///
+/// The title lives on the album row, keyed by the mapped folder's path key,
+/// rather than on the folder row: the album row is what survives the folder
+/// being removed and added again, so the title survives with it, and there is
+/// one stored title instead of two that could disagree. `title` is the user's
+/// choice and is `NULL` when the album takes the folder's name, which is also
+/// what every album written before this schema was called.
+///
+/// `album_id` loses its `NOT NULL`: a title is stored even while album mapping
+/// is off and no album exists yet, and the create then uses it. `rename_pending`
+/// is what a later scan, restart, or reconnect retries; `rename_problem` is why
+/// the last attempt did not reach the server.
+const SCHEMA_V12: &str = "
+CREATE TABLE album_next (
+    folder_key     TEXT PRIMARY KEY,
+    title          TEXT,
+    album_id       TEXT,
+    rename_pending INTEGER NOT NULL DEFAULT 0,
+    rename_problem TEXT
+);
+INSERT INTO album_next (folder_key, album_id) SELECT folder_key, album_id FROM album;
+DROP TABLE album;
+ALTER TABLE album_next RENAME TO album;
+";
+
 /// How long the one writer waits for a competing lock before failing.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How far the sync tag's backfill got (R3.7, SPEC §5).
+///
+/// The whole state of the backfill is these three values: where a later run
+/// resumes, how much the recorded pass has tagged, and whether it finished.
+/// The library it covers is the union of every asset the state holds: each
+/// item's current asset, every old version, and every asset the server
+/// answered as a duplicate.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TagBackfill {
+    /// When a full pass last finished, or `None` while it is unfinished.
+    pub completed_ns: Option<i64>,
+    /// The last asset id of the last completed batch, so a later run resumes
+    /// after it.
+    pub cursor: Option<String>,
+    /// How many assets the recorded pass has tagged.
+    pub tagged: u32,
+}
+
+/// The asset ids the sync tag's backfill covers (R3.7): the asset each item
+/// points at now, plus every asset of every version chain.
+///
+/// `UNION` keeps an id the two tables share once, so tagging an item's current
+/// asset does not happen twice, and a duplicate the server answered is covered
+/// like a created asset because it is the row's asset id either way.
+const TAG_BACKFILL_IDS: &str = "
+    SELECT asset_id FROM sync_item WHERE asset_id IS NOT NULL
+    UNION
+    SELECT asset_id FROM version";
+
+/// Writes one album title, and what the write owes the server (#47).
+///
+/// An album that already exists must be renamed; one that does not yet exist
+/// takes the title when it is created, so nothing is pending. A row that
+/// already held the title keeps whatever it owed, so a folder write that
+/// carries the stored title (a recursive toggle, say) queues no rename, and a
+/// changed title drops the last failure because it was about the old name.
+const ALBUM_TITLE_UPSERT: &str = "
+    INSERT INTO album (folder_key, title, rename_pending) VALUES (?1, ?2, 0)
+    ON CONFLICT(folder_key) DO UPDATE SET
+        rename_pending = CASE
+            WHEN album.album_id IS NOT NULL AND album.title IS NOT excluded.title THEN 1
+            ELSE album.rename_pending
+        END,
+        rename_problem = CASE
+            WHEN album.title IS excluded.title THEN album.rename_problem
+            ELSE NULL
+        END,
+        title = excluded.title
+";
 
 /// The `sync_item` columns [`read_item`] expects, in the order it reads them.
 ///
@@ -354,6 +463,32 @@ pub struct SourceFolder {
     pub album_mapping: bool,
     /// What the folder maps to once album mapping is on (R3.4).
     pub album_scope: AlbumScope,
+    /// The title the user chose for this folder's own album, or `None` when the
+    /// album takes the folder's name (#47).
+    ///
+    /// It is stored on the album row rather than the folder row, so the folder
+    /// being removed and added again keeps it (#47). This field is the row's
+    /// title read back, never a second copy.
+    pub album_title: Option<String>,
+}
+
+/// One mapped folder's album: the title the user chose and the id the server
+/// answered (#47, R3.4).
+///
+/// The row is keyed by the mapped folder's path key, which is the album's
+/// identity (GLOSSARY); the title is what the album should be called.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Album {
+    /// The title the user chose, or `None` when the album takes the folder's
+    /// name (#47).
+    pub title: Option<String>,
+    /// The album the server holds, or `None` while none was created: a title is
+    /// stored before the album exists and used when it is created (#47).
+    pub album_id: Option<String>,
+    /// Whether the title still has to reach the server (#47).
+    pub rename_pending: bool,
+    /// Why the last rename attempt did not reach the server (#47).
+    pub rename_problem: Option<String>,
 }
 
 /// The per-folder item counts a dashboard card shows (R8.1).
@@ -368,6 +503,38 @@ pub struct FolderCounts {
     pub failed: u32,
     /// Missing files that await a review decision (R5.4).
     pub review: u32,
+}
+
+/// When one source folder last reconciled and last uploaded (#43).
+///
+/// The folder detail shows both, and the sync engine writes them from the
+/// paths that already know the outcome: a scan that read the folder and an
+/// upload that reached a terminal success. They sit on the folder row so a
+/// restart keeps them (`folder_time_tests`).
+/// One current asset of one source folder, for the folder detail's list (#44).
+///
+/// The row is the file's identity plus the asset its current version holds, so
+/// the detail can name it, size it, date it, and link it without a second read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FolderAsset {
+    /// The local path, exactly as stored. The view shows its file name.
+    pub path: String,
+    /// The size in bytes of the version the server holds.
+    pub size: u64,
+    /// The asset the item's current version holds, for its Immich link (#44).
+    pub asset_id: String,
+    /// When that version was recorded, ns since the Unix epoch.
+    pub created_at_ns: i64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FolderTimes {
+    /// When a reconciliation scan last read this folder, ns since the Unix
+    /// epoch. `None` until one has.
+    pub last_scan_ns: Option<i64>,
+    /// When this folder last uploaded an asset, ns since the Unix epoch.
+    /// `None` until one has.
+    pub last_upload_ns: Option<i64>,
 }
 
 /// One `sync_item` row, in Rust form.
@@ -947,7 +1114,8 @@ impl StateStore {
                  DELETE FROM attempt;
                  DELETE FROM sync_item;
                  DELETE FROM album;
-                 DELETE FROM source_folder;",
+                 DELETE FROM source_folder;
+                 DELETE FROM tag_backfill;",
             )
             .map_err(|source| self.query_error(source))?;
         transaction
@@ -1074,23 +1242,55 @@ impl StateStore {
     /// Adds a source folder, or updates its recursive flag, album mapping, and
     /// album scope when the same folder is added again (R2.1, R3.4).
     ///
+    /// A title the folder carries is written with the rest (#47). A folder with
+    /// no title leaves the stored one alone, so a caller that builds a row from
+    /// another surface cannot clear a title it never showed.
+    ///
     /// # Errors
     ///
     /// Returns [`StoreError`] when the write fails or the lock is poisoned.
     pub fn add_folder(&self, folder: &SourceFolder) -> Result<(), StoreError> {
+        self.write_folder(
+            folder,
+            "ON CONFLICT(path_key) DO UPDATE SET
+                 path = excluded.path,
+                 recursive = excluded.recursive,
+                 album_mapping = excluded.album_mapping,
+                 album_scope = excluded.album_scope",
+        )
+        .map(|_| ())
+    }
+
+    /// Records a new source folder with every setting it carries, and returns
+    /// whether it was inserted (#40).
+    ///
+    /// A folder the store already holds under the platform's path rule (R2.4)
+    /// is not replaced and `false` comes back, so the setup dialog can show
+    /// "Already added" without disturbing the stored settings, the album title
+    /// and its pending rename included (#47).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the write fails or the lock is poisoned.
+    pub fn insert_folder(&self, folder: &SourceFolder) -> Result<bool, StoreError> {
+        self.write_folder(folder, "ON CONFLICT(path_key) DO NOTHING")
+            .map(|inserted| inserted > 0)
+    }
+
+    /// Writes one source folder row inside a transaction. `conflict` finishes
+    /// the statement: the update an edit needs, or `DO NOTHING` for an insert.
+    fn write_folder(&self, folder: &SourceFolder, conflict: &str) -> Result<usize, StoreError> {
         let mut writer = self.writer()?;
         let transaction = writer
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| self.query_error(source))?;
-        transaction
+        let written = transaction
             .execute(
-                "INSERT INTO source_folder (path, path_key, recursive, album_mapping, album_scope)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(path_key) DO UPDATE SET
-                     path = excluded.path,
-                     recursive = excluded.recursive,
-                     album_mapping = excluded.album_mapping,
-                     album_scope = excluded.album_scope",
+                &format!(
+                    "INSERT INTO source_folder (path, path_key, recursive, album_mapping, album_scope)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     {conflict}"
+                ),
                 params![
                     folder.path,
                     path_key(Path::new(&folder.path)),
@@ -1100,9 +1300,24 @@ impl StateStore {
                 ],
             )
             .map_err(|source| self.query_error(source))?;
+        // A refused insert wrote no folder row, so the title it carried is not
+        // this folder's: writing it would queue a rename the user never asked
+        // for (#47, #40).
+        if written > 0 && folder.album_title.is_some() {
+            transaction
+                .execute(
+                    ALBUM_TITLE_UPSERT,
+                    params![
+                        path_key(Path::new(&folder.path)),
+                        folder.album_title.as_deref(),
+                    ],
+                )
+                .map_err(|source| self.query_error(source))?;
+        }
         transaction
             .commit()
-            .map_err(|source| self.query_error(source))
+            .map_err(|source| self.query_error(source))?;
+        Ok(written)
     }
 
     /// Removes a source folder. Returns whether one was removed (R2.1).
@@ -1130,8 +1345,9 @@ impl StateStore {
         let writer = self.writer()?;
         let mut statement = writer
             .prepare(
-                "SELECT path, recursive, album_mapping, album_scope
-                 FROM source_folder ORDER BY path",
+                "SELECT f.path, f.recursive, f.album_mapping, f.album_scope, a.title
+                 FROM source_folder f LEFT JOIN album a ON a.folder_key = f.path_key
+                 ORDER BY f.path",
             )
             .map_err(|source| self.query_error(source))?;
         let rows = statement
@@ -1141,53 +1357,116 @@ impl StateStore {
             .map_err(|source| self.query_error(source))
     }
 
-    /// The album the server assigned for the mapped folder `folder_key`, when
-    /// this client already made one (R3.4).
+    /// The album row of the mapped folder `folder_key` (R3.4, #47), when this
+    /// client ever wrote one.
     ///
     /// The folder key is the identity, because the album scope is one album per
-    /// folder (GLOSSARY): the album name is a copy the mapping makes, so two
+    /// folder (GLOSSARY): the album title is a name the mapping gives, so two
     /// folders that share a name are two albums (R3.4).
     ///
     /// # Errors
     ///
     /// Returns [`StoreError`] when the query fails.
-    pub fn album(&self, folder_key: &str) -> Result<Option<String>, StoreError> {
+    pub fn album(&self, folder_key: &str) -> Result<Option<Album>, StoreError> {
         let writer = self.writer()?;
         writer
             .query_row(
-                "SELECT album_id FROM album WHERE folder_key = ?1",
+                "SELECT title, album_id, rename_pending, rename_problem
+                 FROM album WHERE folder_key = ?1",
                 [folder_key],
-                |row| row.get(0),
+                |row| {
+                    Ok(Album {
+                        title: row.get(0)?,
+                        album_id: row.get(1)?,
+                        rename_pending: row.get(2)?,
+                        rename_problem: row.get(3)?,
+                    })
+                },
             )
             .optional()
             .map_err(|source| self.query_error(source))
     }
 
-    /// Records the album the server assigned for the mapped folder
-    /// `folder_key`, so the next file in the same folder joins the same album
-    /// (R3.4).
+    /// Records the title the user chose for the mapped folder `folder_key`
+    /// (#47).
     ///
-    /// `name` is recorded for whoever reads the file directly; no query reads
-    /// it back.
+    /// An album that already exists must be renamed, so the row is marked
+    /// pending; one that does not exist yet takes the title when it is created,
+    /// so nothing is pending. Setting the title the row already holds owes the
+    /// server nothing, so a folder write that carries the stored title (a
+    /// recursive toggle, say) never queues a rename.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError`] when the write fails or the lock is poisoned.
-    pub fn remember_album(
+    pub fn set_album_title(&self, folder_key: &str, title: Option<&str>) -> Result<(), StoreError> {
+        let writer = self.writer()?;
+        writer
+            .execute(ALBUM_TITLE_UPSERT, params![folder_key, title])
+            .map_err(|source| self.query_error(source))?;
+        Ok(())
+    }
+
+    /// Records the album the server answered with for the mapped folder
+    /// `folder_key`, with the title it currently holds (#47, R3.4).
+    ///
+    /// This is both the create's answer and the rename's: the stored title
+    /// follows the server, and the rename it owed is done.
+    ///
+    /// `settled` is the title the request was based on. A row whose title has
+    /// changed since — the user typed again while the request was on the wire —
+    /// keeps the newer title and stays pending, so an answer cannot overwrite
+    /// an edit it never saw (#47).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the write fails or the lock is poisoned.
+    pub fn record_album(
         &self,
         folder_key: &str,
-        name: &str,
         album_id: &str,
+        settled: Option<&str>,
+        title: Option<&str>,
     ) -> Result<(), StoreError> {
         let writer = self.writer()?;
         // One statement, so the single write is atomic on its own and needs no
         // transaction around it.
         writer
             .execute(
-                "INSERT INTO album (folder_key, name, album_id) VALUES (?1, ?2, ?3)
+                "INSERT INTO album (folder_key, title, album_id) VALUES (?1, ?4, ?2)
                  ON CONFLICT(folder_key) DO UPDATE SET
-                     name = excluded.name, album_id = excluded.album_id",
-                params![folder_key, name, album_id],
+                     album_id = excluded.album_id,
+                     rename_problem = CASE
+                         WHEN album.title IS ?3 THEN NULL
+                         ELSE album.rename_problem
+                     END,
+                     rename_pending = CASE
+                         WHEN album.title IS ?3 THEN 0
+                         ELSE 1
+                     END,
+                     title = CASE
+                         WHEN album.title IS ?3 THEN excluded.title
+                         ELSE album.title
+                     END",
+                params![folder_key, album_id, settled, title],
+            )
+            .map_err(|source| self.query_error(source))?;
+        Ok(())
+    }
+
+    /// Records that the title of the album of `folder_key` did not reach the
+    /// server, and why (#47). The row stays pending, so a later scan, restart,
+    /// or reconnect tries again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the write fails or the lock is poisoned.
+    pub fn album_rename_failed(&self, folder_key: &str, reason: &str) -> Result<(), StoreError> {
+        let writer = self.writer()?;
+        writer
+            .execute(
+                "UPDATE album SET rename_pending = 1, rename_problem = ?2 WHERE folder_key = ?1",
+                params![folder_key, reason],
             )
             .map_err(|source| self.query_error(source))?;
         Ok(())
@@ -1688,6 +1967,162 @@ impl StateStore {
         Ok(counts)
     }
 
+    /// One page of one source folder's current assets, newest first (#44).
+    ///
+    /// The rows are the items' current versions, so an edited file appears
+    /// once, with its latest asset, and an old version the Immich stack still
+    /// holds is not listed (R4.4). `recursive` follows the folder's own setting
+    /// (R2.1): a folder that does not descend into its subfolders lists its
+    /// direct children only. `offset` is the number of rows already shown, so
+    /// the next page continues where the list stopped; a deep page re-sorts the
+    /// folder's whole range before it skips the rows already shown.
+    ///
+    /// The read runs on a fresh read-only connection, so a page the detail
+    /// opens never queues behind the engine's writer (ADR 0005). It starts
+    /// from the folder's paths rather than from the version chain: the
+    /// existing `sync_item_path_key` index turns the folder into a key range,
+    /// and only the range's own versions are sorted, so a page costs the
+    /// folder's assets rather than the whole library's history.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the query fails.
+    pub fn folder_assets(
+        &self,
+        folder: &str,
+        recursive: bool,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<FolderAsset>, StoreError> {
+        let reader = self.reader()?;
+        let prefix = format!("{}/", path_key(Path::new(folder)));
+        // The prefix ends with a separator, so it is its own upper bound's
+        // predecessor: every key that starts with it sorts below the same text
+        // with that separator replaced by the next byte, and a sibling folder
+        // that merely shares the name sorts above. The range is exactly the
+        // folder's tree.
+        let mut upper = prefix.clone();
+        upper.pop();
+        upper.push('0');
+        // A direct child has nothing after the prefix; a grandchild still
+        // holds a separator. Path keys unify separators on the case-insensitive
+        // behaviour, and Linux paths use `/` anyway, so one separator test
+        // serves both.
+        let descendants = if recursive {
+            ""
+        } else {
+            " AND instr(substr(i.path_key, length(?1) + 1), '/') = 0"
+        };
+        // shortcut: offset paging skews if a not-yet-loaded row is re-recorded;
+        // switch to a (created_at_ns, item_id) cursor when it matters
+        let mut statement = reader
+            .prepare(&format!(
+                "SELECT i.path, i.size, v.asset_id, v.created_at_ns
+                 FROM sync_item i JOIN version v ON v.item_id = i.id
+                 WHERE i.path_key >= ?1 AND i.path_key < ?2 AND v.is_current = 1{descendants}
+                 ORDER BY v.created_at_ns DESC, v.item_id DESC
+                 LIMIT ?3 OFFSET ?4"
+            ))
+            .map_err(|source| self.query_error(source))?;
+        let rows = statement
+            .query_map(
+                params![
+                    prefix,
+                    upper,
+                    i64::try_from(limit).unwrap_or(i64::MAX),
+                    i64::try_from(offset).unwrap_or(i64::MAX),
+                ],
+                |row| {
+                    let size: i64 = row.get(1)?;
+                    let size = u64::try_from(size).map_err(|_| {
+                        conversion_error(
+                            1,
+                            rusqlite::types::Type::Integer,
+                            StoreError::NegativeSize,
+                        )
+                    })?;
+                    Ok(FolderAsset {
+                        path: row.get(0)?,
+                        size,
+                        asset_id: row.get(2)?,
+                        created_at_ns: row.get(3)?,
+                    })
+                },
+            )
+            .map_err(|source| self.query_error(source))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|source| self.query_error(source))
+    }
+
+    /// When one source folder last reconciled and last uploaded, for its
+    /// detail view (#43).
+    ///
+    /// An untracked path reads as [`FolderTimes::default`], the same answer a
+    /// tracked folder that has run neither gives.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the query fails.
+    pub fn folder_times(&self, folder: &str) -> Result<FolderTimes, StoreError> {
+        let writer = self.writer()?;
+        writer
+            .query_row(
+                "SELECT last_scan_ns, last_upload_ns FROM source_folder WHERE path_key = ?1",
+                [path_key(Path::new(folder))],
+                |row| {
+                    Ok(FolderTimes {
+                        last_scan_ns: row.get(0)?,
+                        last_upload_ns: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map(Option::unwrap_or_default)
+            .map_err(|source| self.query_error(source))
+    }
+
+    /// Records that a reconciliation scan just read one source folder (#43).
+    ///
+    /// Returns whether the client holds the folder.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the write fails or the lock is poisoned.
+    pub fn record_folder_scan(&self, folder: &str, at_ns: i64) -> Result<bool, StoreError> {
+        self.record_folder_time(folder, "last_scan_ns", at_ns)
+    }
+
+    /// Records that one source folder just uploaded an asset (#43).
+    ///
+    /// Returns whether the client holds the folder.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the write fails or the lock is poisoned.
+    pub fn record_folder_upload(&self, folder: &str, at_ns: i64) -> Result<bool, StoreError> {
+        self.record_folder_time(folder, "last_upload_ns", at_ns)
+    }
+
+    /// Writes one timestamp column of the folder row `folder` names.
+    ///
+    /// The column is one of this module's two constants, never caller input,
+    /// so the statement cannot name another column.
+    fn record_folder_time(
+        &self,
+        folder: &str,
+        column: &str,
+        at_ns: i64,
+    ) -> Result<bool, StoreError> {
+        let writer = self.writer()?;
+        let changed = writer
+            .execute(
+                &format!("UPDATE source_folder SET {column} = ?1 WHERE path_key = ?2"),
+                params![at_ns, path_key(Path::new(folder))],
+            )
+            .map_err(|source| self.query_error(source))?;
+        Ok(changed > 0)
+    }
+
     /// Makes `version`'s asset the item's current version (R4.4, SPEC §5).
     ///
     /// The chain is written in one transaction: the previous current version
@@ -1805,6 +2240,156 @@ impl StateStore {
         Ok(row.flatten())
     }
 
+    /// The sync tag's backfill state, which is where a later run resumes from
+    /// (R3.7).
+    ///
+    /// A database that never ran a backfill holds no row, which reads as the
+    /// default: no cursor, nothing tagged, no completion.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the row cannot be read.
+    pub fn tag_backfill(&self) -> Result<TagBackfill, StoreError> {
+        let writer = self.writer()?;
+        let row = writer
+            .query_row(
+                "SELECT completed_ns, cursor, tagged FROM tag_backfill WHERE id = 1",
+                [],
+                |row| {
+                    Ok(TagBackfill {
+                        completed_ns: row.get(0)?,
+                        cursor: row.get(1)?,
+                        tagged: u32::try_from(row.get::<_, i64>(2)?).unwrap_or(u32::MAX),
+                    })
+                },
+            )
+            .optional()
+            .map_err(|source| self.query_error(source))?;
+        Ok(row.unwrap_or_default())
+    }
+
+    /// How many asset ids the backfill covers (R3.7): every current asset,
+    /// every old version, and every asset the server answered as a duplicate,
+    /// once each.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the count cannot be read.
+    pub fn tag_backfill_total(&self) -> Result<u32, StoreError> {
+        let writer = self.writer()?;
+        let count: i64 = writer
+            .query_row(
+                &format!("SELECT COUNT(*) FROM ({TAG_BACKFILL_IDS})"),
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|source| self.query_error(source))?;
+        Ok(u32::try_from(count).unwrap_or(u32::MAX))
+    }
+
+    /// One batch of asset ids the backfill still has to tag (R3.7): every id
+    /// after `after`, in id order, at most `limit` of them.
+    ///
+    /// `after` is the previous batch's last id, or `None` for the first batch
+    /// of a run; ids sort as text, so a cursor is just the last id a completed
+    /// batch carried. An id the server no longer holds is still in the batch:
+    /// Immich filters those out and answers `count: 0`, so one unavailable
+    /// asset must not stop the rest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the query fails.
+    pub fn tag_backfill_batch(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>, StoreError> {
+        // shortcut: every batch re-reads the ids after the cursor through one
+        // UNION, which is a few milliseconds for a photo library. A library in
+        // the millions of versions would want the two tables walked in cursor
+        // order instead.
+        let writer = self.writer()?;
+        let mut statement = writer
+            .prepare(&format!(
+                "SELECT asset_id FROM ({TAG_BACKFILL_IDS})
+                 WHERE asset_id > ?1 ORDER BY asset_id LIMIT ?2"
+            ))
+            .map_err(|source| self.query_error(source))?;
+        // `asset_id > NULL` selects nothing, so the first batch compares
+        // against the empty string: every asset id sorts after it.
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        statement
+            .query_map(params![after.unwrap_or(""), limit], |row| row.get(0))
+            .map_err(|source| self.query_error(source))?
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .map_err(|source| self.query_error(source))
+    }
+
+    /// Records one completed backfill batch (R3.7): its last id and the
+    /// running count move in one transaction.
+    ///
+    /// The transaction is what makes an interruption resume at a batch
+    /// boundary: a batch either recorded its cursor or it did not, and a
+    /// batch that is repeated after a crash is safe because tagging is
+    /// idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the transaction fails.
+    pub fn record_tag_batch(&self, cursor: &str, tagged: u32) -> Result<(), StoreError> {
+        self.write_tag_backfill(
+            "INSERT INTO tag_backfill (id, cursor, tagged) VALUES (1, ?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET cursor = excluded.cursor, tagged = excluded.tagged",
+            params![cursor, i64::from(tagged)],
+        )
+    }
+
+    /// Records that the backfill reached the end of the library (R3.7), so a
+    /// restart does not tag the whole library again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the transaction fails.
+    pub fn finish_tag_backfill(&self, completed_ns: i64) -> Result<(), StoreError> {
+        self.write_tag_backfill(
+            "INSERT INTO tag_backfill (id, completed_ns) VALUES (1, ?1)
+             ON CONFLICT(id) DO UPDATE SET completed_ns = excluded.completed_ns",
+            params![completed_ns],
+        )
+    }
+
+    /// Clears the marker, the cursor, and the count, so the next run tags the
+    /// whole library again (R3.7: "Tag existing assets now").
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the transaction fails.
+    pub fn restart_tag_backfill(&self) -> Result<(), StoreError> {
+        self.write_tag_backfill(
+            "INSERT INTO tag_backfill (id, completed_ns, cursor, tagged) VALUES (1, NULL, NULL, 0)
+             ON CONFLICT(id) DO UPDATE SET completed_ns = NULL, cursor = NULL, tagged = 0",
+            [],
+        )
+    }
+
+    /// Runs one backfill state write in a transaction of its own (R3.7).
+    fn write_tag_backfill(
+        &self,
+        sql: &str,
+        values: impl rusqlite::Params,
+    ) -> Result<(), StoreError> {
+        let mut writer = self.writer()?;
+        let transaction = writer
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| self.query_error(source))?;
+        transaction
+            .execute(sql, values)
+            .map_err(|source| self.query_error(source))?;
+        transaction
+            .commit()
+            .map_err(|source| self.query_error(source))
+    }
+
     /// The writer connection, or the poison error after a panic.
     fn writer(&self) -> Result<MutexGuard<'_, Connection>, StoreError> {
         self.writer.lock().map_err(|_| StoreError::Poisoned)
@@ -1849,7 +2434,8 @@ fn read_version(row: &rusqlite::Row<'_>) -> rusqlite::Result<Version> {
     })
 }
 
-/// Reads one `source_folder` row.
+/// Reads one `source_folder` row, with the album title the folder's own album
+/// row holds (#47).
 fn read_folder(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceFolder> {
     let scope_text: String = row.get(3)?;
     let album_scope = AlbumScope::parse(&scope_text).ok_or_else(|| {
@@ -1864,6 +2450,7 @@ fn read_folder(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceFolder> {
         recursive: row.get(1)?,
         album_mapping: row.get(2)?,
         album_scope,
+        album_title: row.get(4)?,
     })
 }
 
@@ -1985,6 +2572,27 @@ pub fn migrations_before_version_schema() -> Migrations<'static> {
 
 /// The schema migrations, in order (ADR 0005: `rusqlite_migration`).
 fn migrations() -> Migrations<'static> {
+    Migrations::new(vec![
+        M::up(SCHEMA_V1),
+        M::up_with_hook(SCHEMA_V2, backfill_path_keys),
+        M::up(SCHEMA_V3),
+        M::up(SCHEMA_V4),
+        M::up(SCHEMA_V5),
+        M::up(SCHEMA_V6),
+        M::up(SCHEMA_V7),
+        M::up(SCHEMA_V8),
+        M::up(SCHEMA_V9),
+        M::up(SCHEMA_V10),
+        M::up(SCHEMA_V11),
+        M::up(SCHEMA_V12),
+    ])
+}
+
+/// The migration list as it stood before the tag backfill state (issue #46),
+/// so an upgrade-path test can build a database at the schema the upgrade
+/// really starts from.
+#[doc(hidden)]
+pub fn migrations_before_tag_backfill() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(SCHEMA_V1),
         M::up_with_hook(SCHEMA_V2, backfill_path_keys),
@@ -2186,9 +2794,140 @@ mod migration_tests {
                 recursive: true,
                 album_mapping: false,
                 album_scope: AlbumScope::Leaf,
+                album_title: None,
             }],
             "R3.4: a folder mapped before album mapping existed reads back off, at the default \
              scope, through the whole composed migration chain"
+        );
+    }
+
+    /// #43: a database written before the folder times existed keeps its
+    /// folders, and they read as never scanned and never uploaded.
+    #[test]
+    fn the_folder_times_arrive_on_a_v10_database() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let path = temp.path().join("state.db");
+        {
+            let mut connection = Connection::open(&path).expect("open the raw database");
+            // Every schema before the folder times, including the tag backfill
+            // #46 merged first, so the composed chain has to apply V11 over
+            // rows V4 wrote.
+            Migrations::new(vec![
+                M::up(SCHEMA_V1),
+                M::up_with_hook(SCHEMA_V2, backfill_path_keys),
+                M::up(SCHEMA_V3),
+                M::up(SCHEMA_V4),
+                M::up(SCHEMA_V5),
+                M::up(SCHEMA_V6),
+                M::up(SCHEMA_V7),
+                M::up(SCHEMA_V8),
+                M::up(SCHEMA_V9),
+                M::up(SCHEMA_V10),
+            ])
+            .to_latest(&mut connection)
+            .expect("create the tenth schema");
+            connection
+                .execute(
+                    "INSERT INTO source_folder (path, path_key, recursive, album_mapping, album_scope)
+                     VALUES (?1, ?2, 1, 1, 'whole_folder')",
+                    params!["/photos", "/photos"],
+                )
+                .expect("insert the source folder");
+            drop(connection);
+        }
+
+        let store = StateStore::open(&path).expect("a v10 database must migrate");
+        assert_eq!(
+            store.folders().expect("read the folders"),
+            vec![SourceFolder {
+                path: "/photos".to_string(),
+                recursive: true,
+                album_mapping: true,
+                album_scope: AlbumScope::WholeFolder,
+                album_title: None,
+            }],
+            "the folder row and its album settings survive the chain"
+        );
+        assert_eq!(
+            store.folder_times("/photos").expect("read the times"),
+            FolderTimes::default(),
+            "a folder from before the folder times reads as never scanned and never uploaded"
+        );
+        assert!(
+            store
+                .record_folder_scan("/photos", 42)
+                .expect("record the scan"),
+            "the migrated row accepts a scan time"
+        );
+    }
+
+    /// #47: a database written before the album title existed keeps the
+    /// albums it recorded, and they read as albums named after their folders.
+    #[test]
+    fn the_album_title_arrives_on_a_v11_database() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let path = temp.path().join("state.db");
+        {
+            let mut connection = Connection::open(&path).expect("open the raw database");
+            // Every schema before the album title, so the composed chain has to
+            // apply V12 over an album row V4 wrote.
+            Migrations::new(vec![
+                M::up(SCHEMA_V1),
+                M::up_with_hook(SCHEMA_V2, backfill_path_keys),
+                M::up(SCHEMA_V3),
+                M::up(SCHEMA_V4),
+                M::up(SCHEMA_V5),
+                M::up(SCHEMA_V6),
+                M::up(SCHEMA_V7),
+                M::up(SCHEMA_V8),
+                M::up(SCHEMA_V9),
+                M::up(SCHEMA_V10),
+                M::up(SCHEMA_V11),
+            ])
+            .to_latest(&mut connection)
+            .expect("create the eleventh schema");
+            connection
+                .execute(
+                    "INSERT INTO source_folder (path, path_key, recursive, album_mapping, album_scope)
+                     VALUES (?1, ?2, 1, 1, 'whole_folder')",
+                    params!["/photos", "/photos"],
+                )
+                .expect("insert the source folder");
+            connection
+                .execute(
+                    "INSERT INTO album (folder_key, name, album_id) VALUES (?1, ?2, ?3)",
+                    params!["/photos", "photos", "album-7"],
+                )
+                .expect("insert the album");
+            drop(connection);
+        }
+
+        let store = StateStore::open(&path).expect("a v11 database must migrate");
+        assert_eq!(
+            store.album("/photos").expect("read the album"),
+            Some(Album {
+                title: None,
+                album_id: Some("album-7".to_string()),
+                rename_pending: false,
+                rename_problem: None,
+            }),
+            "#47: an album named after its folder reads as no custom title, and its id survives"
+        );
+        assert_eq!(
+            store.folders().expect("read the folders")[0].album_title,
+            None,
+            "#47: a folder from before the title existed reads back with no title"
+        );
+        store
+            .set_album_title("/photos", Some("Holiday"))
+            .expect("the migrated row accepts a title");
+        assert!(
+            store
+                .album("/photos")
+                .expect("read the album")
+                .expect("the row")
+                .rename_pending,
+            "#47: the migrated album row can ask for its rename"
         );
     }
 
@@ -2321,6 +3060,57 @@ mod migration_tests {
         assert!(
             !chain[0].is_current && chain[1].is_current,
             "the successor takes the current flag from the seeded row"
+        );
+    }
+
+    /// R3.7: a database written before the backfill state still migrates, the
+    /// rows it holds survive, and the backfill table is usable after it.
+    #[test]
+    fn the_tag_backfill_state_is_added_to_an_existing_database() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let path = temp.path().join("state.db");
+        {
+            let mut connection = Connection::open(&path).expect("open the raw database");
+            // The ninth schema: the backfill table does not exist yet.
+            migrations_before_tag_backfill()
+                .to_latest(&mut connection)
+                .expect("create the ninth schema");
+            connection
+                .execute(
+                    "INSERT INTO sync_item (path, path_key, size, mtime_ns, sha1, asset_id, state, error_class)
+                     VALUES (?1, ?2, 11, 1, ?3, 'asset-1', 'uploaded', NULL)",
+                    params![
+                        "hello.txt",
+                        "hello.txt",
+                        Sha1::from_hex("2aae6c35c94fcfb415dbe95f408b9ce91ee846ed")
+                            .expect("a hex SHA-1")
+                            .as_bytes()
+                            .as_slice(),
+                    ],
+                )
+                .expect("insert the old row");
+            drop(connection);
+        }
+
+        let store = StateStore::open(&path).expect("a v9 database must migrate");
+        let row = store.item("hello.txt").expect("read").expect("the row");
+        assert_eq!(
+            row.asset_id.as_deref(),
+            Some("asset-1"),
+            "R3.7: the existing row survives the migration"
+        );
+        assert_eq!(
+            store.tag_backfill().expect("read the backfill state"),
+            TagBackfill::default(),
+            "R3.7: a database that never ran a backfill starts with no marker"
+        );
+        store
+            .record_tag_batch("asset-1", 1)
+            .expect("the backfill table works after the migration");
+        assert_eq!(
+            store.tag_backfill_total().expect("count the library"),
+            1,
+            "the migrated row's asset is what the backfill covers"
         );
     }
 
@@ -2545,5 +3335,74 @@ mod diagnostics_read_tests {
         let (info, errors) = read.expect("the diagnostics read must not wait for the writer lock");
         info.expect("read the sqlite info while the writer is held");
         errors.expect("read the last errors while the writer is held");
+    }
+}
+
+#[cfg(test)]
+mod folder_time_tests {
+    use super::*;
+
+    fn folder(path: &str) -> SourceFolder {
+        SourceFolder {
+            path: path.to_string(),
+            recursive: true,
+            album_mapping: false,
+            album_scope: AlbumScope::Leaf,
+            album_title: None,
+        }
+    }
+
+    /// #43: the folder detail shows when the folder last scanned and last
+    /// uploaded. The times live on the folder row, so a restart keeps them.
+    #[test]
+    fn a_folder_records_when_it_last_scanned_and_uploaded() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let path = temp.path().join("state.db");
+        let store = StateStore::open(&path).expect("open the store");
+        store
+            .add_folder(&folder("/photos"))
+            .expect("add the folder");
+
+        assert_eq!(
+            store.folder_times("/photos").expect("read the times"),
+            FolderTimes::default(),
+            "a fresh folder has scanned and uploaded nothing yet"
+        );
+
+        assert!(
+            store
+                .record_folder_scan("/photos", 1_700_000_000_000_000_000)
+                .expect("record the scan"),
+            "the tracked folder's scan time is written"
+        );
+        assert!(
+            store
+                .record_folder_upload("/photos", 1_700_000_001_000_000_000)
+                .expect("record the upload"),
+            "the tracked folder's upload time is written"
+        );
+        assert!(
+            !store
+                .record_folder_scan("/elsewhere", 1)
+                .expect("an untracked path writes nothing"),
+            "a path this client does not hold has no row to time"
+        );
+        drop(store);
+
+        let reopened = StateStore::open(&path).expect("reopen the store");
+        assert_eq!(
+            reopened.folder_times("/photos").expect("read the times"),
+            FolderTimes {
+                last_scan_ns: Some(1_700_000_000_000_000_000),
+                last_upload_ns: Some(1_700_000_001_000_000_000),
+            },
+            "#43: the times survive a restart"
+        );
+        assert_eq!(
+            reopened
+                .folder_times("/elsewhere")
+                .expect("an untracked path reads as unset"),
+            FolderTimes::default()
+        );
     }
 }
