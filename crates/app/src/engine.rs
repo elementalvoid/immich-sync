@@ -943,7 +943,7 @@ impl EngineModel {
                     ),
                     // R6.1: the attempt cap is user-settable, 8 by default.
                     attempt_cap: settings.attempt_cap.max(1),
-                    // R3.7: the sync tag is opt-in and persisted.
+                    // R3.7: the sync tag is on by default; the stored setting wins.
                     tag_uploaded_assets: settings.tag_uploaded_assets,
                     ..EngineConfig::default()
                 };
