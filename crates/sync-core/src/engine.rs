@@ -2458,8 +2458,11 @@ fn folder_entry_owning<'a>(
     folders.get_mut(index)
 }
 
-/// The live entry that still holds `path`, for a caller already holding the
-/// folder lock (#43).
+/// The live entry whose folder's exact path key is `path`, for a caller already
+/// holding the folder lock (#43).
+///
+/// Unlike [`folder_entry_owning`], this matches the folder's own path key, not
+/// containment of `path`.
 fn folder_entry_mut<'a>(folders: &'a mut [FolderEntry], path: &str) -> Option<&'a mut FolderEntry> {
     let key = path_key(Path::new(path));
     folders
@@ -2882,7 +2885,9 @@ mod tests {
             })
         };
         let mut queued = 0;
-        while !shifted.load(Ordering::SeqCst) {
+        // Keep churning until at least one file reached the owner, so a
+        // descheduled main thread cannot leave the counts unexercised.
+        while !shifted.load(Ordering::SeqCst) || queued == 0 {
             inner.note_pending(&counted, None);
             inner.note_review_missing(&counted_key);
             inner.note_retrying(&item, &failure);
@@ -2906,7 +2911,6 @@ mod tests {
             }
         }
         churn.join().expect("the churn thread finished");
-        assert!(queued > 0, "#48: the counts were never exercised");
         let folders = inner.folders.lock().expect("the folder lock");
         let owner = folders
             .iter()
