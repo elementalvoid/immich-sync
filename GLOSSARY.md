@@ -143,7 +143,7 @@ The status icon in the notification area. It shows sync state and it opens the c
 _Avoid_: system tray, notification icon
 
 **Folder status**:
-The sync state of one source folder. The dashboard shows one card per source folder.
+The sync state of one source folder. The dashboard shows one card per source folder, and the folder detail renders the same status in full.
 _Avoid_: folder state, folder progress
 
 **Folder setup**:

@@ -167,6 +167,9 @@ pub struct FolderPanel {
     /// Whether the removal is in flight: the dialog closes when the folder
     /// leaves the status, so a failed write keeps it open.
     removing: bool,
+    /// The removal request this dialog waits for, so a status poll that lands
+    /// while the write is in flight is not read as its answer (#43).
+    remove_request: Option<u64>,
     /// What "Open folder" runs (#43).
     opener: FolderOpener,
     focus: FocusHandle,
@@ -197,6 +200,7 @@ impl FolderPanel {
             gone: false,
             confirming: false,
             removing: false,
+            remove_request: None,
             opener: Arc::new(open_in_file_manager),
             focus,
             confirm_focus: cx.focus_handle(),
@@ -237,6 +241,7 @@ impl FolderPanel {
             gone: false,
             confirming: false,
             removing: false,
+            remove_request: None,
             opener,
             focus,
             confirm_focus,
@@ -278,6 +283,9 @@ impl FolderPanel {
                 if self.removing && self.gone {
                     cx.emit(FolderPanelEvent::Closed);
                     return;
+                }
+                if self.removing {
+                    self.apply_remove_result(engine, cx);
                 }
                 cx.notify();
             }
@@ -361,6 +369,27 @@ impl FolderPanel {
         cx.notify();
     }
 
+    /// Applies this dialog's own removal answer (#43).
+    ///
+    /// The engine answers the request that asked, not the newest status, so a
+    /// status poll that lands while the write is in flight cannot be mistaken
+    /// for the refusal. A refused Remove would otherwise leave `removing` set
+    /// forever: the button would stay disabled and say nothing.
+    fn apply_remove_result(&mut self, engine: &Entity<EngineModel>, cx: &Context<Self>) {
+        let Some(request) = self.remove_request else {
+            return;
+        };
+        let Some(result) = engine.read(cx).folder_remove_result() else {
+            return;
+        };
+        if result.request != request {
+            return;
+        }
+        self.problem = result.problem.clone();
+        self.remove_request = None;
+        self.removing = false;
+    }
+
     /// The first Remove: shows the inline confirmation and gives it the
     /// keyboard (#43).
     fn ask_remove(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -378,9 +407,11 @@ impl FolderPanel {
         self.removing = true;
         self.confirming = false;
         let path = self.draft.path.clone();
-        self.engine
-            .clone()
-            .update(cx, |model, cx| model.remove_folder(path, cx));
+        self.remove_request = Some(
+            self.engine
+                .clone()
+                .update(cx, |model, cx| model.remove_folder(path, cx)),
+        );
         cx.notify();
     }
 
@@ -624,15 +655,18 @@ impl FolderPanel {
         );
         let percent = format!("{}%", (progress.clamp(0.0, 1.0) * 100.0).round() as u32);
 
-        let mut body = div()
-            .id("folder-detail-body")
+        // #43: while the Remove confirmation shows, the normal body dims and
+        // the confirmation owns the keyboard. The opacity sits on this inner
+        // wrapper, never on the whole body: a child inherits its parent's
+        // opacity, so a confirmation appended to a dimmed body is dimmed with
+        // it and hard to read.
+        let inner = div()
+            .id("folder-detail-body-dim")
             .test_support()
             .flex()
             .flex_col()
             .gap_3()
             .w_full()
-            // #43: while the Remove confirmation shows, the body dims and the
-            // confirmation owns the keyboard.
             .when(self.confirming, |this| this.opacity(0.4))
             .child(
                 div()
@@ -803,7 +837,19 @@ impl FolderPanel {
                                 this.ask_remove(window, cx);
                             })),
                     ),
-            )
+            );
+
+        let mut body = div()
+            .id("folder-detail-body")
+            .test_support()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .w_full()
+            .child(inner)
+            // The problem notice and the confirmation are the dialog's answers,
+            // not body content: they stay outside the dimmed wrapper, so a
+            // refused Remove is readable while its confirmation is up.
             .when_some(self.problem.clone(), |this, problem| {
                 this.child(notice(
                     "folder-panel-problem",

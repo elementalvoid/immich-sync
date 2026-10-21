@@ -55,8 +55,8 @@ pub struct Dashboard {
     panel: Option<Entity<FolderPanel>>,
     panel_subscription: Option<Subscription>,
     /// Where focus goes back to when the detail closes: the card's Details
-    /// anchor (#43).
-    detail_return: Option<FocusHandle>,
+    /// anchor and the folder's stored path (#43).
+    detail_return: Option<(String, FocusHandle)>,
     /// One focus anchor per folder card, keyed by the stored path so a removal
     /// cannot shift a deleted folder's focus onto its neighbour (#43).
     card_focus: HashMap<String, FocusHandle>,
@@ -239,9 +239,8 @@ impl Dashboard {
     /// settings in one request when the user presses Add, and a Cancel drops
     /// the draft.
     fn open_folder_setup(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
-        // One setup at a time: a delayed Enter (the input's `PressEnter` can
-        // arrive a frame after the raw key event) must not replace a dialog
-        // whose Add is already in flight.
+        // One setup at a time: a second Add must not replace a dialog that is
+        // already open, whose request may still be in flight.
         if self.panel.is_some() {
             return;
         }
@@ -284,7 +283,7 @@ impl Dashboard {
                 this.panel_event(event, window, cx);
             },
         );
-        self.detail_return = Some(self.details_focus(&path, cx).tab_stop(false));
+        self.detail_return = Some((path.clone(), self.details_focus(&path, cx).tab_stop(false)));
         self.panel = Some(panel);
         self.panel_subscription = Some(subscription);
         window.focus(&focus, cx);
@@ -330,6 +329,10 @@ impl Dashboard {
             FolderPanelEvent::Closed => self.close_folder_detail(window, cx),
             FolderPanelEvent::Open(mode, folder) => {
                 self.close_folder_detail(window, cx);
+                // #43 follow-up: the new surface opens without the keyboard,
+                // because focus moves into a view the dashboard does not own.
+                // Moving it into that view's folder filter needs a focus handle
+                // per view; recorded, not done here.
                 cx.emit(DashboardEvent::OpenView(*mode, folder.clone()));
             }
         }
@@ -348,15 +351,28 @@ impl Dashboard {
     }
 
     /// Closes the detail dialog and puts focus back on the folder's card
-    /// (#43).
+    /// (#43), or on the folder field when the card is gone.
     fn close_folder_detail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.panel = None;
         self.panel_subscription = None;
-        if let Some(anchor) = self.detail_return.take() {
-            // The anchor is not a tab stop of its own: its first tab stop is
-            // the card's Details control.
-            window.focus(&anchor, cx);
-            window.focus_next(cx);
+        if let Some((path, anchor)) = self.detail_return.take() {
+            if self
+                .model
+                .folders
+                .iter()
+                .any(|card| card.path.as_deref() == Some(path.as_str()))
+            {
+                // The anchor is not a tab stop of its own: its first tab stop is
+                // the card's Details control.
+                window.focus(&anchor, cx);
+                window.focus_next(cx);
+            } else if let Some(input) = self.folder_input.clone() {
+                // A successful Remove took the card with it, so the card's
+                // anchor renders nowhere: the keyboard goes to the folder field
+                // instead of landing on nothing (#43).
+                let focus = input.read(cx).focus_handle(cx);
+                window.focus(&focus, cx);
+            }
         }
         cx.notify();
     }

@@ -1159,39 +1159,46 @@ impl EngineInner {
 
     /// Records one finished item against its folder and releases its claim.
     fn finish_item(&self, item: &PreparedItem, outcome: &UploadOutcome) {
-        let folder_index = self.folder_index_for(&item.path);
+        // #43: the owning folder is resolved once, by path, and the store write
+        // and the live update both name it that way. `remove_folder` retains
+        // the list, so an index cannot survive between the two.
+        let folder_path = {
+            let folders = self.folders.lock().expect("the folder lock");
+            folder_index_in(&folders, &item.path).map(|index| folders[index].folder.path.clone())
+        };
         // #43: Created and Duplicate are both terminal successes (R3.2), and
         // the folder detail shows when this folder last uploaded one. The store
         // write runs before the folder lock is taken, so it can never hold the
         // lock the status read needs (N2).
         let uploaded_ns = match outcome {
-            UploadOutcome::Created { .. } | UploadOutcome::Duplicate { .. } => {
-                folder_index.and_then(|index| record_folder_time(self, index, FolderMoment::Upload))
-            }
+            UploadOutcome::Created { .. } | UploadOutcome::Duplicate { .. } => folder_path
+                .as_deref()
+                .map(|folder| record_folder_time(self, folder, FolderMoment::Upload)),
             _ => None,
         };
-        if let Some(index) = folder_index {
+        if let Some(folder) = folder_path.as_deref() {
             let mut folders = self.folders.lock().expect("the folder lock");
-            let entry = &mut folders[index];
-            match outcome {
-                UploadOutcome::Created { .. } | UploadOutcome::Duplicate { .. } => {
-                    entry.counts.pending = entry.counts.pending.saturating_sub(1);
-                    entry.counts.uploaded += 1;
-                    // R8.2: a later success clears the parked error, so a
-                    // transient failure does not read as attention for a full
-                    // scan interval.
-                    entry.last_error = None;
-                    if let Some(at_ns) = uploaded_ns {
-                        entry.last_upload_ns = Some(at_ns);
+            if let Some(entry) = folder_entry_mut(&mut folders, folder) {
+                match outcome {
+                    UploadOutcome::Created { .. } | UploadOutcome::Duplicate { .. } => {
+                        entry.counts.pending = entry.counts.pending.saturating_sub(1);
+                        entry.counts.uploaded += 1;
+                        // R8.2: a later success clears the parked error, so a
+                        // transient failure does not read as attention for a full
+                        // scan interval.
+                        entry.last_error = None;
+                        if let Some(at_ns) = uploaded_ns {
+                            entry.last_upload_ns = Some(at_ns);
+                        }
                     }
+                    UploadOutcome::Failed(failure) | UploadOutcome::DeadLetter(failure) => {
+                        entry.counts.pending = entry.counts.pending.saturating_sub(1);
+                        entry.counts.failed += 1;
+                        entry.last_error = Some(failure_text(failure));
+                    }
+                    // Deferred keeps the item queued and its pending count.
+                    UploadOutcome::Deferred => {}
                 }
-                UploadOutcome::Failed(failure) | UploadOutcome::DeadLetter(failure) => {
-                    entry.counts.pending = entry.counts.pending.saturating_sub(1);
-                    entry.counts.failed += 1;
-                    entry.last_error = Some(failure_text(failure));
-                }
-                // Deferred keeps the item queued and its pending count.
-                UploadOutcome::Deferred => {}
             }
             // R8.2: the tray card reads the global copy, so a success that
             // recovers every folder must clear it too.
@@ -2331,26 +2338,14 @@ fn has_present_content_twin(inner: &EngineInner, row: &ItemRecord) -> bool {
 
 /// Records that a reconciliation scan just read `path`, and publishes it
 /// (#43).
+///
+/// The folder is named by its path key throughout: `remove_folder` retains the
+/// list, so an index resolved under one lock can name another folder by the
+/// time it is used again.
 fn note_folder_scanned(inner: &EngineInner, path: &str) {
-    let key = path_key(Path::new(path));
-    let Some(index) = inner
-        .folders
-        .lock()
-        .expect("the folder lock")
-        .iter()
-        .position(|entry| path_key(Path::new(&entry.folder.path)) == key)
-    else {
-        return;
-    };
-    let Some(at_ns) = record_folder_time(inner, index, FolderMoment::Scan) else {
-        return;
-    };
-    if let Some(entry) = inner
-        .folders
-        .lock()
-        .expect("the folder lock")
-        .get_mut(index)
-    {
+    let at_ns = record_folder_time(inner, path, FolderMoment::Scan);
+    let mut folders = inner.folders.lock().expect("the folder lock");
+    if let Some(entry) = folder_entry_mut(&mut folders, path) {
         entry.last_scan_ns = Some(at_ns);
     }
 }
@@ -2382,26 +2377,28 @@ enum FolderMoment {
     Upload,
 }
 
+/// The live entry that still holds `path`, for a caller already holding the
+/// folder lock (#43).
+fn folder_entry_mut<'a>(folders: &'a mut [FolderEntry], path: &str) -> Option<&'a mut FolderEntry> {
+    let key = path_key(Path::new(path));
+    folders
+        .iter_mut()
+        .find(|entry| path_key(Path::new(&entry.folder.path)) == key)
+}
+
 /// Writes one folder timestamp to the store and returns when it happened
 /// (#43).
 ///
-/// The folder path is read under the lock and released before the write, so a
-/// slow store write never holds the folder lock the status read needs (N2).
-/// The caller publishes the returned time on the live entry, because the
-/// observation stands even when the write failed.
-fn record_folder_time(inner: &EngineInner, index: usize, moment: FolderMoment) -> Option<i64> {
-    let path = inner
-        .folders
-        .lock()
-        .expect("the folder lock")
-        .get(index)?
-        .folder
-        .path
-        .clone();
+/// The folder is named by its path key, so a removal that shifts the live list
+/// can never record the time on another folder's row (R2.1). The write runs
+/// without the folder lock, so a slow store never holds the lock the status
+/// read needs (N2). The caller publishes the returned time on the live entry,
+/// because the observation stands even when the write failed.
+fn record_folder_time(inner: &EngineInner, path: &str, moment: FolderMoment) -> i64 {
     let at_ns = now_ns();
     let stored = match moment {
-        FolderMoment::Scan => inner.store.record_folder_scan(&path, at_ns),
-        FolderMoment::Upload => inner.store.record_folder_upload(&path, at_ns),
+        FolderMoment::Scan => inner.store.record_folder_scan(path, at_ns),
+        FolderMoment::Upload => inner.store.record_folder_upload(path, at_ns),
     };
     if let Err(error) = stored {
         tracing::warn!(
@@ -2410,7 +2407,7 @@ fn record_folder_time(inner: &EngineInner, index: usize, moment: FolderMoment) -
             "the folder time could not be recorded"
         );
     }
-    Some(at_ns)
+    at_ns
 }
 
 /// Clears the global last-error once no folder holds one, so the tray card
@@ -2600,6 +2597,116 @@ mod tests {
             );
         }
         churn.join().expect("the churn thread finished");
+    }
+
+    /// #43: a scan time lands on the folder the scan read, never on whichever
+    /// entry occupies its index after a removal.
+    ///
+    /// `remove_folder` retains the list, so every entry above the removal moves
+    /// down one. `note_folder_scanned` resolved the folder's index, released
+    /// the lock, and let `record_folder_time` read that index again: with
+    /// folders `[a, b, c]`, a scan of `b` that meets the removal of `a` in
+    /// between writes the time on `c`'s row. The list is shifted under the
+    /// lookup until it meets that interleaving; the write is keyed by path, so
+    /// no other folder can carry the time.
+    #[test]
+    fn a_removal_cannot_shift_the_folder_a_scan_time_is_recorded_on() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let store =
+            Arc::new(StateStore::open(temp.path().join("state.db")).expect("open the state store"));
+        let mut dirs = Vec::new();
+        for name in ["a", "b", "c"] {
+            let dir = temp.path().join(name);
+            std::fs::create_dir_all(&dir).expect("create the folder");
+            store
+                .add_folder(&SourceFolder {
+                    path: dir.display().to_string(),
+                    recursive: true,
+                    album_mapping: false,
+                    album_scope: AlbumScope::default(),
+                })
+                .expect("add the folder");
+            dirs.push(dir);
+        }
+        // The session is never used: this test sends no request.
+        let session = crate::connection::Connection::new(
+            "http://127.0.0.1:1",
+            Arc::new(crate::credential::MemoryCredentialStore::new()),
+        )
+        .expect("a valid URL")
+        .shared();
+        let engine = Engine::new(
+            Arc::new(Tracking::new(Arc::clone(&store))),
+            session,
+            EngineConfig::default(),
+        )
+        .expect("build the engine");
+        let inner = Arc::clone(&engine.inner);
+        let scanned = dirs[1].display().to_string();
+        let untouched: Vec<String> = [&dirs[0], &dirs[2]]
+            .iter()
+            .map(|dir| dir.display().to_string())
+            .collect();
+        assert_eq!(
+            inner.folder_index_for(&dirs[1].join("photo.jpg")),
+            Some(1),
+            "the list is [a, b, c] and the middle entry was scanned"
+        );
+
+        let shifted = Arc::new(AtomicBool::new(false));
+        let churn = {
+            let inner = Arc::clone(&inner);
+            let shifted = Arc::clone(&shifted);
+            std::thread::spawn(move || {
+                for _ in 0..500 {
+                    // What `remove_folder`'s retain does to the list, and the
+                    // re-add that restores `a` in front of `b` so the shift
+                    // recurs instead of happening once.
+                    let removed = inner.folders.lock().expect("the folder lock").remove(0);
+                    // Out of the list long enough for a lookup to meet it.
+                    std::thread::sleep(Duration::from_micros(100));
+                    inner
+                        .folders
+                        .lock()
+                        .expect("the folder lock")
+                        .insert(0, removed);
+                }
+                shifted.store(true, Ordering::SeqCst);
+            })
+        };
+        while !shifted.load(Ordering::SeqCst) {
+            note_folder_scanned(&inner, &scanned);
+            // The live entries are the second write: the old path resolved the
+            // index again after the store write, so a shift during that write
+            // publishes the time on another folder's entry.
+            let folders = inner.folders.lock().expect("the folder lock");
+            for entry in folders.iter().filter(|entry| entry.folder.path != scanned) {
+                assert_eq!(
+                    entry.last_scan_ns, None,
+                    "#43: a removal shifted the scan time onto {}",
+                    entry.folder.path
+                );
+            }
+        }
+        churn.join().expect("the churn thread finished");
+        for path in &untouched {
+            assert_eq!(
+                store
+                    .folder_times(path)
+                    .expect("read the folder times")
+                    .last_scan_ns,
+                None,
+                "#43: a removal shifted the stored scan time onto another folder"
+            );
+        }
+        assert!(
+            store
+                .folder_times(&scanned)
+                .expect("read the folder times")
+                .last_scan_ns
+                .is_some(),
+            "#43: the folder the scan read keeps its own time"
+        );
     }
 
     #[test]

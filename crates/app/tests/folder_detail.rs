@@ -528,6 +528,19 @@ async fn escape_the_backdrop_and_the_close_control_all_close_the_detail(cx: &mut
             "the card keeps the keyboard after the backdrop closes it"
         );
     });
+
+    // #43: a click on a non-control area inside the dialog is not a backdrop
+    // click: the card is a mouse barrier above it.
+    open_detail_now(cx, window);
+    act(cx, window, |window, cx| {
+        window.click("folder-detail-counts", cx)
+    });
+    read(cx, window, |window, _| {
+        assert!(
+            detail_open(window),
+            "a click inside the dialog on its text does not dismiss it"
+        );
+    });
 }
 
 #[gpui_kit::test]
@@ -701,6 +714,24 @@ async fn the_remove_confirmation_asks_twice_and_says_what_stays_on_the_server(
             Some(true),
             "#43: the confirmation takes the keyboard"
         );
+        // #43: the dimming is structural. Only the normal body is dimmed, so
+        // the confirmation the user must read and act on keeps its contrast.
+        // The harness observes structure, not opacity, so the tree is what the
+        // test can pin: the confirmation is not a child of the dimmed element.
+        assert!(
+            window
+                .within("folder-detail-body-dim")
+                .try_find("folder-detail-confirm")
+                .is_none(),
+            "#43: the confirmation is not inside the dimmed body"
+        );
+        assert!(
+            window
+                .within("folder-detail-body")
+                .try_find("folder-detail-confirm")
+                .is_some(),
+            "#43: the confirmation still sits in the dialog body"
+        );
     });
 
     // Escape cancels the confirmation only, not the dialog.
@@ -755,6 +786,75 @@ async fn the_remove_confirmation_asks_twice_and_says_what_stays_on_the_server(
         window.try_find("folder-panel").is_none()
     })
     .await;
+    read(cx, window, |window, _| {
+        assert_eq!(
+            window.find("dashboard-folder-path").focused(),
+            Some(true),
+            "#43: with no card left to return to, the keyboard goes to the folder field"
+        );
+    });
+}
+
+/// #43: a Remove the store refuses keeps the dialog open, says why, and leaves
+/// the button usable instead of stuck on `Removing…` forever.
+#[gpui_kit::test]
+async fn a_refused_remove_keeps_the_detail_open_with_its_reason(cx: &mut TestAppContext) {
+    // A worker thread wakes the foreground executor, which the harness
+    // permits only in parking mode.
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+    seed_folder(&paths, &photos, true);
+    let (window, store, _view) = open_dashboard(cx, &paths);
+    wait_for_store(cx, &store).await;
+
+    open_detail_now(cx, window);
+    // Refuse only the delete: every read the dialog makes still answers, so the
+    // detail sees a folder that stays and a store that said no.
+    {
+        let raw = rusqlite::Connection::open(&paths.state_db).expect("open the database directly");
+        raw.execute_batch(
+            "CREATE TRIGGER refuse_folder_removal BEFORE DELETE ON source_folder
+             BEGIN SELECT RAISE(ABORT, 'the state database refused the removal'); END;",
+        )
+        .expect("install a trigger that refuses the delete");
+    }
+
+    act(cx, window, |window, cx| {
+        window.click("folder-detail-remove", cx)
+    });
+    act(cx, window, |window, cx| {
+        window.click("folder-detail-remove-confirm", cx);
+    });
+
+    cx.wait_for(window, Duration::from_secs(10), |window, _| {
+        window.try_find("folder-panel-problem").is_some()
+    })
+    .await;
+    read(cx, window, |window, _| {
+        let problem = label(window, "folder-panel-problem");
+        assert!(
+            problem.contains("refused the removal"),
+            "#43: the detail shows why the removal was refused, not only that it stopped: {problem}"
+        );
+        assert!(
+            detail_open(window),
+            "#43: a refused Remove keeps the dialog open"
+        );
+    });
+    // The button is usable again, not stuck on Removing…: a disabled control
+    // ignores the click, so the confirmation appearing is what proves it.
+    act(cx, window, |window, cx| {
+        window.click("folder-detail-remove", cx)
+    });
+    read(cx, window, |window, _| {
+        assert!(
+            window.try_find("folder-detail-confirm").is_some(),
+            "#43: Remove works again after the refusal, so the user can retry"
+        );
+    });
 }
 
 #[gpui_kit::test]

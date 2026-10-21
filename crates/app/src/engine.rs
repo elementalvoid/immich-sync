@@ -82,6 +82,8 @@ pub struct EngineModel {
     problem: Option<String>,
     /// The newest folder-setup outcome, for the add dialog (#40).
     folder_add: Option<FolderAddResult>,
+    /// The newest folder-removal outcome, for the folder detail (#43).
+    folder_remove: Option<FolderRemoveResult>,
     /// Bumped by every setup-dialog add, kept apart from `generation` so an
     /// unrelated folder edit cannot drop the result the dialog waits for, and
     /// a slower earlier add cannot answer a newer dialog (#40).
@@ -120,6 +122,19 @@ pub struct FolderAddResult {
     /// The request this result answers.
     pub request: u64,
     /// Why nothing was written, or `None` when the folder was added.
+    pub problem: Option<String>,
+}
+
+/// The outcome of one folder removal (#43).
+///
+/// The request id lets the detail that asked recognise its own answer, so a
+/// status poll that lands while the write is still in flight cannot be read as
+/// the refusal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FolderRemoveResult {
+    /// The request this result answers.
+    pub request: u64,
+    /// Why nothing was removed, or `None` when the folder was.
     pub problem: Option<String>,
 }
 
@@ -191,6 +206,7 @@ impl EngineModel {
             paused: false,
             problem: None,
             folder_add: None,
+            folder_remove: None,
             add_generation: 0,
             generation: 0,
             start_generation: 0,
@@ -217,6 +233,12 @@ impl EngineModel {
     #[must_use]
     pub fn folder_add_result(&self) -> Option<&FolderAddResult> {
         self.folder_add.as_ref()
+    }
+
+    /// The newest folder-removal outcome, if one has arrived (#43).
+    #[must_use]
+    pub fn folder_remove_result(&self) -> Option<&FolderRemoveResult> {
+        self.folder_remove.as_ref()
     }
 
     /// The parked items the failed-items view lists (R6.5).
@@ -697,7 +719,10 @@ impl EngineModel {
     }
 
     /// Removes a source folder; its items stay in the store (R2.1).
-    pub fn remove_folder(&mut self, path: String, cx: &mut Context<Self>) {
+    ///
+    /// The returned id tags the result, so the folder detail can wait for its
+    /// own answer and stay open with the reason when the store refuses (#43).
+    pub fn remove_folder(&mut self, path: String, cx: &mut Context<Self>) -> u64 {
         // A newer edit supersedes an older result still in flight.
         self.generation = self.generation.wrapping_add(1);
         let tracking = self.store_model.read(cx).tracking();
@@ -716,22 +741,37 @@ impl EngineModel {
                 if model.generation != generation {
                     return;
                 }
-                match result {
+                let problem = match result {
                     Ok(folders) => {
                         model.store_model.update(cx, |store, cx| {
                             store.set_folders(folders, cx);
                         });
                         model.problem = None;
+                        None
                     }
-                    Err(problem) => model.problem = Some(problem),
-                }
+                    Err(problem) => {
+                        model.problem = Some(problem.clone());
+                        Some(problem)
+                    }
+                };
+                model.folder_remove = Some(FolderRemoveResult {
+                    request: generation,
+                    problem,
+                });
                 model.refresh_status(cx);
             },
         );
         if result.is_err() {
             self.problem = Some(WORKER_UNAVAILABLE.to_string());
+            // The dialog waits for its own answer, so a request that never ran
+            // still has to answer it: the reason is the missing worker (#43).
+            self.folder_remove = Some(FolderRemoveResult {
+                request: generation,
+                problem: self.problem.clone(),
+            });
             cx.notify();
         }
+        generation
     }
 
     /// Turns album mapping on or off for one source folder (R3.4).
