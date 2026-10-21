@@ -16,6 +16,11 @@
 //! permission is refused once per credential: the rest of the uploads replay
 //! that refusal instead of probing the key again, until a sign-in or re-login
 //! moves the session to a credential that may hold the permission.
+//!
+//! The same tag also backfills the assets the client uploaded before the
+//! setting was turned on ([`crate::backfill`]): one `PUT /tags/assets` carries a
+//! batch of ids, so the backfill of a whole library costs a request per few
+//! hundred assets instead of one per asset.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,6 +49,26 @@ pub struct TagStatus {
     pub enabled: bool,
     /// Why the tag is not being applied, or why the last attempt failed.
     pub problem: Option<String>,
+    /// How far the backfill over the assets that were uploaded before the tag
+    /// was turned on got (R3.7).
+    pub backfill: BackfillStatus,
+}
+
+/// The sync tag's backfill progress, as the Settings section shows it (R3.7).
+///
+/// The counters describe the pass the state database records, so a restart
+/// publishes what the last run reached before this one starts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BackfillStatus {
+    /// How many assets the recorded pass has tagged.
+    pub tagged: u32,
+    /// How many assets the pass covers: every current asset, every old
+    /// version, and every asset the server answered as a duplicate.
+    pub total: u32,
+    /// Whether a pass is running right now.
+    pub running: bool,
+    /// Whether a pass reached the end of the library and recorded that.
+    pub completed: bool,
 }
 
 /// Why the sync tag could not be applied (R3.7).
@@ -118,16 +143,25 @@ impl Tagger {
     }
 
     /// What the Settings section shows (R3.7).
+    ///
+    /// The backfill's own counters are the engine's, which owns the run; this
+    /// reports only what the tagger knows on its own.
     #[must_use]
     pub fn status(&self) -> TagStatus {
         TagStatus {
             enabled: self.enabled(),
             problem: self.problem.lock().expect("the tag problem lock").clone(),
+            backfill: BackfillStatus::default(),
         }
     }
 
     /// Resolves the tag before anything is uploaded, so a missing API-key
     /// permission reaches Settings before the first asset is tagged (R3.7).
+    ///
+    /// The caller runs this once at the start of a run, and every toggle that
+    /// turns the setting on runs it again, so a tag the user deleted and
+    /// recreated in Immich is upserted again and the new id replaces the cached
+    /// one instead of a stale id being trusted (R3.7).
     ///
     /// The outcome is recorded either way; the caller has nothing to do with a
     /// failure here.
@@ -139,6 +173,10 @@ impl Tagger {
         // settled on.
         *self.refused.lock().expect("the tag refusal lock") = None;
         let epoch = self.session.auth_epoch();
+        // R3.7: the id a previous run resolved is not trusted here. Upserting
+        // costs one request per run and answers the id the tag has now, which
+        // is what makes a tag deleted and recreated in Immich work.
+        *self.tag_id.lock().await = None;
         self.record(epoch, &self.resolve().await.map(|_| ()), None);
     }
 
@@ -167,8 +205,35 @@ impl Tagger {
         if let Some(refusal) = self.refusal() {
             return Err(refusal);
         }
-        let outcome = self.apply(asset_id).await;
+        let outcome = self.apply(&[asset_id.to_string()]).await;
         self.record(epoch, &outcome, Some(asset_id));
+        outcome
+    }
+
+    /// Adds the sync tag to a batch of settled assets with one
+    /// `PUT /tags/assets` (R3.7).
+    ///
+    /// This is the backfill's entry point: the ids are added in one request,
+    /// which the server applies to every asset it still holds. Tagging is
+    /// idempotent, so a batch that is sent twice is safe, and an id the server
+    /// no longer has is filtered out rather than failing the batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TagError`] for a refused or unreachable request, and for an
+    /// API key that is missing one of the permissions the tag needs. The reason
+    /// stays available through [`Self::status`].
+    pub async fn tag_batch(&self, asset_ids: &[String]) -> Result<(), TagError> {
+        if !self.enabled() || asset_ids.is_empty() {
+            return Ok(());
+        }
+        // The same settled refusal an upload replays covers a batch (R3.7).
+        let epoch = self.session.auth_epoch();
+        if let Some(refusal) = self.refusal() {
+            return Err(refusal);
+        }
+        let outcome = self.apply(asset_ids).await;
+        self.record(epoch, &outcome, None);
         outcome
     }
 
@@ -189,13 +254,13 @@ impl Tagger {
             })
     }
 
-    /// Applies the tag and drops the cached id when the call fails: a refused
-    /// id may be a tag the user deleted in Immich, and the next attempt upserts
-    /// it again (R3.7).
-    async fn apply(&self, asset_id: &str) -> Result<(), TagError> {
+    /// Applies the tag to one or more assets and drops the cached id when the
+    /// call fails: a refused id may be a tag the user deleted in Immich, and
+    /// the next attempt upserts it again (R3.7).
+    async fn apply(&self, asset_ids: &[String]) -> Result<(), TagError> {
         let tag_id = self.resolve().await?;
         let client = self.session.client();
-        let asset_ids = vec![asset_id.to_string()];
+        let asset_ids = asset_ids.to_vec();
         let tagged = self
             .session
             .request(move |credential| {

@@ -895,7 +895,7 @@ log_level = \"debug\"
             std::env::consts::OS,
             std::env::consts::ARCH,
             "v3.3.1",
-            "Schema version (PRAGMA user_version): 9",
+            "Schema version (PRAGMA user_version): 10",
         ] {
             assert!(
                 versions.contains(expected),

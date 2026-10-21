@@ -183,8 +183,56 @@ SELECT id, asset_id, sha1, mtime_ns, 1 FROM sync_item WHERE asset_id IS NOT NULL
 /// the count and the review list.
 const SCHEMA_V9: &str = "CREATE INDEX sync_item_state ON sync_item(state);";
 
+/// The tenth schema (issue #46): how far the sync tag's backfill got (R3.7).
+///
+/// One row, so the state cannot disagree with itself. `cursor` is the last
+/// asset id a completed `PUT /tags/assets` batch carried, and the next run
+/// continues after it instead of tagging the whole library again; `tagged` is
+/// how many assets the recorded pass has tagged; `completed_ns` is the marker
+/// that keeps a restart from starting a finished backfill over.
+///
+/// The table starts empty and every write creates its row, so a build that
+/// upgraded and one that never had a backfill read the same defaults.
+const SCHEMA_V10: &str = "
+CREATE TABLE tag_backfill (
+    id           INTEGER PRIMARY KEY CHECK (id = 1),
+    completed_ns INTEGER,
+    cursor       TEXT,
+    tagged       INTEGER NOT NULL DEFAULT 0
+);
+";
+
 /// How long the one writer waits for a competing lock before failing.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How far the sync tag's backfill got (R3.7, SPEC §5).
+///
+/// The whole state of the backfill is these three values: where a later run
+/// resumes, how much the recorded pass has tagged, and whether it finished.
+/// The library it covers is the union of every asset the state holds: each
+/// item's current asset, every old version, and every asset the server
+/// answered as a duplicate.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TagBackfill {
+    /// When a full pass last finished, or `None` while it is unfinished.
+    pub completed_ns: Option<i64>,
+    /// The last asset id of the last completed batch, so a later run resumes
+    /// after it.
+    pub cursor: Option<String>,
+    /// How many assets the recorded pass has tagged.
+    pub tagged: u32,
+}
+
+/// The asset ids the sync tag's backfill covers (R3.7): the asset each item
+/// points at now, plus every asset of every version chain.
+///
+/// `UNION` keeps an id the two tables share once, so tagging an item's current
+/// asset does not happen twice, and a duplicate the server answered is covered
+/// like a created asset because it is the row's asset id either way.
+const TAG_BACKFILL_IDS: &str = "
+    SELECT asset_id FROM sync_item WHERE asset_id IS NOT NULL
+    UNION
+    SELECT asset_id FROM version";
 
 /// The `sync_item` columns [`read_item`] expects, in the order it reads them.
 ///
@@ -947,7 +995,8 @@ impl StateStore {
                  DELETE FROM attempt;
                  DELETE FROM sync_item;
                  DELETE FROM album;
-                 DELETE FROM source_folder;",
+                 DELETE FROM source_folder;
+                 DELETE FROM tag_backfill;",
             )
             .map_err(|source| self.query_error(source))?;
         transaction
@@ -1833,6 +1882,156 @@ impl StateStore {
         Ok(row.flatten())
     }
 
+    /// The sync tag's backfill state, which is where a later run resumes from
+    /// (R3.7).
+    ///
+    /// A database that never ran a backfill holds no row, which reads as the
+    /// default: no cursor, nothing tagged, no completion.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the row cannot be read.
+    pub fn tag_backfill(&self) -> Result<TagBackfill, StoreError> {
+        let writer = self.writer()?;
+        let row = writer
+            .query_row(
+                "SELECT completed_ns, cursor, tagged FROM tag_backfill WHERE id = 1",
+                [],
+                |row| {
+                    Ok(TagBackfill {
+                        completed_ns: row.get(0)?,
+                        cursor: row.get(1)?,
+                        tagged: u32::try_from(row.get::<_, i64>(2)?).unwrap_or(u32::MAX),
+                    })
+                },
+            )
+            .optional()
+            .map_err(|source| self.query_error(source))?;
+        Ok(row.unwrap_or_default())
+    }
+
+    /// How many asset ids the backfill covers (R3.7): every current asset,
+    /// every old version, and every asset the server answered as a duplicate,
+    /// once each.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the count cannot be read.
+    pub fn tag_backfill_total(&self) -> Result<u32, StoreError> {
+        let writer = self.writer()?;
+        let count: i64 = writer
+            .query_row(
+                &format!("SELECT COUNT(*) FROM ({TAG_BACKFILL_IDS})"),
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|source| self.query_error(source))?;
+        Ok(u32::try_from(count).unwrap_or(u32::MAX))
+    }
+
+    /// One batch of asset ids the backfill still has to tag (R3.7): every id
+    /// after `after`, in id order, at most `limit` of them.
+    ///
+    /// `after` is the previous batch's last id, or `None` for the first batch
+    /// of a run; ids sort as text, so a cursor is just the last id a completed
+    /// batch carried. An id the server no longer holds is still in the batch:
+    /// Immich filters those out and answers `count: 0`, so one unavailable
+    /// asset must not stop the rest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the query fails.
+    pub fn tag_backfill_batch(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>, StoreError> {
+        // shortcut: every batch re-reads the ids after the cursor through one
+        // UNION, which is a few milliseconds for a photo library. A library in
+        // the millions of versions would want the two tables walked in cursor
+        // order instead.
+        let writer = self.writer()?;
+        let mut statement = writer
+            .prepare(&format!(
+                "SELECT asset_id FROM ({TAG_BACKFILL_IDS})
+                 WHERE asset_id > ?1 ORDER BY asset_id LIMIT ?2"
+            ))
+            .map_err(|source| self.query_error(source))?;
+        // `asset_id > NULL` selects nothing, so the first batch compares
+        // against the empty string: every asset id sorts after it.
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        statement
+            .query_map(params![after.unwrap_or(""), limit], |row| row.get(0))
+            .map_err(|source| self.query_error(source))?
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .map_err(|source| self.query_error(source))
+    }
+
+    /// Records one completed backfill batch (R3.7): its last id and the
+    /// running count move in one transaction.
+    ///
+    /// The transaction is what makes an interruption resume at a batch
+    /// boundary: a batch either recorded its cursor or it did not, and a
+    /// batch that is repeated after a crash is safe because tagging is
+    /// idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the transaction fails.
+    pub fn record_tag_batch(&self, cursor: &str, tagged: u32) -> Result<(), StoreError> {
+        self.write_tag_backfill(
+            "INSERT INTO tag_backfill (id, cursor, tagged) VALUES (1, ?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET cursor = excluded.cursor, tagged = excluded.tagged",
+            params![cursor, i64::from(tagged)],
+        )
+    }
+
+    /// Records that the backfill reached the end of the library (R3.7), so a
+    /// restart does not tag the whole library again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the transaction fails.
+    pub fn finish_tag_backfill(&self, completed_ns: i64) -> Result<(), StoreError> {
+        self.write_tag_backfill(
+            "INSERT INTO tag_backfill (id, completed_ns) VALUES (1, ?1)
+             ON CONFLICT(id) DO UPDATE SET completed_ns = excluded.completed_ns",
+            params![completed_ns],
+        )
+    }
+
+    /// Clears the marker, the cursor, and the count, so the next run tags the
+    /// whole library again (R3.7: "Tag existing assets now").
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the transaction fails.
+    pub fn restart_tag_backfill(&self) -> Result<(), StoreError> {
+        self.write_tag_backfill(
+            "INSERT INTO tag_backfill (id, completed_ns, cursor, tagged) VALUES (1, NULL, NULL, 0)
+             ON CONFLICT(id) DO UPDATE SET completed_ns = NULL, cursor = NULL, tagged = 0",
+            [],
+        )
+    }
+
+    /// Runs one backfill state write in a transaction of its own (R3.7).
+    fn write_tag_backfill(
+        &self,
+        sql: &str,
+        values: impl rusqlite::Params,
+    ) -> Result<(), StoreError> {
+        let mut writer = self.writer()?;
+        let transaction = writer
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| self.query_error(source))?;
+        transaction
+            .execute(sql, values)
+            .map_err(|source| self.query_error(source))?;
+        transaction
+            .commit()
+            .map_err(|source| self.query_error(source))
+    }
+
     /// The writer connection, or the poison error after a panic.
     fn writer(&self) -> Result<MutexGuard<'_, Connection>, StoreError> {
         self.writer.lock().map_err(|_| StoreError::Poisoned)
@@ -2013,6 +2212,25 @@ pub fn migrations_before_version_schema() -> Migrations<'static> {
 
 /// The schema migrations, in order (ADR 0005: `rusqlite_migration`).
 fn migrations() -> Migrations<'static> {
+    Migrations::new(vec![
+        M::up(SCHEMA_V1),
+        M::up_with_hook(SCHEMA_V2, backfill_path_keys),
+        M::up(SCHEMA_V3),
+        M::up(SCHEMA_V4),
+        M::up(SCHEMA_V5),
+        M::up(SCHEMA_V6),
+        M::up(SCHEMA_V7),
+        M::up(SCHEMA_V8),
+        M::up(SCHEMA_V9),
+        M::up(SCHEMA_V10),
+    ])
+}
+
+/// The migration list as it stood before the tag backfill state (issue #46),
+/// so an upgrade-path test can build a database at the schema the upgrade
+/// really starts from.
+#[doc(hidden)]
+pub fn migrations_before_tag_backfill() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(SCHEMA_V1),
         M::up_with_hook(SCHEMA_V2, backfill_path_keys),
@@ -2349,6 +2567,57 @@ mod migration_tests {
         assert!(
             !chain[0].is_current && chain[1].is_current,
             "the successor takes the current flag from the seeded row"
+        );
+    }
+
+    /// R3.7: a database written before the backfill state still migrates, the
+    /// rows it holds survive, and the backfill table is usable after it.
+    #[test]
+    fn the_tag_backfill_state_is_added_to_an_existing_database() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let path = temp.path().join("state.db");
+        {
+            let mut connection = Connection::open(&path).expect("open the raw database");
+            // The ninth schema: the backfill table does not exist yet.
+            migrations_before_tag_backfill()
+                .to_latest(&mut connection)
+                .expect("create the ninth schema");
+            connection
+                .execute(
+                    "INSERT INTO sync_item (path, path_key, size, mtime_ns, sha1, asset_id, state, error_class)
+                     VALUES (?1, ?2, 11, 1, ?3, 'asset-1', 'uploaded', NULL)",
+                    params![
+                        "hello.txt",
+                        "hello.txt",
+                        Sha1::from_hex("2aae6c35c94fcfb415dbe95f408b9ce91ee846ed")
+                            .expect("a hex SHA-1")
+                            .as_bytes()
+                            .as_slice(),
+                    ],
+                )
+                .expect("insert the old row");
+            drop(connection);
+        }
+
+        let store = StateStore::open(&path).expect("a v9 database must migrate");
+        let row = store.item("hello.txt").expect("read").expect("the row");
+        assert_eq!(
+            row.asset_id.as_deref(),
+            Some("asset-1"),
+            "R3.7: the existing row survives the migration"
+        );
+        assert_eq!(
+            store.tag_backfill().expect("read the backfill state"),
+            TagBackfill::default(),
+            "R3.7: a database that never ran a backfill starts with no marker"
+        );
+        store
+            .record_tag_batch("asset-1", 1)
+            .expect("the backfill table works after the migration");
+        assert_eq!(
+            store.tag_backfill_total().expect("count the library"),
+            1,
+            "the migrated row's asset is what the backfill covers"
         );
     }
 
