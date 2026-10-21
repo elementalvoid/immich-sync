@@ -1123,15 +1123,10 @@ impl EngineInner {
             .map(|entry| PathBuf::from(&entry.folder.path))
     }
 
-    /// The folder entry that contains `path`.
-    fn folder_index_for(&self, path: &Path) -> Option<usize> {
-        folder_index_in(&self.folders.lock().expect("the folder lock"), path)
-    }
-
     /// The meter of the folder that owns `path` (R8.1).
     ///
     /// The owning folder is the first entry that contains the path, as
-    /// [`Self::folder_index_for`] decides, so the path is metered once.
+    /// [`folder_index_in`] decides, so the path is metered once.
     ///
     /// Note for #44: the pending count seeds from a pure prefix query, so a
     /// file under a folder and one of its subfolders is counted on both cards
@@ -1172,33 +1167,37 @@ impl EngineInner {
     /// A missing row whose file came back leaves the review the same way
     /// (R5.1), so the tray's count follows it down.
     fn note_pending(&self, path: &Path, previous: Option<ItemState>) {
-        if let Some(index) = self.folder_index_for(path) {
-            let mut folders = self.folders.lock().expect("the folder lock");
-            let counts = &mut folders[index].counts;
-            match previous {
-                Some(ItemState::RetryWait) => counts.failed = counts.failed.saturating_sub(1),
-                Some(ItemState::Missing) => counts.review = counts.review.saturating_sub(1),
-                _ => {}
-            }
-            counts.pending += 1;
+        // #48: one guard for the owner and its counts. Resolving the owner under
+        // one lock and indexing the live list under another lets a removal move
+        // the entries in between, so the file is counted on another folder's
+        // card, or past the end of the shortened list.
+        let mut folders = self.folders.lock().expect("the folder lock");
+        let Some(entry) = folder_entry_owning(&mut folders, path) else {
+            return;
+        };
+        let counts = &mut entry.counts;
+        match previous {
+            Some(ItemState::RetryWait) => counts.failed = counts.failed.saturating_sub(1),
+            Some(ItemState::Missing) => counts.review = counts.review.saturating_sub(1),
+            _ => {}
         }
+        counts.pending += 1;
     }
 
     /// Records that one item left the review by a decision (R5.3, R5.4).
     fn note_review_decided(&self, path: &str) {
-        if let Some(index) = self.folder_index_for(Path::new(path)) {
-            let mut folders = self.folders.lock().expect("the folder lock");
-            let counts = &mut folders[index].counts;
-            counts.review = counts.review.saturating_sub(1);
+        let mut folders = self.folders.lock().expect("the folder lock");
+        if let Some(entry) = folder_entry_owning(&mut folders, Path::new(path)) {
+            entry.counts.review = entry.counts.review.saturating_sub(1);
         }
     }
 
     /// Records that one item entered the review, raising the tray count
     /// (R5.4).
     fn note_review_missing(&self, path: &str) {
-        if let Some(index) = self.folder_index_for(Path::new(path)) {
-            let mut folders = self.folders.lock().expect("the folder lock");
-            folders[index].counts.review += 1;
+        let mut folders = self.folders.lock().expect("the folder lock");
+        if let Some(entry) = folder_entry_owning(&mut folders, Path::new(path)) {
+            entry.counts.review += 1;
         }
     }
 
@@ -1267,9 +1266,9 @@ impl EngineInner {
     /// Records a transient failure that is about to be retried, so the
     /// dashboard shows why the item is waiting (R8.2) without finishing it.
     fn note_retrying(&self, item: &PreparedItem, failure: &UploadFailure) {
-        if let Some(index) = self.folder_index_for(&item.path) {
-            let mut folders = self.folders.lock().expect("the folder lock");
-            folders[index].last_error = Some(failure_text(failure));
+        let mut folders = self.folders.lock().expect("the folder lock");
+        if let Some(entry) = folder_entry_owning(&mut folders, &item.path) {
+            entry.last_error = Some(failure_text(failure));
         }
     }
 
@@ -1555,8 +1554,10 @@ fn folder_index_in(folders: &[FolderEntry], path: &Path) -> Option<usize> {
 
 /// The source folder that contains `path`, as stored.
 fn folder_entry_for(inner: &EngineInner, path: &Path) -> Option<SourceFolder> {
-    let index = inner.folder_index_for(path)?;
+    // #48: the owner is resolved under the guard that clones it, so a removal
+    // cannot hand back another folder's entry.
     let folders = inner.folders.lock().expect("the folder lock");
+    let index = folder_index_in(&folders, path)?;
     folders.get(index).map(|entry| entry.folder.clone())
 }
 
@@ -2444,6 +2445,19 @@ enum FolderMoment {
     Upload,
 }
 
+/// The live entry that owns `path`, resolved and borrowed under one guard
+/// (#48).
+///
+/// The caller supplies the guard, so `remove_folder`'s `retain` cannot run
+/// between the lookup and the write and move the write onto another entry.
+fn folder_entry_owning<'a>(
+    folders: &'a mut [FolderEntry],
+    path: &Path,
+) -> Option<&'a mut FolderEntry> {
+    let index = folder_index_in(folders, path)?;
+    folders.get_mut(index)
+}
+
 /// The live entry that still holds `path`, for a caller already holding the
 /// folder lock (#43).
 fn folder_entry_mut<'a>(folders: &'a mut [FolderEntry], path: &str) -> Option<&'a mut FolderEntry> {
@@ -2630,7 +2644,7 @@ mod tests {
         let metered = dirs[1].join("metered.jpg");
         let b_meter = inner.meter_for(&metered);
         assert_eq!(
-            inner.folder_index_for(&metered),
+            folder_index_in(&inner.folders.lock().expect("the folder lock"), &metered),
             Some(1),
             "the list is [a, b, c] and the middle entry owns the file"
         );
@@ -2715,7 +2729,10 @@ mod tests {
             .map(|dir| dir.display().to_string())
             .collect();
         assert_eq!(
-            inner.folder_index_for(&dirs[1].join("photo.jpg")),
+            folder_index_in(
+                &inner.folders.lock().expect("the folder lock"),
+                &dirs[1].join("photo.jpg")
+            ),
             Some(1),
             "the list is [a, b, c] and the middle entry was scanned"
         );
@@ -2773,6 +2790,132 @@ mod tests {
                 .last_scan_ns
                 .is_some(),
             "#43: the folder the scan read keeps its own time"
+        );
+    }
+
+    /// A removal cannot move a folder's counts onto another folder (#48).
+    ///
+    /// The count paths resolved the owning index under one folder guard and
+    /// indexed the live list under a second. `remove_folder` retains the list,
+    /// so with folders `[a, b, c]` a removal of `a` in between moves `c` down to
+    /// index 1 and the file's counts land on `b`'s card; the same shift with two
+    /// folders indexes past the end and panics on the worker thread. The list is
+    /// shifted and restored under the bookkeeping until it meets that
+    /// interleaving; one guard cannot be split, so only the folder that owns the
+    /// file is ever counted.
+    #[test]
+    fn a_removal_cannot_shift_the_counts_onto_another_folder() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let store =
+            Arc::new(StateStore::open(temp.path().join("state.db")).expect("open the state store"));
+        let mut dirs = Vec::new();
+        for name in ["a", "b", "c"] {
+            let dir = temp.path().join(name);
+            std::fs::create_dir_all(&dir).expect("create the folder");
+            store
+                .add_folder(&SourceFolder {
+                    path: dir.display().to_string(),
+                    recursive: true,
+                    album_mapping: false,
+                    album_scope: AlbumScope::default(),
+                })
+                .expect("add the folder");
+            dirs.push(dir);
+        }
+        // The session is never used: this test sends no request.
+        let session = crate::connection::Connection::new(
+            "http://127.0.0.1:1",
+            Arc::new(crate::credential::MemoryCredentialStore::new()),
+        )
+        .expect("a valid URL")
+        .shared();
+        let engine = Engine::new(
+            Arc::new(Tracking::new(store)),
+            session,
+            EngineConfig::default(),
+        )
+        .expect("build the engine");
+        let inner = Arc::clone(&engine.inner);
+        let counted = dirs[2].join("photo.jpg");
+        let counted_key = path_key(&counted);
+        let owner_path = dirs[2].display().to_string();
+        assert_eq!(
+            folder_index_in(&inner.folders.lock().expect("the folder lock"), &counted),
+            Some(2),
+            "the list is [a, b, c] and the last entry owns the file"
+        );
+        let item = PreparedItem {
+            path: counted.clone(),
+            size: 1,
+            mtime_ns: 0,
+            sha1: Sha1::from_slice(&[0; 20]).expect("a full digest"),
+            sidecar: None,
+            live_photo_video: None,
+        };
+        let failure = UploadFailure {
+            class: None,
+            kind: FailureKind::Transient,
+            message: "the connection dropped".to_string(),
+            retry_after: None,
+            connection: true,
+        };
+
+        let shifted = Arc::new(AtomicBool::new(false));
+        let churn = {
+            let inner = Arc::clone(&inner);
+            let shifted = Arc::clone(&shifted);
+            std::thread::spawn(move || {
+                for _ in 0..500 {
+                    // What `remove_folder`'s retain does to the list, and the
+                    // re-add that restores `a` in front of `b` so the shift
+                    // recurs instead of happening once.
+                    let removed = inner.folders.lock().expect("the folder lock").remove(0);
+                    // Out of the list long enough for a lookup to meet it.
+                    std::thread::sleep(Duration::from_micros(100));
+                    inner
+                        .folders
+                        .lock()
+                        .expect("the folder lock")
+                        .insert(0, removed);
+                }
+                shifted.store(true, Ordering::SeqCst);
+            })
+        };
+        let mut queued = 0;
+        while !shifted.load(Ordering::SeqCst) {
+            inner.note_pending(&counted, None);
+            inner.note_review_missing(&counted_key);
+            inner.note_retrying(&item, &failure);
+            queued += 1;
+            let folders = inner.folders.lock().expect("the folder lock");
+            for entry in folders
+                .iter()
+                .filter(|entry| entry.folder.path != owner_path)
+            {
+                assert_eq!(
+                    entry.counts,
+                    FolderCounts::default(),
+                    "#48: a removal shifted the counts onto {}",
+                    entry.folder.path
+                );
+                assert_eq!(
+                    entry.last_error, None,
+                    "#48: a removal shifted the retry reason onto {}",
+                    entry.folder.path
+                );
+            }
+        }
+        churn.join().expect("the churn thread finished");
+        assert!(queued > 0, "#48: the counts were never exercised");
+        let folders = inner.folders.lock().expect("the folder lock");
+        let owner = folders
+            .iter()
+            .find(|entry| entry.folder.path == owner_path)
+            .expect("the owner is still listed");
+        assert_eq!(
+            (owner.counts.pending, owner.counts.review),
+            (queued, queued),
+            "R8.1: the owner counted every file handed to it"
         );
     }
 
