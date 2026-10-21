@@ -43,12 +43,20 @@ pub(crate) const STORE_OPENING: &str = "The state database is still opening.";
 /// The [`run_on_worker`] waits that have not finished yet.
 ///
 /// A GPUI local task has to be dropped on the thread that spawned it: the
-/// pinned `gpui-pre` 0.3.8 asserts it on drop (`executor.rs:773`), and its test
-/// scheduler refuses activity from another thread once a test has ended
-/// (`test_scheduler.rs:583`). A detached wait is owned by the scheduler, which
-/// then drops its future on the HTTP runtime's thread when a worker answers
-/// late, and the process aborts instead of reporting anything (#50). Held here,
-/// the waits are dropped by the app, on the app's own thread, while it goes.
+/// pinned `gpui-pre` 0.3.8 asserts it on drop
+/// (`gpui-pre-scheduler/src/executor.rs:774`), and its test scheduler refuses
+/// activity from another thread once a test has ended
+/// (`gpui-pre-scheduler/src/test_scheduler.rs:583`). A detached wait is owned
+/// by the scheduler, which then drops its future on the HTTP runtime's thread
+/// when a worker answers late, and the process aborts instead of reporting
+/// anything (#50). Held here, the waits are dropped by the app, on the app's own
+/// thread, while it goes.
+///
+/// This narrows the window, it does not close it. A worker's wake can win the
+/// race against `Task::drop` setting the task's cancelled state, so a schedule
+/// that lands inside that window can still reach a finished scheduler. The
+/// window lives in `gpui-pre` 0.3.8's task and scheduler handshake, not in this
+/// module, and is left as it is rather than papered over (#50).
 #[derive(Default)]
 struct WorkerWaits(Vec<Task<()>>);
 
@@ -450,38 +458,59 @@ mod tests {
     use gpui_kit::AppContext as _;
     use gpui_kit::TestAppContext;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use sync_core::connection::{Attention, AuthMethod, ConnectionState, Secret, SignIn};
     use sync_core::credential::{MemoryCredentialStore, SharedCredentialStore};
 
+    /// The worker's answer, which reports itself once the helper drops it.
+    ///
+    /// The app is gone, so the wait that held the channel's receiver went with
+    /// it: `results.send` hands the value back rather than waking a waiter, and
+    /// the helper drops it on the runtime thread. That drop is the point the
+    /// test below watches, so it needs no fixed sleep.
+    struct Answered(std::sync::mpsc::Sender<()>);
+
+    impl Drop for Answered {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
     /// #50: the app goes away while the worker is still running.
     ///
     /// GPUI's local tasks must be dropped on the thread that spawned them
-    /// (`gpui-pre` 0.3.8 asserts it, `executor.rs:773`), and its test scheduler
-    /// refuses activity from another thread once the test has ended
-    /// (`test_scheduler.rs:583`). A waiter that is merely detached is owned by
-    /// the scheduler, so the worker's answer wakes it from the runtime thread
-    /// into a finished test and the process aborts (SIGABRT, double panic).
+    /// (`gpui-pre` 0.3.8 asserts it,
+    /// `gpui-pre-scheduler/src/executor.rs:774`), and its test scheduler refuses
+    /// activity from another thread once the test has ended
+    /// (`gpui-pre-scheduler/src/test_scheduler.rs:583`). A waiter that is merely
+    /// detached is owned by the scheduler, so the worker's answer wakes it from
+    /// the runtime thread into a finished test and the process aborts (SIGABRT,
+    /// double panic).
     ///
-    /// The teardown below is the order `#[gpui::test]` uses (`gpui-pre`
-    /// `test.rs:110-115`), including `end_test`. Before the wait was held by
-    /// the app this test aborted the process; it passes once the app drops its
-    /// waiters itself, on its own thread.
+    /// The teardown below is the order `#[gpui::test]` uses
+    /// (`gpui-pre-macros/src/test.rs:170-175`), including `end_test`. Before the
+    /// wait was held by the app this test aborted the process; it passes once
+    /// the app drops its waiters itself, on its own thread.
+    ///
+    /// The observation is the helper dropping the answer back on the runtime
+    /// thread once `results.send` has returned, never a fixed sleep: the wait
+    /// that held the receiver went with the app, so the send hands the answer
+    /// back instead of parking anything, and only a stuck worker can hit the
+    /// timeout.
     #[test]
     fn a_worker_answer_after_the_app_is_gone_does_not_abort() {
         struct Model;
 
-        let answered = Arc::new(AtomicBool::new(false));
         let applied = Arc::new(AtomicUsize::new(0));
         let lost = Arc::new(AtomicUsize::new(0));
         let (release, held) = std::sync::mpsc::channel::<()>();
+        let (answer_sent, answered) = std::sync::mpsc::channel::<()>();
         let cx = TestAppContext::single();
         let scheduler = cx.dispatcher.scheduler().clone();
         let model = cx.update(|cx| cx.new(|_| Model));
         cx.update(|cx| {
             model.update(cx, |_, cx| {
-                let answered = Arc::clone(&answered);
                 let applied = Arc::clone(&applied);
                 let lost = Arc::clone(&lost);
                 super::run_on_worker_or_lost(
@@ -490,9 +519,9 @@ mod tests {
                         // The answer waits for the release below, so it cannot
                         // land before the app is gone whatever the load is.
                         let _ = held.recv();
-                        answered.store(true, Ordering::SeqCst);
+                        Answered(answer_sent)
                     },
-                    move |_: &mut Model, (): (), _| {
+                    move |_: &mut Model, _: Answered, _| {
                         applied.fetch_add(1, Ordering::SeqCst);
                     },
                     move |_: &mut Model, _| {
@@ -520,11 +549,12 @@ mod tests {
         // ended: releasing a detached wait here wakes it from the runtime
         // thread and aborts the process (#50).
         drop(release);
-        std::thread::sleep(Duration::from_millis(500));
-        assert!(
-            answered.load(Ordering::SeqCst),
-            "the worker answered after the app was gone"
-        );
+        // Progress-bounded, not a fixed sleep: this returns when the answer has
+        // been through `results.send` on the runtime thread, and 5 s only
+        // catches a worker that never gets there.
+        answered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the worker answered after the app was gone");
         assert_eq!(
             applied.load(Ordering::SeqCst),
             0,
