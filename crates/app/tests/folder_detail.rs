@@ -1495,11 +1495,15 @@ async fn an_unreadable_store_says_why_the_list_is_missing(cx: &mut TestAppContex
     let (window, store, _view) = open_dashboard(cx, &paths);
     wait_for_store(cx, &store).await;
 
-    // The detail's read is a fresh connection to the file, so a database the
-    // path no longer names cannot answer it, as a removed or damaged file
-    // cannot.
-    std::fs::remove_file(&paths.state_db).expect("remove the state database");
-    std::fs::create_dir(&paths.state_db).expect("put a directory where the database was");
+    // The detail's read is a fresh connection to the file, so a schema without
+    // the table it joins cannot answer it, as a damaged database cannot. The
+    // fault goes through SQLite rather than the filesystem: every open
+    // connection keeps its handle to the file, which Windows insists on.
+    {
+        let raw = rusqlite::Connection::open(&paths.state_db).expect("open the database directly");
+        raw.execute_batch("DROP TABLE version")
+            .expect("drop the version table the asset list joins");
+    }
 
     open_detail_now(cx, window);
     cx.wait_for(window, Duration::from_secs(10), |window, _| {
