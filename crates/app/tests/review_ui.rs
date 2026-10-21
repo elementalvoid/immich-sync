@@ -87,7 +87,11 @@ fn seed(paths: &AppPaths, root: &Path, names: &[&str]) {
 fn open_review_view(
     cx: &mut TestAppContext,
     paths: &AppPaths,
-) -> (AnyWindowHandle, gpui_kit::Entity<EngineModel>) {
+) -> (
+    AnyWindowHandle,
+    gpui_kit::Entity<EngineModel>,
+    gpui_kit::Entity<ReviewView>,
+) {
     let paths = paths.clone();
     cx.update(|cx| {
         gpui_kit::init(cx);
@@ -97,12 +101,11 @@ fn open_review_view(
         });
         let store_model = cx.new(|cx| StoreModel::open(&paths, cx));
         let engine = cx.new(|cx| EngineModel::new(connection, store_model.clone(), &paths, cx));
-        let window = gpui_kit::open_window(window_options(), cx, |window, cx| {
+        let (window, view) = gpui_kit::open_window(window_options(), cx, |window, cx| {
             cx.new(|cx| ReviewView::new(engine.clone(), window, cx))
         })
-        .expect("open the review window")
-        .0;
-        (window, engine)
+        .expect("open the review window");
+        (window, engine, view)
     })
 }
 
@@ -153,15 +156,16 @@ fn tab(window: &mut Window, cx: &mut App) {
 }
 
 /// Tabs until `id` holds the keyboard focus.
-fn tab_to(window: &mut Window, id: &'static str, cx: &mut App) {
+fn tab_to(window: &mut Window, id: impl Into<gpui_kit::SharedString>, cx: &mut App) {
+    let id: gpui_kit::SharedString = id.into();
     for _ in 0..24 {
-        if window.find(id).focused() == Some(true) {
+        if window.find(id.clone()).focused() == Some(true) {
             return;
         }
         tab(window, cx);
     }
     assert_eq!(
-        window.find(id).focused(),
+        window.find(id.clone()).focused(),
         Some(true),
         "{id} is not keyboard reachable"
     );
@@ -174,7 +178,7 @@ async fn the_review_names_every_row_and_both_actions(cx: &mut TestAppContext) {
     let paths = temporary_paths(temp.path());
     let photos = temp.path().join("photos");
     seed(&paths, &photos, &["IMG_0001.jpg", "CLIP_0002.mp4"]);
-    let (window, _engine) = open_review_view(cx, &paths);
+    let (window, _engine, _view) = open_review_view(cx, &paths);
     wait_for_rows(cx, window, 2).await;
 
     cx.update_window(window, |_, window, cx| {
@@ -215,7 +219,7 @@ async fn every_review_control_is_a_keyboard_reachable_tab_stop(cx: &mut TestAppC
     let paths = temporary_paths(temp.path());
     let photos = temp.path().join("photos");
     seed(&paths, &photos, &["IMG_0001.jpg", "CLIP_0002.mp4"]);
-    let (window, _engine) = open_review_view(cx, &paths);
+    let (window, _engine, _view) = open_review_view(cx, &paths);
     wait_for_rows(cx, window, 2).await;
 
     cx.update_window(window, |_, window, cx| {
@@ -236,7 +240,7 @@ async fn keeping_a_file_leaves_the_asset_and_clears_its_row(cx: &mut TestAppCont
     let paths = temporary_paths(temp.path());
     let photos = temp.path().join("photos");
     seed(&paths, &photos, &["keep.jpg", "other.jpg"]);
-    let (window, engine) = open_review_view(cx, &paths);
+    let (window, engine, _view) = open_review_view(cx, &paths);
     wait_for_rows(cx, window, 2).await;
     assert_eq!(
         cx.read(|cx| engine.read(cx).status().counts.review),
@@ -277,7 +281,7 @@ async fn a_trash_while_signed_out_says_so_and_keeps_the_row(cx: &mut TestAppCont
     let paths = temporary_paths(temp.path());
     let photos = temp.path().join("photos");
     seed(&paths, &photos, &["denied.jpg"]);
-    let (window, _engine) = open_review_view(cx, &paths);
+    let (window, _engine, _view) = open_review_view(cx, &paths);
     wait_for_rows(cx, window, 1).await;
 
     cx.update_window(window, |_, window, cx| {
@@ -431,7 +435,7 @@ async fn a_second_keep_of_the_same_row_must_not_double_count(cx: &mut TestAppCon
     let photos = temp.path().join("photos");
     seed(&paths, &photos, &["keep.jpg", "other.jpg"]);
     let paths_for_model = paths.clone();
-    let (window, engine) = cx.update(|cx| {
+    let (window, engine, _view) = cx.update(|cx| {
         gpui_kit::init(cx);
         let connection = cx.new(|_| {
             let store: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
@@ -440,12 +444,11 @@ async fn a_second_keep_of_the_same_row_must_not_double_count(cx: &mut TestAppCon
         let store_model = cx.new(|cx| StoreModel::open(&paths_for_model, cx));
         let engine =
             cx.new(|cx| EngineModel::new(connection, store_model.clone(), &paths_for_model, cx));
-        let window = gpui_kit::open_window(window_options(), cx, |window, cx| {
+        let (window, view) = gpui_kit::open_window(window_options(), cx, |window, cx| {
             cx.new(|cx| ReviewView::new(engine.clone(), window, cx))
         })
-        .expect("open the review window")
-        .0;
-        (window, engine)
+        .expect("open the review window");
+        (window, engine, view)
     });
     wait_for_rows(cx, window, 2).await;
 
@@ -459,4 +462,171 @@ async fn a_second_keep_of_the_same_row_must_not_double_count(cx: &mut TestAppCon
     .expect("click Keep twice");
     wait_for_rows(cx, window, 1).await;
     wait_for_review_count(cx, &engine, 1).await;
+}
+
+/// Adds one source folder with no missing files yet, so the filter can show an
+/// empty folder.
+fn seed_folder(paths: &AppPaths, root: &Path) {
+    std::fs::create_dir_all(root).expect("create the source folder");
+    StateStore::open(&paths.state_db)
+        .expect("open the state database")
+        .add_folder(&SourceFolder {
+            path: root.display().to_string(),
+            recursive: true,
+            album_mapping: false,
+            album_scope: sync_core::store::AlbumScope::Leaf,
+        })
+        .expect("add the source folder");
+}
+
+#[gpui_kit::test]
+async fn choosing_a_folder_narrows_the_review_its_summary_and_its_empty_state(
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("Camera Roll");
+    let videos = temp.path().join("Videos");
+    seed(&paths, &photos, &["IMG_0001.jpg"]);
+    seed_folder(&paths, &videos);
+    let (window, _engine, _view) = open_review_view(cx, &paths);
+    wait_for_rows(cx, window, 1).await;
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("review-folder-filter").label(),
+            Some("Folder filter: All folders"),
+            "the review starts on All folders too"
+        );
+
+        // Videos sorts after Camera Roll, so it is the second folder option.
+        window.click("review-folder-filter", cx);
+        assert_eq!(
+            window.find("review-folder-option-2").label(),
+            Some(format!("Show only {}", videos.display()).as_str()),
+            "labels stay short; the accessible name carries the full path"
+        );
+        window.click("review-folder-option-2", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("review-empty").label(),
+            Some("No missing files in Videos"),
+            "the empty state names the folder the filter shows"
+        );
+        assert_eq!(
+            window.find("review-summary").label(),
+            Some("Nothing waits for a decision."),
+            "the summary follows the filter"
+        );
+        assert!(window.try_find("review-row-0").is_none());
+
+        window.click("review-folder-filter", cx);
+        window.click("review-folder-option-1", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("review-summary").label(),
+            Some("1 file disappeared from a source folder."),
+            "the summary counts the selected folder's files"
+        );
+        assert!(window.try_find("review-row-0").is_some());
+        assert_eq!(
+            window.find("review-folder-chip").label(),
+            Some("Showing Camera Roll")
+        );
+    })
+    .expect("read the filtered review");
+}
+
+#[gpui_kit::test]
+async fn the_review_filter_and_its_clear_action_are_keyboard_reachable_and_named(
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("Camera Roll");
+    seed(&paths, &photos, &["IMG_0001.jpg", "IMG_0002.jpg"]);
+    seed_folder(&paths, &temp.path().join("Videos"));
+    let (window, _engine, _view) = open_review_view(cx, &paths);
+    wait_for_rows(cx, window, 2).await;
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        // N5: the keyboard reaches the filter and its options.
+        tab_to(window, "review-folder-filter", cx);
+        window.click("review-folder-filter", cx);
+        window.render_frame(cx);
+        tab_to(window, "review-folder-option-0", cx);
+        tab_to(window, "review-folder-option-1", cx);
+        window.click("review-folder-option-1", cx);
+        window.render_frame(cx);
+
+        assert_eq!(
+            window.find("review-folder-filter").focused(),
+            Some(true),
+            "choosing a folder keeps the keyboard focus on the trigger"
+        );
+
+        // The clear action is named and a tab stop of its own.
+        assert_eq!(
+            window.find("review-folder-clear").label(),
+            Some("Clear the folder filter")
+        );
+        tab_to(window, "review-folder-clear", cx);
+        window.click("review-folder-clear", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("review-folder-filter").focused(),
+            Some(true),
+            "clearing keeps the keyboard focus on the filter's trigger"
+        );
+    })
+    .expect("tab through the review filter");
+
+    assert_eq!(
+        review_count(cx, window),
+        2,
+        "clearing the filter restores every missing file"
+    );
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("review-folder-filter").label(),
+            Some("Folder filter: All folders")
+        );
+    })
+    .expect("read the cleared review filter");
+}
+
+#[gpui_kit::test]
+async fn the_review_opens_with_a_folder_already_selected(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("Camera Roll");
+    let videos = temp.path().join("Videos");
+    seed(&paths, &photos, &["IMG_0001.jpg"]);
+    seed(&paths, &videos, &["CLIP_0002.mp4"]);
+    let (window, _engine, view) = open_review_view(cx, &paths);
+    wait_for_rows(cx, window, 2).await;
+
+    // The seam the folder detail will call (#43).
+    let selected = videos.display().to_string();
+    cx.update(|cx| {
+        view.update(cx, |view, cx| view.select_folder(selected.clone(), cx));
+    });
+    cx.update_window(window, |_, window, cx| window.render_frame(cx))
+        .expect("render the selected folder");
+
+    assert_eq!(review_count(cx, window), 1, "the seam narrows the list");
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("review-folder-chip").label(),
+            Some("Showing Videos")
+        );
+    })
+    .expect("read the selected folder");
 }
