@@ -140,6 +140,13 @@ impl Backfill {
                 return;
             }
         };
+        // R3.7: an empty library is not a finished backfill. Recording the
+        // completion would spend the one automatic pass before the first upload
+        // exists, so a fresh install that starts with the tag on would never
+        // tag the files it uploads next.
+        if total == 0 {
+            return;
+        }
         self.publish(|status| {
             status.running = true;
             status.total = total;
