@@ -88,13 +88,19 @@ impl Render for ReviewView {
         let filter = self.filter.read(cx);
         items.retain(|item| filter.keeps(&item.path, &folders, case));
         let rows = rows(&items);
-        let summary = summary(&items);
         let problem = self.engine.read(cx).review_problem().map(str::to_string);
         // R5.3, #41: the empty state names the folder the filter shows.
         let empty = self
             .filter
             .read(cx)
             .empty_heading("No missing files", "Every tracked file is present");
+        // #41 review: an empty filtered list must not be summarised as if the
+        // whole client were empty, so the summary says what the list says.
+        let summary = if rows.is_empty() && self.filter.read(cx).is_active() {
+            empty.clone()
+        } else {
+            summary(&items)
+        };
 
         div()
             .id("review-view")

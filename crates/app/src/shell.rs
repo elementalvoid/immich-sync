@@ -7,7 +7,7 @@ use gpui_kit::*;
 use gpui_tray::{Icon, Tray};
 
 use crate::connection::ConnectionModel;
-use crate::dashboard::Dashboard;
+use crate::dashboard::{Dashboard, DashboardEvent};
 use crate::diagnostics::DiagnosticsModel;
 use crate::diagnostics_view::DiagnosticsView;
 use crate::engine::EngineModel;
@@ -335,6 +335,13 @@ pub enum ViewMode {
     Diagnostics,
 }
 
+/// The environment variable that pins a folder detail open (#43).
+///
+/// Set it to a source folder's stored path and the dashboard opens that
+/// folder's detail once the store has loaded it, so a screenshot run captures
+/// the dialog. A product run never sets it.
+pub const FORCE_DETAIL_ENV: &str = "IMMICH_SYNC_FOLDER_DETAIL";
+
 /// The environment variable that pins the visible surface.
 ///
 /// Set it to `dashboard`, `settings`, `upload`, `failed`, `review`, `logs`, or
@@ -377,6 +384,7 @@ pub struct AppShell {
     review: Entity<ReviewView>,
     _connection: Entity<ConnectionModel>,
     _connection_subscription: Subscription,
+    _dashboard_subscription: Subscription,
 }
 
 impl AppShell {
@@ -413,6 +421,15 @@ impl AppShell {
         if mode == ViewMode::Logs {
             logs.update(cx, |logs, cx| logs.set_visible(true, cx));
         }
+        // #43: the folder detail cannot switch surfaces itself, so the
+        // dashboard reports the request and the shell opens it.
+        let dashboard_subscription = cx.subscribe(
+            &dashboard,
+            |this, _dashboard, event: &DashboardEvent, cx| {
+                let DashboardEvent::OpenView(mode, folder) = event;
+                this.show_filtered(*mode, folder.clone(), cx);
+            },
+        );
         Self {
             mode,
             dashboard,
@@ -424,7 +441,20 @@ impl AppShell {
             review,
             _connection: connection,
             _connection_subscription: subscription,
+            _dashboard_subscription: dashboard_subscription,
         }
+    }
+
+    /// The visible surface.
+    #[must_use]
+    pub fn mode(&self) -> ViewMode {
+        self.mode
+    }
+
+    /// The dashboard, so a test can drive the folder detail it owns (#43).
+    #[must_use]
+    pub fn dashboard(&self) -> Entity<Dashboard> {
+        self.dashboard.clone()
     }
 
     /// Switches the visible surface.

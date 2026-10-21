@@ -74,6 +74,12 @@ pub struct StatusCard {
     pub connection: Option<String>,
     /// The last error, already classified by the engine.
     pub last_error: Option<String>,
+    /// When this folder last uploaded an asset, ns since the Unix epoch (#43).
+    /// `None` on the global card, which is not a folder.
+    pub last_upload_ns: Option<i64>,
+    /// When a reconciliation scan last read this folder, ns since the Unix
+    /// epoch (#43). `None` on the global card.
+    pub last_scan_ns: Option<i64>,
 }
 
 /// The text one status card renders.
@@ -225,6 +231,8 @@ impl DashboardModel {
             uploads: status.uploads,
             connection,
             last_error: status.last_error.clone(),
+            last_upload_ns: None,
+            last_scan_ns: None,
             recursive: false,
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
@@ -253,6 +261,9 @@ impl DashboardModel {
                 uploads: folder.uploads,
                 connection: None,
                 last_error: folder.last_error.clone(),
+                // #43: the folder detail shows both, relative and exact.
+                last_upload_ns: folder.last_upload_ns,
+                last_scan_ns: folder.last_scan_ns,
                 recursive: folder.recursive,
                 album_mapping: folder.album_mapping,
                 album_scope: folder.album_scope,
@@ -292,6 +303,8 @@ pub fn sample() -> DashboardModel {
             },
             connection: Some("Connected".to_string()),
             last_error: None,
+            last_upload_ns: None,
+            last_scan_ns: None,
             recursive: false,
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
@@ -316,6 +329,8 @@ pub fn sample() -> DashboardModel {
                 },
                 connection: None,
                 last_error: None,
+                last_upload_ns: Some(1_700_000_000_000_000_000),
+                last_scan_ns: Some(1_700_000_060_000_000_000),
                 recursive: true,
                 album_mapping: true,
                 album_scope: AlbumScope::WholeFolder,
@@ -335,6 +350,8 @@ pub fn sample() -> DashboardModel {
                 uploads: UploadTraffic::default(),
                 connection: None,
                 last_error: None,
+                last_upload_ns: Some(1_700_000_000_000_000_000),
+                last_scan_ns: None,
                 recursive: true,
                 album_mapping: true,
                 album_scope: AlbumScope::Leaf,
@@ -356,6 +373,8 @@ pub fn sample() -> DashboardModel {
                 last_error: Some(
                     "permission_denied: the API key cannot write to this album".to_string(),
                 ),
+                last_upload_ns: Some(1_700_000_000_000_000_000),
+                last_scan_ns: Some(1_700_000_060_000_000_000),
                 recursive: false,
                 album_mapping: true,
                 album_scope: AlbumScope::WholeFolder,
@@ -375,6 +394,8 @@ pub fn sample() -> DashboardModel {
                 uploads: UploadTraffic::default(),
                 connection: None,
                 last_error: None,
+                last_upload_ns: None,
+                last_scan_ns: None,
                 recursive: true,
                 album_mapping: false,
                 album_scope: AlbumScope::Leaf,

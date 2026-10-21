@@ -52,6 +52,12 @@ pub struct FolderStatus {
     pub counts: FolderCounts,
     /// The last failure under this folder, if any.
     pub last_error: Option<String>,
+    /// When a reconciliation scan last read this folder, ns since the Unix
+    /// epoch (R8.1, #43). `None` until one has.
+    pub last_scan_ns: Option<i64>,
+    /// When this folder last uploaded an asset, ns since the Unix epoch
+    /// (R8.1, #43). `None` until one has.
+    pub last_upload_ns: Option<i64>,
     /// This folder's share of the upload traffic: the bytes its upload bodies
     /// have moved and the requests on the wire right now (R8.1).
     pub uploads: UploadTraffic,

@@ -109,7 +109,7 @@ Acceptance: a sync at a 1 MB/s limit produces near-limit observed throughput. Ra
 
 ### R8 — Shell and user experience
 
-- R8.1 The config window is a dashboard with status cards: one global card and one per source folder.
+- R8.1 The config window is a dashboard with status cards: one global card and one per source folder. A source folder's card opens its detail: the full path, its live state, progress, and counts, its settings, its full last error, the last successful upload and last reconciliation scan, an Open folder action, links into the Failed and Review views filtered to that folder, and Remove behind a confirmation.
 - R8.2 The tray icon shows the activity state (idle, syncing, paused, needs attention), the review count, upload progress, and the last error in its tooltip.
 - R8.3 The tray menu offers Show, Pause, Resume, Sync now, and Quit.
 - R8.4 Closing the window hides it. Quit exits the client. A second launch focuses the first instance.
@@ -156,7 +156,7 @@ Acceptance: a clean Windows machine installs from the NSIS installer. A clean Li
 
 ## 5. Data model summary
 
-- `source_folder`: path, recursive flag, album mapping flag, album scope.
+- `source_folder`: path, recursive flag, album mapping flag, album scope, last reconciliation scan, last successful upload.
 - `album`: mapped folder path key, album name, album id.
 - `sync_item`: path, size, mtime, SHA-1, current asset id, stack id, state, last error class.
 - `version`: item id, asset id, SHA-1, created at, current flag.

@@ -190,6 +190,11 @@ struct FolderEntry {
     available: bool,
     counts: FolderCounts,
     last_error: Option<String>,
+    /// When a scan last read this folder and when it last uploaded, for the
+    /// folder detail (#43). The store holds the same two values, so a restart
+    /// reads them back.
+    last_scan_ns: Option<i64>,
+    last_upload_ns: Option<i64>,
     /// This folder's upload meter (R8.1). Every upload the engine runs for a
     /// file under this folder streams under its limit view and counts itself
     /// here, so the bytes of two concurrent uploads can never be swapped.
@@ -296,12 +301,19 @@ impl Engine {
                 tracing::warn!(folder = %folder.path, error = %error, "the folder counts could not be read");
                 FolderCounts::default()
             });
+            // #43: the folder detail keeps its timestamps across a restart.
+            let times = store.folder_times(&folder.path).unwrap_or_else(|error| {
+                tracing::warn!(folder = %folder.path, error = %error, "the folder times could not be read");
+                crate::store::FolderTimes::default()
+            });
             entries.push(FolderEntry {
                 available: Path::new(&folder.path).is_dir(),
                 meter: Arc::new(UploadMeter::new(&bandwidth)),
                 folder,
                 counts,
                 last_error: None,
+                last_scan_ns: times.last_scan_ns,
+                last_upload_ns: times.last_upload_ns,
             });
         }
         let uploader = Uploader::new(session.clone(), store.clone());
@@ -569,6 +581,11 @@ impl Engine {
 
     /// Adds a source folder and scans it (R2.1).
     ///
+    /// This is an upsert: a path the client already tracks has its recursive
+    /// flag set and keeps its album settings, which is what a card's Recursive
+    /// switch writes. Use [`Self::add_folder_settings`] to record a new folder
+    /// and refuse one that already exists.
+    ///
     /// The folder row belongs to the tracking module; this engine hears about
     /// the change through its observer, which installs the watch and asks for
     /// a scan.
@@ -657,6 +674,8 @@ impl Engine {
                     available: entry.available,
                     counts: entry.counts,
                     last_error: entry.last_error.clone(),
+                    last_scan_ns: entry.last_scan_ns,
+                    last_upload_ns: entry.last_upload_ns,
                     uploads: traffic,
                 }
             })
@@ -872,11 +891,16 @@ impl Observer for EngineObserver {
                         );
                         FolderCounts::default()
                     });
+                // #43: a folder new to this engine starts from the times
+                // the store already holds for it.
+                let times = inner.store.folder_times(&stored.path).unwrap_or_default();
                 folders.push(FolderEntry {
                     available,
                     folder: stored.clone(),
                     counts,
                     last_error: None,
+                    last_scan_ns: times.last_scan_ns,
+                    last_upload_ns: times.last_upload_ns,
                     // R8.1: every upload under this folder meters into this
                     // one, under the folder's view of the client limit (R7.1).
                     meter: Arc::new(UploadMeter::new(&inner.bandwidth)),
@@ -1136,6 +1160,16 @@ impl EngineInner {
     /// Records one finished item against its folder and releases its claim.
     fn finish_item(&self, item: &PreparedItem, outcome: &UploadOutcome) {
         let folder_index = self.folder_index_for(&item.path);
+        // #43: Created and Duplicate are both terminal successes (R3.2), and
+        // the folder detail shows when this folder last uploaded one. The store
+        // write runs before the folder lock is taken, so it can never hold the
+        // lock the status read needs (N2).
+        let uploaded_ns = match outcome {
+            UploadOutcome::Created { .. } | UploadOutcome::Duplicate { .. } => {
+                folder_index.and_then(|index| record_folder_time(self, index, FolderMoment::Upload))
+            }
+            _ => None,
+        };
         if let Some(index) = folder_index {
             let mut folders = self.folders.lock().expect("the folder lock");
             let entry = &mut folders[index];
@@ -1147,6 +1181,9 @@ impl EngineInner {
                     // transient failure does not read as attention for a full
                     // scan interval.
                     entry.last_error = None;
+                    if let Some(at_ns) = uploaded_ns {
+                        entry.last_upload_ns = Some(at_ns);
+                    }
                 }
                 UploadOutcome::Failed(failure) | UploadOutcome::DeadLetter(failure) => {
                     entry.counts.pending = entry.counts.pending.saturating_sub(1);
@@ -2097,6 +2134,9 @@ async fn scan_once(inner: &Arc<EngineInner>) {
         match report {
             Ok(Ok(report)) => {
                 set_folder_available(inner, &folder.path, true);
+                // #43: the folder detail shows when the folder last scanned;
+                // this is the one pass that read it.
+                note_folder_scanned(inner, &folder.path);
                 reports.push((folder, report));
             }
             Ok(Err(ScanError::Missing(path))) => {
@@ -2289,6 +2329,32 @@ fn has_present_content_twin(inner: &EngineInner, row: &ItemRecord) -> bool {
     })
 }
 
+/// Records that a reconciliation scan just read `path`, and publishes it
+/// (#43).
+fn note_folder_scanned(inner: &EngineInner, path: &str) {
+    let key = path_key(Path::new(path));
+    let Some(index) = inner
+        .folders
+        .lock()
+        .expect("the folder lock")
+        .iter()
+        .position(|entry| path_key(Path::new(&entry.folder.path)) == key)
+    else {
+        return;
+    };
+    let Some(at_ns) = record_folder_time(inner, index, FolderMoment::Scan) else {
+        return;
+    };
+    if let Some(entry) = inner
+        .folders
+        .lock()
+        .expect("the folder lock")
+        .get_mut(index)
+    {
+        entry.last_scan_ns = Some(at_ns);
+    }
+}
+
 /// Marks one folder available or missing (R2.5).
 fn set_folder_available(inner: &EngineInner, path: &str, available: bool) {
     let key = path_key(Path::new(path));
@@ -2305,6 +2371,46 @@ fn set_folder_available(inner: &EngineInner, path: &str, available: bool) {
     if available {
         clear_global_error_if_recovered(inner, &folders);
     }
+}
+
+/// Which of a folder's two timestamps a write records (#43).
+#[derive(Clone, Copy)]
+enum FolderMoment {
+    /// A reconciliation scan read the folder.
+    Scan,
+    /// The folder uploaded an asset.
+    Upload,
+}
+
+/// Writes one folder timestamp to the store and returns when it happened
+/// (#43).
+///
+/// The folder path is read under the lock and released before the write, so a
+/// slow store write never holds the folder lock the status read needs (N2).
+/// The caller publishes the returned time on the live entry, because the
+/// observation stands even when the write failed.
+fn record_folder_time(inner: &EngineInner, index: usize, moment: FolderMoment) -> Option<i64> {
+    let path = inner
+        .folders
+        .lock()
+        .expect("the folder lock")
+        .get(index)?
+        .folder
+        .path
+        .clone();
+    let at_ns = now_ns();
+    let stored = match moment {
+        FolderMoment::Scan => inner.store.record_folder_scan(&path, at_ns),
+        FolderMoment::Upload => inner.store.record_folder_upload(&path, at_ns),
+    };
+    if let Err(error) = stored {
+        tracing::warn!(
+            folder = %path,
+            error = %error,
+            "the folder time could not be recorded"
+        );
+    }
+    Some(at_ns)
 }
 
 /// Clears the global last-error once no folder holds one, so the tray card

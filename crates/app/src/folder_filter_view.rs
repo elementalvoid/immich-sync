@@ -188,6 +188,9 @@ fn option(
     };
     Button::new(format!("{prefix}-folder-option-{index}"))
         .ghost()
+        // #41 review: the options live under a `Role::List`, so each one is a
+        // list item instead of a bare button a screen reader cannot place.
+        .role(Role::ListItem)
         .label(label)
         .accessibility_label(accessibility_label)
         .selected(is_selected)

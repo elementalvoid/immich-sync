@@ -81,13 +81,19 @@ impl Render for FailedView {
         let filter = self.filter.read(cx);
         items.retain(|item| filter.keeps(&item.path, &folders, case));
         let rows = rows(&items);
-        let summary = summary(&items);
         let problem = self.engine.read(cx).problem().map(str::to_string);
         // R6.5, #41: the empty state names the folder the filter shows.
         let empty = self
             .filter
             .read(cx)
             .empty_heading("No failed items", "Nothing has failed");
+        // #41 review: an empty filtered list must not be summarised as if the
+        // whole client were empty, so the summary says what the list says.
+        let summary = if rows.is_empty() && self.filter.read(cx).is_active() {
+            empty.clone()
+        } else {
+            summary(&items)
+        };
 
         div()
             .id("failed-view")

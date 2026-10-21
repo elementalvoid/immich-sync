@@ -222,6 +222,53 @@ async fn a_folder_with_100_files_syncs_without_manual_action() {
     engine.stop();
 }
 
+/// #43: the folder detail shows when the folder last scanned and last
+/// uploaded. Both are written by the paths that already know the outcome, and
+/// the live status carries the same values the row holds.
+#[tokio::test]
+async fn a_folder_records_its_last_scan_and_upload() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let photo = write_file(&photos, "photo-001.jpg", b"one photo");
+    add_folder(&store, &photos, true);
+    let folder = photos.display().to_string();
+
+    let engine = start_engine(&server, &store, EngineConfig::default()).await;
+    assert!(
+        wait_for_progress(
+            || terminal_count(&store, std::slice::from_ref(&photo)),
+            || all_terminal(&store, std::slice::from_ref(&photo)),
+            Duration::from_secs(20),
+        )
+        .await,
+        "the fixture file never reached a terminal success state"
+    );
+
+    let times = store.folder_times(&folder).expect("read the folder times");
+    assert!(
+        times.last_scan_ns.is_some(),
+        "#43: the scan that found the file is recorded"
+    );
+    assert!(
+        times.last_upload_ns.is_some(),
+        "#43: the successful upload is recorded"
+    );
+
+    // R8.1: the dashboard reads the engine's status, so an open detail follows
+    // the same two times without another store read.
+    let status = engine.status();
+    let live = status
+        .folders
+        .iter()
+        .find(|live| live.path == folder)
+        .expect("the folder is in the live status");
+    assert_eq!(live.last_scan_ns, times.last_scan_ns);
+    assert_eq!(live.last_upload_ns, times.last_upload_ns);
+    engine.stop();
+}
+
 #[tokio::test]
 async fn the_batch_size_is_configurable() {
     let server = MockImmich::start().await;

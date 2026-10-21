@@ -21,7 +21,7 @@ use crate::connection::{
     ConnectionModel, STORE_OPENING, WORKER_UNAVAILABLE, run_on_worker, run_on_worker_or_lost,
     worker,
 };
-use crate::folder_panel::{ALREADY_ADDED, confirmed};
+use crate::folder_panel::{ALREADY_ADDED, confirmed_folder};
 use crate::notify::Notifier;
 use crate::paths::AppPaths;
 use crate::settings::SettingsStore;
@@ -634,7 +634,7 @@ impl EngineModel {
             move || async move {
                 // N2: the filesystem probe and the store write belong on the
                 // worker, not the UI thread.
-                let folder = confirmed(&draft)?;
+                let folder = confirmed_folder(&draft)?;
                 // The tracking module decides, and it serves the engine and the
                 // signed-out client alike; the insert refuses a path the client
                 // already holds under the platform's path rule (R2.4).
@@ -936,7 +936,8 @@ impl EngineModel {
                     .folders()
                     .iter()
                     .zip(store.folder_counts())
-                    .map(|(folder, counts)| FolderStatus {
+                    .zip(store.folder_times())
+                    .map(|((folder, counts), times)| FolderStatus {
                         path: folder.path.clone(),
                         recursive: folder.recursive,
                         album_mapping: folder.album_mapping,
@@ -945,6 +946,10 @@ impl EngineModel {
                         // The last known counts from the store (R8.1).
                         counts: *counts,
                         last_error: None,
+                        // #43: the last known scan and upload times, from the
+                        // store the engine writes them to.
+                        last_scan_ns: times.last_scan_ns,
+                        last_upload_ns: times.last_upload_ns,
                         // The meter dies with the engine it belongs to; the
                         // store-only status has nothing on the wire (R8.1).
                         uploads: UploadTraffic::default(),

@@ -1,29 +1,67 @@
 //! The folder panel: one source folder's settings, confirmed before it syncs
-//! (#40).
+//! (#40) and opened as its live detail (#43).
 //!
-//! The panel owns the draft, the reason the last Add did not write, and the
-//! modal host. The dashboard owns which panel is open: it creates one when the
-//! add field or Browse asks for setup, and drops it when the panel reports that
-//! the folder was added or the user cancelled.
+//! One panel serves both: the draft is the setup dialog, and the detail is the
+//! same card in live mode. The title, the path block, the three settings
+//! controls, the modal host, the focus trap, and Escape are shared, so the two
+//! modes cannot drift apart. The dashboard owns which panel is open: it creates
+//! one when the add field, Browse, a card, or its Details control asks for it.
+//!
+//! In detail mode the panel reads the folder's live status from the engine on
+//! every engine notification, so counts, state, progress, the last error, and
+//! the two timestamps follow the client while the dialog stays open.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use gpui_kit::base::Disableable as _;
 use gpui_kit::base::FocusTrapElement as _;
+use gpui_kit::base::SelectableText;
 use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::Theme;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::radio::Radio;
-use gpui_kit::component::switch::Switch;
+use gpui_kit::component::progress::Progress;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use sync_core::store::{AlbumScope, SourceFolder};
 
-use crate::dashboard::CardPalette;
+use crate::dashboard::{CardPalette, state_tag};
 use crate::engine::EngineModel;
+use crate::folder_controls::{SettingsControls, SettingsIds, SettingsValues};
 use crate::settings_view::notice;
+use crate::shell::ViewMode;
+use crate::status::{ActivityState, StatusCard, folder_name};
+use crate::times;
 
 /// The reason the setup dialog shows when the folder is already tracked (#40).
 pub(crate) const ALREADY_ADDED: &str = "Already added.";
+
+/// The action "Open folder" runs (#43).
+///
+/// The product opens the platform's file manager; a test injects a recorder, so
+/// the path can be asserted without launching anything.
+pub type FolderOpener = Arc<dyn Fn(&str) -> std::io::Result<()>>;
+
+/// Opens `path` in the platform's file manager (R8.1 folder detail, #43).
+///
+/// The child is reaped on a thread of its own: the dialog must not wait for a
+/// file manager the user may keep open, and a client that runs for days must not
+/// collect one zombie per launch.
+///
+/// # Errors
+///
+/// Returns the platform's error when the file manager cannot be started.
+pub fn open_in_file_manager(path: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    let mut command = std::process::Command::new("explorer");
+    #[cfg(not(target_os = "windows"))]
+    let mut command = std::process::Command::new("xdg-open");
+    let mut child = command.arg(path).spawn()?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
 
 /// What the platform's filesystem holds at a draft path (#40).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,7 +104,7 @@ fn probe(path: &Path) -> PathProbe {
 /// This runs on the worker, so the filesystem probe never blocks the UI thread
 /// (N2). Nothing is written here: the caller writes the returned folder, and an
 /// error is the reason the dialog shows while it stays open.
-pub(crate) fn confirmed(draft: &SourceFolder) -> Result<SourceFolder, String> {
+pub(crate) fn confirmed_folder(draft: &SourceFolder) -> Result<SourceFolder, String> {
     let path = draft.path.trim();
     if path.is_empty() {
         return Err("Enter the path of a folder to add.".to_string());
@@ -81,38 +119,59 @@ pub(crate) fn confirmed(draft: &SourceFolder) -> Result<SourceFolder, String> {
 }
 
 /// Which lifecycle the panel shows.
-///
-/// The setup dialog is the draft. The path, the three settings, and the modal
-/// host below are shared with any later folder mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FolderPanelMode {
     /// A folder that is not tracked yet: Add records the draft and Cancel
     /// discards it (#40).
     Draft,
+    /// A folder that is already tracked: its live detail (#43).
+    Detail,
 }
 
 /// What the panel asks its owner to do.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FolderPanelEvent {
     /// The folder was written: close the panel and show its card.
     Added,
     /// The user cancelled: close the panel; nothing was written.
     Cancelled,
+    /// The detail closed, or its Remove completed: close the panel and return
+    /// focus to the card.
+    Closed,
+    /// Open the failed-items or the deletion-review view on this folder
+    /// (#41, #43).
+    Open(ViewMode, String),
 }
 
-/// The folder panel: a draft's settings, the Add/Cancel lifecycle, and the
+/// The folder panel: a draft's settings or one folder's live detail, inside the
 /// focus-trapped modal host.
 pub struct FolderPanel {
     engine: Entity<EngineModel>,
     mode: FolderPanelMode,
-    /// The draft: the path plus the three settings the user confirms.
+    /// The draft: the path plus the three settings. In detail mode the path is
+    /// the folder's identity and the settings are the live values, so one
+    /// renderer serves both.
     draft: SourceFolder,
-    /// Why the last Add did not write. The panel stays open while it is set.
+    /// Why the last action failed. The panel stays open while it is set.
     problem: Option<String>,
-    /// The engine request this panel waits for, so a slower earlier result
+    /// The engine request a draft Add waits for, so a slower earlier result
     /// cannot answer a newer dialog (#40).
     pending: Option<u64>,
+    /// The folder's live card, in detail mode (#43).
+    card: Option<StatusCard>,
+    /// Whether the folder is no longer a source folder while the detail is
+    /// open. Its last known settings stay usable.
+    gone: bool,
+    /// Whether the inline Remove confirmation is showing (#43).
+    confirming: bool,
+    /// Whether the removal is in flight: the dialog closes when the folder
+    /// leaves the status, so a failed write keeps it open.
+    removing: bool,
+    /// What "Open folder" runs (#43).
+    opener: FolderOpener,
     focus: FocusHandle,
+    /// Where the inline Remove confirmation sends the keyboard.
+    confirm_focus: FocusHandle,
     _subscription: Subscription,
 }
 
@@ -134,13 +193,99 @@ impl FolderPanel {
             },
             problem: None,
             pending: None,
+            card: None,
+            gone: false,
+            confirming: false,
+            removing: false,
+            opener: Arc::new(open_in_file_manager),
             focus,
+            confirm_focus: cx.focus_handle(),
             _subscription: subscription,
         }
     }
 
-    /// Applies the newest engine result when it answers this panel's request.
+    /// Opens the live detail for one tracked folder (#43).
+    ///
+    /// The card the dashboard clicked is the first frame's data; every later
+    /// engine notification refreshes it, so the dialog follows the client
+    /// without a poll of its own.
+    pub fn detail(
+        engine: Entity<EngineModel>,
+        path: String,
+        opener: FolderOpener,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let focus = cx.focus_handle();
+        let confirm_focus = cx.focus_handle();
+        let subscription = cx.observe(&engine, |this, engine, cx| this.engine_changed(&engine, cx));
+        let card = folder_card(&engine, &path, cx);
+        let draft = SourceFolder {
+            path: path.clone(),
+            recursive: card.as_ref().is_some_and(|card| card.recursive),
+            album_mapping: card.as_ref().is_some_and(|card| card.album_mapping),
+            album_scope: card
+                .as_ref()
+                .map_or(AlbumScope::Leaf, |card| card.album_scope),
+        };
+        Self {
+            engine,
+            mode: FolderPanelMode::Detail,
+            draft,
+            problem: None,
+            pending: None,
+            card,
+            gone: false,
+            confirming: false,
+            removing: false,
+            opener,
+            focus,
+            confirm_focus,
+            _subscription: subscription,
+        }
+    }
+
+    /// The folder's live card, when the engine's status holds it.
+    fn refresh_detail(&mut self, engine: &Entity<EngineModel>, cx: &mut Context<Self>) {
+        match folder_card(engine, &self.draft.path, cx) {
+            Some(card) => {
+                // #43: the live values are the card's, so the settings the
+                // dialog shows are the ones the store holds.
+                self.draft.recursive = card.recursive;
+                self.draft.album_mapping = card.album_mapping;
+                self.draft.album_scope = card.album_scope;
+                self.card = Some(card);
+                self.gone = false;
+            }
+            None => {
+                // The row left the status: the last known settings stay
+                // usable, and Open folder is disabled.
+                self.gone = true;
+                if let Some(card) = self.card.as_mut() {
+                    card.available = false;
+                }
+            }
+        }
+    }
+
+    /// Applies the newest engine result.
     fn engine_changed(&mut self, engine: &Entity<EngineModel>, cx: &mut Context<Self>) {
+        match self.mode {
+            FolderPanelMode::Draft => self.add_result(engine, cx),
+            FolderPanelMode::Detail => {
+                self.refresh_detail(engine, cx);
+                // #43: a completed Remove closes the dialog once the store no
+                // longer holds the folder, so a refused write keeps it open.
+                if self.removing && self.gone {
+                    cx.emit(FolderPanelEvent::Closed);
+                    return;
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    /// Applies the newest draft Add result when it answers this panel's request.
+    fn add_result(&mut self, engine: &Entity<EngineModel>, cx: &mut Context<Self>) {
         let Some(result) = engine.read(cx).folder_add_result().cloned() else {
             return;
         };
@@ -162,7 +307,7 @@ impl FolderPanel {
     /// One request at a time: a second Add while the first is in flight is
     /// ignored, so a slow store cannot write the folder twice.
     fn add(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.pending.is_some() {
+        if self.mode != FolderPanelMode::Draft || self.pending.is_some() {
             return;
         }
         self.problem = None;
@@ -181,6 +326,89 @@ impl FolderPanel {
         cx.notify();
     }
 
+    /// In detail mode, writes one setting immediately through the engine
+    /// model, the same request the folder's card makes (#43, R2.1, R3.4).
+    fn write_recursive(&mut self, recursive: bool, cx: &mut Context<Self>) {
+        let path = self.draft.path.clone();
+        self.engine
+            .clone()
+            .update(cx, |model, cx| model.add_folder(path, recursive, cx));
+    }
+
+    fn write_album_mapping(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let path = self.draft.path.clone();
+        self.engine
+            .clone()
+            .update(cx, |model, cx| model.set_album_mapping(path, enabled, cx));
+    }
+
+    fn write_album_scope(&mut self, scope: AlbumScope, cx: &mut Context<Self>) {
+        let path = self.draft.path.clone();
+        self.engine
+            .clone()
+            .update(cx, |model, cx| model.set_album_scope(path, scope, cx));
+    }
+
+    /// Opens the stored path in the platform's file manager (#43).
+    ///
+    /// A file manager that cannot start is the dialog's problem to show, the
+    /// same way a refused Add is.
+    fn open_folder(&mut self, cx: &mut Context<Self>) {
+        self.problem = match (self.opener)(&self.draft.path) {
+            Ok(()) => None,
+            Err(error) => Some(format!("The folder could not be opened: {error}")),
+        };
+        cx.notify();
+    }
+
+    /// The first Remove: shows the inline confirmation and gives it the
+    /// keyboard (#43).
+    fn ask_remove(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.confirming = true;
+        window.focus(&self.confirm_focus, cx);
+        cx.notify();
+    }
+
+    /// The second Remove: asks the engine to drop the folder and waits for the
+    /// status to lose it, so a refused write leaves the dialog open (#43).
+    fn remove_confirmed(&mut self, cx: &mut Context<Self>) {
+        if self.removing {
+            return;
+        }
+        self.removing = true;
+        self.confirming = false;
+        let path = self.draft.path.clone();
+        self.engine
+            .clone()
+            .update(cx, |model, cx| model.remove_folder(path, cx));
+        cx.notify();
+    }
+
+    /// Escape during the confirmation cancels only the confirmation (#43).
+    fn cancel_confirmation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.confirming = false;
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    /// Escape, the backdrop, and the close control, each respecting what may
+    /// still be in flight.
+    fn dismiss(&mut self, cx: &mut Context<Self>) {
+        match self.mode {
+            FolderPanelMode::Draft => self.cancel(cx),
+            FolderPanelMode::Detail => cx.emit(FolderPanelEvent::Closed),
+        }
+    }
+
+    /// Escape inside the dialog: a confirmation cancels itself first (#43).
+    fn escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.confirming {
+            self.cancel_confirmation(window, cx);
+            return;
+        }
+        self.dismiss(cx);
+    }
+
     /// Cancels the draft. While an Add is in flight this is a no-op: its result
     /// (a written folder or a refusal) must be shown, so the dialog waits for
     /// it instead of closing under it.
@@ -191,129 +419,106 @@ impl FolderPanel {
         cx.emit(FolderPanelEvent::Cancelled);
     }
 
-    fn set_recursive(&mut self, recursive: bool, cx: &mut Context<Self>) {
-        self.draft.recursive = recursive;
-        cx.notify();
+    /// The name the dialog announces (N5).
+    fn aria_label(&self) -> &'static str {
+        match self.mode {
+            FolderPanelMode::Draft => "Folder setup",
+            FolderPanelMode::Detail => "Folder detail",
+        }
     }
 
-    fn set_album_mapping(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        self.draft.album_mapping = enabled;
-        cx.notify();
+    /// The visible heading the setup dialog gives the panel; the detail's
+    /// heading is the folder's own name (#43).
+    fn draft_title(&self) -> &'static str {
+        "Add a source folder"
     }
 
-    fn set_album_scope(&mut self, scope: AlbumScope, cx: &mut Context<Self>) {
-        self.draft.album_scope = scope;
-        cx.notify();
+    /// The name the path's last component gives the folder.
+    fn folder_name(&self) -> String {
+        self.card
+            .as_ref()
+            .map_or_else(|| folder_name(&self.draft.path), |card| card.title.clone())
     }
 
-    /// The heading the mode gives the panel.
-    fn title(&self, cx: &Context<Self>) -> impl IntoElement + use<> {
-        let text = match self.mode {
-            FolderPanelMode::Draft => "Add a source folder",
-        };
-        div()
-            .text_base()
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(cx.theme().foreground)
-            .child(text)
-    }
-
-    /// The path the dialog confirms (R2.1), shown as one line.
+    /// The path block: the whole path, wrapped and selectable (#43).
     fn path(&self, cx: &Context<Self>) -> impl IntoElement + use<> {
         let shown = if self.draft.path.is_empty() {
             "No path yet.".to_string()
         } else {
             self.draft.path.clone()
         };
+        let muted = cx.theme().muted_foreground;
+        let selectable = self.mode == FolderPanelMode::Detail;
         div()
             .id("folder-panel-path")
             .test_support()
             .aria_label(format!("Folder path: {shown}"))
-            .truncate()
+            .min_w_0()
+            .w_full()
             .text_sm()
-            .text_color(cx.theme().muted_foreground)
-            .child(shown)
+            .text_color(muted)
+            .when(!selectable, |this| this.truncate())
+            // The detail shows the path whole: a long one wraps instead of
+            // being cut, and it can be selected and copied.
+            .when(selectable, |this| {
+                this.child(
+                    SelectableText::new("folder-panel-path-text", shown.clone()).document_order(0),
+                )
+            })
+            .when(!selectable, |this| this.child(shown))
     }
 
-    /// The three settings the setup dialog confirms (R2.1, R3.4).
+    /// The three settings controls, shared with the folder cards (#43).
     fn settings(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let muted = cx.theme().muted_foreground;
-        let leaf = self.draft.album_scope == AlbumScope::Leaf;
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .child(div().text_xs().text_color(muted).child("Recursive"))
-                    .child(
-                        Switch::new("folder-panel-recursive")
-                            .checked(self.draft.recursive)
-                            .accessibility_label("Sync this folder recursively")
-                            .on_click(cx.listener(|this, recursive, _, cx| {
-                                this.set_recursive(*recursive, cx);
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .child(div().text_xs().text_color(muted).child("Album mapping"))
-                    .child(
-                        Switch::new("folder-panel-album")
-                            .checked(self.draft.album_mapping)
-                            .accessibility_label("Album mapping for this folder")
-                            .on_click(cx.listener(|this, enabled, _, cx| {
-                                this.set_album_mapping(*enabled, cx);
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .flex_wrap()
-                    .items_center()
-                    .gap_2()
-                    .child(div().text_xs().text_color(muted).child("Album scope"))
-                    .child(
-                        Radio::new("folder-panel-album-leaf")
-                            .label(AlbumScope::Leaf.label())
-                            .accessibility_label(
-                                "Album scope for this folder: one album per folder",
-                            )
-                            .checked(leaf)
-                            .on_change(cx.listener(|this, checked, _, cx| {
-                                if *checked {
-                                    this.set_album_scope(AlbumScope::Leaf, cx);
-                                }
-                            })),
-                    )
-                    .child(
-                        Radio::new("folder-panel-album-whole")
-                            .label(AlbumScope::WholeFolder.label())
-                            .accessibility_label(
-                                "Album scope for this folder: one album for this folder",
-                            )
-                            .checked(!leaf)
-                            .on_change(cx.listener(|this, checked, _, cx| {
-                                if *checked {
-                                    this.set_album_scope(AlbumScope::WholeFolder, cx);
-                                }
-                            })),
-                    ),
-            )
+        let values = SettingsValues {
+            recursive: self.draft.recursive,
+            album_mapping: self.draft.album_mapping,
+            album_scope: self.draft.album_scope,
+        };
+        let name = match self.mode {
+            FolderPanelMode::Draft => "this folder".to_string(),
+            FolderPanelMode::Detail => self.folder_name(),
+        };
+        let detail = self.mode == FolderPanelMode::Detail;
+        SettingsControls::new(
+            SettingsIds {
+                recursive: "folder-panel-recursive".into(),
+                album_mapping: "folder-panel-album".into(),
+                album_leaf: "folder-panel-album-leaf".into(),
+                album_whole: "folder-panel-album-whole".into(),
+            },
+            name,
+            values,
+            cx.listener(move |this, recursive: &bool, _, cx| {
+                if detail {
+                    this.write_recursive(*recursive, cx);
+                } else {
+                    this.draft.recursive = *recursive;
+                    cx.notify();
+                }
+            }),
+            cx.listener(move |this, enabled: &bool, _, cx| {
+                if detail {
+                    this.write_album_mapping(*enabled, cx);
+                } else {
+                    this.draft.album_mapping = *enabled;
+                    cx.notify();
+                }
+            }),
+            cx.listener(move |this, scope: &AlbumScope, _, cx| {
+                if detail {
+                    this.write_album_scope(*scope, cx);
+                } else {
+                    this.draft.album_scope = *scope;
+                    cx.notify();
+                }
+            }),
+        )
+        .render(cx.theme().muted_foreground)
     }
 
     /// The draft footer: Cancel writes nothing, Add records the four values.
-    fn actions(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn draft_actions(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let pending = self.pending.is_some();
         div()
             .flex()
@@ -340,11 +545,365 @@ impl FolderPanel {
             )
     }
 
+    /// The setup dialog's body: title, path, settings, and the Add footer.
+    fn draft_body(
+        &self,
+        palette: &CardPalette,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .w_full()
+            .child(
+                div()
+                    .text_base()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.foreground)
+                    .child(self.draft_title()),
+            )
+            .child(self.path(cx))
+            .child(self.settings(cx))
+            .when_some(self.problem.clone(), |this, problem| {
+                this.child(notice(
+                    "folder-panel-problem",
+                    problem,
+                    theme.danger,
+                    palette,
+                ))
+            })
+            .child(self.draft_actions(cx))
+            .into_any_element()
+    }
+
+    /// The detail body: the live state, the settings that write immediately,
+    /// the timestamps, the links into the filtered views, and Remove (#43).
+    fn detail_body(
+        &self,
+        palette: &CardPalette,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let muted = theme.muted_foreground;
+        let available = !self.gone && self.card.as_ref().is_some_and(|card| card.available);
+        let activity = match &self.card {
+            Some(card) if card.available => card.activity,
+            // A folder that is no longer readable is a folder needing the user
+            // (R2.5), and one that left the list reads the same way.
+            _ => ActivityState::NeedsAttention,
+        };
+        let progress = self.card.as_ref().map_or(0.0, |card| card.progress);
+        let (uploaded, pending, failed, review) = self.card.as_ref().map_or((0, 0, 0, 0), |card| {
+            (
+                card.counts.uploaded,
+                card.counts.pending,
+                card.counts.failed,
+                card.review_count,
+            )
+        });
+        let tracked = uploaded + pending + failed + review;
+        let last_error = self.card.as_ref().and_then(|card| card.last_error.clone());
+        let now_ns = times::now_ns();
+        let upload_line = times::moment_line(
+            "Last successful upload",
+            self.card.as_ref().and_then(|card| card.last_upload_ns),
+            now_ns,
+        );
+        let scan_line = times::moment_line(
+            "Last reconciliation scan",
+            self.card.as_ref().and_then(|card| card.last_scan_ns),
+            now_ns,
+        );
+        let title = self.folder_name();
+        let path = self.draft.path.clone();
+        let counts = format!(
+            "{uploaded} uploaded · {pending} pending · {failed} failed · {review} to review · \
+             {tracked} tracked"
+        );
+        let percent = format!("{}%", (progress.clamp(0.0, 1.0) * 100.0).round() as u32);
+
+        let mut body = div()
+            .id("folder-detail-body")
+            .test_support()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .w_full()
+            // #43: while the Remove confirmation shows, the body dims and the
+            // confirmation owns the keyboard.
+            .when(self.confirming, |this| this.opacity(0.4))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .justify_between()
+                    .gap_3()
+                    .child(
+                        div()
+                            .id("folder-detail-title")
+                            .test_support()
+                            .aria_label(title.clone())
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(title.clone()),
+                    )
+                    .child(
+                        Button::new("folder-detail-close")
+                            .ghost()
+                            .label("✕")
+                            .accessibility_label("Close the folder detail")
+                            .on_click(cx.listener(|this, _, _, cx| this.dismiss(cx))),
+                    ),
+            )
+            .child(self.path(cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .id("folder-detail-state")
+                            .test_support()
+                            .aria_label(activity.label().to_string())
+                            .child(state_tag(
+                                activity,
+                                activity.label().to_string(),
+                                palette,
+                                theme,
+                            )),
+                    )
+                    .child(
+                        Progress::new("folder-detail-progress")
+                            .flex_1()
+                            .value(progress.clamp(0.0, 1.0) * 100.0)
+                            .accessibility_label(format!("{title} progress")),
+                    )
+                    .child(
+                        div()
+                            .id("folder-detail-percent")
+                            .test_support()
+                            .aria_label(percent.clone())
+                            .text_sm()
+                            .text_color(muted)
+                            .child(percent),
+                    ),
+            )
+            .child(
+                div()
+                    .id("folder-detail-counts")
+                    .test_support()
+                    .aria_label(counts.clone())
+                    .text_sm()
+                    .text_color(muted)
+                    .child(counts),
+            )
+            .when(!available, |this| {
+                this.child(notice(
+                    "folder-detail-unavailable",
+                    format!("Folder unavailable: {path}"),
+                    theme.warning,
+                    palette,
+                ))
+            })
+            .child(self.settings(cx))
+            .when_some(last_error, |this, error| {
+                this.child(
+                    div()
+                        .id("folder-detail-error")
+                        .test_support()
+                        .role(Role::Alert)
+                        .aria_label(format!("Last error: {error}"))
+                        .border_l_2()
+                        .border_color(theme.danger)
+                        .pl_2()
+                        .text_sm()
+                        .text_color(theme.foreground)
+                        .child(error),
+                )
+            })
+            .child(
+                div()
+                    .id("folder-detail-upload")
+                    .test_support()
+                    .aria_label(upload_line.clone())
+                    .text_sm()
+                    .text_color(muted)
+                    .child(upload_line),
+            )
+            .child(
+                div()
+                    .id("folder-detail-scan")
+                    .test_support()
+                    .aria_label(scan_line.clone())
+                    .text_sm()
+                    .text_color(muted)
+                    .child(scan_line),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("folder-detail-open")
+                            .secondary()
+                            .disabled(!available)
+                            .label("Open folder")
+                            .accessibility_label(format!("Open {path} in the file manager"))
+                            .on_click(cx.listener(|this, _, _, cx| this.open_folder(cx))),
+                    )
+                    .child(
+                        Button::new("folder-detail-failed")
+                            .ghost()
+                            .label(format!("{failed} failed"))
+                            .accessibility_label(format!("View {failed} failed items in {title}"))
+                            .on_click(cx.listener({
+                                let position = path.clone();
+                                move |_, _, _, cx| {
+                                    cx.emit(FolderPanelEvent::Open(
+                                        ViewMode::Failed,
+                                        position.clone(),
+                                    ));
+                                }
+                            })),
+                    )
+                    .child(
+                        Button::new("folder-detail-review")
+                            .ghost()
+                            .label(format!("{review} to review"))
+                            .accessibility_label(format!("View {review} missing files in {title}"))
+                            .on_click(cx.listener({
+                                let position = path.clone();
+                                move |_, _, _, cx| {
+                                    cx.emit(FolderPanelEvent::Open(
+                                        ViewMode::Review,
+                                        position.clone(),
+                                    ));
+                                }
+                            })),
+                    )
+                    .child(
+                        Button::new("folder-detail-remove")
+                            .danger()
+                            .disabled(self.removing)
+                            .label(if self.removing {
+                                "Removing…"
+                            } else {
+                                "Remove"
+                            })
+                            .accessibility_label(format!("Remove {title}"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.ask_remove(window, cx);
+                            })),
+                    ),
+            )
+            .when_some(self.problem.clone(), |this, problem| {
+                this.child(notice(
+                    "folder-panel-problem",
+                    problem,
+                    theme.danger,
+                    palette,
+                ))
+            });
+
+        if self.confirming {
+            body = body.child(self.confirmation(&title, palette, theme, cx));
+        }
+        body.into_any_element()
+    }
+
+    /// The inline Remove confirmation: the second action is the one that
+    /// removes, and it says what stays on the server (#43).
+    fn confirmation(
+        &self,
+        title: &str,
+        palette: &CardPalette,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .id("folder-detail-confirm")
+            .test_support()
+            .role(Role::Alert)
+            .aria_label(format!("Remove {title}?"))
+            .track_focus(&self.confirm_focus)
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .w_full()
+            .rounded(theme.radius_lg)
+            .border_1()
+            .border_color(theme.danger)
+            .bg(palette.surface)
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(palette.text)
+                    .child(format!("Remove “{title}” from Immich Sync?")),
+            )
+            .child(div().text_xs().text_color(palette.meta).child(
+                "Its uploaded assets stay on the server. The client stops syncing this folder \
+                     and forgets the items it tracked.",
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new("folder-detail-remove-cancel")
+                            .secondary()
+                            .label("Cancel")
+                            .accessibility_label("Keep the folder")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.cancel_confirmation(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("folder-detail-remove-confirm")
+                            .danger()
+                            .label("Remove folder")
+                            .accessibility_label(format!("Remove {title} now"))
+                            .on_click(cx.listener(|this, _, _, cx| this.remove_confirmed(cx))),
+                    ),
+            )
+            .into_any_element()
+    }
+
     /// The modal host: centered over a backdrop, focus trapped, Escape cancels.
+    ///
+    /// The backdrop is the host's sibling rather than an ancestor of the card,
+    /// so a click on the dialog never reaches it (#43).
     fn modal(&self, card: AnyElement, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let focus = self.focus.clone();
         let viewport = window.viewport_size();
+        let backdrop = div()
+            .id("folder-panel-backdrop")
+            .test_support()
+            .absolute()
+            .top_0()
+            .left_0()
+            .w(viewport.width)
+            .h(viewport.height)
+            .bg(theme.background.opacity(0.75))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.dismiss(cx);
+                    cx.stop_propagation();
+                }),
+            );
         deferred(
             anchored().position(point(px(0.), px(0.))).child(
                 div()
@@ -358,25 +917,38 @@ impl FolderPanel {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .bg(theme.background.opacity(0.75))
                     .track_focus(&focus)
                     .focus_trap("folder-panel-trap", &focus)
-                    // The backdrop swallows pointer and wheel events, so the
+                    // The host swallows pointer and wheel events, so the
                     // dashboard behind the modal stays inert.
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                         if event.keystroke.key == "escape" {
-                            this.cancel(cx);
-                            cx.stop_propagation();
+                            this.escape(window, cx);
                         }
                     }))
+                    .child(backdrop)
                     .child(card),
             ),
         )
         .with_priority(10)
         .into_any_element()
     }
+}
+
+/// The live card the engine's status holds for `path`, when it holds one.
+fn folder_card(
+    engine: &Entity<EngineModel>,
+    path: &str,
+    cx: &mut Context<FolderPanel>,
+) -> Option<StatusCard> {
+    engine
+        .read(cx)
+        .dashboard_model(cx)
+        .folders
+        .into_iter()
+        .find(|card| card.path.as_deref() == Some(path))
 }
 
 impl Focusable for FolderPanel {
@@ -390,33 +962,39 @@ impl Render for FolderPanel {
         // The theme is copied before the controls borrow the context mutably.
         let theme = cx.theme().clone();
         let palette = CardPalette::new(&theme);
+        let viewport = window.viewport_size();
+        // The detail carries more than the setup, so it gets the wider card; a
+        // short window scrolls the body instead of clipping its last control.
+        let width = match self.mode {
+            FolderPanelMode::Draft => rems(30.),
+            FolderPanelMode::Detail => rems(34.),
+        };
+        let body = match self.mode {
+            FolderPanelMode::Draft => self.draft_body(&palette, &theme, cx),
+            FolderPanelMode::Detail => self.detail_body(&palette, &theme, cx),
+        };
         let card = div()
             .id("folder-panel")
             .test_support()
             .role(Role::Dialog)
-            .aria_label("Folder setup")
+            .aria_label(self.aria_label())
             .flex()
             .flex_col()
             .gap_3()
-            .w(rems(30.))
+            .w(width)
+            .max_h(viewport.height - px(96.))
+            .overflow_y_scroll()
             .p_5()
             .rounded(theme.radius_lg)
             .bg(theme.popover)
             .text_color(theme.foreground)
             .border_1()
             .border_color(theme.border)
-            .child(self.title(cx))
-            .child(self.path(cx))
-            .child(self.settings(cx))
-            .when_some(self.problem.clone(), |this, problem| {
-                this.child(notice(
-                    "folder-panel-problem",
-                    problem,
-                    theme.danger,
-                    &palette,
-                ))
-            })
-            .child(self.actions(cx))
+            // The card is a mouse barrier above the backdrop: a press inside
+            // the dialog never reaches the backdrop that dismisses it, and it
+            // is what lets the path's text selection see the drag (#43).
+            .block_mouse_except_scroll()
+            .child(body)
             .into_any_element();
         self.modal(card, window, cx)
     }
@@ -426,7 +1004,7 @@ impl Render for FolderPanel {
 mod tests {
     // GPUI's glob imports its own `test` macro, so this module names what it
     // uses and keeps Rust's `#[test]`.
-    use super::{PathProbe, confirmed, path_problem};
+    use super::{PathProbe, confirmed_folder, path_problem};
     use gpui_kit::TestAppContext;
     use sync_core::store::{AlbumScope, SourceFolder};
 
@@ -458,7 +1036,7 @@ mod tests {
 
     #[test]
     fn an_empty_draft_names_the_missing_path() {
-        let error = confirmed(&draft("  ")).expect_err("an empty path is refused");
+        let error = confirmed_folder(&draft("  ")).expect_err("an empty path is refused");
         assert_eq!(error, "Enter the path of a folder to add.");
     }
 
@@ -467,7 +1045,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("create a temp dir");
         let missing = temp.path().join("not there");
 
-        let error = confirmed(&draft(&missing.display().to_string()))
+        let error = confirmed_folder(&draft(&missing.display().to_string()))
             .expect_err("a missing path is refused");
         assert_eq!(error, "That path does not exist.");
     }
@@ -478,7 +1056,8 @@ mod tests {
         let file = temp.path().join("photo.jpg");
         std::fs::write(&file, b"not a folder").expect("create the file");
 
-        let error = confirmed(&draft(&file.display().to_string())).expect_err("a file is refused");
+        let error =
+            confirmed_folder(&draft(&file.display().to_string())).expect_err("a file is refused");
         assert_eq!(error, "That path is a file, not a folder.");
     }
 
@@ -498,7 +1077,7 @@ mod tests {
             .expect("lock the folder");
 
         let probed = probe(&locked);
-        let refused = confirmed(&draft(&locked.display().to_string()));
+        let refused = confirmed_folder(&draft(&locked.display().to_string()));
         // Restore the mode before the tempdir drops, so its cleanup can empty
         // the directory.
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))
@@ -523,11 +1102,118 @@ mod tests {
         std::fs::create_dir(&photos).expect("create the folder");
         let spelled = format!("  {}  ", photos.display());
 
-        let folder = confirmed(&draft(&spelled)).expect("a readable folder is accepted");
+        let folder = confirmed_folder(&draft(&spelled)).expect("a readable folder is accepted");
         assert_eq!(folder.path, photos.display().to_string());
         assert!(folder.recursive, "the draft's settings are kept");
         assert!(!folder.album_mapping);
         assert_eq!(folder.album_scope, AlbumScope::Leaf);
+    }
+
+    /// #43: the detail renders the folder's full last error. In the product it
+    /// comes from the engine's folder status, which a signed-out client has
+    /// none of, so the rendering is pinned on an injected card.
+    #[gpui_kit::test]
+    fn a_folders_last_error_renders_in_full(cx: &mut TestAppContext) {
+        use crate::connection::ConnectionModel;
+        use crate::engine::EngineModel;
+        use crate::paths::AppPaths;
+        use crate::status::DashboardModel;
+        use crate::store::StoreModel;
+        use gpui_kit::test::TestWindowExt as _;
+        use gpui_kit::{
+            AppContext as _, Bounds, Point, Role, WindowBounds, WindowOptions, px, size,
+        };
+        use std::sync::Arc;
+        use sync_core::connection::ServerProfile;
+        use sync_core::credential::{MemoryCredentialStore, SharedCredentialStore};
+        use sync_core::status::{Activity, FolderStatus, Status};
+        use sync_core::store::FolderCounts;
+
+        const ERROR: &str = "the server answered 503 in a form this client does not understand: \
+                             Service Unavailable";
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let paths = AppPaths {
+            config_file: temp.path().join("config").join("settings.toml"),
+            state_db: temp.path().join("data").join("state.db"),
+            autostart_dir: temp.path().join("config").join("autostart"),
+        };
+        let status = Status {
+            activity: Activity::NeedsAttention,
+            folders: vec![FolderStatus {
+                path: "/photos".to_string(),
+                recursive: true,
+                album_mapping: false,
+                album_scope: AlbumScope::Leaf,
+                available: true,
+                counts: FolderCounts::default(),
+                last_error: Some(ERROR.to_string()),
+                last_scan_ns: None,
+                last_upload_ns: None,
+                uploads: sync_core::meter::UploadTraffic::default(),
+            }],
+            counts: FolderCounts::default(),
+            last_error: Some(ERROR.to_string()),
+            uploads: sync_core::meter::UploadTraffic::default(),
+        };
+        let mut card = DashboardModel::from_engine(&status, None).folders.remove(0);
+
+        let credentials: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+        let (window, panel) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            let connection =
+                cx.new(|_| ConnectionModel::new(ServerProfile::default(), credentials));
+            let store = cx.new(|cx| StoreModel::open(&paths, cx));
+            let engine = cx.new(|cx| EngineModel::new(connection, store, &paths, cx));
+            let panel = cx.new(|cx| {
+                super::FolderPanel::detail(
+                    engine,
+                    card.path.clone().expect("the card is a folder"),
+                    Arc::new(|_| Ok(())),
+                    cx,
+                )
+            });
+            // The engine has no status for a folder it never read, so the card
+            // the view tests is injected.
+            card.available = true;
+            panel.update(cx, |panel, _| panel.card = Some(card));
+            let root = panel.clone();
+            let (window, _root) = gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Point::default(),
+                        size: size(px(1200.), px(800.)),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |_, _| root,
+            )
+            .expect("open the panel's window");
+            (window, panel)
+        });
+
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                window.find("folder-detail-error").label(),
+                Some(format!("Last error: {ERROR}").as_str()),
+                "#43: the whole last error is announced"
+            );
+            assert_eq!(window.find("folder-detail-error").role(), Some(Role::Alert));
+            assert_eq!(
+                window.find("folder-detail-state").label(),
+                Some("Needs attention")
+            );
+            assert!(
+                panel
+                    .read(cx)
+                    .card
+                    .as_ref()
+                    .is_some_and(|card| card.available),
+                "the fixture card is the one rendered"
+            );
+        })
+        .expect("read the rendered error");
     }
 
     /// #40 (S1): a worker answer that never arrives must not strand the setup
