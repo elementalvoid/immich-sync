@@ -315,6 +315,12 @@ async fn a_resume_during_engine_startup_leaves_uploads_flowing(cx: &mut TestAppC
         1,
         "R8.7: uploads must flow once the resume reaches the engine"
     );
+    // R3.7: the fresh settings store leaves the tag on, so the upload that just
+    // flowed is tagged as well.
+    assert!(
+        pump_until(cx, |_| !server.tag_asset_calls().is_empty()),
+        "R3.7: the default-on sync tag never reached the upload"
+    );
 }
 
 #[gpui_kit::test]

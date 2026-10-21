@@ -344,6 +344,35 @@ fn a_settings_file_that_says_off_loads_off() {
     assert!(store.problem().is_none());
 }
 
+/// R3.7: a settings file that predates the sync tag setting, or one written by
+/// hand without it, loads with the new default on.
+#[test]
+fn a_settings_file_without_the_tag_setting_loads_it_on() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let path = temp.path().join("settings.toml");
+    fs::write(
+        &path,
+        "autostart = false\n\
+         bandwidth_bytes_per_second = 0\n\
+         concurrency = 4\n\
+         scan_interval_minutes = 30\n\
+         attempt_cap = 8\n\
+         server_url = \"https://immich.example.com\"\n\
+         email = \"sync@example.com\"\n\
+         auth_method = \"password\"\n\
+         log_level = \"info\"\n",
+    )
+    .expect("write the settings file");
+
+    let store = SettingsStore::open(path);
+
+    assert!(
+        store.settings().tag_uploaded_assets,
+        "R3.7: a missing setting takes the on default"
+    );
+    assert!(store.problem().is_none());
+}
+
 #[test]
 fn settings_round_trip_across_a_restart() {
     let temp = tempfile::tempdir().expect("create a temp dir");

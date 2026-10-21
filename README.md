@@ -206,14 +206,14 @@ its card instead of producing one error per file.
 - **Settings.** Changes save immediately. General holds **Autostart at login**
   (off by default); Limits holds the bandwidth limit (0 means unlimited) and
   concurrent uploads; Sync holds the reconciliation scan interval and the retry
-  attempt cap; Tagging holds **Tag uploaded assets** (on by default), which
-  adds the fixed tag `immich-sync` to every asset the client uploads. With an
-  API key, tagging needs the `tag.create`, `tag.asset`, and `asset.update`
-  permissions. The same
-  section shows the backfill's progress and **Tag existing assets now**, which
-  tags every asset the client has already uploaded, and **View in Immich**
-  (with a server URL set) opens the tag's page. Immich hides tags until **Tags**
-  is enabled in your Immich account features (Account Settings → Features).
+  attempt cap; Tagging holds **Tag uploaded assets** (on by default), which adds
+  the fixed tag `immich-sync` to every asset the client uploads. With an API
+  key, tagging needs the `tag.create`, `tag.asset`, and `asset.update`
+  permissions. The same section shows the backfill's progress and **Tag existing
+  assets now**, which tags every asset the client has already uploaded, and
+  **View in Immich** (with a server URL set) opens the tag's page. Immich hides
+  tags until **Tags** is enabled in your Immich account features (Account
+  Settings → Features).
 - **Diagnostics.** Client and server versions and permissions, the state
   database and its integrity, the last error per class, throughput, a
   **Collect bundle** action, and a **Rebuild** action that starts the state over
