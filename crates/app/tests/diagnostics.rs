@@ -967,6 +967,18 @@ async fn the_bundle_action_saves_an_archive_shows_its_path_and_copies_it(cx: &mu
     let bundle_directory = paths.log_directory();
 
     let connection = connection_model(cx, &server, AuthMethod::ApiKey);
+    // `tracing` caches a callsite's interest for the whole process. A test
+    // thread with no subscriber can register one of the client's callsites
+    // first, while this test's thread-local sink is the only installed
+    // dispatcher (`a_missing_version_permission_is_an_actionable_message` does
+    // exactly that). The cache then says "never", and the client's event is
+    // dropped even on this thread: issue #49's missing log line. If the test
+    // rebuilds the cache while its own sink is installed, every callsite is
+    // enabled again. The production client installs one process-wide sink, so
+    // there is no second dispatcher that could poison the cache. This first
+    // rebuild is insurance for what `open_shell` logs before the sign-in; the
+    // measured poison window is the store wait, guarded again below.
+    tracing::callsite::rebuild_interest_cache();
     let (window, store, _engine, diagnostics) = open_shell(
         cx,
         SettingsStore::open(paths.config_file.clone()),
@@ -991,6 +1003,9 @@ async fn the_bundle_action_saves_an_archive_shows_its_path_and_copies_it(cx: &mu
             })
             .expect("record the attempt");
     });
+    // The store wait above is a wide window for the same poison, and the sign-in
+    // line is the one the archive assertion needs: rebuild again right before it.
+    tracing::callsite::rebuild_interest_cache();
     sign_in(
         cx,
         &connection,

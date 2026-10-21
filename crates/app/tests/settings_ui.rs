@@ -2130,11 +2130,24 @@ async fn a_missing_tag_permission_is_named_in_the_tagging_section(cx: &mut TestA
     })
     .expect("draw the frame the switch produced");
 
-    // The save outcome lands a tick after the file does (N2), and its `record`
-    // notifies the view. Pump it and draw that frame now, while the probe is
-    // still held, so nothing after this point owes a repaint to the save.
-    cx.executor().timer(Duration::from_millis(10)).await;
-    cx.run_until_parked();
+    // The save outcome lands a tick after the file does (N2): its `record`
+    // notifies the view, and its finish hands the switch to the engine, whose
+    // next poll (250 ms) publishes the new tag state and notifies the view
+    // again. Wait for that state instead of pumping one tick, because a loaded
+    // runner can take longer than the fixed pump, and the late notification
+    // would then be counted against the probe's answer below; it flaked on CI
+    // as `left: 2` while issue #49's CI was being fixed. The probe is held for
+    // a second, so the switch is always published before the answer.
+    let mut applied = false;
+    for _ in 0..600 {
+        if cx.read(|cx| engine_model.read(cx).tag_status().enabled) {
+            applied = true;
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    assert!(applied, "the engine never applied the tag switch");
     cx.update_window(window, |_, window, cx| {
         window.draw(cx).clear(cx);
         assert!(
@@ -2142,7 +2155,7 @@ async fn a_missing_tag_permission_is_named_in_the_tagging_section(cx: &mut TestA
             "the save outcome arrived before the probe answered"
         );
     })
-    .expect("draw the frame the save outcome produced");
+    .expect("draw the frame the applied switch produced");
 
     // The harness re-renders the root view on every `draw`, so the notice
     // appearing in a frame does not prove the view asked for one. Watch the
