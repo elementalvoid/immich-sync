@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use gpui_kit::test::TestWindowExt as _;
+use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
 use gpui_kit::{
     Action, AnyWindowHandle, AppContext as _, Bounds, MenuItem, Point, TestAppContext,
     WindowBounds, WindowOptions, px, size,
@@ -343,6 +343,99 @@ fn open_shell(
         )
         .expect("open the shell window")
     })
+}
+
+/// #43: the folder detail's Failed and Review links open the matching view with
+/// that folder already selected, through the shell's own surface switch.
+#[gpui_kit::test]
+async fn the_folder_detail_links_open_a_filtered_view(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let camera_roll = temp.path().join("Camera Roll");
+    std::fs::create_dir_all(&camera_roll).expect("create the source folder");
+    let selected = camera_roll.display().to_string();
+    {
+        let store = sync_core::store::StateStore::open(&paths.state_db).expect("open the store");
+        store
+            .add_folder(&sync_core::store::SourceFolder {
+                path: selected.clone(),
+                recursive: true,
+                album_mapping: false,
+                album_scope: sync_core::store::AlbumScope::Leaf,
+            })
+            .expect("add the source folder");
+    }
+    let (window, shell) = open_shell(cx, &paths);
+
+    // The card appears once the store has opened, off the UI thread.
+    cx.wait_for(window, std::time::Duration::from_secs(30), |window, _| {
+        window.try_find(("folder-details", 0_usize)).is_some()
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        window.click(("folder-details", 0_usize), cx);
+    })
+    .expect("open the folder detail");
+    cx.wait_for(window, std::time::Duration::from_secs(10), |window, _| {
+        window.try_find("folder-panel").is_some()
+    })
+    .await;
+
+    cx.update_window(window, |_, window, cx| {
+        window.click("folder-detail-failed", cx);
+    })
+    .expect("follow the failed link");
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            shell.read(cx).mode(),
+            ViewMode::Failed,
+            "#43: the Failed link opens the failed-items view"
+        );
+        assert_eq!(
+            window.find("failed-folder-chip").label(),
+            Some("Showing Camera Roll"),
+            "the failed-items view opens filtered to the detail's folder"
+        );
+        assert!(
+            window.try_find("folder-panel").is_none(),
+            "the detail closes as the view opens"
+        );
+    })
+    .expect("read the failed view");
+
+    // The same detail, the other link.
+    cx.update_window(window, |_, _, cx| {
+        shell.update(cx, |shell, cx| shell.show(ViewMode::Dashboard, cx));
+    })
+    .expect("back to the dashboard");
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(("folder-details", 0_usize), cx);
+    })
+    .expect("open the folder detail again");
+    cx.wait_for(window, std::time::Duration::from_secs(10), |window, _| {
+        window.try_find("folder-panel").is_some()
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        window.click("folder-detail-review", cx);
+    })
+    .expect("follow the review link");
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            shell.read(cx).mode(),
+            ViewMode::Review,
+            "#43: the Review link opens the deletion review"
+        );
+        assert_eq!(
+            window.find("review-folder-chip").label(),
+            Some("Showing Camera Roll"),
+            "the review opens filtered to the detail's folder"
+        );
+    })
+    .expect("read the review");
 }
 
 #[gpui_kit::test]

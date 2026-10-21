@@ -354,6 +354,16 @@ async fn the_failed_view_offers_every_source_folder_under_all_folders(cx: &mut T
 
         window.click("failed-folder-filter", cx);
         assert_eq!(
+            window.find("failed-folder-options").role(),
+            Some(Role::List),
+            "the options are one list"
+        );
+        assert_eq!(
+            window.find("failed-folder-option-0").role(),
+            Some(Role::ListItem),
+            "each option is a list item of that list"
+        );
+        assert_eq!(
             window.find("failed-folder-option-0").label(),
             Some("Show items from all folders, selected"),
             "the option list marks the current choice, not only with colour"
@@ -411,8 +421,8 @@ async fn choosing_a_folder_narrows_the_list_its_summary_and_its_empty_state(
         );
         assert_eq!(
             window.find("failed-summary").label(),
-            Some("Nothing has failed."),
-            "the summary follows the filter"
+            Some("No failed items in Videos"),
+            "an empty filtered list is summarised for its folder, not for the whole client"
         );
         assert!(window.try_find("failed-row-0").is_none());
 

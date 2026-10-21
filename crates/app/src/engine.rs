@@ -21,7 +21,7 @@ use crate::connection::{
     ConnectionModel, STORE_OPENING, WORKER_UNAVAILABLE, run_on_worker, run_on_worker_or_lost,
     worker,
 };
-use crate::folder_panel::{ALREADY_ADDED, confirmed};
+use crate::folder_panel::{ALREADY_ADDED, confirmed_folder};
 use crate::notify::Notifier;
 use crate::paths::AppPaths;
 use crate::settings::SettingsStore;
@@ -82,6 +82,8 @@ pub struct EngineModel {
     problem: Option<String>,
     /// The newest folder-setup outcome, for the add dialog (#40).
     folder_add: Option<FolderAddResult>,
+    /// The newest folder-removal outcome, for the folder detail (#43).
+    folder_remove: Option<FolderRemoveResult>,
     /// Bumped by every setup-dialog add, kept apart from `generation` so an
     /// unrelated folder edit cannot drop the result the dialog waits for, and
     /// a slower earlier add cannot answer a newer dialog (#40).
@@ -89,6 +91,10 @@ pub struct EngineModel {
     /// Bumped by every folder edit, so an older edit result cannot overwrite a
     /// newer one.
     generation: u64,
+    /// Bumped by every remove, kept apart from `generation` so a settings edit
+    /// during a pending Remove cannot drop the answer the detail waits for
+    /// (#43).
+    remove_generation: u64,
     /// Bumped by every engine start attempt, kept apart from `generation` so a
     /// folder edit cannot discard an engine that is already being built.
     start_generation: u64,
@@ -120,6 +126,19 @@ pub struct FolderAddResult {
     /// The request this result answers.
     pub request: u64,
     /// Why nothing was written, or `None` when the folder was added.
+    pub problem: Option<String>,
+}
+
+/// The outcome of one folder removal (#43).
+///
+/// The request id lets the detail that asked recognise its own answer, so a
+/// status poll that lands while the write is still in flight cannot be read as
+/// the refusal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FolderRemoveResult {
+    /// The request this result answers.
+    pub request: u64,
+    /// Why nothing was removed, or `None` when the folder was.
     pub problem: Option<String>,
 }
 
@@ -191,8 +210,10 @@ impl EngineModel {
             paused: false,
             problem: None,
             folder_add: None,
+            folder_remove: None,
             add_generation: 0,
             generation: 0,
+            remove_generation: 0,
             start_generation: 0,
             store_generation: 0,
             rebuilding: false,
@@ -217,6 +238,12 @@ impl EngineModel {
     #[must_use]
     pub fn folder_add_result(&self) -> Option<&FolderAddResult> {
         self.folder_add.as_ref()
+    }
+
+    /// The newest folder-removal outcome, if one has arrived (#43).
+    #[must_use]
+    pub fn folder_remove_result(&self) -> Option<&FolderRemoveResult> {
+        self.folder_remove.as_ref()
     }
 
     /// The parked items the failed-items view lists (R6.5).
@@ -664,7 +691,7 @@ impl EngineModel {
             move || async move {
                 // N2: the filesystem probe and the store write belong on the
                 // worker, not the UI thread.
-                let folder = confirmed(&draft)?;
+                let folder = confirmed_folder(&draft)?;
                 // The tracking module decides, and it serves the engine and the
                 // signed-out client alike; the insert refuses a path the client
                 // already holds under the platform's path rule (R2.4).
@@ -726,12 +753,31 @@ impl EngineModel {
         cx.notify();
     }
 
+    /// A test seam: answers the next remove now, the way a worker that could
+    /// not start answers before the caller records its request (#43).
+    #[cfg(test)]
+    pub(crate) fn lose_next_remove_for_test(&mut self, cx: &mut Context<Self>) {
+        let request = self.remove_generation.wrapping_add(1);
+        self.problem = Some(WORKER_UNAVAILABLE.to_string());
+        self.folder_remove = Some(FolderRemoveResult {
+            request,
+            problem: self.problem.clone(),
+        });
+        cx.notify();
+    }
+
     /// Removes a source folder; its items stay in the store (R2.1).
-    pub fn remove_folder(&mut self, path: String, cx: &mut Context<Self>) {
-        // A newer edit supersedes an older result still in flight.
+    ///
+    /// The returned id tags the result, so the folder detail can wait for its
+    /// own answer and stay open with the reason when the store refuses (#43).
+    pub fn remove_folder(&mut self, path: String, cx: &mut Context<Self>) -> u64 {
+        // A newer edit supersedes an older result still in flight, and a newer
+        // remove supersedes an older one; the request tag is the remove's own,
+        // so an unrelated settings edit cannot drop it (#43).
         self.generation = self.generation.wrapping_add(1);
+        self.remove_generation = self.remove_generation.wrapping_add(1);
         let tracking = self.store_model.read(cx).tracking();
-        let generation = self.generation;
+        let request = self.remove_generation;
         let result = run_on_worker(
             cx,
             move || async move {
@@ -743,25 +789,37 @@ impl EngineModel {
                 tracking.folders().map_err(|error| error.to_string())
             },
             move |model, result, cx| {
-                if model.generation != generation {
+                if model.remove_generation != request {
                     return;
                 }
-                match result {
+                let problem = match result {
                     Ok(folders) => {
                         model.store_model.update(cx, |store, cx| {
                             store.set_folders(folders, cx);
                         });
                         model.problem = None;
+                        None
                     }
-                    Err(problem) => model.problem = Some(problem),
-                }
+                    Err(problem) => {
+                        model.problem = Some(problem.clone());
+                        Some(problem)
+                    }
+                };
+                model.folder_remove = Some(FolderRemoveResult { request, problem });
                 model.refresh_status(cx);
             },
         );
         if result.is_err() {
             self.problem = Some(WORKER_UNAVAILABLE.to_string());
+            // The dialog waits for its own answer, so a request that never ran
+            // still has to answer it: the reason is the missing worker (#43).
+            self.folder_remove = Some(FolderRemoveResult {
+                request,
+                problem: self.problem.clone(),
+            });
             cx.notify();
         }
+        request
     }
 
     /// Turns album mapping on or off for one source folder (R3.4).
@@ -966,7 +1024,8 @@ impl EngineModel {
                     .folders()
                     .iter()
                     .zip(store.folder_counts())
-                    .map(|(folder, counts)| FolderStatus {
+                    .zip(store.folder_times())
+                    .map(|((folder, counts), times)| FolderStatus {
                         path: folder.path.clone(),
                         recursive: folder.recursive,
                         album_mapping: folder.album_mapping,
@@ -975,6 +1034,10 @@ impl EngineModel {
                         // The last known counts from the store (R8.1).
                         counts: *counts,
                         last_error: None,
+                        // #43: the last known scan and upload times, from the
+                        // store the engine writes them to.
+                        last_scan_ns: times.last_scan_ns,
+                        last_upload_ns: times.last_upload_ns,
                         // The meter dies with the engine it belongs to; the
                         // store-only status has nothing on the wire (R8.1).
                         uploads: UploadTraffic::default(),

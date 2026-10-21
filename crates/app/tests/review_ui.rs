@@ -517,8 +517,8 @@ async fn choosing_a_folder_narrows_the_review_its_summary_and_its_empty_state(
         );
         assert_eq!(
             window.find("review-summary").label(),
-            Some("Nothing waits for a decision."),
-            "the summary follows the filter"
+            Some("No missing files in Videos"),
+            "an empty filtered list is summarised for its folder, not for the whole client"
         );
         assert!(window.try_find("review-row-0").is_none());
 

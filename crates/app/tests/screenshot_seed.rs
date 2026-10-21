@@ -170,4 +170,19 @@ fn seed_capture_state() {
             ItemState::Missing,
         );
     }
+
+    // The folder-detail capture (#43): a scan a few minutes old and an upload
+    // just before it, so the dialog shows both timestamp forms instead of
+    // "not yet".
+    let now_ns = immich_sync::times::now_ns();
+    let minute = 60 * 1_000_000_000;
+    store
+        .record_folder_scan(&pictures.display().to_string(), now_ns - 3 * minute)
+        .expect("record the capture scan time");
+    store
+        .record_folder_upload(&pictures.display().to_string(), now_ns - 8 * minute)
+        .expect("record the capture upload time");
+    store
+        .record_folder_scan(&videos.display().to_string(), now_ns - 3 * minute)
+        .expect("record the second capture scan time");
 }

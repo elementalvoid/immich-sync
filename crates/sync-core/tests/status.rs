@@ -23,6 +23,8 @@ fn folder(path: &str, counts: FolderCounts) -> FolderStatus {
         available: true,
         counts,
         last_error: None,
+        last_scan_ns: None,
+        last_upload_ns: None,
         uploads: UploadTraffic::default(),
     }
 }

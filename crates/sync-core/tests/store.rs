@@ -1250,8 +1250,8 @@ fn the_sqlite_info_reports_the_schema_the_size_and_the_table_counts() {
 
     let empty = store.sqlite_info().expect("read the sqlite info");
     assert_eq!(
-        empty.migration_version, 10,
-        "the schema stands at the tenth migration"
+        empty.migration_version, 11,
+        "the schema stands at the eleventh migration"
     );
     assert!(empty.size_bytes > 0, "a migrated database occupies pages");
     assert_eq!(empty.integrity, "ok", "a fresh database is sound");

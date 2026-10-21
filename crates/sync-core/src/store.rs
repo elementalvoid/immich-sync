@@ -202,6 +202,19 @@ CREATE TABLE tag_backfill (
 );
 ";
 
+/// The eleventh schema (#43): when a source folder last reconciled and last
+/// uploaded, for its detail view.
+///
+/// The folder detail shows both as a relative time and an exact timestamp, and
+/// only the store outlives the process that observed them, so they live on the
+/// folder row. They are written where the outcome is already known — a scan
+/// that read the folder, an upload that reached a terminal success — and never
+/// read from a network path (R9.2).
+const SCHEMA_V11: &str = "
+ALTER TABLE source_folder ADD COLUMN last_scan_ns INTEGER;
+ALTER TABLE source_folder ADD COLUMN last_upload_ns INTEGER;
+";
+
 /// How long the one writer waits for a competing lock before failing.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -416,6 +429,22 @@ pub struct FolderCounts {
     pub failed: u32,
     /// Missing files that await a review decision (R5.4).
     pub review: u32,
+}
+
+/// When one source folder last reconciled and last uploaded (#43).
+///
+/// The folder detail shows both, and the sync engine writes them from the
+/// paths that already know the outcome: a scan that read the folder and an
+/// upload that reached a terminal success. They sit on the folder row so a
+/// restart keeps them (`folder_time_tests`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FolderTimes {
+    /// When a reconciliation scan last read this folder, ns since the Unix
+    /// epoch. `None` until one has.
+    pub last_scan_ns: Option<i64>,
+    /// When this folder last uploaded an asset, ns since the Unix epoch.
+    /// `None` until one has.
+    pub last_upload_ns: Option<i64>,
 }
 
 /// One `sync_item` row, in Rust form.
@@ -1765,6 +1794,75 @@ impl StateStore {
         Ok(counts)
     }
 
+    /// When one source folder last reconciled and last uploaded, for its
+    /// detail view (#43).
+    ///
+    /// An untracked path reads as [`FolderTimes::default`], the same answer a
+    /// tracked folder that has run neither gives.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the query fails.
+    pub fn folder_times(&self, folder: &str) -> Result<FolderTimes, StoreError> {
+        let writer = self.writer()?;
+        writer
+            .query_row(
+                "SELECT last_scan_ns, last_upload_ns FROM source_folder WHERE path_key = ?1",
+                [path_key(Path::new(folder))],
+                |row| {
+                    Ok(FolderTimes {
+                        last_scan_ns: row.get(0)?,
+                        last_upload_ns: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map(Option::unwrap_or_default)
+            .map_err(|source| self.query_error(source))
+    }
+
+    /// Records that a reconciliation scan just read one source folder (#43).
+    ///
+    /// Returns whether the client holds the folder.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the write fails or the lock is poisoned.
+    pub fn record_folder_scan(&self, folder: &str, at_ns: i64) -> Result<bool, StoreError> {
+        self.record_folder_time(folder, "last_scan_ns", at_ns)
+    }
+
+    /// Records that one source folder just uploaded an asset (#43).
+    ///
+    /// Returns whether the client holds the folder.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the write fails or the lock is poisoned.
+    pub fn record_folder_upload(&self, folder: &str, at_ns: i64) -> Result<bool, StoreError> {
+        self.record_folder_time(folder, "last_upload_ns", at_ns)
+    }
+
+    /// Writes one timestamp column of the folder row `folder` names.
+    ///
+    /// The column is one of this module's two constants, never caller input,
+    /// so the statement cannot name another column.
+    fn record_folder_time(
+        &self,
+        folder: &str,
+        column: &str,
+        at_ns: i64,
+    ) -> Result<bool, StoreError> {
+        let writer = self.writer()?;
+        let changed = writer
+            .execute(
+                &format!("UPDATE source_folder SET {column} = ?1 WHERE path_key = ?2"),
+                params![at_ns, path_key(Path::new(folder))],
+            )
+            .map_err(|source| self.query_error(source))?;
+        Ok(changed > 0)
+    }
+
     /// Makes `version`'s asset the item's current version (R4.4, SPEC §5).
     ///
     /// The chain is written in one transaction: the previous current version
@@ -2223,6 +2321,7 @@ fn migrations() -> Migrations<'static> {
         M::up(SCHEMA_V8),
         M::up(SCHEMA_V9),
         M::up(SCHEMA_V10),
+        M::up(SCHEMA_V11),
     ])
 }
 
@@ -2435,6 +2534,65 @@ mod migration_tests {
             }],
             "R3.4: a folder mapped before album mapping existed reads back off, at the default \
              scope, through the whole composed migration chain"
+        );
+    }
+
+    /// #43: a database written before the folder times existed keeps its
+    /// folders, and they read as never scanned and never uploaded.
+    #[test]
+    fn the_folder_times_arrive_on_a_v10_database() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let path = temp.path().join("state.db");
+        {
+            let mut connection = Connection::open(&path).expect("open the raw database");
+            // Every schema before the folder times, including the tag backfill
+            // #46 merged first, so the composed chain has to apply V11 over
+            // rows V4 wrote.
+            Migrations::new(vec![
+                M::up(SCHEMA_V1),
+                M::up_with_hook(SCHEMA_V2, backfill_path_keys),
+                M::up(SCHEMA_V3),
+                M::up(SCHEMA_V4),
+                M::up(SCHEMA_V5),
+                M::up(SCHEMA_V6),
+                M::up(SCHEMA_V7),
+                M::up(SCHEMA_V8),
+                M::up(SCHEMA_V9),
+                M::up(SCHEMA_V10),
+            ])
+            .to_latest(&mut connection)
+            .expect("create the tenth schema");
+            connection
+                .execute(
+                    "INSERT INTO source_folder (path, path_key, recursive, album_mapping, album_scope)
+                     VALUES (?1, ?2, 1, 1, 'whole_folder')",
+                    params!["/photos", "/photos"],
+                )
+                .expect("insert the source folder");
+            drop(connection);
+        }
+
+        let store = StateStore::open(&path).expect("a v10 database must migrate");
+        assert_eq!(
+            store.folders().expect("read the folders"),
+            vec![SourceFolder {
+                path: "/photos".to_string(),
+                recursive: true,
+                album_mapping: true,
+                album_scope: AlbumScope::WholeFolder,
+            }],
+            "the folder row and its album settings survive the chain"
+        );
+        assert_eq!(
+            store.folder_times("/photos").expect("read the times"),
+            FolderTimes::default(),
+            "a folder from before the folder times reads as never scanned and never uploaded"
+        );
+        assert!(
+            store
+                .record_folder_scan("/photos", 42)
+                .expect("record the scan"),
+            "the migrated row accepts a scan time"
         );
     }
 
@@ -2842,5 +3000,73 @@ mod diagnostics_read_tests {
         let (info, errors) = read.expect("the diagnostics read must not wait for the writer lock");
         info.expect("read the sqlite info while the writer is held");
         errors.expect("read the last errors while the writer is held");
+    }
+}
+
+#[cfg(test)]
+mod folder_time_tests {
+    use super::*;
+
+    fn folder(path: &str) -> SourceFolder {
+        SourceFolder {
+            path: path.to_string(),
+            recursive: true,
+            album_mapping: false,
+            album_scope: AlbumScope::Leaf,
+        }
+    }
+
+    /// #43: the folder detail shows when the folder last scanned and last
+    /// uploaded. The times live on the folder row, so a restart keeps them.
+    #[test]
+    fn a_folder_records_when_it_last_scanned_and_uploaded() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let path = temp.path().join("state.db");
+        let store = StateStore::open(&path).expect("open the store");
+        store
+            .add_folder(&folder("/photos"))
+            .expect("add the folder");
+
+        assert_eq!(
+            store.folder_times("/photos").expect("read the times"),
+            FolderTimes::default(),
+            "a fresh folder has scanned and uploaded nothing yet"
+        );
+
+        assert!(
+            store
+                .record_folder_scan("/photos", 1_700_000_000_000_000_000)
+                .expect("record the scan"),
+            "the tracked folder's scan time is written"
+        );
+        assert!(
+            store
+                .record_folder_upload("/photos", 1_700_000_001_000_000_000)
+                .expect("record the upload"),
+            "the tracked folder's upload time is written"
+        );
+        assert!(
+            !store
+                .record_folder_scan("/elsewhere", 1)
+                .expect("an untracked path writes nothing"),
+            "a path this client does not hold has no row to time"
+        );
+        drop(store);
+
+        let reopened = StateStore::open(&path).expect("reopen the store");
+        assert_eq!(
+            reopened.folder_times("/photos").expect("read the times"),
+            FolderTimes {
+                last_scan_ns: Some(1_700_000_000_000_000_000),
+                last_upload_ns: Some(1_700_000_001_000_000_000),
+            },
+            "#43: the times survive a restart"
+        );
+        assert_eq!(
+            reopened
+                .folder_times("/elsewhere")
+                .expect("an untracked path reads as unset"),
+            FolderTimes::default()
+        );
     }
 }

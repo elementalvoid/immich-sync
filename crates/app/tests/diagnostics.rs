@@ -47,8 +47,9 @@ use sync_core::store::{
 };
 
 const API_KEY: &str = "api-key-abc123";
-/// The schema stands at the tenth migration.
-const DB_MIGRATION_VERSION: i64 = 10;
+/// The schema stands at the eleventh migration (#43 added the folder times on
+/// top of the tag backfill #46).
+const DB_MIGRATION_VERSION: i64 = 11;
 
 fn temporary_paths(dir: &Path) -> AppPaths {
     AppPaths {

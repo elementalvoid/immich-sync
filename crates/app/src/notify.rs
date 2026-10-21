@@ -210,6 +210,8 @@ mod tests {
             available,
             counts: FolderCounts::default(),
             last_error: None,
+            last_scan_ns: None,
+            last_upload_ns: None,
             uploads: UploadTraffic::default(),
         });
         status
