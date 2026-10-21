@@ -216,7 +216,7 @@ fn the_tray_tooltip_carries_the_activity_and_the_progress() {
         review: 2,
     };
     let tooltip = shell::tray_status_tooltip(
-        sync_core::engine::Activity::Syncing,
+        sync_core::status::Activity::Syncing,
         &ConnectionState::Connected,
         counts,
         None,
@@ -230,7 +230,7 @@ fn the_tray_tooltip_carries_the_activity_and_the_progress() {
     );
 
     let attention = shell::tray_status_tooltip(
-        sync_core::engine::Activity::NeedsAttention,
+        sync_core::status::Activity::NeedsAttention,
         &ConnectionState::NeedsAttention(Attention::Rejected),
         sync_core::store::FolderCounts::default(),
         Some("unsupported_format"),

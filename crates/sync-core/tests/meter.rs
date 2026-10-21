@@ -17,6 +17,7 @@ use sync_core::credential::MemoryCredentialStore;
 use sync_core::engine::{Engine, EngineConfig};
 use sync_core::meter::UploadTraffic;
 use sync_core::store::{AlbumScope, SourceFolder, StateStore};
+use sync_core::tracking::Tracking;
 use sync_core::upload::Uploader;
 
 use common::wait_until;
@@ -69,7 +70,12 @@ fn write_file(root: &Path, name: &str, bytes: usize) -> PathBuf {
 
 fn built(store: &Arc<StateStore>, session: SharedSession) -> Arc<Engine> {
     Arc::new(
-        Engine::new(store.clone(), session, EngineConfig::default()).expect("build the engine"),
+        Engine::new(
+            Arc::new(Tracking::new(store.clone())),
+            session,
+            EngineConfig::default(),
+        )
+        .expect("build the engine"),
     )
 }
 

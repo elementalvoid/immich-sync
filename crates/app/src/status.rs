@@ -7,8 +7,8 @@
 use std::path::Path;
 
 use crate::diagnostics::format_rate;
-use sync_core::engine::{Activity, EngineStatus};
 use sync_core::meter::UploadTraffic;
+use sync_core::status::{Activity, Status};
 use sync_core::store::{AlbumScope, FolderCounts};
 
 /// The activity state of the client or one source folder (SPEC R8.2).
@@ -213,7 +213,7 @@ impl DashboardModel {
     /// Maps the live engine status onto the global card and one card per
     /// source folder (R8.1, R8.2).
     #[must_use]
-    pub fn from_engine(status: &EngineStatus, connection: Option<String>) -> Self {
+    pub fn from_engine(status: &Status, connection: Option<String>) -> Self {
         let global = StatusCard {
             title: "All folders".to_string(),
             path: None,

@@ -5,29 +5,29 @@
 //! persists folder changes while the client is signed out, and republishes the
 //! engine's status to the dashboard on a short poll.
 
-use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_kit::*;
-use sync_core::engine::{Activity, Engine, EngineConfig, EngineStatus, FolderStatus, Limits};
+use sync_core::engine::{Engine, EngineConfig, Limits};
 use sync_core::meter::UploadTraffic;
+use sync_core::status::{Activity, ConnectionHealth, FolderStatus, Status, StatusInputs};
 use sync_core::store::{
-    AlbumScope, FailedItem, FolderCounts, ReviewDecision, ReviewItem, SourceFolder, StateStore,
+    AlbumScope, FailedItem, FolderCounts, ReviewItem, SourceFolder, StateStore,
 };
 
 use crate::connection::{
     ConnectionModel, STORE_OPENING, WORKER_UNAVAILABLE, run_on_worker, run_on_worker_or_lost,
     worker,
 };
-use crate::folder_panel::{ALREADY_ADDED, already_tracked, confirmed};
+use crate::folder_panel::{ALREADY_ADDED, confirmed};
+use crate::notify::Notifier;
 use crate::paths::AppPaths;
 use crate::settings::SettingsStore;
 use crate::status::DashboardModel;
 use crate::store::StoreModel;
 use sync_core::connection::{ConnectionState, SharedSession};
-use sync_core::paths::PathCase;
 use sync_core::tags::TagStatus;
 
 /// How often the dashboard picks up the engine's live counts.
@@ -59,7 +59,7 @@ pub struct EngineModel {
     /// The newest live-settings change for the running engine. One applier task
     /// per engine drains it, so two quick edits cannot land out of order.
     live: Option<tokio::sync::watch::Sender<LiveSettings>>,
-    status: EngineStatus,
+    status: Status,
     /// The sync tag's live state, which the Settings section renders (R3.7).
     tag: TagStatus,
     /// The parked items the failed-items view lists (R6.5), re-read off the UI
@@ -72,22 +72,12 @@ pub struct EngineModel {
     /// model, not the row: the item is still in the review, and a later success
     /// clears it.
     review_problem: Option<String>,
-    /// The review count the last notification was based on, so the 250 ms
-    /// status poll cannot post the same notification twice (R5.4).
-    notified_review: u32,
-    /// Whether the attention notification already fired for the current
-    /// attention episode (R10.1). It clears when the activity leaves attention,
-    /// so a later episode notifies again.
-    notified_attention: bool,
-    /// The failed items the attention and failure notifications already cover
-    /// (R10.1), so a repeated read of the same parked item stays quiet while a
-    /// newly parked one raises its own notification.
-    notified_failed: HashSet<String>,
-    /// Whether the first read of the parked list has seeded `notified_failed`
-    /// (R10.1). The items the first read holds are the ones the process
-    /// started with, so they stay quiet; only a failure that parks later
-    /// notifies.
-    failed_latch_seeded: bool,
+    /// Decides which system notifications one observation raises (R5.4,
+    /// R10.1). It owns the latches, so the model keeps none of them.
+    notifier: Notifier,
+    /// Whether a successful read of the parked list has landed. The notifier
+    /// owns the seeding of its failure latch (R10.1).
+    failed_read: bool,
     paused: bool,
     problem: Option<String>,
     /// The newest folder-setup outcome, for the add dialog (#40).
@@ -119,16 +109,6 @@ enum AlbumChange {
     Mapping(bool),
     /// Set the album scope.
     Scope(AlbumScope),
-}
-
-impl AlbumChange {
-    /// Applies the change to one folder row.
-    fn apply(self, folder: &mut SourceFolder) {
-        match self {
-            Self::Mapping(enabled) => folder.album_mapping = enabled,
-            Self::Scope(scope) => folder.album_scope = scope,
-        }
-    }
 }
 
 /// The outcome of one folder-setup add (#40).
@@ -206,10 +186,8 @@ impl EngineModel {
             failed: Vec::new(),
             review: Vec::new(),
             review_problem: None,
-            notified_review: 0,
-            notified_attention: false,
-            notified_failed: HashSet::new(),
-            failed_latch_seeded: false,
+            notifier: Notifier::default(),
+            failed_read: false,
             paused: false,
             problem: None,
             folder_add: None,
@@ -225,7 +203,7 @@ impl EngineModel {
 
     /// The engine's latest status.
     #[must_use]
-    pub fn status(&self) -> &EngineStatus {
+    pub fn status(&self) -> &Status {
         &self.status
     }
 
@@ -264,26 +242,17 @@ impl EngineModel {
     /// Nothing is sent to the server, so this works while the client is signed
     /// out; the state write still runs on the worker runtime (N2).
     pub fn keep_review(&mut self, path: String, cx: &mut Context<Self>) {
-        let engine = self.engine.clone();
-        let store = self.store_model.read(cx).store();
+        let tracking = self.store_model.read(cx).tracking();
         let action_path = path.clone();
         let result = run_on_worker(
             cx,
             move || async move {
                 // N2: the store write belongs on the worker, not the UI thread.
-                match engine {
-                    Some(engine) => engine
-                        .keep_review_item(&action_path)
-                        .map(|_| ())
-                        .map_err(|error| error.to_string()),
-                    None => match store {
-                        Some(store) => store
-                            .decide_review(&action_path, ReviewDecision::Keep)
-                            .map(|_| ())
-                            .map_err(|error| error.to_string()),
-                        None => Err(STORE_OPENING.to_string()),
-                    },
-                }
+                let tracking = tracking.ok_or_else(|| STORE_OPENING.to_string())?;
+                tracking
+                    .keep_review(&action_path)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
             },
             move |model, result, cx| model.finish_review_action(result, &path, cx),
         );
@@ -349,18 +318,21 @@ impl EngineModel {
     /// Re-reads the missing files from the store on the background executor
     /// (N2) and republishes them when they changed.
     pub fn refresh_review(&mut self, cx: &mut Context<Self>) {
-        let Some(store) = self.store_model.read(cx).store() else {
+        let Some(tracking) = self.store_model.read(cx).tracking() else {
             return;
         };
         let read = cx
             .background_executor()
-            .spawn(async move { store.review_items() });
+            .spawn(async move { tracking.review_items() });
         cx.spawn(async move |this, cx| {
             let read = read.await;
             let _ = this.update(cx, |model, cx| match read {
                 Ok(items) => {
                     if items != model.review {
                         model.review = items;
+                        // R5.4: the status counts this list, so it follows the
+                        // read that just landed instead of waiting for the poll.
+                        model.refresh_status(cx);
                         cx.notify();
                     }
                 }
@@ -374,26 +346,17 @@ impl EngineModel {
 
     /// Re-attempts one parked item by hand (R6.5).
     pub fn retry_failed(&mut self, path: String, cx: &mut Context<Self>) {
-        let engine = self.engine.clone();
-        let store = self.store_model.read(cx).store();
+        let tracking = self.store_model.read(cx).tracking();
         let result = run_on_worker(
             cx,
             move || async move {
                 // The store write runs on the worker runtime, so the UI thread
                 // never waits behind a worker's `BEGIN IMMEDIATE` (N2).
-                match engine {
-                    Some(engine) => engine
-                        .retry_failed(&path)
-                        .map(|_| ())
-                        .map_err(|error| error.to_string()),
-                    None => match store {
-                        Some(store) => store
-                            .retry_item(&path)
-                            .map(|_| ())
-                            .map_err(|error| error.to_string()),
-                        None => Err(STORE_OPENING.to_string()),
-                    },
-                }
+                let tracking = tracking.ok_or_else(|| STORE_OPENING.to_string())?;
+                tracking
+                    .retry_failed(&path)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
             },
             |model, result, cx| {
                 match result {
@@ -412,12 +375,12 @@ impl EngineModel {
     /// Re-reads the parked items from the store on the background executor
     /// (N2) and republishes them when they changed.
     pub fn refresh_failed(&mut self, cx: &mut Context<Self>) {
-        let Some(store) = self.store_model.read(cx).store() else {
+        let Some(tracking) = self.store_model.read(cx).tracking() else {
             return;
         };
         let read = cx
             .background_executor()
-            .spawn(async move { store.failed_items() });
+            .spawn(async move { tracking.failed_items() });
         cx.spawn(async move |this, cx| {
             let read = read.await;
             let _ = this.update(cx, |model, cx| match read {
@@ -427,35 +390,12 @@ impl EngineModel {
                         cx.notify();
                     }
                     // R10.1: the first read is the parked list the process
-                    // started with, so it seeds the latch instead of notifying:
-                    // a relaunch must not announce the dead letter again. After
-                    // that, a newly parked item raises a notification of its
-                    // own, and an item that left the list forgets it was
-                    // announced, so a later failure notifies again.
-                    model
-                        .notified_failed
-                        .retain(|path| model.failed.iter().any(|item| item.path == *path));
-                    if !model.failed_latch_seeded {
-                        model.failed_latch_seeded = true;
-                        model
-                            .notified_failed
-                            .extend(model.failed.iter().map(|item| item.path.clone()));
-                        return;
-                    }
-                    let fresh: Vec<String> = model
-                        .failed
-                        .iter()
-                        .filter(|item| !model.notified_failed.contains(&item.path))
-                        .map(|item| item.path.clone())
-                        .collect();
-                    if !fresh.is_empty() {
-                        tracing::info!(
-                            count = fresh.len(),
-                            "R10.1: a failed item raised a notification"
-                        );
-                        model.notified_failed.extend(fresh.iter().cloned());
-                        cx.show_system_notification(crate::shell::new_failure_notification(&fresh));
-                    }
+                    // started with, so the notifier seeds its latch instead of
+                    // notifying: a relaunch must not announce the dead letter
+                    // again. After that, a newly parked item raises a
+                    // notification of its own.
+                    model.failed_read = true;
+                    model.publish_notifications(cx);
                 }
                 Err(error) => {
                     tracing::warn!(error = %error, "the failed items could not be read");
@@ -642,57 +582,18 @@ impl EngineModel {
         }
         // A newer edit supersedes an older result still in flight.
         self.generation = self.generation.wrapping_add(1);
-        let engine = self.engine.clone();
-        let store = self.store_model.read(cx).store();
+        let tracking = self.store_model.read(cx).tracking();
         let generation = self.generation;
         let result = run_on_worker(
             cx,
             move || async move {
                 // The store write runs on the worker runtime, so the UI thread
                 // never waits behind a worker's `BEGIN IMMEDIATE` (N2).
-                match engine {
-                    Some(engine) => engine
-                        .add_folder(&path, recursive)
-                        .map(|()| None)
-                        .map_err(|error| error.to_string()),
-                    None => match store {
-                        Some(store) => match store.folders() {
-                            // R3.4: a new folder never opts into album mapping,
-                            // but editing an existing one (the recursion
-                            // toggle) must keep the album settings it already
-                            // has. The lookup compares path keys (R2.4),
-                            // so a re-add spelled differently still edits the
-                            // row it already has.
-                            Ok(folders) => {
-                                let case = sync_core::paths::PathCase::for_platform();
-                                let existing = folders.into_iter().find(|folder| {
-                                    sync_core::paths::equal(
-                                        Path::new(&folder.path),
-                                        Path::new(&path),
-                                        case,
-                                    )
-                                });
-                                let album_mapping =
-                                    existing.as_ref().is_some_and(|folder| folder.album_mapping);
-                                let album_scope = existing
-                                    .map_or_else(AlbumScope::default, |folder| folder.album_scope);
-                                match store.add_folder(&SourceFolder {
-                                    path: path.clone(),
-                                    recursive,
-                                    album_mapping,
-                                    album_scope,
-                                }) {
-                                    Ok(()) => {
-                                        store.folders().map(Some).map_err(|error| error.to_string())
-                                    }
-                                    Err(error) => Err(error.to_string()),
-                                }
-                            }
-                            Err(error) => Err(error.to_string()),
-                        },
-                        None => Err(STORE_OPENING.to_string()),
-                    },
-                }
+                let tracking = tracking.ok_or_else(|| STORE_OPENING.to_string())?;
+                tracking
+                    .add_folder(&path, recursive)
+                    .map_err(|error| error.to_string())?;
+                tracking.folders().map_err(|error| error.to_string())
             },
             move |model, result, cx| {
                 if model.generation != generation {
@@ -700,11 +601,9 @@ impl EngineModel {
                 }
                 match result {
                     Ok(folders) => {
-                        if let Some(folders) = folders {
-                            model.store_model.update(cx, |store, cx| {
-                                store.set_folders(folders, cx);
-                            });
-                        }
+                        model.store_model.update(cx, |store, cx| {
+                            store.set_folders(folders, cx);
+                        });
                         model.problem = None;
                     }
                     Err(problem) => model.problem = Some(problem),
@@ -729,51 +628,26 @@ impl EngineModel {
     pub fn add_folder_settings(&mut self, draft: SourceFolder, cx: &mut Context<Self>) -> u64 {
         self.add_generation = self.add_generation.wrapping_add(1);
         let request = self.add_generation;
-        let engine = self.engine.clone();
-        let store = self.store_model.read(cx).store();
+        let tracking = self.store_model.read(cx).tracking();
         let result = run_on_worker_or_lost(
             cx,
             move || async move {
                 // N2: the filesystem probe and the store write belong on the
                 // worker, not the UI thread.
                 let folder = confirmed(&draft)?;
-                match engine {
-                    Some(engine) => {
-                        engine
-                            .add_folder_settings(&folder)
-                            .map(|()| None)
-                            .map_err(|error| match error {
-                                sync_core::engine::EngineError::FolderExists(_) => {
-                                    ALREADY_ADDED.to_string()
-                                }
-                                other => other.to_string(),
-                            })
-                    }
-                    None => match store {
-                        Some(store) => match store.folders() {
-                            Ok(folders) => {
-                                let path = Path::new(&folder.path);
-                                if already_tracked(&folders, path, PathCase::for_platform()) {
-                                    Err(ALREADY_ADDED.to_string())
-                                } else {
-                                    // The store's insert still decides: it
-                                    // refuses a row another writer got there
-                                    // first (R2.4).
-                                    match store.insert_folder(&folder) {
-                                        Ok(true) => store
-                                            .folders()
-                                            .map(Some)
-                                            .map_err(|error| error.to_string()),
-                                        Ok(false) => Err(ALREADY_ADDED.to_string()),
-                                        Err(error) => Err(error.to_string()),
-                                    }
-                                }
-                            }
-                            Err(error) => Err(error.to_string()),
-                        },
-                        None => Err(STORE_OPENING.to_string()),
-                    },
-                }
+                // The tracking module decides, and it serves the engine and the
+                // signed-out client alike; the insert refuses a path the client
+                // already holds under the platform's path rule (R2.4).
+                let tracking = tracking.ok_or_else(|| STORE_OPENING.to_string())?;
+                tracking
+                    .insert_folder(&folder)
+                    .map_err(|error| match error {
+                        sync_core::tracking::TrackingError::FolderExists(_) => {
+                            ALREADY_ADDED.to_string()
+                        }
+                        other => other.to_string(),
+                    })?;
+                tracking.folders().map_err(|error| error.to_string())
             },
             move |model, result, cx| {
                 // A newer add supersedes an older result still in flight.
@@ -781,13 +655,15 @@ impl EngineModel {
                     return;
                 }
                 let problem = match result {
-                    Ok(Some(folders)) => {
+                    // The engine's card follows the tracking observer; the
+                    // cached list the signed-out views read is refreshed here,
+                    // because the insert wrote it.
+                    Ok(folders) => {
                         model.store_model.update(cx, |store, cx| {
                             store.set_folders(folders, cx);
                         });
                         None
                     }
-                    Ok(None) => None,
                     Err(problem) => Some(problem),
                 };
                 model.folder_add = Some(FolderAddResult { request, problem });
@@ -824,26 +700,17 @@ impl EngineModel {
     pub fn remove_folder(&mut self, path: String, cx: &mut Context<Self>) {
         // A newer edit supersedes an older result still in flight.
         self.generation = self.generation.wrapping_add(1);
-        let engine = self.engine.clone();
-        let store = self.store_model.read(cx).store();
+        let tracking = self.store_model.read(cx).tracking();
         let generation = self.generation;
         let result = run_on_worker(
             cx,
             move || async move {
                 // N2: the store write belongs on the worker, not the UI thread.
-                match engine {
-                    Some(engine) => engine
-                        .remove_folder(&path)
-                        .map(|()| None)
-                        .map_err(|error| error.to_string()),
-                    None => match store {
-                        Some(store) => match store.remove_folder(&path) {
-                            Ok(_) => store.folders().map(Some).map_err(|error| error.to_string()),
-                            Err(error) => Err(error.to_string()),
-                        },
-                        None => Ok(None),
-                    },
-                }
+                let tracking = tracking.ok_or_else(|| STORE_OPENING.to_string())?;
+                tracking
+                    .remove_folder(&path)
+                    .map_err(|error| error.to_string())?;
+                tracking.folders().map_err(|error| error.to_string())
             },
             move |model, result, cx| {
                 if model.generation != generation {
@@ -851,11 +718,9 @@ impl EngineModel {
                 }
                 match result {
                     Ok(folders) => {
-                        if let Some(folders) = folders {
-                            model.store_model.update(cx, |store, cx| {
-                                store.set_folders(folders, cx);
-                            });
-                        }
+                        model.store_model.update(cx, |store, cx| {
+                            store.set_folders(folders, cx);
+                        });
                         model.problem = None;
                     }
                     Err(problem) => model.problem = Some(problem),
@@ -891,53 +756,31 @@ impl EngineModel {
     fn change_album(&mut self, path: String, change: AlbumChange, cx: &mut Context<Self>) {
         // A newer edit supersedes an older result still in flight.
         self.generation = self.generation.wrapping_add(1);
-        let engine = self.engine.clone();
-        let store = self.store_model.read(cx).store();
+        let tracking = self.store_model.read(cx).tracking();
         let generation = self.generation;
         let result = run_on_worker(
             cx,
             move || async move {
                 // N2: the store write belongs on the worker, not the UI thread.
-                match engine {
-                    Some(engine) => match change {
-                        AlbumChange::Mapping(enabled) => engine.set_album_mapping(&path, enabled),
-                        AlbumChange::Scope(scope) => engine.set_album_scope(&path, scope),
-                    }
-                    .map(|()| None)
-                    .map_err(|error| error.to_string()),
-                    None => match store {
-                        Some(store) => match store.folders() {
-                            Ok(folders) => {
-                                match folders.into_iter().find(|folder| folder.path == path) {
-                                    Some(mut folder) => {
-                                        change.apply(&mut folder);
-                                        match store.add_folder(&folder) {
-                                            Ok(()) => store.folders().map(Some),
-                                            Err(error) => Err(error),
-                                        }
-                                        .map_err(|error| error.to_string())
-                                    }
-                                    None => Err("That folder is not in the client.".to_string()),
-                                }
-                            }
-                            Err(error) => Err(error.to_string()),
-                        },
-                        None => Err(STORE_OPENING.to_string()),
-                    },
+                let tracking = tracking.ok_or_else(|| STORE_OPENING.to_string())?;
+                match change {
+                    AlbumChange::Mapping(enabled) => tracking.set_album_mapping(&path, enabled),
+                    AlbumChange::Scope(scope) => tracking.set_album_scope(&path, scope),
                 }
+                .map_err(|error| error.to_string())?;
+                tracking.folders().map_err(|error| error.to_string())
             },
             move |model, result, cx| {
                 if model.generation != generation {
                     return;
                 }
                 match result {
-                    Ok(Some(folders)) => {
-                        model
-                            .store_model
-                            .update(cx, |store, cx| store.set_folders(folders, cx));
+                    Ok(folders) => {
+                        model.store_model.update(cx, |store, cx| {
+                            store.set_folders(folders, cx);
+                        });
                         model.problem = None;
                     }
-                    Ok(None) => model.problem = None,
                     Err(problem) => model.problem = Some(problem),
                 }
                 model.refresh_status(cx);
@@ -973,7 +816,7 @@ impl EngineModel {
             self.refresh_status(cx);
             return;
         }
-        let Some(store) = self.store_model.read(cx).store() else {
+        let Some(tracking) = self.store_model.read(cx).tracking() else {
             self.refresh_status(cx);
             return;
         };
@@ -1003,7 +846,7 @@ impl EngineModel {
                     tag_uploaded_assets: settings.tag_uploaded_assets,
                     ..EngineConfig::default()
                 };
-                match Engine::new(store, session, config) {
+                match Engine::new(tracking, session, config) {
                     Ok(engine) => {
                         let engine = Arc::new(engine);
                         // R8.7: a pause set before the engine existed still
@@ -1107,103 +950,36 @@ impl EngineModel {
                         uploads: UploadTraffic::default(),
                     })
                     .collect::<Vec<_>>();
-                let paused = self.paused;
-                let unavailable = folders.iter().any(|folder| !folder.available);
-                let mut counts = FolderCounts::default();
-                for folder in &folders {
-                    counts.pending += folder.counts.pending;
-                    counts.uploaded += folder.counts.uploaded;
-                    counts.failed += folder.counts.failed;
-                    counts.review += folder.counts.review;
-                }
-                EngineStatus {
-                    activity: if paused {
-                        Activity::Paused
-                    } else if unavailable {
-                        Activity::NeedsAttention
-                    } else if counts.pending > 0 {
-                        Activity::Syncing
-                    } else if counts.failed > 0 || counts.review > 0 {
-                        Activity::NeedsAttention
-                    } else {
-                        Activity::Idle
-                    },
+                Status::derive(StatusInputs {
                     folders,
-                    counts,
+                    paused: self.paused,
+                    connection: ConnectionHealth::from_state(self.connection.read(cx).state()),
+                    // R5.4: the cached list is the store's whole review,
+                    // including items under a removed source folder, so it is
+                    // the total the engine would have read.
+                    review_total: Some(u32::try_from(self.review.len()).unwrap_or(u32::MAX)),
                     last_error: None,
-                    uploads: UploadTraffic::default(),
-                }
+                })
             }
         };
-        // R5.4, R10.1: a new review item is the one thing the tray cannot show
-        // on its own, so it also raises a system notification. The count the
-        // last one was based on is kept, so the poll cannot repeat it.
-        let review = self.status.counts.review;
-        if let Some(notification) =
-            crate::shell::new_review_notification(review, self.notified_review)
-        {
-            tracing::info!(
-                count = review,
-                "R5.4: the deletion review raised a notification"
-            );
-            cx.show_system_notification(notification);
-        }
-        self.notified_review = review;
-
-        // R10.1: a lost connection, a refused credential, or a folder that
-        // cannot be read is the other thing the tray cannot show on its own.
-        self.refresh_attention_notification(cx);
+        self.publish_notifications(cx);
         cx.notify();
     }
 
-    /// Raises the attention notification once per attention episode (R10.1).
-    ///
-    /// A failed item has its own notification, so the generic one stays quiet
-    /// while the only reason is parked failures; the connection state is the
-    /// one reason that must speak even when the engine is not running yet.
-    fn refresh_attention_notification(&mut self, cx: &mut Context<Self>) {
-        let connection_attention = matches!(
-            self.connection.read(cx).state(),
-            ConnectionState::NeedsAttention(_)
-        );
-        let attention = self.status.activity == Activity::NeedsAttention || connection_attention;
-        if !attention {
-            self.notified_attention = false;
-            return;
-        }
-        let Some(reason) = self.attention_reason(cx) else {
-            return;
+    /// Posts what the notification policy answers for the current status and
+    /// parked list (R5.4, R10.1).
+    fn publish_notifications(&mut self, cx: &mut Context<Self>) {
+        let reason = match self.connection.read(cx).state() {
+            ConnectionState::NeedsAttention(attention) => Some(attention.message()),
+            _ => None,
         };
-        if let Some(notification) =
-            crate::shell::new_attention_notification(attention, self.notified_attention, &reason)
+        let failed = self.failed_read.then_some(self.failed.as_slice());
+        for notification in self
+            .notifier
+            .observe(&self.status, failed, reason.as_deref())
         {
-            tracing::info!(
-                reason = %reason,
-                "R10.1: the client entered attention and raised a notification"
-            );
             cx.show_system_notification(notification);
         }
-        self.notified_attention = true;
-    }
-
-    /// The user-facing reason the client needs attention, when it is not a
-    /// deletion review or a parked failure. `None` lets the generic
-    /// notification stay quiet; the specific notification covers those.
-    ///
-    /// A permanent folder error keeps the engine's global error too, so it
-    /// speaks even with no parked item. A transient retry sets only the
-    /// folder's own error, so it stays quiet.
-    fn attention_reason(&self, cx: &Context<Self>) -> Option<String> {
-        if let ConnectionState::NeedsAttention(attention) = self.connection.read(cx).state() {
-            return Some(attention.message());
-        }
-        if self.status.counts.failed > 0 {
-            return None;
-        }
-        if let Some(folder) = self.status.folders.iter().find(|folder| !folder.available) {
-            return Some(format!("The source folder {} is unavailable.", folder.path));
-        }
-        self.status.last_error.clone()
     }
 
     /// The shared store, once it has opened.
@@ -1212,29 +988,16 @@ impl EngineModel {
         self.store_model.read(cx).store()
     }
 
-    /// The current source folders, from the engine or the stored list.
+    /// The current source folders, from the store the client tracks them in.
     #[must_use]
     pub fn folders(&self, cx: &App) -> Vec<SourceFolder> {
-        match &self.engine {
-            Some(engine) => engine
-                .status()
-                .folders
-                .iter()
-                .map(|folder| SourceFolder {
-                    path: folder.path.clone(),
-                    recursive: folder.recursive,
-                    album_mapping: folder.album_mapping,
-                    album_scope: folder.album_scope,
-                })
-                .collect(),
-            None => self.store_model.read(cx).folders().to_vec(),
-        }
+        self.store_model.read(cx).folders().to_vec()
     }
 }
 
 /// The status before the engine has anything.
-fn empty_status() -> EngineStatus {
-    EngineStatus {
+fn empty_status() -> Status {
+    Status {
         activity: Activity::Idle,
         folders: Vec::new(),
         counts: FolderCounts::default(),

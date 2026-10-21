@@ -17,13 +17,15 @@ use sync_core::connection::{
     Attention, AuthMethod, Connection, ConnectionState, Secret, SharedSession, SignIn,
 };
 use sync_core::credential::MemoryCredentialStore;
-use sync_core::engine::{Activity, Engine, EngineConfig, EngineError, ReviewError};
+use sync_core::engine::{Engine, EngineConfig, EngineError, ReviewError};
 use sync_core::failure::FailureClass;
 use sync_core::hash::{Sha1, sha1_file};
+use sync_core::status::Activity;
 use sync_core::store::{
     AlbumScope, AttemptOutcome, AttemptRecord, FolderCounts, ItemRecord, ItemState, SourceFolder,
     StateStore,
 };
+use sync_core::tracking::Tracking;
 
 use common::wait_until;
 
@@ -84,7 +86,10 @@ async fn start_engine(
     config: EngineConfig,
 ) -> Arc<Engine> {
     let session = signed_in(server).await;
-    let engine = Arc::new(Engine::new(store.clone(), session, config).expect("build the engine"));
+    let engine = Arc::new(
+        Engine::new(Arc::new(Tracking::new(store.clone())), session, config)
+            .expect("build the engine"),
+    );
     engine.start();
     engine
 }
@@ -470,7 +475,12 @@ async fn stopping_an_engine_that_never_started_is_safe() {
     let temp = tempfile::tempdir().expect("create a temp dir");
     let store = store_in(&temp);
     let session = signed_in(&server).await;
-    let engine = Engine::new(store, session, EngineConfig::default()).expect("build the engine");
+    let engine = Engine::new(
+        Arc::new(Tracking::new(store)),
+        session,
+        EngineConfig::default(),
+    )
+    .expect("build the engine");
 
     engine.stop();
     // Drop stops it again; neither call may panic with nothing to abort.
@@ -1266,57 +1276,11 @@ async fn re_adding_a_folder_keeps_its_album_mapping() {
     engine.stop();
 }
 
-/// A re-add takes the album fields from the live entry, not from the stored
-/// row: a near-simultaneous album edit can leave the store holding the row the
-/// re-add read before that edit, and writing it back loses the edit (R3.4).
-#[tokio::test]
-async fn a_re_add_keeps_the_live_album_edit_over_a_stale_stored_row() {
-    let server = MockImmich::start().await;
-    let temp = tempfile::tempdir().expect("create a temp dir");
-    let store = store_in(&temp);
-    let photos = temp.path().join("photos");
-    std::fs::create_dir_all(&photos).expect("create the folder");
-    let engine = start_engine(&server, &store, EngineConfig::default()).await;
-    let path = photos.display().to_string();
-
-    engine.add_folder(&path, true).expect("add the folder");
-    engine
-        .set_album_mapping(&path, true)
-        .expect("enable album mapping");
-    // The interleaving the re-add races, made deterministic: the album edit
-    // has landed, and the store still holds the row a racing re-add read
-    // before it.
-    store
-        .add_folder(&SourceFolder {
-            path: path.clone(),
-            recursive: true,
-            album_mapping: false,
-            album_scope: AlbumScope::Leaf,
-        })
-        .expect("write the stale row");
-
-    engine.add_folder(&path, false).expect("re-add the folder");
-
-    let stored = store
-        .folders()
-        .expect("read the folders")
-        .into_iter()
-        .find(|folder| folder.path == path)
-        .expect("the folder is stored");
-    assert!(
-        stored.album_mapping,
-        "the re-add wrote the stale row back over the live album edit"
-    );
-    assert!(
-        !stored.recursive,
-        "the re-add still applies its own recursive flag"
-    );
-    assert!(
-        engine.status().folders[0].album_mapping,
-        "the live card and the store must agree after the re-add"
-    );
-    engine.stop();
-}
+// The stale-stored-row case is gone by construction: every folder write goes
+// through `Tracking`, which holds one write lock across the read and the
+// upsert, so a live entry can no longer be ahead of the store. The
+// interleaved test below still runs both edits at the same time through the
+// public interface.
 
 /// The two edits can run at the same time: album toggles (which take the
 /// folders lock) and re-adds. Neither may lose the other's field (R3.4).
@@ -1528,8 +1492,14 @@ fn start_engine_over(
     store: &Arc<StateStore>,
     config: EngineConfig,
 ) -> Arc<Engine> {
-    let engine =
-        Arc::new(Engine::new(store.clone(), session.clone(), config).expect("build the engine"));
+    let engine = Arc::new(
+        Engine::new(
+            Arc::new(Tracking::new(store.clone())),
+            session.clone(),
+            config,
+        )
+        .expect("build the engine"),
+    );
     engine.start();
     engine
 }

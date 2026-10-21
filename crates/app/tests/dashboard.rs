@@ -200,7 +200,7 @@ fn sample_data_covers_several_folders_and_states() {
 
 #[gpui_kit::test]
 fn folder_progress_survives_counts_above_a_u16() {
-    use sync_core::engine::{Activity, EngineStatus, FolderStatus};
+    use sync_core::status::{Activity, FolderStatus, Status};
     use sync_core::store::FolderCounts;
 
     let counts = FolderCounts {
@@ -209,7 +209,7 @@ fn folder_progress_survives_counts_above_a_u16() {
         failed: 0,
         review: 0,
     };
-    let status = EngineStatus {
+    let status = Status {
         activity: Activity::Syncing,
         folders: vec![FolderStatus {
             path: "/photos".to_string(),
@@ -576,10 +576,10 @@ fn tab_to(window: &mut Window, id: impl Into<ElementId> + Clone, cx: &mut App) {
 
 #[gpui_kit::test]
 fn engine_status_maps_to_the_global_card_and_one_card_per_folder() {
-    use sync_core::engine::{Activity, EngineStatus, FolderStatus};
+    use sync_core::status::{Activity, FolderStatus, Status};
     use sync_core::store::FolderCounts;
 
-    let status = EngineStatus {
+    let status = Status {
         activity: Activity::Syncing,
         folders: vec![
             FolderStatus {

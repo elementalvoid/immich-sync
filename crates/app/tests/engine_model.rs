@@ -18,8 +18,8 @@ use sync_core::connection::{
     Attention, AuthMethod, ConnectionState, Secret, ServerProfile, SignIn,
 };
 use sync_core::credential::{MemoryCredentialStore, SharedCredentialStore};
-use sync_core::engine::Activity;
 use sync_core::hash::Sha1;
+use sync_core::status::Activity;
 use sync_core::store::{ItemRecord, ItemState, SourceFolder, StateStore};
 
 /// The path layout the other app tests use, so the engine gets a temp
@@ -1076,6 +1076,143 @@ async fn a_signed_out_re_add_of_a_mapped_folder_keeps_its_album_settings(cx: &mu
         readded.album_scope,
         sync_core::store::AlbumScope::WholeFolder,
         "R3.4: the re-add must keep the stored scope"
+    );
+}
+
+/// R2.4, R8.1: a re-add that spells the path differently keeps the counts the
+/// dashboard cached at open. The cache used to match the raw string, so the
+/// re-spelled folder fell back to zero counts for the rest of the session.
+#[gpui_kit::test]
+async fn a_re_spelled_re_add_keeps_the_cached_counts(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    {
+        let store = StateStore::open(&paths.state_db).expect("open the state database");
+        store
+            .add_folder(&SourceFolder {
+                path: photos.display().to_string(),
+                recursive: true,
+                album_mapping: false,
+                album_scope: sync_core::store::AlbumScope::Leaf,
+            })
+            .expect("seed the folder");
+        store
+            .record(&ItemRecord {
+                path: photos.join("one.jpg").display().to_string(),
+                size: 1024,
+                mtime_ns: 1_700_000_000_000_000_000,
+                sha1: Sha1::from_hex("2aae6c35c94fcfb415dbe95f408b9ce91ee846ed")
+                    .expect("a hex SHA-1"),
+                asset_id: Some("asset-1".to_string()),
+                state: ItemState::Uploaded,
+                error_class: None,
+                error_message: None,
+                attempts: 0,
+                sidecar: None,
+            })
+            .expect("seed the uploaded row");
+    }
+
+    let connection = cx.update(|cx| {
+        let credentials: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+        cx.new(|_| ConnectionModel::new(ServerProfile::default(), credentials))
+    });
+    let store = cx.update(|cx| cx.new(|cx| StoreModel::open(&paths, cx)));
+    for _ in 0..600 {
+        if cx.read(|cx| store.read(cx).store().is_some()) {
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        cx.read(|cx| store.read(cx).folder_counts()[0].uploaded),
+        1,
+        "the seeded count is the one the dashboard starts with"
+    );
+
+    let engine =
+        cx.update(|cx| cx.new(|cx| EngineModel::new(connection, store.clone(), &paths, cx)));
+    cx.update(|cx| {
+        engine.update(cx, |model, cx| {
+            model.add_folder(format!("{}/", photos.display()), true, cx);
+        });
+    });
+
+    let mut respelled = false;
+    for _ in 0..600 {
+        if cx.read(|cx| {
+            store
+                .read(cx)
+                .folders()
+                .first()
+                .is_some_and(|folder| folder.path.ends_with('/'))
+        }) {
+            respelled = true;
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    assert!(respelled, "the re-spelled re-add reached the store");
+    assert_eq!(
+        cx.read(|cx| store.read(cx).folder_counts()[0].uploaded),
+        1,
+        "R8.1: the re-add reset the cached counts to zero"
+    );
+}
+
+/// R8.2: with no engine and no session, the derived status is idle, not
+/// attention. The connection is a status input now, so a client that has not
+/// signed in does not read as a problem.
+#[gpui_kit::test]
+async fn a_signed_out_client_shows_idle_not_attention(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+    {
+        let store = StateStore::open(&paths.state_db).expect("open the state database");
+        store
+            .add_folder(&SourceFolder {
+                path: photos.display().to_string(),
+                recursive: true,
+                album_mapping: false,
+                album_scope: sync_core::store::AlbumScope::Leaf,
+            })
+            .expect("seed the folder");
+    }
+
+    let connection = cx.update(|cx| {
+        let credentials: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+        cx.new(|_| ConnectionModel::new(ServerProfile::default(), credentials))
+    });
+    let store = cx.update(|cx| cx.new(|cx| StoreModel::open(&paths, cx)));
+    for _ in 0..600 {
+        if cx.read(|cx| store.read(cx).store().is_some()) {
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    let engine =
+        cx.update(|cx| cx.new(|cx| EngineModel::new(connection, store.clone(), &paths, cx)));
+
+    // No engine starts: `sync_now` republishes the store-backed status and
+    // returns, which is the path a signed-out client uses.
+    cx.update(|cx| engine.update(cx, |model, cx| model.sync_now(cx)));
+    assert_eq!(
+        cx.read(|cx| engine.read(cx).status().folders.len()),
+        1,
+        "the store-backed status never arrived"
+    );
+    assert_eq!(
+        cx.read(|cx| engine.read(cx).status().activity),
+        Activity::Idle,
+        "R8.2: a client that has not signed in must not ask for attention"
     );
 }
 

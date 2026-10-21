@@ -19,6 +19,7 @@ use sync_core::credential::MemoryCredentialStore;
 use sync_core::engine::{Engine, EngineConfig};
 use sync_core::store::{AlbumScope, ItemState, SourceFolder, StateStore};
 use sync_core::tags::SYNC_TAG;
+use sync_core::tracking::Tracking;
 
 /// Starts the mock and signs in, returning the session the engine attaches to
 /// every request (R1.4).
@@ -100,7 +101,10 @@ async fn start_engine(
     config: EngineConfig,
 ) -> Arc<Engine> {
     let session = signed_in(server).await;
-    let engine = Arc::new(Engine::new(store.clone(), session, config).expect("build the engine"));
+    let engine = Arc::new(
+        Engine::new(Arc::new(Tracking::new(store.clone())), session, config)
+            .expect("build the engine"),
+    );
     engine.start();
     engine
 }
@@ -435,8 +439,14 @@ async fn an_api_key_missing_a_permission_gets_no_tag_and_a_named_reason() {
     add_folder(&store, &photos);
 
     let session = signed_in_with(&server, AuthMethod::ApiKey, "test-key").await;
-    let engine =
-        Arc::new(Engine::new(store.clone(), session, tagged_config()).expect("build the engine"));
+    let engine = Arc::new(
+        Engine::new(
+            Arc::new(Tracking::new(store.clone())),
+            session,
+            tagged_config(),
+        )
+        .expect("build the engine"),
+    );
     engine.start();
 
     assert!(
@@ -671,8 +681,14 @@ async fn a_settled_permission_refusal_is_not_probed_again_for_each_upload() {
     add_folder(&store, &photos);
 
     let session = signed_in_with(&server, AuthMethod::ApiKey, "test-key").await;
-    let engine =
-        Arc::new(Engine::new(store.clone(), session, tagged_config()).expect("build the engine"));
+    let engine = Arc::new(
+        Engine::new(
+            Arc::new(Tracking::new(store.clone())),
+            session,
+            tagged_config(),
+        )
+        .expect("build the engine"),
+    );
     engine.start();
     assert!(
         wait_until(
@@ -739,7 +755,12 @@ async fn a_new_sign_in_clears_the_settled_permission_refusal() {
 
     let session = signed_in_with(&server, AuthMethod::ApiKey, "test-key").await;
     let engine = Arc::new(
-        Engine::new(store.clone(), session.clone(), tagged_config()).expect("build the engine"),
+        Engine::new(
+            Arc::new(Tracking::new(store.clone())),
+            session.clone(),
+            tagged_config(),
+        )
+        .expect("build the engine"),
     );
     engine.start();
     assert!(

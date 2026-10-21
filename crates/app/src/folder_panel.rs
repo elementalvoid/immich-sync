@@ -16,7 +16,6 @@ use gpui_kit::component::radio::Radio;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use sync_core::paths::{PathCase, equal};
 use sync_core::store::{AlbumScope, SourceFolder};
 
 use crate::dashboard::CardPalette;
@@ -79,15 +78,6 @@ pub(crate) fn confirmed(draft: &SourceFolder) -> Result<SourceFolder, String> {
         path: path.to_string(),
         ..draft.clone()
     })
-}
-
-/// Whether `path` is already one of `folders` under the platform's path rule
-/// (R2.4), so a case-only variant cannot become a second source folder on
-/// Windows.
-pub(crate) fn already_tracked(folders: &[SourceFolder], path: &Path, case: PathCase) -> bool {
-    folders
-        .iter()
-        .any(|folder| equal(Path::new(&folder.path), path, case))
 }
 
 /// Which lifecycle the panel shows.
@@ -436,17 +426,9 @@ impl Render for FolderPanel {
 mod tests {
     // GPUI's glob imports its own `test` macro, so this module names what it
     // uses and keeps Rust's `#[test]`.
-    use super::{PathProbe, already_tracked, confirmed, path_problem};
+    use super::{PathProbe, confirmed, path_problem};
     use gpui_kit::TestAppContext;
-    use std::path::Path;
-    use sync_core::paths::PathCase;
     use sync_core::store::{AlbumScope, SourceFolder};
-
-    /// A Windows path, built from parts so the repository's hardcoded-path
-    /// scan stays clean (its own test scans every source file).
-    fn win(rest: &str) -> String {
-        format!("{}:\\{}", 'C', rest.replace('/', "\\"))
-    }
 
     fn draft(path: &str) -> SourceFolder {
         SourceFolder {
@@ -546,32 +528,6 @@ mod tests {
         assert!(folder.recursive, "the draft's settings are kept");
         assert!(!folder.album_mapping);
         assert_eq!(folder.album_scope, AlbumScope::Leaf);
-    }
-
-    /// #40: "already added" follows the platform's path rule (R2.4), so a
-    /// case-only variant of a tracked folder is the same folder on Windows.
-    #[test]
-    fn already_tracked_follows_the_path_rule() {
-        let tracked = vec![draft(&win("Pictures/Camera Roll"))];
-
-        assert!(already_tracked(
-            &tracked,
-            Path::new(&win("pictures/camera roll").replace('C', "c")),
-            PathCase::Insensitive
-        ));
-        assert!(
-            !already_tracked(
-                &tracked,
-                Path::new(&win("pictures/camera roll").replace('C', "c")),
-                PathCase::Sensitive
-            ),
-            "the Linux rule keeps the two spellings apart"
-        );
-        assert!(!already_tracked(
-            &tracked,
-            Path::new(&win("Pictures/Other")),
-            PathCase::Insensitive
-        ));
     }
 
     /// #40 (S1): a worker answer that never arrives must not strand the setup

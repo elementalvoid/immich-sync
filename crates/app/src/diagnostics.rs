@@ -12,7 +12,7 @@ use std::time::Instant;
 use gpui_kit::*;
 use sync_core::ClientError;
 use sync_core::connection::{RequestCredential, SharedSession};
-use sync_core::engine::EngineStatus;
+use sync_core::status::Status;
 use sync_core::store::{ClassError, SqliteInfo};
 
 use crate::connection::{ConnectionModel, WORKER_UNAVAILABLE, run_on_worker};
@@ -78,7 +78,7 @@ pub struct DiagnosticsModel {
     info: Option<SqliteInfo>,
     errors: Vec<ClassError>,
     server: ServerInfo,
-    status: EngineStatus,
+    status: Status,
     throughput: Throughput,
     problem: Option<String>,
     rebuilding: bool,
@@ -112,8 +112,8 @@ impl DiagnosticsModel {
             info: None,
             errors: Vec::new(),
             server: ServerInfo::default(),
-            status: EngineStatus {
-                activity: sync_core::engine::Activity::Idle,
+            status: Status {
+                activity: sync_core::status::Activity::Idle,
                 folders: Vec::new(),
                 counts: sync_core::store::FolderCounts::default(),
                 last_error: None,
@@ -156,7 +156,7 @@ impl DiagnosticsModel {
 
     /// The engine's live status, for the throughput card.
     #[must_use]
-    pub fn status(&self) -> &EngineStatus {
+    pub fn status(&self) -> &Status {
         &self.status
     }
 
