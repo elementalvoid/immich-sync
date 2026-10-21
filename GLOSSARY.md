@@ -155,7 +155,7 @@ The dialog that confirms a new source folder's recursion and album settings. The
 _Avoid_: add dialog, onboarding
 
 **Folder detail**:
-The enlarged view of one source folder: its full path, live state and counts, its own upload activity, settings, timestamps, and the list of the assets it has uploaded with links into the Failed and Review views filtered to it. Its Remove needs a confirmation, because the folder's uploaded assets stay on the server.
+The enlarged view of one source folder: its full path, live state and counts, its own upload activity, settings, timestamps, and the list of the assets it has uploaded, with links into the Failed and Review views filtered to it. Its Remove needs a confirmation, because the folder's uploaded assets stay on the server.
 _Avoid_: folder modal, folder popup
 
 ### Diagnostics

@@ -32,9 +32,9 @@ internals.
 ## Consequences
 
 - The engine no longer writes source folder rows or review decisions; it reacts
-  to the tracking changes. `Engine::add_folder`, `set_album_mapping`,
-  `set_album_scope`, `remove_folder`, `keep_review_item`, and `retry_failed`
-  delegate.
+  to the tracking changes. `Engine::add_folder`, `add_folder_settings`,
+  `set_album_mapping`, `set_album_scope`, `set_album_title`, `remove_folder`,
+  `keep_review_item`, and `retry_failed` delegate.
 - An observer is registered when the engine is built and removed when it is
   dropped. The list is not a single slot: a start that loses its race is
   stopped and dropped while the winner keeps observing.

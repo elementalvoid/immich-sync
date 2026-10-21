@@ -1574,11 +1574,11 @@ mod tests {
     }
 
     /// #40 (R2.1): a directory this process cannot list is refused with its
-    /// own reason. The test skips itself when the process can still list a
-    /// mode-000 directory, which is what running as root does.
+    /// own reason. Running as root can list a mode-000 directory, so the name
+    /// says the test skips itself then, and the skip prints a `SKIP` line.
     #[cfg(unix)]
     #[test]
-    fn an_unreadable_folder_is_refused_with_its_own_reason() {
+    fn an_unreadable_folder_is_refused_with_its_own_reason_unless_run_as_root() {
         use super::probe;
         use std::os::unix::fs::PermissionsExt;
 
@@ -1597,7 +1597,7 @@ mod tests {
 
         if probed == PathProbe::Folder {
             eprintln!(
-                "skipping an_unreadable_folder_is_refused_with_its_own_reason: \
+                "SKIP an_unreadable_folder_is_refused_with_its_own_reason_unless_run_as_root: \
                  this process lists a mode-000 directory, so it is root"
             );
             return;
