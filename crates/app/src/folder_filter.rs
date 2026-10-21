@@ -145,6 +145,7 @@ mod tests {
             recursive,
             album_mapping: false,
             album_scope: sync_core::store::AlbumScope::Leaf,
+            album_title: None,
         }
     }
 

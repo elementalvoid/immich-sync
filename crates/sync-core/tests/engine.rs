@@ -63,6 +63,7 @@ fn add_folder(store: &StateStore, path: &Path, recursive: bool) {
             recursive,
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
+            album_title: None,
         })
         .expect("add the source folder");
 }
@@ -75,6 +76,7 @@ fn add_mapped_folder(store: &StateStore, path: &Path, recursive: bool, scope: Al
             recursive,
             album_mapping: true,
             album_scope: scope,
+            album_title: None,
         })
         .expect("add the mapped source folder");
 }
@@ -1131,6 +1133,7 @@ async fn adding_a_folder_through_the_engine_syncs_its_existing_files() {
             recursive: true,
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
+            album_title: None,
         }]
     );
 
@@ -1161,6 +1164,7 @@ async fn adding_a_folder_with_confirmed_settings_writes_every_choice_once() {
         recursive: false,
         album_mapping: true,
         album_scope: AlbumScope::WholeFolder,
+        album_title: None,
     };
 
     engine
@@ -1190,6 +1194,7 @@ async fn adding_a_folder_with_confirmed_settings_writes_every_choice_once() {
         recursive: true,
         album_mapping: false,
         album_scope: AlbumScope::Leaf,
+        album_title: None,
         ..confirmed.clone()
     };
     let error = engine

@@ -98,6 +98,7 @@ fn seed_folder(paths: &AppPaths, path: &Path, recursive: bool) {
             recursive,
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
+            album_title: None,
         })
         .expect("add the source folder");
 }

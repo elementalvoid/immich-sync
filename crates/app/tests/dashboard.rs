@@ -216,6 +216,8 @@ fn folder_progress_survives_counts_above_a_u16() {
             recursive: true,
             album_mapping: true,
             album_scope: sync_core::store::AlbumScope::Leaf,
+            album_title: None,
+            album_rename: None,
             available: true,
             counts,
             last_error: None,
@@ -589,6 +591,8 @@ fn engine_status_maps_to_the_global_card_and_one_card_per_folder() {
                 recursive: true,
                 album_mapping: true,
                 album_scope: sync_core::store::AlbumScope::Leaf,
+                album_title: None,
+                album_rename: None,
                 available: true,
                 counts: FolderCounts {
                     uploaded: 7,
@@ -606,6 +610,8 @@ fn engine_status_maps_to_the_global_card_and_one_card_per_folder() {
                 recursive: false,
                 album_mapping: true,
                 album_scope: sync_core::store::AlbumScope::Leaf,
+                album_title: None,
+                album_rename: None,
                 available: false,
                 counts: FolderCounts::default(),
                 last_error: None,
@@ -731,6 +737,7 @@ async fn folder_add_and_remove_controls_reach_the_store(cx: &mut TestAppContext)
             recursive: true,
             album_mapping: false,
             album_scope: sync_core::store::AlbumScope::Leaf,
+            album_title: None,
         }],
         "R2.1: the add control persisted the folder"
     );
@@ -1303,6 +1310,7 @@ async fn add_writes_the_path_and_all_three_settings_in_one_request(cx: &mut Test
             recursive: false,
             album_mapping: true,
             album_scope: sync_core::store::AlbumScope::WholeFolder,
+            album_title: None,
         },
         "#40: one write records the path and all three settings"
     );
@@ -1565,6 +1573,7 @@ async fn adding_a_tracked_folder_says_already_added_and_changes_nothing(cx: &mut
         recursive: false,
         album_mapping: true,
         album_scope: sync_core::store::AlbumScope::WholeFolder,
+        album_title: None,
     };
     let paths = immich_sync::paths::AppPaths {
         config_file: temp.path().join("config").join("settings.toml"),
@@ -1673,5 +1682,58 @@ async fn the_setup_dialog_names_its_controls_and_traps_focus(cx: &mut TestAppCon
         added.path,
         photos.display().to_string(),
         "N5: Space on the focused Add records the folder"
+    );
+}
+
+/// #47: the setup dialog has an Album title field, blank by default with the
+/// folder's name as its placeholder, and Add stores the title with the folder.
+#[gpui_kit::test]
+async fn the_setup_dialog_saves_the_album_title_with_the_folder(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the fixture folder");
+    let (window, store, _view) = open_live_dashboard(cx, temp.path());
+    wait_for_store(cx, &store).await;
+
+    let path_text = photos.display().to_string();
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        open_setup_through_the_field(window, &path_text, cx);
+        // #47: the field is blank until the user types, and the folder's name
+        // is what the album is called without one.
+        tab_to(window, "folder-panel-title", cx);
+        window.input("Holiday 2024", cx);
+        window.render_frame(cx);
+        add_in_setup(window, cx);
+    })
+    .expect("add the folder with a title");
+
+    let added = wait_for_folder(cx, &store, |folder| {
+        folder.album_title.as_deref() == Some("Holiday 2024")
+    })
+    .await;
+    assert_eq!(
+        added.path, path_text,
+        "#47: the title lands on the folder that was added"
+    );
+}
+
+/// #47: a setup dialog left blank stores no title, which means the folder's
+/// name.
+#[gpui_kit::test]
+async fn the_setup_dialog_left_blank_stores_no_album_title(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the fixture folder");
+    let (window, store, _view) = open_live_dashboard(cx, temp.path());
+
+    add_folder_through_ui(cx, window, &store, &photos).await;
+
+    assert_eq!(
+        cx.read(|cx| store.read(cx).folders()[0].album_title.clone()),
+        None,
+        "#47: a blank title is the folder's name, and nothing custom is stored"
     );
 }

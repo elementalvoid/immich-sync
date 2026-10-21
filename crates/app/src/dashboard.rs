@@ -260,7 +260,7 @@ impl Dashboard {
         let Some(engine) = self.engine.clone() else {
             return;
         };
-        let panel = cx.new(|cx| FolderPanel::setup(engine, path, cx));
+        let panel = cx.new(|cx| FolderPanel::setup(engine, path, window, cx));
         let focus = panel.read(cx).focus_handle(cx);
         let subscription = cx.subscribe_in(
             &panel,
@@ -288,7 +288,8 @@ impl Dashboard {
         };
         let opener = self.folder_opener.clone();
         let link_opener = self.link_opener.clone();
-        let panel = cx.new(|cx| FolderPanel::detail(engine, path.clone(), opener, link_opener, cx));
+        let panel =
+            cx.new(|cx| FolderPanel::detail(engine, path.clone(), opener, link_opener, window, cx));
         let focus = panel.read(cx).focus_handle(cx);
         let subscription = cx.subscribe_in(
             &panel,

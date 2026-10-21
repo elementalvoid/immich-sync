@@ -281,6 +281,16 @@ pub(crate) struct AlbumAssetsRequest<'a> {
     pub(crate) ids: &'a [String],
 }
 
+/// The `PATCH /albums/{id}` request body (#47).
+///
+/// Immich's `UpdateAlbumDto`: the client sends only the field it changes, so
+/// the album's description, order, and thumbnail stay as the user left them.
+#[derive(Serialize)]
+pub(crate) struct UpdateAlbumRequest<'a> {
+    #[serde(rename = "albumName")]
+    pub(crate) album_name: &'a str,
+}
+
 /// The `POST /albums` response body.
 #[derive(Deserialize)]
 pub(crate) struct AlbumBody {
