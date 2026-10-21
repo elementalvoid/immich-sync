@@ -665,7 +665,14 @@ async fn the_whole_path_is_selectable_so_nothing_is_truncated(cx: &mut TestAppCo
     cx.executor().allow_parking();
     let temp = tempfile::tempdir().expect("create a temp dir");
     let paths = temporary_paths(temp.path());
-    let photos = temp.path().join("photos").join("Camera Roll");
+    // Deep enough that the path wraps onto several lines on every platform, so
+    // the wrapped case this test exists for is exercised here and not only on
+    // Windows CI, whose temp path is longer.
+    let photos = temp
+        .path()
+        .join("photos")
+        .join("a-rather-long-directory-name".repeat(3))
+        .join("Camera Roll");
     std::fs::create_dir_all(&photos).expect("create the source folder");
     let folder = seed_folder(&paths, &photos, true);
     let (window, store, _view) = open_dashboard(cx, &paths);
@@ -673,11 +680,14 @@ async fn the_whole_path_is_selectable_so_nothing_is_truncated(cx: &mut TestAppCo
 
     open_detail_now(cx, window);
     read(cx, window, |window, cx| {
+        // Corner to corner, not middle to middle: the path wraps onto more than
+        // one line, and only a drag from the first line's start to the last
+        // line's end covers every line. The 2px inset keeps both ends inside
+        // the block whatever the DPI.
         let bounds = window.find("folder-panel-path").bounds();
-        let middle = bounds.size.height / 2.;
         window.drag(
-            bounds.origin + point(px(2.), middle),
-            bounds.origin + point(bounds.size.width - px(2.), middle),
+            bounds.origin + point(px(2.), px(2.)),
+            bounds.origin + point(bounds.size.width - px(2.), bounds.size.height - px(2.)),
             cx,
         );
         let selected = gpui_kit::base::TextSelection::selected_text(window, cx);
