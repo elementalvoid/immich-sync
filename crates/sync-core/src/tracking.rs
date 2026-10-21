@@ -266,8 +266,9 @@ impl Tracking {
     /// the engine write it by the same rule.
     ///
     /// The title is not a column of the folder row, so this writes the album
-    /// row alone: writing the folder row as well would carry a title and clear
-    /// the very one it is setting.
+    /// row alone. A folder-row write carries the title it was given and skips
+    /// one that is none, which would leave the stored title in place instead of
+    /// clearing it.
     ///
     /// # Errors
     ///
