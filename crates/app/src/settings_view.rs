@@ -1516,17 +1516,10 @@ fn group_digits(value: u32) -> String {
 /// open a `file:` or `mailto:` target from a hand-edited settings file.
 #[must_use]
 pub fn sync_tag_url(server_url: &str) -> Option<String> {
-    let trimmed = server_url.trim().trim_end_matches('/');
-    let (scheme, rest) = trimmed.split_once("://")?;
-    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
-        return None;
-    }
-    let web = rest.strip_suffix("/api").unwrap_or(rest);
-    let web = web.trim_end_matches('/');
-    if web.is_empty() {
-        return None;
-    }
-    Some(format!("{scheme}://{web}/tags?path={SYNC_TAG}"))
+    Some(format!(
+        "{}/tags?path={SYNC_TAG}",
+        crate::asset_link::web_root(server_url)?
+    ))
 }
 
 /// A notice with a colored edge, named by `id`. The accessible name carries

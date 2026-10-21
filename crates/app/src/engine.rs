@@ -1081,6 +1081,16 @@ impl EngineModel {
         self.store_model.read(cx).store()
     }
 
+    /// The configured Immich server URL, as the connection holds it (#44).
+    ///
+    /// It is the API base the settings file was saved with, and the folder
+    /// detail builds its asset links from it. Reading it here keeps the panel
+    /// from opening the settings file on the UI thread.
+    #[must_use]
+    pub fn server_url(&self, cx: &App) -> String {
+        self.connection.read(cx).profile().server_url.clone()
+    }
+
     /// The current source folders, from the store the client tracks them in.
     #[must_use]
     pub fn folders(&self, cx: &App) -> Vec<SourceFolder> {

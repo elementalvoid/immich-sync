@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::asset_link::{self, LinkOpener};
 use crate::engine::EngineModel;
 use crate::folder_controls::{SettingsControls, SettingsIds, SettingsValues};
 use crate::folder_panel::{FolderOpener, FolderPanel, FolderPanelEvent};
@@ -63,6 +64,9 @@ pub struct Dashboard {
     /// What "Open folder" runs (#43). The product opens the platform's file
     /// manager; a test injects a recorder.
     folder_opener: FolderOpener,
+    /// What an asset link opens (#44). The product opens the default browser; a
+    /// test injects a recorder.
+    link_opener: LinkOpener,
     /// A folder whose detail a capture run pins open (#43), so a screenshot of
     /// the detail needs no pointer.
     capture_detail: Option<String>,
@@ -86,6 +90,7 @@ impl Dashboard {
             detail_return: None,
             card_focus: HashMap::new(),
             folder_opener: Arc::new(crate::folder_panel::open_in_file_manager),
+            link_opener: asset_link::browser_opener(),
             capture_detail: None,
             _subscriptions: Vec::new(),
         }
@@ -118,6 +123,7 @@ impl Dashboard {
             detail_return: None,
             card_focus: HashMap::new(),
             folder_opener: Arc::new(crate::folder_panel::open_in_file_manager),
+            link_opener: asset_link::browser_opener(),
             capture_detail: std::env::var(crate::shell::FORCE_DETAIL_ENV).ok(),
             _subscriptions: subscriptions,
         }
@@ -128,6 +134,13 @@ impl Dashboard {
     /// next detail the view opens.
     pub fn set_folder_opener(&mut self, opener: impl Fn(&str) -> std::io::Result<()> + 'static) {
         self.folder_opener = Arc::new(opener);
+    }
+
+    /// Replaces the action an asset link runs, so a test can assert the URL
+    /// without starting a browser (#44). It applies to the next detail the view
+    /// opens.
+    pub fn set_link_opener(&mut self, opener: impl Fn(&str, &App) + 'static) {
+        self.link_opener = Arc::new(opener);
     }
 
     /// Whether new uploads are held (R8.7).
@@ -274,7 +287,8 @@ impl Dashboard {
             return;
         };
         let opener = self.folder_opener.clone();
-        let panel = cx.new(|cx| FolderPanel::detail(engine, path.clone(), opener, cx));
+        let link_opener = self.link_opener.clone();
+        let panel = cx.new(|cx| FolderPanel::detail(engine, path.clone(), opener, link_opener, cx));
         let focus = panel.read(cx).focus_handle(cx);
         let subscription = cx.subscribe_in(
             &panel,

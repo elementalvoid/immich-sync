@@ -30,13 +30,22 @@ pub fn now_ns() -> i64 {
 #[must_use]
 pub fn moment_line(label: &str, at_ns: Option<i64>, now_ns: i64) -> String {
     match at_ns {
-        Some(at_ns) => format!(
-            "{label}: {} · {}",
-            relative_time(now_ns, at_ns),
-            rfc3339_local(at_ns)
-        ),
+        Some(at_ns) => format!("{label}: {}", moment(at_ns, now_ns)),
         None => format!("{label}: {NOT_YET}"),
     }
+}
+
+/// One moment, relative and exact: `3 minutes ago · 2026-02-05T14:03:07+01:00`.
+///
+/// The folder detail's asset list shows one per uploaded asset (#44), the same
+/// two forms its folder-level lines carry.
+#[must_use]
+pub fn moment(at_ns: i64, now_ns: i64) -> String {
+    format!(
+        "{} · {}",
+        relative_time(now_ns, at_ns),
+        rfc3339_local(at_ns)
+    )
 }
 
 /// The relative time from `now_ns` back to `at_ns`, at the coarsest sensible
