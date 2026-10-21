@@ -2945,6 +2945,7 @@ mod tests {
                     recursive: true,
                     album_mapping: false,
                     album_scope: AlbumScope::default(),
+                    album_title: None,
                 })
                 .expect("add the folder");
             dirs.push(dir);
