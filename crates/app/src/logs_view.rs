@@ -1,11 +1,13 @@
-//! The Logs view (SPEC R10.3): where the log lives, the recent lines, the
-//! refresh action, and the persisted level control.
+//! The Logs view (SPEC R10.3): where the log lives, the recent lines, the live
+//! tail, the refresh action, and the persisted level control.
 //!
 //! The level is stored by the settings surface's store, because one file must
-//! have one writer. The view renders the tail once when it is built and on
-//! demand, so reading the file never happens on every frame.
+//! have one writer. Reading the file happens off the UI thread, on the way in
+//! and then once a second while the Logs surface is on screen; a hidden surface
+//! reads nothing.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use gpui_kit::base::{Disableable as _, SelectableText, TextSelection};
 use gpui_kit::component::ActiveTheme as _;
@@ -17,14 +19,22 @@ use crate::dashboard::CardPalette;
 use crate::logging::{self, LogLevel, TAIL_LINES};
 use crate::settings_view::{SettingsView, field_text, notice, section};
 
+/// How often the live tail re-reads the newest log file while the Logs surface
+/// is visible.
+pub const LIVE_TAIL_POLL: Duration = Duration::from_secs(1);
+
 /// The Logs view.
 pub struct LogsView {
     /// The settings surface owns the settings file and the level it persists.
     settings: Entity<SettingsView>,
     /// The directory the rotating log writes to (the state directory).
     directory: PathBuf,
-    /// The bounded tail read when the view was built or last refreshed.
+    /// The bounded tail read when the view was shown, refreshed, or polled.
     lines: Vec<String>,
+    /// The last read the paused count measured against. It advances with every
+    /// read while the displayed rows stay frozen, so an idle poll cannot count
+    /// the same arrival twice.
+    counted: Vec<String>,
     /// The newest log file's name, read with the tail.
     current_file: Option<String>,
     /// Why the tail could not be read, when it could not.
@@ -37,10 +47,50 @@ pub struct LogsView {
     /// Holds keyboard focus while the tail is dragged, which is what lets the
     /// Root's Ctrl+C binding reach the selection.
     lines_focus: FocusHandle,
+    /// Where the tail is scrolled to. Following is this handle's distance from
+    /// the bottom, never a line count.
+    scroll: ScrollHandle,
+    /// Whether the user scrolled away from the newest lines, which pauses
+    /// following. A poll sets it from the scroll handle, and a poll reads that
+    /// handle after the frame that moved it, so a scroll this view asked for can
+    /// never read as the user scrolling up.
+    paused: bool,
+    /// How many lines arrived while the user was reading older ones.
+    new_lines: usize,
+    /// The poll loop, running only while the surface is visible. Dropping it
+    /// stops the timer.
+    live: Option<Task<()>>,
+    /// Whether the shell last marked the surface visible.
+    visible: bool,
+    /// Discards a read a newer one has superseded, so two reads in flight
+    /// cannot count the same new lines twice.
+    read_generation: u64,
+    /// What the read in flight does when it lands. A read latches this before
+    /// its file read starts, and the apply re-reads the viewport for a poll.
+    follow: Follow,
+    /// The window the tail is painted in, where a selection is read from before
+    /// a live replace would drop the rows under it. Set by every render.
+    window: Option<AnyWindowHandle>,
+}
+
+/// What a tail read does when it lands.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Follow {
+    /// Follow only while the tail is still scrolled to its end when the read
+    /// lands, so a scroll during the read is not undone by the replace.
+    FromViewport,
+    /// Follow from the read on, whatever the viewport says: the user asked for
+    /// the tail, and the jump control clears the pause while the rows still
+    /// read as scrolled up.
+    Always,
 }
 
 impl LogsView {
     /// A view over the log directory the settings paths resolved.
+    ///
+    /// It reads nothing until the shell shows its surface: [`Self::set_visible`]
+    /// makes the first read, so a view that is never on screen never touches
+    /// the log.
     pub fn new(settings: Entity<SettingsView>, cx: &mut Context<Self>) -> Self {
         let directory = settings.read(cx).paths().log_directory();
         let save_problem = settings.read(cx).save_problem().map(str::to_string);
@@ -48,48 +98,185 @@ impl LogsView {
             this.save_problem = settings.read(cx).save_problem().map(str::to_string);
             cx.notify();
         });
-        let mut view = Self {
+        Self {
             settings,
             directory,
             lines: Vec::new(),
+            counted: Vec::new(),
             current_file: None,
             read_problem: None,
             save_problem,
             _subscriptions: vec![subscription],
             lines_focus: cx.focus_handle(),
-        };
-        view.read_tail(cx);
-        view
+            scroll: ScrollHandle::new(),
+            paused: false,
+            new_lines: 0,
+            live: None,
+            visible: false,
+            read_generation: 0,
+            follow: Follow::Always,
+            window: None,
+        }
     }
 
-    /// Re-reads the newest log file's name and the tail of its lines, and drops
-    /// any selection the old tail held so Ctrl+C cannot copy text that is no
-    /// longer on screen (#38).
+    /// Starts or stops the live tail: the shell marks the surface visible when
+    /// it shows the Logs view and not visible when it switches away.
+    ///
+    /// Showing reads once straight away, so an opened surface is current, and
+    /// then once a [`LIVE_TAIL_POLL`]. A hidden surface has no loop at all, so
+    /// nothing reads the file while another surface is on screen.
+    pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.visible == visible {
+            return;
+        }
+        self.visible = visible;
+        if !visible {
+            self.live = None;
+            return;
+        }
+        self.read_tail(Follow::Always, cx);
+        self.live = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(LIVE_TAIL_POLL).await;
+                if this.update(cx, |this, cx| this.poll_live(cx)).is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// Whether the live tail is running, which the shell decides through
+    /// [`Self::set_visible`].
+    #[must_use]
+    pub fn is_live(&self) -> bool {
+        self.live.is_some()
+    }
+
+    /// One tick of the live tail: reads where the tail is scrolled to, then
+    /// re-reads the file for as long as the surface is visible.
+    ///
+    /// Following is the scroll position, so the user returning to the end
+    /// resumes it and scrolling up pauses it, whatever moved the handle. An
+    /// existing selection pauses it too: a live replace would overwrite the
+    /// text under it (#38's defect on the hot path).
+    fn poll_live(&mut self, cx: &mut Context<Self>) {
+        if !self.visible {
+            return;
+        }
+        self.paused = !self.at_bottom() || self.has_selection(cx);
+        self.read_tail(Follow::FromViewport, cx);
+    }
+
+    /// Whether the window holds any text selection. The check is window-wide,
+    /// the same scope Refresh's clear uses.
+    fn has_selection(&self, cx: &mut Context<Self>) -> bool {
+        self.window.is_some_and(|window| {
+            window
+                .update(cx, |_, window, cx| TextSelection::has_selection(window, cx))
+                // A window that cannot be read may hold a selection, and a
+                // replace over one loses the user's text: pause instead.
+                .unwrap_or(true)
+        })
+    }
+
+    /// Re-reads the newest log file's name and the tail of its lines, follows
+    /// it again, and drops any selection the old tail held so Ctrl+C cannot
+    /// copy text that is no longer on screen (#38).
     pub fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.read_tail(cx);
+        // The clear is window-wide rather than scoped to this view, so a
+        // refresh also drops a selection held in another surface's text. It is
+        // acceptable here: Refresh is the user's own action on the one text
+        // surface whose rows it replaces, and a selection left over rows that
+        // no longer hold that text is the bug #38 fixed.
         TextSelection::clear(window, cx);
+        self.resume(cx);
     }
 
-    /// Replaces the tail the view holds with the newest log file's.
-    fn read_tail(&mut self, cx: &mut Context<Self>) {
-        self.current_file = logging::newest_file(&self.directory)
-            .ok()
-            .flatten()
-            .and_then(|path| {
-                path.file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-            });
-        match logging::tail(&self.directory, TAIL_LINES) {
-            Ok(lines) => {
-                self.lines = lines;
-                self.read_problem = None;
-            }
+    /// Takes the current tail and follows it again. Refresh and the jump
+    /// control both ask for that.
+    fn resume(&mut self, cx: &mut Context<Self>) {
+        self.paused = false;
+        self.read_tail(Follow::Always, cx);
+    }
+
+    /// Reads the newest file's name and its bounded tail on the background
+    /// executor (N2), then applies the result on the UI thread. `follow` says
+    /// what the apply does with a viewport the read did not wait for.
+    fn read_tail(&mut self, follow: Follow, cx: &mut Context<Self>) {
+        self.follow = follow;
+        self.read_generation = self.read_generation.wrapping_add(1);
+        let generation = self.read_generation;
+        let directory = self.directory.clone();
+        let read = cx
+            .background_executor()
+            .spawn(async move { logging::newest_tail(&directory, TAIL_LINES) });
+        cx.spawn(async move |this, cx| {
+            let read = read.await;
+            let _ = this.update(cx, |this, cx| this.apply_tail(generation, read, cx));
+        })
+        .detach();
+    }
+
+    /// Applies one tail read: replaces the tail while the view follows it, and
+    /// only counts the new lines while the user reads older ones.
+    fn apply_tail(
+        &mut self,
+        generation: u64,
+        read: anyhow::Result<(Option<String>, Vec<String>)>,
+        cx: &mut Context<Self>,
+    ) {
+        // A read still in flight when the surface hides changes nothing.
+        if !self.visible {
+            return;
+        }
+        // A newer read supersedes an older one, so a slow read cannot land over
+        // it or count the same lines twice.
+        if generation != self.read_generation {
+            return;
+        }
+        let (file, tail) = match read {
+            Ok(read) => read,
             Err(error) => {
-                self.lines.clear();
+                // The lines already on screen stay: a read that failed says so
+                // and a later poll can recover them.
                 self.read_problem = Some(format!("Could not read the log file: {error:#}"));
+                cx.notify();
+                return;
             }
+        };
+        self.read_problem = None;
+        // The timer's read decided before the file read finished, and the user
+        // may have scrolled or selected since: replacing now would pull them
+        // back to the end or drop the text under the selection. A read the user
+        // asked for follows whatever the viewport says.
+        if self.follow == Follow::FromViewport && (!self.at_bottom() || self.has_selection(cx)) {
+            self.paused = true;
+        }
+        if self.paused {
+            self.new_lines = self
+                .new_lines
+                .saturating_add(gained_lines(&self.counted, &tail));
+            // The counted window advances while the rows stay frozen, so the
+            // next poll measures what arrived after this read. The current
+            // file's name stays with the rows: it names the file they show.
+            self.counted = tail;
+        } else {
+            self.current_file = file;
+            self.lines = tail.clone();
+            self.counted = tail;
+            self.new_lines = 0;
+            self.scroll.scroll_to_bottom();
         }
         cx.notify();
+    }
+
+    /// Whether the tail is scrolled to its end.
+    ///
+    /// The offset runs from zero at the top to `-max_offset` at the bottom, so
+    /// `max_offset + offset` is the distance left below the last line. A few
+    /// pixels of slack keep the sub-pixel layout from reading as a scroll up.
+    fn at_bottom(&self) -> bool {
+        f32::from(self.scroll.max_offset().y + self.scroll.offset().y) < 4.
     }
 
     /// The level the settings hold, which is also the level the subscriber runs
@@ -191,7 +378,7 @@ impl LogsView {
                     "logs-path-current",
                     "logs-path-current-value",
                     "Current file",
-                    "Reads from the newest file. Refresh to re-read it.",
+                    "Reads from the newest file. It follows the file while this surface is open.",
                     current,
                 )
                 .into_any_element(),
@@ -356,6 +543,7 @@ impl LogsView {
                     .id("logs-lines")
                     .test_support()
                     .track_focus(&self.lines_focus)
+                    .track_scroll(&self.scroll)
                     .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                         window.focus(&focus, cx);
                     })
@@ -368,18 +556,67 @@ impl LogsView {
                     .into_any_element(),
             );
         }
+        // Below the tail, so pausing and resuming cannot move the lines the
+        // user is reading.
+        if self.paused {
+            let jump = match self.new_lines {
+                0 => "Jump to latest".to_string(),
+                1 => "1 new line · Jump to latest".to_string(),
+                count => format!("{count} new lines · Jump to latest"),
+            };
+            body.push(
+                div()
+                    .id("logs-paused")
+                    .test_support()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap_6()
+                    .min_h(rems(2.25))
+                    .child(field_text(
+                        "Live tail paused",
+                        "New lines keep arriving; the tail stays where you left it.",
+                        &palette,
+                    ))
+                    .child(
+                        Button::new("logs-jump-latest")
+                            .label(jump.clone())
+                            .accessibility_label(jump)
+                            .on_click(cx.listener(|this, _, _, cx| this.resume(cx))),
+                    )
+                    .into_any_element(),
+            );
+        }
         section(
             "logs-lines-section",
             "Recent lines",
-            "The newest file's last lines. A new session appends to the same file.",
+            "The newest file's last lines. They follow the file while this surface is open.",
             body,
             cx,
         )
     }
 }
 
+/// How many lines `fresh` holds that `held` does not.
+///
+/// The file only grows, so the tail on screen is a run at the start of the
+/// fresh one and everything after that run is new. A whole fresh window means
+/// the run is gone, which happens when the log rotated or outgrew the window.
+fn gained_lines(held: &[String], fresh: &[String]) -> usize {
+    let longest = held.len().min(fresh.len());
+    let shared = (1..=longest)
+        .rev()
+        .find(|count| held[held.len() - count..] == fresh[..*count])
+        .unwrap_or(0);
+    fresh.len() - shared
+}
+
 impl Render for LogsView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The live poll reads the window's selection before it replaces the
+        // rows, and this is where a window reference is available.
+        self.window = Some(window.window_handle());
         let theme = cx.theme();
         let background = theme.background;
         let foreground = theme.foreground;

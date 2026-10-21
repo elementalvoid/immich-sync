@@ -169,5 +169,5 @@ One archive Diagnostics collects for a support message: the logs, versions, data
 _Avoid_: support bundle, log bundle, diagnostics archive
 
 **Live tail**:
-The Logs view's automatic reading of new lines from the newest log file. Following pauses while the user reads older lines.
+The Logs view's automatic reading of new lines from the newest log file. Following pauses while the user reads older lines or holds a selection.
 _Avoid_: auto-refresh, follow mode
