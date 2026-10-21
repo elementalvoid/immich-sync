@@ -809,6 +809,10 @@ impl EngineModel {
     /// it belongs to the dialog: it names what the add could not do, the same
     /// way a refusal does.
     pub(crate) fn folder_add_lost(&mut self, request: u64, cx: &mut Context<Self>) {
+        // A newer add supersedes an older result still in flight.
+        if self.add_generation != request {
+            return;
+        }
         self.folder_add = Some(FolderAddResult {
             request,
             problem: Some(WORKER_UNAVAILABLE.to_string()),

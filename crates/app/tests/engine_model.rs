@@ -1147,6 +1147,43 @@ async fn a_confirmed_folder_add_scans_the_folder_through_the_running_engine(
         pump_until(cx, |_| server.upload_requests() >= 1),
         "R2.1: a confirmed folder starts scanning and uploading its files"
     );
+
+    // #40: the running engine's duplicate refusal reaches the dialog by name,
+    // and the tracked row keeps the settings it already had. The second draft
+    // differs, so an upsert would show up below.
+    let duplicate = SourceFolder {
+        recursive: true,
+        ..confirmed.clone()
+    };
+    let refused =
+        cx.update(|cx| engine.update(cx, |model, cx| model.add_folder_settings(duplicate, cx)));
+    assert!(
+        pump_until(cx, |cx| cx.read(|cx| engine
+            .read(cx)
+            .folder_add_result()
+            .is_some_and(|result| result.request == refused))),
+        "#40: the duplicate add's answer never reached the dialog"
+    );
+    let result = cx
+        .read(|cx| engine.read(cx).folder_add_result().cloned())
+        .expect("the duplicate add came back");
+    assert_eq!(
+        result.problem.as_deref(),
+        Some("Already added."),
+        "#40: a folder the running engine tracks is refused by name"
+    );
+    assert_eq!(
+        cx.read(|cx| {
+            store
+                .read(cx)
+                .store()
+                .expect("the store is open")
+                .folders()
+                .expect("read the folders")
+        }),
+        vec![confirmed.clone()],
+        "#40: a duplicate add leaves the tracked row as it was"
+    );
 }
 
 /// #40: an Add that arrives before the state store opens comes back with that

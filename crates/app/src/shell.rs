@@ -407,8 +407,14 @@ impl AppShell {
             dashboard.set_connection(Some(summary), cx);
         });
         let logs = cx.new(|cx| LogsView::new(settings.clone(), cx));
+        let mode = forced_view().unwrap_or(ViewMode::Dashboard);
+        // A pinned Logs surface is on screen from the first frame, so its live
+        // tail starts with it.
+        if mode == ViewMode::Logs {
+            logs.update(cx, |logs, cx| logs.set_visible(true, cx));
+        }
         Self {
-            mode: forced_view().unwrap_or(ViewMode::Dashboard),
+            mode,
             dashboard,
             settings,
             logs,
@@ -423,7 +429,14 @@ impl AppShell {
 
     /// Switches the visible surface.
     pub fn show(&mut self, mode: ViewMode, cx: &mut Context<Self>) {
-        self.mode = mode;
+        if self.mode != mode {
+            self.mode = mode;
+            // The live tail reads only while its surface is on screen, so the
+            // shell starts it on the way in and stops it on the way out
+            // (R10.3).
+            self.logs
+                .update(cx, |logs, cx| logs.set_visible(mode == ViewMode::Logs, cx));
+        }
         cx.notify();
     }
 
@@ -443,6 +456,13 @@ impl AppShell {
             _ => {}
         }
         self.show(mode, cx);
+    }
+
+    /// The Logs surface. Its live tail runs only while [`Self::show`] has it
+    /// visible.
+    #[must_use]
+    pub fn logs(&self) -> Entity<LogsView> {
+        self.logs.clone()
     }
 
     /// The view switch. Every button is a keyboard reachable tab stop.

@@ -342,7 +342,9 @@ impl FolderPanel {
             .child(
                 Button::new("folder-panel-add")
                     .primary()
-                    .label("Add")
+                    // The visible label shows the wait so a slow worker is not
+                    // silence; the control stays enabled so focus does not move.
+                    .label(if pending { "Adding…" } else { "Add" })
                     .accessibility_label("Add the folder")
                     .on_click(cx.listener(|this, _, window, cx| this.add(window, cx))),
             )

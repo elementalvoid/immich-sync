@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use immich_sync::logging::{
-    LOG_PREFIX, LogLevel, LogPolicy, LogSink, newest_file, record_start, tail,
+    LOG_PREFIX, LogLevel, LogPolicy, LogSink, newest_file, newest_tail, record_start,
 };
 use immich_sync::paths::AppPaths;
 use immich_sync::settings::SettingsStore;
@@ -201,9 +201,12 @@ fn the_tail_returns_the_latest_lines_of_the_newest_file() {
     age(&old, 60);
 
     assert_eq!(
-        tail(temp.path(), 2).expect("tail the log directory"),
-        ["second", "third"],
-        "the tail reads the newest file and the latest lines"
+        newest_tail(temp.path(), 2).expect("tail the log directory"),
+        (
+            Some("immich-sync.log.2026-01-02".to_string()),
+            vec!["second".to_string(), "third".to_string()]
+        ),
+        "the tail reads the newest file, its name, and the latest lines"
     );
 }
 
