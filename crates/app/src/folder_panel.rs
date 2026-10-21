@@ -43,7 +43,7 @@ pub(crate) const ALREADY_ADDED: &str = "Already added.";
 
 /// How many of a folder's uploaded assets one page of the detail's list holds
 /// (#44): the first page, every Load more, and the floor a live refresh keeps.
-pub(crate) const ASSET_PAGE: usize = 50;
+const ASSET_PAGE: usize = 50;
 
 /// The action "Open folder" runs (#43).
 ///
@@ -193,11 +193,9 @@ pub struct FolderPanel {
     /// Why the last asset read failed, if it did. It replaces the list.
     assets_problem: Option<String>,
     /// Whether an asset read is in flight, so the list is not called empty
-    /// before it has answered.
+    /// before it has answered. One read at a time: a page that is in flight
+    /// keeps every other read waiting, so no answer can overtake another.
     assets_loading: bool,
-    /// The read this detail waits for. A page that answers after a newer read
-    /// started is dropped, so a slow page cannot overwrite a fresh one.
-    assets_generation: u64,
     /// The folder's uploaded count and recursion setting the loaded rows were
     /// read at, so the next status poll that changes either reloads them.
     assets_read_at: Option<(u32, bool)>,
@@ -237,7 +235,6 @@ impl FolderPanel {
             assets_more: false,
             assets_problem: None,
             assets_loading: false,
-            assets_generation: 0,
             assets_read_at: None,
             focus,
             confirm_focus: cx.focus_handle(),
@@ -290,7 +287,6 @@ impl FolderPanel {
             assets_more: false,
             assets_problem: None,
             assets_loading: false,
-            assets_generation: 0,
             assets_read_at: None,
             focus,
             confirm_focus,
@@ -302,6 +298,9 @@ impl FolderPanel {
 
     /// The folder's live card, when the engine's status holds it.
     fn refresh_detail(&mut self, engine: &Entity<EngineModel>, cx: &mut Context<Self>) {
+        // #44: a URL corrected while the detail is open reaches the links it
+        // has not drawn yet, so the dialog need not be reopened.
+        self.server_url = engine.read(cx).server_url(cx);
         match folder_card(engine, &self.draft.path, cx) {
             Some(card) => {
                 // #43: the live values are the card's, so the settings the
@@ -349,17 +348,15 @@ impl FolderPanel {
 
     /// Reads one page of this folder's current assets (#44).
     ///
-    /// The read runs on the background executor, never the UI thread, and its
-    /// answer is applied only when it is still the newest request. Nothing is
-    /// written: paging is two reads of the same list.
+    /// The read runs on the background executor, never the UI thread. One
+    /// read is in flight at a time, so its answer needs no guard against a
+    /// newer one. Nothing is written: paging is two reads of the same list.
     fn read_assets(&mut self, offset: usize, count: usize, uploaded: u32, cx: &mut Context<Self>) {
         let Some(store) = self.engine.read(cx).store(cx) else {
             return;
         };
         let folder = self.draft.path.clone();
         let recursive = self.draft.recursive;
-        self.assets_generation = self.assets_generation.wrapping_add(1);
-        let generation = self.assets_generation;
         self.assets_loading = true;
         self.assets_read_at = Some((uploaded, recursive));
         let read = cx
@@ -368,24 +365,20 @@ impl FolderPanel {
         cx.spawn(async move |this, cx| {
             let result = read.await;
             let _ = this.update(cx, |panel, cx| {
-                panel.apply_assets(generation, offset, count, result, cx);
+                panel.apply_assets(offset, count, result, cx);
             });
         })
         .detach();
     }
 
-    /// Applies one asset page, unless a newer read has started since.
+    /// Applies one asset page.
     fn apply_assets(
         &mut self,
-        generation: u64,
         offset: usize,
         count: usize,
         result: Result<Vec<FolderAsset>, StoreError>,
         cx: &mut Context<Self>,
     ) {
-        if generation != self.assets_generation {
-            return;
-        }
         self.assets_loading = false;
         match result {
             Ok(rows) => {
@@ -809,9 +802,12 @@ impl FolderPanel {
         );
         // #44: this folder's own share of the traffic, in the global card's
         // own words. It rides the 250 ms status poll, never a timer of its own.
+        // A folder that left the status has no live rate, so "Folder
+        // unavailable" is never paired with one.
         let activity_line = crate::status::upload_line(
             self.card
                 .as_ref()
+                .filter(|card| card.available)
                 .map_or(UploadTraffic::default(), |card| card.uploads),
         );
         let title = self.folder_name();
@@ -1127,7 +1123,7 @@ impl FolderPanel {
         let name = folder_name(&asset.path);
         let size = format_bytes(asset.size);
         let when = times::moment(asset.created_at_ns, now_ns);
-        let described = format!("{name} · {size} · {when}");
+        let described = format!("{name} · {size} · uploaded {when}");
         // #44: no configured server URL hides the link rather than opening a
         // wrong one; the row stays readable either way.
         let url = asset_link::asset_url(&self.server_url, &asset.asset_id);
@@ -1166,7 +1162,7 @@ impl FolderPanel {
                             .min_w_0()
                             .text_xs()
                             .text_color(theme.muted_foreground)
-                            .child(format!("{size} · {when}")),
+                            .child(format!("{size} · uploaded {when}")),
                     )
                     .when_some(url, |this, url| {
                         this.child(
@@ -1683,6 +1679,22 @@ mod tests {
                 window.find("folder-detail-activity").label(),
                 Some("Idle"),
                 "#44: nothing on the wire reads Idle"
+            );
+            panel.update(cx, |panel, _| {
+                if let Some(card) = panel.card.as_mut() {
+                    card.available = false;
+                    card.uploads = UploadTraffic {
+                        bytes: 41_943_040,
+                        bytes_per_second: 2_516_582,
+                        in_flight: 3,
+                    };
+                }
+            });
+            window.render_frame(cx);
+            assert_eq!(
+                window.find("folder-detail-activity").label(),
+                Some("Idle"),
+                "#44: a folder that left the status keeps no live rate"
             );
         })
         .expect("read the rendered activity line");

@@ -1267,7 +1267,7 @@ async fn the_list_shows_the_newest_assets_with_their_name_size_and_time(cx: &mut
         assert_eq!(
             label(window, ("folder-asset", 0_usize)),
             format!(
-                "edited.jpg · 4.0 KiB · 3 hours ago · {}",
+                "edited.jpg · 4.0 KiB · uploaded 3 hours ago · {}",
                 times::rfc3339_local(second + 30)
             ),
             "#44: the newest asset comes first, named, sized, and dated twice"
@@ -1275,14 +1275,14 @@ async fn the_list_shows_the_newest_assets_with_their_name_size_and_time(cx: &mut
         assert_eq!(
             label(window, ("folder-asset", 1_usize)),
             format!(
-                "newer.jpg · 2.0 KiB · 3 hours ago · {}",
+                "newer.jpg · 2.0 KiB · uploaded 3 hours ago · {}",
                 times::rfc3339_local(second)
             )
         );
         assert_eq!(
             label(window, ("folder-asset", 2_usize)),
             format!(
-                "older.jpg · 1.0 KiB · 3 hours ago · {}",
+                "older.jpg · 1.0 KiB · uploaded 3 hours ago · {}",
                 times::rfc3339_local(first)
             )
         );
@@ -1335,7 +1335,7 @@ async fn load_more_appends_the_next_page_and_keeps_the_loaded_rows(cx: &mut Test
         assert_eq!(
             label(window, ("folder-asset", 99_usize)),
             format!(
-                "IMG_0020.jpg · 1.0 KiB · 3 hours ago · {}",
+                "IMG_0020.jpg · 1.0 KiB · uploaded 3 hours ago · {}",
                 times::rfc3339_local(base + 20)
             ),
             "#44: the appended page continues the one order"
@@ -1575,6 +1575,71 @@ async fn the_list_reloads_on_a_new_upload_and_keeps_the_loaded_row_count(cx: &mu
         assert!(
             label(window, ("folder-asset", 1_usize)).starts_with("IMG_0119.jpg"),
             "#44: the rows that were loaded stay, in order, under the new one"
+        );
+    });
+}
+
+/// #44 (R2.1): turning Recursive off reloads the list at the folder's new
+/// setting, so a subfolder's asset leaves the rows it was listed in.
+#[gpui_kit::test]
+async fn turning_recursion_off_reloads_the_list_with_direct_children_only(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    let sub = photos.join("sub");
+    std::fs::create_dir_all(&sub).expect("create the source folder");
+    seed_folder(&paths, &photos, true);
+    let base = times::now_ns() - THREE_AND_A_HALF_HOURS_NS;
+    seed_asset(
+        &paths,
+        &photos.join("direct.jpg"),
+        1024,
+        "asset-direct",
+        base,
+    );
+    seed_asset(
+        &paths,
+        &photos.join("second.jpg"),
+        2048,
+        "asset-second",
+        base + 1,
+    );
+    seed_asset(
+        &paths,
+        &sub.join("nested.jpg"),
+        4096,
+        "asset-nested",
+        base + 2,
+    );
+    let (window, store, _view) = open_dashboard(cx, &paths);
+    wait_for_store(cx, &store).await;
+
+    open_detail_now(cx, window);
+    wait_for_asset_rows(cx, window, 3).await;
+    read(cx, window, |window, _| {
+        assert!(
+            label(window, ("folder-asset", 0_usize)).starts_with("nested.jpg"),
+            "R2.1: the recursive folder lists its subfolder's asset"
+        );
+    });
+
+    // The setting writes immediately; the next status poll carries the new
+    // value and reloads the rows at it.
+    act(cx, window, |window, cx| {
+        window.click("folder-panel-recursive", cx)
+    });
+    wait_for_folder(cx, &store, |folder| !folder.recursive).await;
+    wait_for_asset_rows(cx, window, 2).await;
+    read(cx, window, |window, _| {
+        assert!(
+            window.try_find(("folder-asset", 2_usize)).is_none(),
+            "#44: the subfolder's row left with the recursion setting"
+        );
+        assert!(
+            label(window, ("folder-asset", 0_usize)).starts_with("second.jpg")
+                && label(window, ("folder-asset", 1_usize)).starts_with("direct.jpg"),
+            "#44: the list now holds the folder's direct children only"
         );
     });
 }

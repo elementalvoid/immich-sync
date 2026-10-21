@@ -1817,7 +1817,8 @@ impl StateStore {
     /// holds is not listed (R4.4). `recursive` follows the folder's own setting
     /// (R2.1): a folder that does not descend into its subfolders lists its
     /// direct children only. `offset` is the number of rows already shown, so
-    /// the next page continues where the list stopped.
+    /// the next page continues where the list stopped; a deep page re-sorts the
+    /// folder's whole range before it skips the rows already shown.
     ///
     /// The read runs on a fresh read-only connection, so a page the detail
     /// opens never queues behind the engine's writer (ADR 0005). It starts
@@ -1855,6 +1856,8 @@ impl StateStore {
         } else {
             " AND instr(substr(i.path_key, length(?1) + 1), '/') = 0"
         };
+        // shortcut: offset paging skews if a not-yet-loaded row is re-recorded;
+        // switch to a (created_at_ns, item_id) cursor when it matters
         let mut statement = reader
             .prepare(&format!(
                 "SELECT i.path, i.size, v.asset_id, v.created_at_ns
