@@ -17,7 +17,7 @@ use crate::model::{
     AssetInfo, AssetInfoBody, AssetUpload, Auth, AuthStatus, BulkAction, BulkCheckBody,
     BulkCheckItem, BulkCheckResult, BulkIdsRequest, BulkTagRequest, CreateAlbumRequest,
     CreateStackRequest, LoginResponse, RejectReason, ServerAbout, SessionToken, StackBody,
-    TagUpsertBody, TagUpsertRequest, UploadBody, UploadResponse,
+    TagUpsertBody, TagUpsertRequest, UpdateAlbumRequest, UploadBody, UploadResponse,
 };
 
 /// The longest error message body kept from the server. A reverse proxy can
@@ -537,6 +537,38 @@ impl ImmichClient {
         .await?;
         let result = self.read_album(response).await;
         log_outcome("create-album", &result);
+        result
+    }
+
+    /// Renames one album (#47).
+    ///
+    /// `PATCH /albums/{id}` with `UpdateAlbumDto.albumName` is
+    /// `x-immich-state: Stable` in the v3.3.1 spec and needs the `album.update`
+    /// permission, which a password session holds and an API key may not.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::InvalidToken`] for a refused credential, an
+    /// unknown album id as a [`ClientError::Protocol`] with its 404 status (so
+    /// the caller can recreate the album), the typed refusal classes (R6.3),
+    /// and the transport and protocol variants.
+    pub async fn rename_album(
+        &self,
+        auth: Auth<'_>,
+        album_id: &str,
+        name: &str,
+    ) -> Result<Album, ClientError> {
+        let response = send(
+            self.authorize(
+                self.http
+                    .patch(self.endpoint(&format!("albums/{album_id}"))),
+                auth,
+            )
+            .json(&UpdateAlbumRequest { album_name: name }),
+        )
+        .await?;
+        let result = self.read_album(response).await;
+        log_outcome("rename-album", &result);
         result
     }
 

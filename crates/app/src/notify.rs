@@ -207,6 +207,8 @@ mod tests {
             recursive: true,
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
+            album_title: None,
+            album_rename: None,
             available,
             counts: FolderCounts::default(),
             last_error: None,

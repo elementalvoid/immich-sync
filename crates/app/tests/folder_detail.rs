@@ -55,9 +55,18 @@ fn seed_folder(paths: &AppPaths, path: &Path, recursive: bool) -> SourceFolder {
         recursive,
         album_mapping: false,
         album_scope: AlbumScope::Leaf,
+        album_title: None,
     };
     store.add_folder(&folder).expect("add the source folder");
     folder
+}
+
+/// The album title the state database holds for `folder` (#47).
+fn seed_album_title(paths: &AppPaths, folder: &Path, title: &str) {
+    let store = StateStore::open(&paths.state_db).expect("open the state database");
+    store
+        .set_album_title(&sync_core::paths::path_key(folder), Some(title))
+        .expect("store the album title");
 }
 
 /// One tracked item under `folder`, so the folder's counts are not all zero.
@@ -1095,6 +1104,8 @@ fn a_folder_status_carries_its_times_into_the_detail_card() {
             recursive: true,
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
+            album_title: None,
+            album_rename: None,
             available: true,
             counts: FolderCounts::default(),
             last_error: None,
@@ -1119,5 +1130,89 @@ fn a_folder_status_carries_its_times_into_the_detail_card() {
     assert_eq!(
         model.global.last_scan_ns, None,
         "the global card is not a folder and has no folder times"
+    );
+}
+
+/// The album title the detail's field shows, or `None` when it holds none.
+fn album_title_input(window: &Window) -> Option<String> {
+    gpui_kit::base::test_support::snapshots(window)
+        .into_iter()
+        .find(|snapshot| {
+            snapshot.role() == Some(gpui_kit::Role::TextInput)
+                && snapshot
+                    .path()
+                    .contains(&ElementId::Name("folder-panel-title".into()))
+        })
+        .and_then(|snapshot| snapshot.value().map(str::to_string))
+}
+
+/// Replaces the focused field's text with `value` (#47).
+fn retype(window: &mut Window, value: &str, cx: &mut App) {
+    window.press("ctrl-a", cx);
+    window.input(value, cx);
+}
+
+/// #47: the detail shows the stored album title and saves a new one.
+#[gpui_kit::test]
+async fn the_detail_shows_the_album_title_and_saves_a_new_one(cx: &mut TestAppContext) {
+    // A worker thread wakes the foreground executor, which the harness
+    // permits only in parking mode.
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+    seed_folder(&paths, &photos, true);
+    seed_album_title(&paths, &photos, "Holiday 2024");
+    let (window, store, _view) = open_dashboard(cx, &paths);
+    wait_for_store(cx, &store).await;
+    open_detail_now(cx, window);
+
+    read(cx, window, |window, _| {
+        assert_eq!(
+            album_title_input(window).as_deref(),
+            Some("Holiday 2024"),
+            "#47: the detail shows the title the user chose"
+        );
+        assert_eq!(
+            label(window, "folder-panel-title"),
+            "Album title for photos",
+            "N5: the title field is named for the folder it changes"
+        );
+    });
+
+    // #47: the title saves through the field, and the detail stays open.
+    act(cx, window, |window, cx| {
+        tab_to(window, "folder-panel-title", cx);
+        retype(window, "Holiday 2025", cx);
+        window.render_frame(cx);
+        window.click("folder-panel-title-save", cx);
+    });
+    let stored = wait_for_folder(cx, &store, |folder| {
+        folder.album_title.as_deref() == Some("Holiday 2025")
+    })
+    .await;
+    assert_eq!(stored.album_title.as_deref(), Some("Holiday 2025"));
+    read(cx, window, |window, _| {
+        assert!(
+            detail_open(window),
+            "#47: saving a title keeps the detail open"
+        );
+    });
+
+    // #47: clearing the title stores no custom one, which means the folder's
+    // name.
+    act(cx, window, |window, cx| {
+        tab_to(window, "folder-panel-title", cx);
+        window.press("ctrl-a", cx);
+        window.press("backspace", cx);
+        window.render_frame(cx);
+        window.press("enter", cx);
+    });
+    wait_for_folder(cx, &store, |folder| folder.album_title.is_none()).await;
+    assert_eq!(
+        cx.read(|cx| store.read(cx).folders()[0].album_title.clone()),
+        None,
+        "#47: a cleared title means the folder's name"
     );
 }

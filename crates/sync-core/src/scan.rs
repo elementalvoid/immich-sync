@@ -126,6 +126,7 @@ mod tests {
             recursive,
             album_mapping: false,
             album_scope: crate::store::AlbumScope::default(),
+            album_title: None,
         }
     }
 
