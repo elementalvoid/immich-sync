@@ -103,9 +103,11 @@ impl Backfill {
     /// the whole library again (R3.7: "Tag existing assets now").
     ///
     /// This is safe while a run is in flight: the pass that was interrupted
-    /// stops at its batch boundary without recording that batch, and the pass
-    /// this call wakes starts from the cleared cursor instead of continuing
-    /// past the library's head.
+    /// stops at its next batch boundary without recording that batch, and the
+    /// pass this call wakes starts from the cleared cursor instead of
+    /// continuing past the library's head. The stop is checked immediately
+    /// before the store write, so only a press landing in the microseconds
+    /// between that check and the write can record the stale batch.
     ///
     /// # Errors
     ///
@@ -204,7 +206,9 @@ impl Backfill {
             // R3.7: "Tag existing assets now" cleared the state while this
             // batch was on the wire. Recording it would move the cleared cursor
             // past the library's head, so this pass stops and the queued one
-            // starts from the first id.
+            // starts from the first id. A press in the microseconds after this
+            // check still records; that narrow window is why the doc above does
+            // not claim atomicity.
             if self.generation.load(Ordering::SeqCst) != generation {
                 tracing::info!("R3.7: the backfill was restarted; this pass stops");
                 break;
