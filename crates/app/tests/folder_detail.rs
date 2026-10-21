@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, ElementId, Entity, Point, TestAppContext, Window,
-    WindowBounds, WindowOptions, point, px, size,
+    AnyWindowHandle, App, AppContext as _, ElementId, Entity, Point, ScrollDelta, TestAppContext,
+    Window, WindowBounds, WindowOptions, point, px, size,
 };
 use immich_sync::connection::ConnectionModel;
 use immich_sync::dashboard::Dashboard;
@@ -57,9 +57,18 @@ fn seed_folder(paths: &AppPaths, path: &Path, recursive: bool) -> SourceFolder {
         recursive,
         album_mapping: false,
         album_scope: AlbumScope::Leaf,
+        album_title: None,
     };
     store.add_folder(&folder).expect("add the source folder");
     folder
+}
+
+/// The album title the state database holds for `folder` (#47).
+fn seed_album_title(paths: &AppPaths, folder: &Path, title: &str) {
+    let store = StateStore::open(&paths.state_db).expect("open the state database");
+    store
+        .set_album_title(&sync_core::paths::path_key(folder), Some(title))
+        .expect("store the album title");
 }
 
 /// One tracked item under `folder`, so the folder's counts are not all zero.
@@ -223,6 +232,30 @@ fn read<R>(
         read(window, cx)
     })
     .expect("read the window")
+}
+
+/// Scrolls the dialog until the element with `id` is on screen.
+///
+/// The detail card scrolls its body when the window is short (#43), and the
+/// album title field above the list pushes Load more below the fold, so a
+/// control is clicked only after it is really visible.
+fn scroll_into_view(window: &mut Window, cx: &mut App, id: impl Into<ElementId>) {
+    let id = id.into();
+    window.render_frame(cx);
+    for _ in 0..60 {
+        if window
+            .try_find(id.clone())
+            .is_some_and(|target| target.visible())
+        {
+            return;
+        }
+        window.scroll(
+            "folder-panel",
+            ScrollDelta::Pixels(point(px(0.), px(-120.))),
+            cx,
+        );
+    }
+    panic!("{id:?} never became visible in the dialog");
 }
 
 /// Opens the detail and waits for it to be on screen.
@@ -1141,6 +1174,8 @@ fn a_folder_status_carries_its_times_into_the_detail_card() {
             recursive: true,
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
+            album_title: None,
+            album_rename: None,
             available: true,
             counts: FolderCounts::default(),
             last_error: None,
@@ -1328,6 +1363,7 @@ async fn load_more_appends_the_next_page_and_keeps_the_loaded_rows(cx: &mut Test
     });
 
     act(cx, window, |window, cx| {
+        scroll_into_view(window, cx, "folder-assets-more");
         window.click("folder-assets-more", cx)
     });
     wait_for_asset_rows(cx, window, 100).await;
@@ -1495,11 +1531,15 @@ async fn an_unreadable_store_says_why_the_list_is_missing(cx: &mut TestAppContex
     let (window, store, _view) = open_dashboard(cx, &paths);
     wait_for_store(cx, &store).await;
 
-    // The detail's read is a fresh connection to the file, so a database the
-    // path no longer names cannot answer it, as a removed or damaged file
-    // cannot.
-    std::fs::remove_file(&paths.state_db).expect("remove the state database");
-    std::fs::create_dir(&paths.state_db).expect("put a directory where the database was");
+    // The detail's read is a fresh connection to the file, so a schema without
+    // the table it joins cannot answer it, as a damaged database cannot. The
+    // fault goes through SQLite rather than the filesystem: every open
+    // connection keeps its handle to the file, which Windows insists on.
+    {
+        let raw = rusqlite::Connection::open(&paths.state_db).expect("open the database directly");
+        raw.execute_batch("DROP TABLE version")
+            .expect("drop the version table the asset list joins");
+    }
 
     open_detail_now(cx, window);
     cx.wait_for(window, Duration::from_secs(10), |window, _| {
@@ -1542,6 +1582,7 @@ async fn the_list_reloads_on_a_new_upload_and_keeps_the_loaded_row_count(cx: &mu
     open_detail_now(cx, window);
     wait_for_asset_rows(cx, window, 50).await;
     act(cx, window, |window, cx| {
+        scroll_into_view(window, cx, "folder-assets-more");
         window.click("folder-assets-more", cx)
     });
     wait_for_asset_rows(cx, window, 100).await;
@@ -1652,4 +1693,88 @@ async fn turning_recursion_off_reloads_the_list_with_direct_children_only(cx: &m
             "#44: the list now holds the folder's direct children only"
         );
     });
+}
+
+/// The album title the detail's field shows, or `None` when it holds none.
+fn album_title_input(window: &Window) -> Option<String> {
+    gpui_kit::base::test_support::snapshots(window)
+        .into_iter()
+        .find(|snapshot| {
+            snapshot.role() == Some(gpui_kit::Role::TextInput)
+                && snapshot
+                    .path()
+                    .contains(&ElementId::Name("folder-panel-title".into()))
+        })
+        .and_then(|snapshot| snapshot.value().map(str::to_string))
+}
+
+/// Replaces the focused field's text with `value` (#47).
+fn retype(window: &mut Window, value: &str, cx: &mut App) {
+    window.press("ctrl-a", cx);
+    window.input(value, cx);
+}
+
+/// #47: the detail shows the stored album title and saves a new one.
+#[gpui_kit::test]
+async fn the_detail_shows_the_album_title_and_saves_a_new_one(cx: &mut TestAppContext) {
+    // A worker thread wakes the foreground executor, which the harness
+    // permits only in parking mode.
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+    seed_folder(&paths, &photos, true);
+    seed_album_title(&paths, &photos, "Holiday 2024");
+    let (window, store, _view) = open_dashboard(cx, &paths);
+    wait_for_store(cx, &store).await;
+    open_detail_now(cx, window);
+
+    read(cx, window, |window, _| {
+        assert_eq!(
+            album_title_input(window).as_deref(),
+            Some("Holiday 2024"),
+            "#47: the detail shows the title the user chose"
+        );
+        assert_eq!(
+            label(window, "folder-panel-title"),
+            "Album title for photos",
+            "N5: the title field is named for the folder it changes"
+        );
+    });
+
+    // #47: the title saves through the field, and the detail stays open.
+    act(cx, window, |window, cx| {
+        tab_to(window, "folder-panel-title", cx);
+        retype(window, "Holiday 2025", cx);
+        window.render_frame(cx);
+        window.click("folder-panel-title-save", cx);
+    });
+    let stored = wait_for_folder(cx, &store, |folder| {
+        folder.album_title.as_deref() == Some("Holiday 2025")
+    })
+    .await;
+    assert_eq!(stored.album_title.as_deref(), Some("Holiday 2025"));
+    read(cx, window, |window, _| {
+        assert!(
+            detail_open(window),
+            "#47: saving a title keeps the detail open"
+        );
+    });
+
+    // #47: clearing the title stores no custom one, which means the folder's
+    // name.
+    act(cx, window, |window, cx| {
+        tab_to(window, "folder-panel-title", cx);
+        window.press("ctrl-a", cx);
+        window.press("backspace", cx);
+        window.render_frame(cx);
+        window.press("enter", cx);
+    });
+    wait_for_folder(cx, &store, |folder| folder.album_title.is_none()).await;
+    assert_eq!(
+        cx.read(|cx| store.read(cx).folders()[0].album_title.clone()),
+        None,
+        "#47: a cleared title means the folder's name"
+    );
 }

@@ -379,6 +379,14 @@ fn configuration_text(
             "    album scope: {}\n",
             folder.album_scope.label()
         ));
+        // #47: the title the user chose, or the folder's name it falls back to.
+        text.push_str(&format!(
+            "    album title: {}\n",
+            folder
+                .album_title
+                .as_deref()
+                .unwrap_or("(the folder's name)")
+        ));
     }
     entries.push(("configuration.txt".to_string(), text.into_bytes()));
     entries.iter().any(|(name, _)| name == "settings.toml")
@@ -805,6 +813,7 @@ log_level = \"debug\"
                 recursive: true,
                 album_mapping: true,
                 album_scope: AlbumScope::WholeFolder,
+                album_title: None,
             })
             .expect("add the source folder");
         let uploaded = item("/photos/IMG_0001.jpg", 2048, ItemState::Uploaded);
@@ -895,9 +904,9 @@ log_level = \"debug\"
             std::env::consts::OS,
             std::env::consts::ARCH,
             "v3.3.1",
-            // The latest migration the state database stands at (V11: the
-            // folder times #43 added on top of the tag backfill #46).
-            "Schema version (PRAGMA user_version): 11",
+            // The latest migration the state database stands at (V12: the
+            // album title #47 added on top of the folder times #43).
+            "Schema version (PRAGMA user_version): 12",
         ] {
             assert!(
                 versions.contains(expected),
@@ -930,6 +939,7 @@ log_level = \"debug\"
             "/photos",
             "album mapping: on",
             "One album for this folder",
+            "album title: (the folder's name)",
         ] {
             assert!(
                 configuration.contains(expected),

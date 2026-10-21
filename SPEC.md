@@ -59,7 +59,7 @@ Acceptance: a file added while the client is stopped is found at startup. A file
 - R3.1 New files are hashed with SHA-1, checked with `POST /api/assets/bulk-upload-check` in batches, and uploaded with `POST /api/assets` and the `x-immich-checksum` header.
 - R3.2 `created` and `duplicate` both count as success.
 - R3.3 A sidecar file uploads as `sidecarData`. A live photo video uploads first, and the photo links it with `livePhotoVideoId`.
-- R3.4 Album mapping is opt-in per folder. The album scope is per folder: leaf folders or the whole source folder. A new folder's mapping and scope are confirmed with its other settings before it syncs.
+- R3.4 Album mapping is opt-in per folder. The album scope is per folder: leaf folders or the whole source folder. A new folder's mapping, scope, and album title are confirmed with its other settings before it syncs. The title is the user's name for the album the folder itself holds (the whole-folder album, or the album for files directly in the source folder); a leaf subfolder's album keeps the subfolder's name. A blank title means the folder's name. The title is stored with the folder's album row even while mapping is off, and changing it renames the album with `PATCH /api/albums/{id}` (`UpdateAlbumDto.albumName`, Stable, `album.update`). A rename that cannot reach the server keeps the title and its reason, and is retried on the next scan, restart, or reconnect; an album deleted in Immich is created again with the title and its new id recorded. The title is never polled from Immich, and Immich does not require titles to be unique.
 - R3.5 Only Immich operations with `x-immich-state: Stable` are used for sync correctness.
 - R3.6 Upload success means the server returned the asset id. Server-side processing continues asynchronously.
 - R3.7 The sync tag is opt-in in Settings, off by default. When it is on, the client upserts the fixed tag `immich-sync` with `PUT /api/tags` (`x-immich-state: Stable`) and keeps the returned id for the run, so a tag deleted in Immich is created again on the next run. Every asset an upload settles with (`created` or `duplicate`, including a changed file's new version) gets the tag with `PUT /api/tags/assets`. Tagging runs after the upload is recorded, so a tag failure leaves the item uploaded and is reported in Settings instead. With an API key, tagging needs the `tag.create`, `tag.asset`, and `asset.update` permissions; Settings names a missing one. Turning the setting off stops new tagging and deletes no tag.
@@ -159,7 +159,7 @@ Acceptance: a clean Windows machine installs from the NSIS installer. A clean Li
 ## 5. Data model summary
 
 - `source_folder`: path, recursive flag, album mapping flag, album scope, last reconciliation scan, last successful upload.
-- `album`: mapped folder path key, album name, album id.
+- `album`: mapped folder path key, album title, album id, rename pending flag and reason.
 - `sync_item`: path, size, mtime, SHA-1, current asset id, stack id, state, last error class.
 - `version`: item id, asset id, SHA-1, created at, current flag.
 - `attempt`: item id, start time, outcome, error class.

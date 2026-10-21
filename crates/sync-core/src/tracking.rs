@@ -152,7 +152,12 @@ impl Tracking {
                 path: path.to_string(),
                 recursive,
                 album_mapping: existing.as_ref().is_some_and(|folder| folder.album_mapping),
-                album_scope: existing.map_or_else(AlbumScope::default, |folder| folder.album_scope),
+                album_scope: existing
+                    .as_ref()
+                    .map_or_else(AlbumScope::default, |folder| folder.album_scope),
+                // #47: a re-add is not a title edit, so the stored title is
+                // carried instead of being written away.
+                album_title: existing.and_then(|folder| folder.album_title),
             };
             self.store.add_folder(&folder)?;
             folder
@@ -253,6 +258,47 @@ impl Tracking {
         self.update_folder(path, |folder| folder.album_scope = scope)
     }
 
+    /// Sets the title of one source folder's own album (#47).
+    ///
+    /// A blank or whitespace-only title is stored as none, which means the
+    /// folder's name. The title is stored even while album mapping is off, and
+    /// the store decides whether it owes the server a rename, so the shell and
+    /// the engine write it by the same rule.
+    ///
+    /// The title is not a column of the folder row, so this writes the album
+    /// row alone. A folder-row write carries the title it was given and skips
+    /// one that is none, which would leave the stored title in place instead of
+    /// clearing it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrackingError::UnknownFolder`] for a path this client does
+    /// not hold, and a [`StoreError`] when the write fails.
+    pub fn set_album_title(&self, path: &str, title: &str) -> Result<SourceFolder, TrackingError> {
+        let title = title.trim();
+        let title = (!title.is_empty()).then(|| title.to_string());
+        let folder = {
+            let _write = self.writes.lock().expect("the folder write lock");
+            let folder = stored_folder(&self.store, path)?
+                .ok_or_else(|| TrackingError::UnknownFolder(path.to_string()))?;
+            self.store
+                .set_album_title(&path_key(Path::new(&folder.path)), title.as_deref())?;
+            SourceFolder {
+                album_title: title,
+                ..folder
+            }
+        };
+        tracing::info!(
+            folder = %folder.path,
+            album_title = folder.album_title.as_deref().unwrap_or(""),
+            "the album title changed"
+        );
+        // The write has landed before anyone hears about it, so the engine's
+        // retry reads the title it has to send.
+        self.notify(|observer| observer.folder_changed(&folder));
+        Ok(folder)
+    }
+
     /// Keeps the server asset for one missing file and clears it from the
     /// review (R5.3). Nothing is sent: the server already holds the asset.
     ///
@@ -325,7 +371,8 @@ impl Tracking {
             folder = %folder.path,
             album_mapping = folder.album_mapping,
             album_scope = folder.album_scope.as_str(),
-            "the album mapping changed"
+            album_title = folder.album_title.as_deref().unwrap_or(""),
+            "the album settings changed"
         );
         self.notify(|observer| observer.folder_changed(&folder));
         Ok(folder)

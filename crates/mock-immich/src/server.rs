@@ -8,7 +8,7 @@ use axum::body::Body;
 use axum::extract::{Multipart, Path, State as AxumState};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -38,6 +38,7 @@ pub enum Operation {
     RestoreAssets,
     CreateAlbum,
     AddAssetsToAlbum,
+    UpdateAlbum,
 }
 
 /// A fault the mock injects for a matching request.
@@ -98,6 +99,9 @@ struct Inner {
     create_album_requests: u64,
     /// How many `PUT /albums/{id}/assets` requests arrived.
     add_album_requests: u64,
+    /// How many `PATCH /albums/{id}` requests arrived, and the name each one
+    /// carried (#47). A test reads the wire shape here.
+    update_album_calls: Vec<AlbumRenameCall>,
     /// Immich's `passwordLogin.enabled` system config.
     password_login_disabled: bool,
     /// The key `x-api-key` must carry, once one is configured.
@@ -214,6 +218,19 @@ struct Album {
     id: String,
     name: String,
     asset_ids: Vec<String>,
+}
+
+/// One `PATCH /albums/{id}` call, as the double received it (#47).
+///
+/// The recorded call proves the endpoint, the album it named, and the body
+/// field the client sent; the album's new name alone cannot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AlbumRenameCall {
+    /// The album id in the path.
+    pub album_id: String,
+    /// The body's `albumName`. A body without it is refused before it is
+    /// recorded.
+    pub album_name: String,
 }
 
 /// One `POST /assets` request, as the server received it.
@@ -366,6 +383,13 @@ impl Inner {
             },
         );
         id
+    }
+
+    /// Rename one album (#47). Returns `None` when the album is unknown.
+    fn rename_album(&mut self, album_id: &str, name: String) -> Option<String> {
+        let album = self.albums.get_mut(album_id)?;
+        album.name = name;
+        Some(album.name.clone())
     }
 
     /// Add the known, not-yet-listed assets to the album. Returns `None` when
@@ -763,6 +787,20 @@ impl MockImmich {
             .add_album_requests
     }
 
+    /// Every `PATCH /albums/{id}` call, in request order (#47).
+    ///
+    /// The recorded call is what proves the endpoint, the album, and the
+    /// `albumName` field; the album's new name alone cannot.
+    #[must_use]
+    pub fn album_rename_calls(&self) -> Vec<AlbumRenameCall> {
+        self.state
+            .inner
+            .lock()
+            .expect("mock state poisoned")
+            .update_album_calls
+            .clone()
+    }
+
     /// Every `PUT /assets/copy` call, in request order (R4.2).
     ///
     /// The recorded call is what proves the flags and the source and target
@@ -839,6 +877,16 @@ impl MockImmich {
             .delete_tag(id);
     }
 
+    /// Deletes one album the way the user can in Immich (#47).
+    ///
+    /// The assets stay; only the album is gone, so a client that still holds its
+    /// id sees a 404 on the next call.
+    pub fn delete_album(&self, id: &str) {
+        let mut inner = self.state.inner.lock().expect("mock state poisoned");
+        inner.albums.remove(id);
+        inner.album_order.retain(|held| held != id);
+    }
+
     /// The tag ids on one asset, in the order they were applied (R4.2).
     #[must_use]
     pub fn tags_of(&self, asset_id: &str) -> Vec<String> {
@@ -906,6 +954,7 @@ impl MockImmich {
             .route("/tags", put(upsert_tags))
             .route("/tags/assets", put(tag_assets))
             .route("/albums", post(create_album))
+            .route("/albums/{id}", patch(update_album))
             .route("/albums/{id}/assets", put(add_assets_to_album))
             .with_state(Arc::clone(&state));
         let router = Router::new()
@@ -1777,6 +1826,38 @@ async fn add_assets_to_album(
         .map(|id| json!({ "id": id, "success": added.contains(id) }))
         .collect();
     Json(results).into_response()
+}
+
+/// `PATCH /albums/{id}` with `UpdateAlbumDto.albumName` (#47).
+///
+/// The call is recorded before the fault runs, the way `create_album` counts
+/// its request, so a faulted request cannot hide from the assertion.
+async fn update_album(
+    AxumState(state): AxumState<Arc<State>>,
+    Path(album_id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let Some(name) = body.get("albumName").and_then(|value| value.as_str()) else {
+        return message(StatusCode::BAD_REQUEST, "albumName is required");
+    };
+    state
+        .inner
+        .lock()
+        .expect("mock state poisoned")
+        .update_album_calls
+        .push(AlbumRenameCall {
+            album_id: album_id.clone(),
+            album_name: name.to_string(),
+        });
+    if let Some(response) = guard(&state, Operation::UpdateAlbum).await {
+        return response;
+    }
+    let mut inner = state.inner.lock().expect("mock state poisoned");
+    if inner.rename_album(&album_id, name.to_string()).is_none() {
+        return message(StatusCode::NOT_FOUND, "Album not found");
+    }
+    let album = inner.albums.get(&album_id).expect("the album exists");
+    Json(album_response(album)).into_response()
 }
 
 fn id_list(value: Option<&Value>) -> Vec<String> {
