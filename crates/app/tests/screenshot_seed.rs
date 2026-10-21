@@ -15,7 +15,7 @@
 use std::path::Path;
 
 use sync_core::hash::Sha1;
-use sync_core::store::{AlbumScope, ItemRecord, ItemState, SourceFolder, StateStore};
+use sync_core::store::{AlbumScope, ItemRecord, ItemState, NewVersion, SourceFolder, StateStore};
 
 fn row(folder: &Path, name: &str, state: ItemState, index: usize) -> ItemRecord {
     let error_class = match state {
@@ -104,6 +104,9 @@ fn seed_capture_state() {
     }
 
     let mut index = 0;
+    // #44: the folder detail lists the assets' current versions, newest first,
+    // so the uploaded rows get one each, spread over the last two days.
+    let upload_base_ns = immich_sync::times::now_ns();
     let mut write = |folder: &Path, name: &str, state: ItemState| {
         index += 1;
         let row = row(folder, name, state, index);
@@ -112,6 +115,18 @@ fn seed_capture_state() {
             ItemState::DeadLetter => record_attempts(&store, &row, 8),
             ItemState::FailedPermanent => record_attempts(&store, &row, 1),
             _ => {}
+        }
+        if let Some(asset_id) = row.asset_id.clone() {
+            store
+                .record_version(&NewVersion {
+                    path: row.path.clone(),
+                    asset_id,
+                    sha1: row.sha1,
+                    created_at_ns: upload_base_ns
+                        - i64::try_from(index).expect("a small index") * 7 * 60 * 1_000_000_000,
+                    stack_id: None,
+                })
+                .expect("record the capture version");
         }
     };
     for photo in 0..312 {

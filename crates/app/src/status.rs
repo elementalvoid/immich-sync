@@ -154,12 +154,15 @@ impl StatusCard {
 
 /// The upload line a card shows (R8.1).
 ///
+/// The folder detail shows the same line for one folder (#44), so the two
+/// phrasings cannot drift apart.
+///
 /// The engine's rate is a rolling average over two seconds, so the window still
 /// holds the last bytes after an upload finishes, and a burst shorter than one
 /// status poll has a rate with nothing on the wire. The line is `Idle` only when
 /// nothing is on the wire *and* no byte is moving; a rate on its own is shown
 /// alone rather than with a zero count.
-fn upload_line(uploads: UploadTraffic) -> String {
+pub(crate) fn upload_line(uploads: UploadTraffic) -> String {
     if uploads.in_flight == 0 {
         return if uploads.bytes_per_second == 0 {
             "Idle".to_string()

@@ -9,7 +9,9 @@
 //!
 //! In detail mode the panel reads the folder's live status from the engine on
 //! every engine notification, so counts, state, progress, the last error, and
-//! the two timestamps follow the client while the dialog stays open.
+//! the two timestamps follow the client while the dialog stays open. Its uploaded
+//! assets are read a page at a time through the state store (#44), on the
+//! background executor: the UI thread never waits behind the database.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -23,9 +25,12 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::progress::Progress;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use sync_core::store::{AlbumScope, SourceFolder};
+use sync_core::meter::UploadTraffic;
+use sync_core::store::{AlbumScope, FolderAsset, SourceFolder, StoreError};
 
+use crate::asset_link::{self, LinkOpener};
 use crate::dashboard::{CardPalette, state_tag};
+use crate::diagnostics::format_bytes;
 use crate::engine::EngineModel;
 use crate::folder_controls::{SettingsControls, SettingsIds, SettingsValues};
 use crate::settings_view::notice;
@@ -35,6 +40,10 @@ use crate::times;
 
 /// The reason the setup dialog shows when the folder is already tracked (#40).
 pub(crate) const ALREADY_ADDED: &str = "Already added.";
+
+/// How many of a folder's uploaded assets one page of the detail's list holds
+/// (#44): the first page, every Load more, and the floor a live refresh keeps.
+pub(crate) const ASSET_PAGE: usize = 50;
 
 /// The action "Open folder" runs (#43).
 ///
@@ -172,6 +181,26 @@ pub struct FolderPanel {
     remove_request: Option<u64>,
     /// What "Open folder" runs (#43).
     opener: FolderOpener,
+    /// The configured server URL the asset links are built from (#44).
+    server_url: String,
+    /// What an asset link opens (#44): the default browser in the product, a
+    /// recorder in a test.
+    link_opener: LinkOpener,
+    /// One page of the folder's current assets, newest first (#44).
+    assets: Vec<FolderAsset>,
+    /// Whether the last page came back full, so there may be another one.
+    assets_more: bool,
+    /// Why the last asset read failed, if it did. It replaces the list.
+    assets_problem: Option<String>,
+    /// Whether an asset read is in flight, so the list is not called empty
+    /// before it has answered.
+    assets_loading: bool,
+    /// The read this detail waits for. A page that answers after a newer read
+    /// started is dropped, so a slow page cannot overwrite a fresh one.
+    assets_generation: u64,
+    /// The folder's uploaded count and recursion setting the loaded rows were
+    /// read at, so the next status poll that changes either reloads them.
+    assets_read_at: Option<(u32, bool)>,
     focus: FocusHandle,
     /// Where the inline Remove confirmation sends the keyboard.
     confirm_focus: FocusHandle,
@@ -202,6 +231,14 @@ impl FolderPanel {
             removing: false,
             remove_request: None,
             opener: Arc::new(open_in_file_manager),
+            server_url: String::new(),
+            link_opener: asset_link::browser_opener(),
+            assets: Vec::new(),
+            assets_more: false,
+            assets_problem: None,
+            assets_loading: false,
+            assets_generation: 0,
+            assets_read_at: None,
             focus,
             confirm_focus: cx.focus_handle(),
             _subscription: subscription,
@@ -212,17 +249,20 @@ impl FolderPanel {
     ///
     /// The card the dashboard clicked is the first frame's data; every later
     /// engine notification refreshes it, so the dialog follows the client
-    /// without a poll of its own.
+    /// without a poll of its own. The first page of the folder's uploaded
+    /// assets is read straight away, off the UI thread (#44).
     pub fn detail(
         engine: Entity<EngineModel>,
         path: String,
         opener: FolderOpener,
+        link_opener: LinkOpener,
         cx: &mut Context<Self>,
     ) -> Self {
         let focus = cx.focus_handle();
         let confirm_focus = cx.focus_handle();
         let subscription = cx.observe(&engine, |this, engine, cx| this.engine_changed(&engine, cx));
         let card = folder_card(&engine, &path, cx);
+        let server_url = engine.read(cx).server_url(cx);
         let draft = SourceFolder {
             path: path.clone(),
             recursive: card.as_ref().is_some_and(|card| card.recursive),
@@ -231,7 +271,8 @@ impl FolderPanel {
                 .as_ref()
                 .map_or(AlbumScope::Leaf, |card| card.album_scope),
         };
-        Self {
+        let uploaded = card.as_ref().map_or(0, |card| card.counts.uploaded);
+        let mut panel = Self {
             engine,
             mode: FolderPanelMode::Detail,
             draft,
@@ -243,10 +284,20 @@ impl FolderPanel {
             removing: false,
             remove_request: None,
             opener,
+            server_url,
+            link_opener,
+            assets: Vec::new(),
+            assets_more: false,
+            assets_problem: None,
+            assets_loading: false,
+            assets_generation: 0,
+            assets_read_at: None,
             focus,
             confirm_focus,
             _subscription: subscription,
-        }
+        };
+        panel.read_assets(0, ASSET_PAGE, uploaded, cx);
+        panel
     }
 
     /// The folder's live card, when the engine's status holds it.
@@ -278,6 +329,10 @@ impl FolderPanel {
             FolderPanelMode::Draft => self.add_result(engine, cx),
             FolderPanelMode::Detail => {
                 self.refresh_detail(engine, cx);
+                // #44: a status poll is the list's only clock. A folder whose
+                // uploaded count or recursion setting moved reloads the rows it
+                // has loaded; nothing else touches the store.
+                self.reload_assets_if_changed(cx);
                 // #43: a completed Remove closes the dialog once the store no
                 // longer holds the folder, so a refused write keeps it open.
                 if self.removing && self.gone {
@@ -290,6 +345,111 @@ impl FolderPanel {
                 cx.notify();
             }
         }
+    }
+
+    /// Reads one page of this folder's current assets (#44).
+    ///
+    /// The read runs on the background executor, never the UI thread, and its
+    /// answer is applied only when it is still the newest request. Nothing is
+    /// written: paging is two reads of the same list.
+    fn read_assets(&mut self, offset: usize, count: usize, uploaded: u32, cx: &mut Context<Self>) {
+        let Some(store) = self.engine.read(cx).store(cx) else {
+            return;
+        };
+        let folder = self.draft.path.clone();
+        let recursive = self.draft.recursive;
+        self.assets_generation = self.assets_generation.wrapping_add(1);
+        let generation = self.assets_generation;
+        self.assets_loading = true;
+        self.assets_read_at = Some((uploaded, recursive));
+        let read = cx
+            .background_executor()
+            .spawn(async move { store.folder_assets(&folder, recursive, count, offset) });
+        cx.spawn(async move |this, cx| {
+            let result = read.await;
+            let _ = this.update(cx, |panel, cx| {
+                panel.apply_assets(generation, offset, count, result, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Applies one asset page, unless a newer read has started since.
+    fn apply_assets(
+        &mut self,
+        generation: u64,
+        offset: usize,
+        count: usize,
+        result: Result<Vec<FolderAsset>, StoreError>,
+        cx: &mut Context<Self>,
+    ) {
+        if generation != self.assets_generation {
+            return;
+        }
+        self.assets_loading = false;
+        match result {
+            Ok(rows) => {
+                // A full page may have a successor; a short one is the end.
+                self.assets_more = rows.len() == count;
+                if offset == 0 {
+                    self.assets = rows;
+                } else {
+                    self.assets.extend(rows);
+                }
+                self.assets_problem = None;
+            }
+            Err(error) => {
+                // #44: a read error replaces the list rather than leaving rows
+                // that no longer describe the folder.
+                self.assets.clear();
+                self.assets_more = false;
+                self.assets_problem = Some(format!(
+                    "The folder's uploaded assets could not be read: {error}"
+                ));
+            }
+        }
+        // A count that moved while this read ran reloads the rows it kept.
+        self.reload_assets_if_changed(cx);
+        cx.notify();
+    }
+
+    /// Reloads the loaded rows when the folder's uploaded count or recursion
+    /// setting changed under them (#44).
+    ///
+    /// One read at a time: while a page is in flight the refresh waits for it,
+    /// and the read that lands re-checks, so a busy sync converges instead of
+    /// queueing reads.
+    fn reload_assets_if_changed(&mut self, cx: &mut Context<Self>) {
+        if self.mode != FolderPanelMode::Detail || self.gone || self.assets_loading {
+            return;
+        }
+        let Some(uploaded) = self.card.as_ref().map(|card| card.counts.uploaded) else {
+            return;
+        };
+        if self.assets_read_at == Some((uploaded, self.draft.recursive)) {
+            return;
+        }
+        // Keep the rows the user already loaded; Load more is what grows it.
+        let count = self.assets.len().max(ASSET_PAGE);
+        self.read_assets(0, count, uploaded, cx);
+    }
+
+    /// Load more: appends the next page without losing the loaded rows (#44).
+    fn load_more_assets(&mut self, cx: &mut Context<Self>) {
+        if self.mode != FolderPanelMode::Detail || self.assets_loading {
+            return;
+        }
+        let uploaded = self.card.as_ref().map_or(0, |card| card.counts.uploaded);
+        self.read_assets(self.assets.len(), ASSET_PAGE, uploaded, cx);
+        cx.notify();
+    }
+
+    /// Opens one asset's Immich page in the default browser (#44).
+    ///
+    /// Only a web address reaches the opener, so a hand-edited settings file
+    /// cannot make the client launch anything else.
+    fn open_asset(&mut self, url: String, cx: &mut Context<Self>) {
+        asset_link::open_asset(&url, &self.link_opener, cx);
     }
 
     /// Applies the newest draft Add result when it answers this panel's request.
@@ -647,6 +807,13 @@ impl FolderPanel {
             self.card.as_ref().and_then(|card| card.last_scan_ns),
             now_ns,
         );
+        // #44: this folder's own share of the traffic, in the global card's
+        // own words. It rides the 250 ms status poll, never a timer of its own.
+        let activity_line = crate::status::upload_line(
+            self.card
+                .as_ref()
+                .map_or(UploadTraffic::default(), |card| card.uploads),
+        );
         let title = self.folder_name();
         let path = self.draft.path.clone();
         let counts = format!(
@@ -736,6 +903,15 @@ impl FolderPanel {
                     .text_color(muted)
                     .child(counts),
             )
+            .child(
+                div()
+                    .id("folder-detail-activity")
+                    .test_support()
+                    .aria_label(activity_line.clone())
+                    .text_sm()
+                    .text_color(muted)
+                    .child(activity_line),
+            )
             .when(!available, |this| {
                 this.child(notice(
                     "folder-detail-unavailable",
@@ -778,6 +954,7 @@ impl FolderPanel {
                     .text_color(muted)
                     .child(scan_line),
             )
+            .child(self.assets_section(palette, theme, cx))
             .child(
                 div()
                     .flex()
@@ -863,6 +1040,147 @@ impl FolderPanel {
             body = body.child(self.confirmation(&title, palette, theme, cx));
         }
         body.into_any_element()
+    }
+
+    /// The folder's uploaded assets: one row per current asset, newest first,
+    /// with the states that are not a list (#44).
+    ///
+    /// The rows are the pages the panel already read; this only renders them,
+    /// so a dialog left open never reads the store from the render path.
+    fn assets_section(
+        &self,
+        palette: &CardPalette,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let now_ns = times::now_ns();
+        let heading = div()
+            .text_sm()
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(palette.text)
+            .child("Uploaded assets");
+        let state = if let Some(problem) = self.assets_problem.clone() {
+            notice("folder-assets-problem", problem, theme.danger, palette).into_any_element()
+        } else if self.assets.is_empty() {
+            let (id, text) = if self.assets_loading {
+                ("folder-assets-loading", "Reading the folder's assets…")
+            } else {
+                (
+                    "folder-assets-empty",
+                    "No uploaded assets in this folder yet.",
+                )
+            };
+            div()
+                .id(id)
+                .test_support()
+                .aria_label(text)
+                .text_xs()
+                .text_color(palette.meta)
+                .child(text)
+                .into_any_element()
+        } else {
+            // The list scrolls inside the dialog, so a folder with hundreds of
+            // assets does not push Load more or the actions out of reach.
+            let mut rows = div()
+                .id("folder-assets-list")
+                .test_support()
+                .flex()
+                .flex_col()
+                .w_full()
+                .max_h(rems(18.))
+                .overflow_y_scroll();
+            for (index, asset) in self.assets.iter().enumerate() {
+                rows = rows.child(self.asset_row(index, asset, now_ns, theme, cx));
+            }
+            rows.into_any_element()
+        };
+
+        div()
+            .id("folder-detail-assets")
+            .test_support()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .w_full()
+            .child(heading)
+            .child(state)
+            .when(self.assets_more, |this| {
+                this.child(
+                    Button::new("folder-assets-more")
+                        .secondary()
+                        .label("Load more")
+                        .accessibility_label(format!("Load the next {ASSET_PAGE} uploaded assets"))
+                        .on_click(cx.listener(|this, _, _, cx| this.load_more_assets(cx))),
+                )
+            })
+    }
+
+    /// One uploaded asset: its name, size, upload time, and Immich link (#44).
+    fn asset_row(
+        &self,
+        index: usize,
+        asset: &FolderAsset,
+        now_ns: i64,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let name = folder_name(&asset.path);
+        let size = format_bytes(asset.size);
+        let when = times::moment(asset.created_at_ns, now_ns);
+        let described = format!("{name} · {size} · {when}");
+        // #44: no configured server URL hides the link rather than opening a
+        // wrong one; the row stays readable either way.
+        let url = asset_link::asset_url(&self.server_url, &asset.asset_id);
+        // Two lines: the file's name gets the row's width, and the metadata
+        // shares the second line with the link. One line squeezed the name to
+        // an ellipsis, which is the one thing the row is for.
+        div()
+            .id(("folder-asset", index))
+            .test_support()
+            .aria_label(described)
+            .flex()
+            .flex_col()
+            .gap_1()
+            .w_full()
+            .py_1()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .w_full()
+                    .truncate()
+                    .text_sm()
+                    .text_color(theme.foreground)
+                    .child(name.clone()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .w_full()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(format!("{size} · {when}")),
+                    )
+                    .when_some(url, |this, url| {
+                        this.child(
+                            Button::new(("folder-asset-link", index))
+                                .ghost()
+                                .label("View in Immich")
+                                .accessibility_label(format!("Open {name} in Immich"))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.open_asset(url.clone(), cx);
+                                })),
+                        )
+                    }),
+            )
+            .into_any_element()
     }
 
     /// The inline Remove confirmation: the second action is the one that
@@ -1215,6 +1533,7 @@ mod tests {
                     engine,
                     card.path.clone().expect("the card is a folder"),
                     Arc::new(|_| Ok(())),
+                    crate::asset_link::browser_opener(),
                     cx,
                 )
             });
@@ -1260,6 +1579,113 @@ mod tests {
             );
         })
         .expect("read the rendered error");
+    }
+
+    /// #44: the activity line reads this folder's own meter, in the same words
+    /// the global card uses, and says `Idle` when nothing is on the wire.
+    ///
+    /// The meter itself is the engine's (#39); this pins what the detail does
+    /// with the reading the status poll carries.
+    #[gpui_kit::test]
+    fn the_activity_line_reads_the_folders_meter(cx: &mut TestAppContext) {
+        use crate::connection::ConnectionModel;
+        use crate::engine::EngineModel;
+        use crate::paths::AppPaths;
+        use crate::status::DashboardModel;
+        use crate::store::StoreModel;
+        use gpui_kit::test::TestWindowExt as _;
+        use gpui_kit::{AppContext as _, Bounds, Point, WindowBounds, WindowOptions, px, size};
+        use std::sync::Arc;
+        use sync_core::connection::ServerProfile;
+        use sync_core::credential::{MemoryCredentialStore, SharedCredentialStore};
+        use sync_core::meter::UploadTraffic;
+        use sync_core::status::{Activity, FolderStatus, Status};
+        use sync_core::store::FolderCounts;
+
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let paths = AppPaths {
+            config_file: temp.path().join("config").join("settings.toml"),
+            state_db: temp.path().join("data").join("state.db"),
+            autostart_dir: temp.path().join("config").join("autostart"),
+        };
+        let status = Status {
+            activity: Activity::Syncing,
+            folders: vec![FolderStatus {
+                path: "/photos".to_string(),
+                recursive: true,
+                album_mapping: false,
+                album_scope: AlbumScope::Leaf,
+                available: true,
+                counts: FolderCounts::default(),
+                last_error: None,
+                last_scan_ns: None,
+                last_upload_ns: None,
+                uploads: UploadTraffic {
+                    bytes: 41_943_040,
+                    bytes_per_second: 2_516_582,
+                    in_flight: 3,
+                },
+            }],
+            counts: FolderCounts::default(),
+            last_error: None,
+            uploads: UploadTraffic::default(),
+        };
+        let mut card = DashboardModel::from_engine(&status, None).folders.remove(0);
+
+        let credentials: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+        let (window, panel) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            let connection =
+                cx.new(|_| ConnectionModel::new(ServerProfile::default(), credentials));
+            let store = cx.new(|cx| StoreModel::open(&paths, cx));
+            let engine = cx.new(|cx| EngineModel::new(connection, store, &paths, cx));
+            card.available = true;
+            let panel = cx.new(|cx| {
+                super::FolderPanel::detail(
+                    engine,
+                    card.path.clone().expect("the card is a folder"),
+                    Arc::new(|_| Ok(())),
+                    crate::asset_link::browser_opener(),
+                    cx,
+                )
+            });
+            panel.update(cx, |panel, _| panel.card = Some(card));
+            let root = panel.clone();
+            let (window, _root) = gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Point::default(),
+                        size: size(px(1200.), px(800.)),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |_, _| root,
+            )
+            .expect("open the panel's window");
+            (window, panel)
+        });
+
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                window.find("folder-detail-activity").label(),
+                Some("2.4 MiB/s · 3 uploading"),
+                "#44: the folder's rate and its uploads on the wire, in the global card's words"
+            );
+            panel.update(cx, |panel, _| {
+                if let Some(card) = panel.card.as_mut() {
+                    card.uploads = UploadTraffic::default();
+                }
+            });
+            window.render_frame(cx);
+            assert_eq!(
+                window.find("folder-detail-activity").label(),
+                Some("Idle"),
+                "#44: nothing on the wire reads Idle"
+            );
+        })
+        .expect("read the rendered activity line");
     }
 
     /// #40 (S1): a worker answer that never arrives must not strand the setup
@@ -1375,6 +1801,7 @@ mod tests {
                     engine.clone(),
                     "/photos".to_string(),
                     Arc::new(|_| Ok(())),
+                    crate::asset_link::browser_opener(),
                     cx,
                 )
             });

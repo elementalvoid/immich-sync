@@ -25,7 +25,9 @@ use sync_core::credential::{MemoryCredentialStore, SharedCredentialStore};
 use sync_core::failure::FailureClass;
 use sync_core::hash::Sha1;
 use sync_core::status::{Activity, FolderStatus, Status};
-use sync_core::store::{AlbumScope, FolderCounts, ItemRecord, ItemState, SourceFolder, StateStore};
+use sync_core::store::{
+    AlbumScope, FolderCounts, ItemRecord, ItemState, NewVersion, SourceFolder, StateStore,
+};
 
 /// The path layout the other app tests use, so the view gets a temp database.
 fn temporary_paths(dir: &Path) -> AppPaths {
@@ -101,11 +103,25 @@ fn open_dashboard(
     cx: &mut TestAppContext,
     paths: &AppPaths,
 ) -> (AnyWindowHandle, Entity<StoreModel>, Entity<Dashboard>) {
+    open_dashboard_with_server(cx, paths, "")
+}
+
+/// Opens the same dashboard over a connection that holds `server_url`, as the
+/// settings file leaves it after a sign-in (#44).
+fn open_dashboard_with_server(
+    cx: &mut TestAppContext,
+    paths: &AppPaths,
+    server_url: &str,
+) -> (AnyWindowHandle, Entity<StoreModel>, Entity<Dashboard>) {
     let paths = paths.clone();
+    let profile = ServerProfile {
+        server_url: server_url.to_string(),
+        ..ServerProfile::default()
+    };
     cx.update(|cx| {
         gpui_kit::init(cx);
         let credentials: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
-        let connection = cx.new(|_| ConnectionModel::new(ServerProfile::default(), credentials));
+        let connection = cx.new(|_| ConnectionModel::new(profile, credentials));
         let store = cx.new(|cx| StoreModel::open(&paths, cx));
         let engine = cx.new(|cx| EngineModel::new(connection, store.clone(), &paths, cx));
         let (window, view) = gpui_kit::open_window(window_options(), cx, |window, cx| {
@@ -1062,15 +1078,26 @@ async fn the_detail_renders_in_both_themes(cx: &mut TestAppContext) {
     let photos = temp.path().join("photos");
     std::fs::create_dir_all(&photos).expect("create the source folder");
     seed_folder(&paths, &photos, true);
+    // #44: the list and its link are part of the detail, so they render in
+    // both themes too.
+    seed_asset(
+        &paths,
+        &photos.join("one.jpg"),
+        1024,
+        "asset-one",
+        times::now_ns() - THREE_AND_A_HALF_HOURS_NS,
+    );
 
     for system in [
         immich_sync::theme::SystemTheme::Dark,
         immich_sync::theme::SystemTheme::Light,
     ] {
-        let (window, store, _view) = open_dashboard(cx, &paths);
+        let (window, store, _view) =
+            open_dashboard_with_server(cx, &paths, "https://immich.example.com");
         wait_for_store(cx, &store).await;
         cx.update(|cx| immich_sync::theme::apply_system_theme(system, cx));
         open_detail_now(cx, window);
+        wait_for_asset_rows(cx, window, 1).await;
         read(cx, window, |window, _| {
             assert!(
                 window.find("folder-panel").visible(),
@@ -1081,6 +1108,15 @@ async fn the_detail_renders_in_both_themes(cx: &mut TestAppContext) {
                 label(window, "folder-panel-path"),
                 format!("Folder path: {}", photos.display()),
                 "{system:?} shows the whole path"
+            );
+            assert!(
+                label(window, ("folder-asset", 0_usize)).starts_with("one.jpg"),
+                "{system:?} shows the uploaded asset"
+            );
+            assert_eq!(
+                label(window, ("folder-asset-link", 0_usize)),
+                "Open one.jpg in Immich",
+                "{system:?} names the link"
             );
         });
     }
@@ -1120,4 +1156,425 @@ fn a_folder_status_carries_its_times_into_the_detail_card() {
         model.global.last_scan_ns, None,
         "the global card is not a folder and has no folder times"
     );
+}
+
+/// Seeds one uploaded asset and its current version, the shape the detail's
+/// list reads (#44).
+fn seed_asset(paths: &AppPaths, path: &Path, size: u64, asset_id: &str, created_at_ns: i64) {
+    let store = StateStore::open(&paths.state_db).expect("open the state database");
+    let sha1 = Sha1::from_hex("2aae6c35c94fcfb415dbe95f408b9ce91ee846ed").expect("a hex SHA-1");
+    store
+        .record(&ItemRecord {
+            path: path.display().to_string(),
+            size,
+            mtime_ns: 1_700_000_000_000_000_000,
+            sha1,
+            asset_id: Some(asset_id.to_string()),
+            state: ItemState::Uploaded,
+            error_class: None,
+            error_message: None,
+            attempts: 0,
+            sidecar: None,
+        })
+        .expect("record the asset");
+    store
+        .record_version(&NewVersion {
+            path: path.display().to_string(),
+            asset_id: asset_id.to_string(),
+            sha1,
+            created_at_ns,
+            stack_id: None,
+        })
+        .expect("record the current version");
+}
+
+/// Seeds `count` assets under `folder`, oldest first, so the newest is the
+/// highest index (#44).
+fn seed_assets(paths: &AppPaths, folder: &Path, count: usize, base_ns: i64) {
+    for index in 0..count {
+        let index = i64::try_from(index).expect("a small index");
+        seed_asset(
+            paths,
+            &folder.join(format!("IMG_{index:04}.jpg")),
+            1_024 + u64::try_from(index).expect("a small index"),
+            &format!("asset-{index:04}"),
+            base_ns + index,
+        );
+    }
+}
+
+/// Waits until the detail lists exactly `count` asset rows (#44).
+async fn wait_for_asset_rows(cx: &mut TestAppContext, window: AnyWindowHandle, count: usize) {
+    cx.wait_for(window, Duration::from_secs(10), |window, _| {
+        (0..count).all(|index| window.try_find(("folder-asset", index)).is_some())
+            && window.try_find(("folder-asset", count)).is_none()
+    })
+    .await;
+}
+
+/// The fixed point every seeded asset's time sits relative to: three and a half
+/// hours back, so the relative form reads "3 hours ago" and cannot cross a scale
+/// inside one test.
+const THREE_AND_A_HALF_HOURS_NS: i64 = 3 * 60 * 60 * 1_000_000_000 + 30 * 60 * 1_000_000_000;
+
+/// #44: one asset's row reads its name, size, and upload time, newest first.
+#[gpui_kit::test]
+async fn the_list_shows_the_newest_assets_with_their_name_size_and_time(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+    seed_folder(&paths, &photos, true);
+    let now = times::now_ns();
+    let first = now - THREE_AND_A_HALF_HOURS_NS;
+    let second = first + 60 * 1_000_000_000;
+    seed_asset(
+        &paths,
+        &photos.join("older.jpg"),
+        1024,
+        "asset-older",
+        first,
+    );
+    seed_asset(
+        &paths,
+        &photos.join("newer.jpg"),
+        2048,
+        "asset-newer",
+        second,
+    );
+    // Edited once: the old asset stays in the chain, the new one is current.
+    seed_asset(
+        &paths,
+        &photos.join("edited.jpg"),
+        4096,
+        "asset-edited-1",
+        first + 30,
+    );
+    seed_asset(
+        &paths,
+        &photos.join("edited.jpg"),
+        4096,
+        "asset-edited-2",
+        second + 30,
+    );
+    let (window, store, _view) = open_dashboard(cx, &paths);
+    wait_for_store(cx, &store).await;
+
+    open_detail_now(cx, window);
+    wait_for_asset_rows(cx, window, 3).await;
+    read(cx, window, |window, _| {
+        assert_eq!(
+            label(window, ("folder-asset", 0_usize)),
+            format!(
+                "edited.jpg · 4.0 KiB · 3 hours ago · {}",
+                times::rfc3339_local(second + 30)
+            ),
+            "#44: the newest asset comes first, named, sized, and dated twice"
+        );
+        assert_eq!(
+            label(window, ("folder-asset", 1_usize)),
+            format!(
+                "newer.jpg · 2.0 KiB · 3 hours ago · {}",
+                times::rfc3339_local(second)
+            )
+        );
+        assert_eq!(
+            label(window, ("folder-asset", 2_usize)),
+            format!(
+                "older.jpg · 1.0 KiB · 3 hours ago · {}",
+                times::rfc3339_local(first)
+            )
+        );
+    });
+}
+
+/// #44: the detail lists the newest 50 and Load more appends the next 50
+/// without losing the rows already shown.
+#[gpui_kit::test]
+async fn load_more_appends_the_next_page_and_keeps_the_loaded_rows(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+    seed_folder(&paths, &photos, true);
+    let base = times::now_ns() - THREE_AND_A_HALF_HOURS_NS;
+    seed_assets(&paths, &photos, 120, base);
+    let (window, store, _view) = open_dashboard(cx, &paths);
+    wait_for_store(cx, &store).await;
+
+    open_detail_now(cx, window);
+    wait_for_asset_rows(cx, window, 50).await;
+    let newest = read(cx, window, |window, _| {
+        label(window, ("folder-asset", 0_usize))
+    });
+    assert!(
+        newest.starts_with("IMG_0119.jpg"),
+        "#44: the first page starts at the newest asset: {newest}"
+    );
+    let last_before = read(cx, window, |window, _| {
+        label(window, ("folder-asset", 49_usize))
+    });
+
+    act(cx, window, |window, cx| {
+        window.click("folder-assets-more", cx)
+    });
+    wait_for_asset_rows(cx, window, 100).await;
+    read(cx, window, |window, _| {
+        assert_eq!(
+            label(window, ("folder-asset", 0_usize)),
+            newest,
+            "#44: Load more does not lose or reorder the loaded rows"
+        );
+        assert_eq!(
+            label(window, ("folder-asset", 49_usize)),
+            last_before,
+            "#44: the 50th row is the same one before and after Load more"
+        );
+        assert_eq!(
+            label(window, ("folder-asset", 99_usize)),
+            format!(
+                "IMG_0020.jpg · 1.0 KiB · 3 hours ago · {}",
+                times::rfc3339_local(base + 20)
+            ),
+            "#44: the appended page continues the one order"
+        );
+    });
+}
+
+/// #44: with no configured server URL there is no link, only the row.
+#[gpui_kit::test]
+async fn a_folder_without_a_server_url_shows_no_asset_link(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+    seed_folder(&paths, &photos, true);
+    seed_asset(
+        &paths,
+        &photos.join("one.jpg"),
+        1024,
+        "asset-one",
+        times::now_ns() - THREE_AND_A_HALF_HOURS_NS,
+    );
+    let (window, store, _view) = open_dashboard(cx, &paths);
+    wait_for_store(cx, &store).await;
+
+    open_detail_now(cx, window);
+    wait_for_asset_rows(cx, window, 1).await;
+    read(cx, window, |window, _| {
+        assert!(
+            window.try_find(("folder-asset-link", 0_usize)).is_none(),
+            "#44: a missing server URL hides the link instead of opening a wrong one"
+        );
+        assert!(
+            window
+                .try_find(("folder-asset", 0_usize))
+                .is_some_and(|row| row.visible()),
+            "the asset itself is still listed"
+        );
+    });
+}
+
+/// #44: the link is the configured server URL minus a trailing `/api`, plus
+/// `/photos/{assetId}`, a reverse-proxy prefix included, and it opens in the
+/// injected browser. It is named and reachable from the keyboard.
+#[gpui_kit::test]
+async fn an_asset_link_is_named_reachable_and_opens_the_configured_server(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+    seed_folder(&paths, &photos, true);
+    seed_asset(
+        &paths,
+        &photos.join("one.jpg"),
+        1024,
+        "asset-one",
+        times::now_ns() - THREE_AND_A_HALF_HOURS_NS,
+    );
+    let (window, store, view) =
+        open_dashboard_with_server(cx, &paths, "https://immich.example.com/immich/api");
+    wait_for_store(cx, &store).await;
+
+    let opened: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorder = opened.clone();
+    cx.update(|cx| {
+        view.update(cx, |view, _| {
+            view.set_link_opener(move |url, _| {
+                recorder
+                    .lock()
+                    .expect("the recorder lock")
+                    .push(url.to_string());
+            });
+        });
+    });
+
+    open_detail_now(cx, window);
+    wait_for_asset_rows(cx, window, 1).await;
+    read(cx, window, |window, cx| {
+        assert_eq!(
+            label(window, ("folder-asset-link", 0_usize)),
+            "Open one.jpg in Immich",
+            "N5: the link names the asset it opens"
+        );
+        tab_to(window, ("folder-asset-link", 0_usize), cx);
+        assert!(
+            opened.lock().expect("the recorder lock").is_empty(),
+            "reaching the link does not open it"
+        );
+    });
+    act(cx, window, |window, cx| window.press("enter", cx));
+    assert_eq!(
+        opened.lock().expect("the recorder lock").as_slice(),
+        ["https://immich.example.com/immich/photos/asset-one"],
+        "#44: the link keeps the proxy prefix and drops the API base"
+    );
+}
+
+/// #44: a folder with nothing uploaded says so instead of showing an empty
+/// list.
+#[gpui_kit::test]
+async fn a_folder_with_no_uploaded_assets_says_so(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+    seed_folder(&paths, &photos, true);
+    let (window, store, _view) = open_dashboard(cx, &paths);
+    wait_for_store(cx, &store).await;
+
+    open_detail_now(cx, window);
+    cx.wait_for(window, Duration::from_secs(10), |window, _| {
+        window.try_find("folder-assets-empty").is_some()
+    })
+    .await;
+    read(cx, window, |window, _| {
+        assert_eq!(
+            label(window, "folder-assets-empty"),
+            "No uploaded assets in this folder yet.",
+            "#44: the empty state is explicit"
+        );
+        assert!(
+            window.try_find("folder-assets-more").is_none(),
+            "an empty list has no next page"
+        );
+    });
+}
+
+/// #44: a store that cannot answer replaces the list with an explicit reason.
+#[gpui_kit::test]
+async fn an_unreadable_store_says_why_the_list_is_missing(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+    seed_folder(&paths, &photos, true);
+    seed_asset(
+        &paths,
+        &photos.join("one.jpg"),
+        1024,
+        "asset-one",
+        times::now_ns() - THREE_AND_A_HALF_HOURS_NS,
+    );
+    let (window, store, _view) = open_dashboard(cx, &paths);
+    wait_for_store(cx, &store).await;
+
+    // The detail's read is a fresh connection to the file, so a database the
+    // path no longer names cannot answer it, as a removed or damaged file
+    // cannot.
+    std::fs::remove_file(&paths.state_db).expect("remove the state database");
+    std::fs::create_dir(&paths.state_db).expect("put a directory where the database was");
+
+    open_detail_now(cx, window);
+    cx.wait_for(window, Duration::from_secs(10), |window, _| {
+        window.try_find("folder-assets-problem").is_some()
+    })
+    .await;
+    read(cx, window, |window, _| {
+        let problem = label(window, "folder-assets-problem");
+        assert!(
+            problem.starts_with("The folder's uploaded assets could not be read:"),
+            "#44: the read error is explicit: {problem}"
+        );
+        assert!(
+            window.try_find(("folder-asset", 0_usize)).is_none(),
+            "#44: a failed read replaces the rows"
+        );
+    });
+}
+
+/// #44: the list follows the folder's uploaded count while it stays open,
+/// keeping the rows the user loaded rather than dropping back to the first
+/// page.
+#[gpui_kit::test]
+async fn the_list_reloads_on_a_new_upload_and_keeps_the_loaded_row_count(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+    let folder = seed_folder(&paths, &photos, true);
+    seed_assets(
+        &paths,
+        &photos,
+        120,
+        times::now_ns() - THREE_AND_A_HALF_HOURS_NS,
+    );
+    let (window, store, _view) = open_dashboard(cx, &paths);
+    wait_for_store(cx, &store).await;
+
+    open_detail_now(cx, window);
+    wait_for_asset_rows(cx, window, 50).await;
+    act(cx, window, |window, cx| {
+        window.click("folder-assets-more", cx)
+    });
+    wait_for_asset_rows(cx, window, 100).await;
+
+    // One more upload lands: the folder's count moves, and the next status poll
+    // reloads the 100 rows the user has loaded.
+    seed_asset(
+        &paths,
+        &photos.join("IMG_9999.jpg"),
+        999,
+        "asset-newest",
+        times::now_ns(),
+    );
+    let path = folder.path.clone();
+    for _ in 0..600 {
+        cx.update(|cx| {
+            store.update(cx, |store, cx| store.refresh_counts(&path, cx));
+        });
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+        let reloaded = read(cx, window, |window, _| {
+            label(window, ("folder-asset", 0_usize)).starts_with("IMG_9999.jpg")
+        });
+        if reloaded {
+            break;
+        }
+    }
+    read(cx, window, |window, _| {
+        assert!(
+            label(window, ("folder-asset", 0_usize)).starts_with("IMG_9999.jpg"),
+            "#44: the new upload leads the refreshed list"
+        );
+        assert!(
+            window.try_find(("folder-asset", 99_usize)).is_some(),
+            "#44: the refresh keeps the 100 rows the user loaded"
+        );
+        assert!(
+            window.try_find(("folder-asset", 100_usize)).is_none(),
+            "the refresh does not load more than the user asked for"
+        );
+        assert!(
+            label(window, ("folder-asset", 1_usize)).starts_with("IMG_0119.jpg"),
+            "#44: the rows that were loaded stay, in order, under the new one"
+        );
+    });
 }
