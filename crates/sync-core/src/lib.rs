@@ -6,6 +6,7 @@
 //! remaining engine tickets fill in discovery, the queue, and retry.
 
 pub mod albums;
+pub mod backfill;
 pub mod backoff;
 pub mod breaker;
 pub mod connection;

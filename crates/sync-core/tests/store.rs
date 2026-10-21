@@ -6,7 +6,7 @@ use sync_core::failure::FailureClass;
 use sync_core::hash::Sha1;
 use sync_core::store::{
     AlbumScope, AttemptOutcome, AttemptRecord, ItemRecord, ItemState, NewVersion, ReviewDecision,
-    SidecarDigest, SourceFolder, StateStore, StoreError,
+    SidecarDigest, SourceFolder, StateStore, StoreError, TagBackfill,
 };
 
 /// `sha1("hello world")`, hex.
@@ -1250,8 +1250,8 @@ fn the_sqlite_info_reports_the_schema_the_size_and_the_table_counts() {
 
     let empty = store.sqlite_info().expect("read the sqlite info");
     assert_eq!(
-        empty.migration_version, 9,
-        "the schema stands at the ninth migration"
+        empty.migration_version, 10,
+        "the schema stands at the tenth migration"
     );
     assert!(empty.size_bytes > 0, "a migrated database occupies pages");
     assert_eq!(empty.integrity, "ok", "a fresh database is sound");
@@ -1467,5 +1467,124 @@ fn recording_a_version_for_an_unknown_item_is_an_error() {
     assert!(
         matches!(error, StoreError::UnknownItem(_)),
         "the error says which item is missing: {error}"
+    );
+}
+
+/// R3.7: the backfill enumerates every asset the client ever uploaded, once
+/// each and in id order, so a cursor can resume the run.
+#[test]
+fn the_tag_backfill_enumerates_every_uploaded_asset_once() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    // An edited file: the chain holds both assets and the item points at the
+    // newest, so the old version is enumerated and the current one only once.
+    store
+        .record(&record("edited.jpg", ItemState::Uploaded))
+        .expect("write the row");
+    for (asset, at) in [("asset-b", 1), ("asset-c", 2)] {
+        store
+            .record_version(&NewVersion {
+                path: "edited.jpg".to_string(),
+                asset_id: asset.to_string(),
+                sha1: hello_world_sha1(),
+                created_at_ns: at,
+                stack_id: None,
+            })
+            .expect("seed the version chain");
+    }
+    // A duplicate: the row holds the asset the server already had.
+    store
+        .record(&ItemRecord {
+            asset_id: Some("asset-d".to_string()),
+            state: ItemState::Duplicate,
+            ..record("duplicate.jpg", ItemState::Duplicate)
+        })
+        .expect("write the duplicate row");
+    // A row no upload settled contributes no id.
+    store
+        .record(&ItemRecord {
+            asset_id: None,
+            state: ItemState::Pending,
+            ..record("pending.jpg", ItemState::Pending)
+        })
+        .expect("write the pending row");
+
+    assert_eq!(
+        store.tag_backfill_total().expect("count the library"),
+        3,
+        "R3.7: the current asset, the old version, and the duplicate, once each"
+    );
+    assert_eq!(
+        store
+            .tag_backfill_batch(None, 2)
+            .expect("read the first batch"),
+        vec!["asset-b".to_string(), "asset-c".to_string()],
+        "R3.7: a batch is the ids after the cursor, in id order, without a repeat"
+    );
+    assert_eq!(
+        store
+            .tag_backfill_batch(Some("asset-c"), 2)
+            .expect("read the next batch"),
+        vec!["asset-d".to_string()],
+        "the cursor continues after the last id of the previous batch"
+    );
+    assert!(
+        store
+            .tag_backfill_batch(Some("asset-d"), 2)
+            .expect("read past the end")
+            .is_empty(),
+        "past the last id the batch is empty, which is how the run finishes"
+    );
+}
+
+/// R3.7: the backfill records the last completed batch and its completion, so
+/// a restart resumes instead of starting over and "tag now" clears it.
+#[test]
+fn the_tag_backfill_marker_survives_a_reopen_and_the_restart_clears_it() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let path = temp.path().join("state.db");
+    {
+        let store = StateStore::open(&path).expect("open a fresh store");
+        assert_eq!(
+            store.tag_backfill().expect("read the state"),
+            TagBackfill::default(),
+            "a library nothing was tagged in has no marker and no cursor"
+        );
+        store
+            .record_tag_batch("asset-c", 2)
+            .expect("record a completed batch");
+    }
+
+    let store = StateStore::open(&path).expect("reopen the store");
+    assert_eq!(
+        store.tag_backfill().expect("read the state"),
+        TagBackfill {
+            completed_ns: None,
+            cursor: Some("asset-c".to_string()),
+            tagged: 2,
+        },
+        "R3.7: the last completed batch survives a restart"
+    );
+    store
+        .finish_tag_backfill(42)
+        .expect("record the completion");
+    assert_eq!(
+        store.tag_backfill().expect("read the state").completed_ns,
+        Some(42),
+        "R3.7: a finished backfill is recorded so a restart does not repeat it"
+    );
+
+    store
+        .restart_tag_backfill()
+        .expect("clear the backfill state");
+    assert_eq!(
+        store.tag_backfill().expect("read the state"),
+        TagBackfill::default(),
+        "R3.7: \"tag existing assets now\" clears the marker, the cursor and the count"
+    );
+    assert_eq!(
+        store.tag_backfill_total().expect("count the library"),
+        0,
+        "the total counts the assets the state holds"
     );
 }

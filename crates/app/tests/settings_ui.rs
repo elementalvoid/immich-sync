@@ -42,6 +42,8 @@ use sync_core::credential::{
     CredentialError, CredentialStore, MemoryCredentialStore, SharedCredentialStore,
 };
 use sync_core::engine::Limits;
+use sync_core::hash::Sha1;
+use sync_core::store::{ItemRecord, ItemState, StateStore};
 
 /// A stand-in for the OS autostart mechanism, so the settings-to-OS wiring is
 /// testable on every platform. On Linux the real XDG backend is covered by
@@ -2043,6 +2045,147 @@ async fn the_tag_switch_persists_and_reaches_the_running_engine(cx: &mut TestApp
     assert!(
         !cx.read(|cx| engine_model.read(cx).tag_status().enabled),
         "R3.7: the engine stopped tagging"
+    );
+}
+
+/// R3.7: the Tagging section shows where the backfill over the assets uploaded
+/// before the switch stands, reaches its completed state through the engine
+/// model, and "Tag existing assets now" runs the whole library again.
+#[gpui_kit::test]
+async fn the_tagging_section_shows_the_backfill_and_tags_the_library_again(
+    cx: &mut TestAppContext,
+) {
+    let (_runtime, server) = mock_server();
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    // One asset an earlier run uploaded: the library the backfill covers.
+    {
+        let store = StateStore::open(paths.state_db.clone()).expect("seed the state database");
+        store
+            .record(&ItemRecord {
+                path: temp.path().join("seeded.jpg").display().to_string(),
+                size: 11,
+                mtime_ns: 1,
+                sha1: Sha1::from_hex("2aae6c35c94fcfb415dbe95f408b9ce91ee846ed")
+                    .expect("a hex SHA-1"),
+                asset_id: Some("asset-seeded".to_string()),
+                state: ItemState::Uploaded,
+                error_class: None,
+                error_message: None,
+                attempts: 0,
+                sidecar: None,
+            })
+            .expect("seed an uploaded asset");
+    }
+    let mut stored = SettingsStore::open(paths.config_file.clone());
+    stored
+        .update(|settings| {
+            settings.server_url = server.base_url().to_string();
+        })
+        .expect("seed the server URL");
+
+    let credentials: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+    let (window, view, connection) =
+        open_settings_view(cx, stored, paths.clone(), FakeAutostart::new(), credentials);
+    let profile = ServerProfile {
+        server_url: server.base_url().to_string(),
+        email: "sync@example.com".to_string(),
+        method: AuthMethod::Password,
+    };
+    cx.update(|cx| {
+        connection.update(cx, |model, cx| {
+            model.sign_in(
+                SignIn {
+                    email: profile.email.clone(),
+                    secret: Secret::new("correct horse"),
+                    method: AuthMethod::Password,
+                },
+                profile,
+                cx,
+            );
+        });
+    });
+
+    let store_model = cx.update(|cx| cx.new(|cx| StoreModel::open(&paths, cx)));
+    let engine_model = cx.update(|cx| {
+        let engine = cx.new(|cx| EngineModel::new(connection, store_model, &paths, cx));
+        engine.update(cx, |model, cx| model.start(cx));
+        engine
+    });
+    for _ in 0..600 {
+        if cx.read(|cx| engine_model.read(cx).is_running()) {
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    assert!(
+        cx.read(|cx| engine_model.read(cx).is_running()),
+        "the engine never started"
+    );
+    cx.update(|cx| view.update(cx, |view, cx| view.set_engine(engine_model.clone(), cx)));
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("settings-tag-backfill").is_none(),
+            "R3.7: a switch that is off shows no backfill progress"
+        );
+        tab_to(window, "settings-tag-upload", cx);
+        window.press("space", cx);
+    })
+    .expect("turn the tag on");
+
+    // The write lands first, then the engine starts the backfill; the finished
+    // state arrives on the status poll.
+    for _ in 0..600 {
+        if cx.read(|cx| {
+            let status = engine_model.read(cx).tag_status();
+            status.enabled && status.backfill.completed
+        }) {
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    assert!(
+        cx.read(|cx| engine_model.read(cx).tag_status().backfill.completed),
+        "R3.7: the backfill never completed: {:?}",
+        cx.read(|cx| engine_model.read(cx).tag_status().clone())
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("settings-tag-backfill").label(),
+            Some("Existing assets tagged: 1 of 1"),
+            "R3.7: the section shows the completed state and its count"
+        );
+        assert!(
+            window.find("settings-tag-now-row").visible(),
+            "R3.7: the action is offered while the switch is on"
+        );
+        window.click("settings-tag-now", cx);
+    })
+    .expect("run the backfill again");
+
+    // The action cleared the marker on the worker runtime, so the engine tags
+    // the library again: one more batch on the wire.
+    for _ in 0..600 {
+        if server.tag_asset_calls().len() >= 2
+            && cx.read(|cx| engine_model.read(cx).tag_status().backfill.completed)
+        {
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        server.tag_asset_calls().len(),
+        2,
+        "R3.7: \"Tag existing assets now\" runs the whole library again: {:?}",
+        server.tag_asset_calls()
     );
 }
 
