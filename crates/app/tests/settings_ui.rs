@@ -2118,9 +2118,7 @@ async fn a_missing_tag_permission_is_named_in_the_tagging_section(cx: &mut TestA
     .expect("turn the tag on");
 
     // Let the setting land, then draw the frame its write produces: the switch
-    // is on and nothing is known against it yet (N2). `draw` without `refresh`
-    // re-renders only the views that notified, so this frame consumes that
-    // notification.
+    // is on and nothing is known against it yet (N2).
     let saved = wait_for_settings(cx, &paths, |settings| settings.tag_uploaded_assets).await;
     assert!(saved.tag_uploaded_assets, "R3.7: the setting persisted");
     cx.update_window(window, |_, window, cx| {
@@ -2131,6 +2129,30 @@ async fn a_missing_tag_permission_is_named_in_the_tagging_section(cx: &mut TestA
         );
     })
     .expect("draw the frame the switch produced");
+
+    // The save outcome lands a tick after the file does (N2), and its `record`
+    // notifies the view. Pump it and draw that frame now, while the probe is
+    // still held, so nothing after this point owes a repaint to the save.
+    cx.executor().timer(Duration::from_millis(10)).await;
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        window.draw(cx).clear(cx);
+        assert!(
+            window.try_find("settings-tag-problem").is_none(),
+            "the save outcome arrived before the probe answered"
+        );
+    })
+    .expect("draw the frame the save outcome produced");
+
+    // The harness re-renders the root view on every `draw`, so the notice
+    // appearing in a frame does not prove the view asked for one. Watch the
+    // view's own notifications instead: from here only its observation of the
+    // engine may notify it.
+    let repaints = Rc::new(Cell::new(0));
+    let _repaint_watch = {
+        let repaints = Rc::clone(&repaints);
+        cx.update(|cx| cx.observe(&view, move |_, _| repaints.set(repaints.get() + 1)))
+    };
 
     // The probe answers on the engine's worker runtime, and the model's poll
     // publishes it (R3.7).
@@ -2144,9 +2166,14 @@ async fn a_missing_tag_permission_is_named_in_the_tagging_section(cx: &mut TestA
         cx.run_until_parked();
     }
     assert!(settled, "the permission probe never settled");
+    assert_eq!(
+        repaints.get(),
+        1,
+        "R3.7: the section did not notify when the engine's answer arrived"
+    );
 
-    // Nothing has asked the settings view to render since the frame above, so
-    // only its own observation of the engine can have put the notice on screen.
+    // The observation notified for that answer; this frame shows the state it
+    // exposed.
     let label = cx
         .update_window(window, |_, window, cx| {
             window.draw(cx).clear(cx);
