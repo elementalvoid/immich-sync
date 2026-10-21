@@ -359,7 +359,8 @@ async fn the_backfill_publishes_its_progress_and_completes() {
 }
 
 /// R3.7: a finished backfill is recorded, so the next run over the same
-/// library sends no tag requests and starts from its completed state.
+/// library sends no tag requests, starts from its completed state, and keeps
+/// the count it tagged even when the library grew since.
 #[tokio::test]
 async fn a_completed_backfill_is_remembered_across_a_restart() {
     let server = MockImmich::start().await;
@@ -382,6 +383,37 @@ async fn a_completed_backfill_is_remembered_across_a_restart() {
         "R3.7: the completion is in the state database"
     );
     let calls = server.tag_asset_calls().len();
+    // An asset the library gained after the pass finished, outside the synced
+    // folder so the restarted engine's scan leaves it alone: the library is one
+    // asset bigger, but that asset is not part of the finished pass.
+    library
+        .store
+        .record(&sync_core::store::ItemRecord {
+            path: temp
+                .path()
+                .join("elsewhere/after.jpg")
+                .display()
+                .to_string(),
+            size: 5,
+            mtime_ns: 1,
+            sha1: sync_core::hash::Sha1::from_hex("2aae6c35c94fcfb415dbe95f408b9ce91ee846ed")
+                .expect("a hex SHA-1"),
+            asset_id: Some("asset-uploaded-after-the-pass".to_string()),
+            state: ItemState::Uploaded,
+            error_class: None,
+            error_message: None,
+            attempts: 0,
+            sidecar: None,
+        })
+        .expect("record an upload that landed after the pass");
+    assert_eq!(
+        library
+            .store
+            .tag_backfill_total()
+            .expect("count the library"),
+        5,
+        "the library grew after the pass finished"
+    );
 
     let restarted = start_engine(&server, &library.store, backfill_config(2)).await;
     // The run start resolves the tag, which is the one request a restart may
@@ -392,21 +424,20 @@ async fn a_completed_backfill_is_remembered_across_a_restart() {
     );
     assert!(
         wait_until(
-            || restarted.tag_status().backfill.completed,
+            || {
+                let status = restarted.tag_status().backfill;
+                status.completed && status.tagged == 4 && status.total == 4
+            },
             Duration::from_secs(20)
         )
         .await,
-        "R3.7: the restarted engine reads the recorded completion"
+        "R3.7: the completion keeps its own count, not the library's size now: {:?}",
+        restarted.tag_status().backfill
     );
     assert_eq!(
         server.tag_asset_calls().len(),
         calls,
         "R3.7: a restart does not tag the whole library again"
-    );
-    assert_eq!(
-        restarted.tag_status().backfill.tagged,
-        restarted.tag_status().backfill.total,
-        "the recorded completion keeps its count"
     );
 
     // R3.7: the completion record survives the toggle too, so turning the
@@ -572,6 +603,166 @@ async fn an_interrupted_backfill_resumes_after_its_last_completed_batch() {
         engine.tag_status().backfill.tagged,
         4,
         "R3.7: the count continues from the recorded progress"
+    );
+    engine.stop();
+}
+
+/// R3.7: "Tag existing assets now" pressed while a batch is in flight stops
+/// that pass at the batch boundary instead of letting it record the cursor it
+/// read before the clear, so the queued pass starts at the library's first id
+/// and no asset before the cleared cursor is skipped.
+#[tokio::test]
+async fn tag_now_during_a_batch_restarts_the_pass_at_the_first_id() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let library = library_of_six(&server, &temp).await;
+    // A pass that already got past its first two assets, so the batch in flight
+    // below is not the head of the library.
+    library
+        .store
+        .record_tag_batch(&library.assets[1], 2)
+        .expect("record the interrupted batch");
+    // Hold the resumed pass's next batch, so "tag now" lands while it is the
+    // work in flight.
+    server.fail(
+        Operation::TagAssets,
+        Fault::Slow(Duration::from_millis(700)),
+    );
+
+    let engine = start_engine(&server, &library.store, backfill_config(2)).await;
+    assert!(
+        wait_until(
+            || server
+                .requests()
+                .iter()
+                .any(|request| request.ends_with("/tags/assets")),
+            Duration::from_secs(20)
+        )
+        .await,
+        "the resumed pass never put a batch on the wire"
+    );
+    engine.retag_all().expect("clear the recorded progress");
+
+    assert!(
+        wait_until(
+            || engine.tag_status().backfill.completed && server.tag_asset_calls().len() == 4,
+            Duration::from_secs(20)
+        )
+        .await,
+        "R3.7: the queued pass did not finish the whole library: {:?} {:?}",
+        engine.tag_status().backfill,
+        server.tag_asset_calls()
+    );
+    let tag = server.tag_id(SYNC_TAG).expect("the tag exists");
+    assert_eq!(
+        server.tag_asset_calls(),
+        vec![
+            TagAssetCall {
+                tag_ids: vec![tag.clone()],
+                asset_ids: library.assets[2..4].to_vec(),
+            },
+            TagAssetCall {
+                tag_ids: vec![tag.clone()],
+                asset_ids: library.assets[0..2].to_vec(),
+            },
+            TagAssetCall {
+                tag_ids: vec![tag.clone()],
+                asset_ids: library.assets[2..4].to_vec(),
+            },
+            TagAssetCall {
+                tag_ids: vec![tag],
+                asset_ids: library.assets[4..6].to_vec(),
+            },
+        ],
+        "R3.7: the cleared pass starts at the first id, so nothing before the old cursor is skipped"
+    );
+    assert_eq!(
+        engine.tag_status().backfill.tagged,
+        6,
+        "R3.7: the re-run counts the whole library"
+    );
+    engine.stop();
+}
+
+/// R3.7: a batch that keeps failing stops the run at the retry cap, records the
+/// reason, keeps the progress that already landed, and does not record a
+/// completion, so a later attempt continues from the cursor.
+#[tokio::test]
+async fn a_batch_that_keeps_failing_stops_at_the_retry_cap() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let library = library_uploaded_without_the_tag(&server, &temp).await;
+    // A pass that already tagged its first batch, then met a server that keeps
+    // answering 500. The fault is queued past the cap, so a run that did not
+    // stop would keep spending attempts instead of meeting a success.
+    library
+        .store
+        .record_tag_batch(&library.assets[1], 2)
+        .expect("record the interrupted batch");
+    for _ in 0..4 {
+        server.fail(
+            Operation::TagAssets,
+            Fault::Status {
+                code: 500,
+                retry_after: None,
+            },
+        );
+    }
+    let config = EngineConfig {
+        attempt_cap: 2,
+        ..backfill_config(2)
+    };
+
+    let engine = start_engine(&server, &library.store, config).await;
+
+    assert!(
+        wait_until(
+            || {
+                let status = engine.tag_status();
+                !status.backfill.running && !status.backfill.completed && status.problem.is_some()
+            },
+            Duration::from_secs(20)
+        )
+        .await,
+        "R3.7: the run did not stop after the retry cap: {:?} {:?}",
+        engine.tag_status().backfill,
+        engine.tag_status().problem
+    );
+    let attempts = server
+        .requests()
+        .iter()
+        .filter(|request| request.ends_with("/tags/assets"))
+        .count();
+    assert_eq!(
+        attempts,
+        2,
+        "R3.7: the batch was tried attempt_cap times and no more: {:?}",
+        server.requests()
+    );
+    let problem = engine
+        .tag_status()
+        .problem
+        .expect("R3.7: the failure's reason is recorded");
+    assert!(
+        problem.contains("500"),
+        "R3.7: the reason names what the server answered: {problem}"
+    );
+    let status = engine.tag_status().backfill;
+    assert_eq!(
+        (status.tagged, status.completed),
+        (2, false),
+        "a run that stopped at the cap keeps the progress it recorded"
+    );
+    let recorded = library.store.tag_backfill().expect("read the state");
+    assert_eq!(
+        recorded.cursor.as_deref(),
+        Some(library.assets[1].as_str()),
+        "R3.7: the cursor stays where the last completed batch left it"
+    );
+    assert_eq!(recorded.tagged, 2, "the progress is preserved");
+    assert!(
+        recorded.completed_ns.is_none(),
+        "R3.7: a run that stopped at the retry cap is not recorded as finished"
     );
     engine.stop();
 }

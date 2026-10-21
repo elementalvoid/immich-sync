@@ -23,8 +23,10 @@
 
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::backoff::RetryPolicy;
+use crate::engine::now_ns;
 use crate::failure::{FailureKind, classify};
 use crate::store::{StateStore, StoreError};
 use crate::tags::{BackfillStatus, TagError, Tagger};
@@ -49,18 +51,6 @@ pub struct BackfillPolicy {
     pub retry: RetryPolicy,
 }
 
-impl Default for BackfillPolicy {
-    fn default() -> Self {
-        Self {
-            batch: BACKFILL_BATCH,
-            // The retry policy's ceiling reaches a minute by then, so a server
-            // that is down stops being hammered before the run gives up.
-            attempts: 8,
-            retry: RetryPolicy::default(),
-        }
-    }
-}
-
 /// Runs the sync tag's backfill (R3.7).
 ///
 /// The state database is the truth: the run reads the cursor, the count, and
@@ -75,6 +65,10 @@ pub struct Backfill {
     /// the run, because the view reads it on the UI thread and must not touch
     /// the database there (N2).
     status: Mutex<BackfillStatus>,
+    /// Bumped by "Tag existing assets now" once the store is cleared, so a
+    /// batch that was already on the wire when the user pressed it cannot
+    /// record a cursor the clear made stale (R3.7).
+    generation: AtomicU64,
 }
 
 impl Backfill {
@@ -95,6 +89,7 @@ impl Backfill {
             store,
             policy,
             status: Mutex::new(status),
+            generation: AtomicU64::new(0),
         })
     }
 
@@ -107,15 +102,19 @@ impl Backfill {
     /// Clears the recorded completion and the progress, so the next run tags
     /// the whole library again (R3.7: "Tag existing assets now").
     ///
-    /// This is safe while a run is in flight: the run re-reads the state from
-    /// the store before every batch, so it picks up the cleared cursor and
-    /// starts over instead of continuing past it.
+    /// This is safe while a run is in flight: the pass that was interrupted
+    /// stops at its batch boundary without recording that batch, and the pass
+    /// this call wakes starts from the cleared cursor instead of continuing
+    /// past the library's head.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError`] when the state cannot be cleared.
     pub fn restart(&self) -> Result<(), StoreError> {
         self.store.restart_tag_backfill()?;
+        // After the write, so a pass that sees the bump knows the row it would
+        // record over is already cleared.
+        self.generation.fetch_add(1, Ordering::SeqCst);
         *self.status.lock().expect("the backfill status lock") = BackfillStatus::default();
         Ok(())
     }
@@ -123,13 +122,15 @@ impl Backfill {
     /// One pass over the library the state database holds (R3.7).
     ///
     /// The pass ends when the library is finished, when the setting is turned
-    /// off, when a batch is refused for good, or when the store cannot be read
-    /// or written; the first two leave the state resumable, the other two keep
-    /// the progress that already landed.
+    /// off, when a batch is refused for good, when "Tag existing assets now"
+    /// clears the state, or when the store cannot be read or written. Every
+    /// batch is recorded as it lands, so the next run resumes from a state this
+    /// one left, not from the start of the library.
     pub async fn run(&self, tagger: &Tagger) {
         if !tagger.enabled() {
             return;
         }
+        let generation = self.generation.load(Ordering::SeqCst);
         let total = match self.store.tag_backfill_total() {
             Ok(total) => total,
             Err(error) => {
@@ -160,6 +161,10 @@ impl Backfill {
             if recorded.completed_ns.is_some() {
                 self.publish(|status| {
                     status.tagged = recorded.tagged;
+                    // The pass covered exactly what it tagged; the library can
+                    // have grown since it finished, so a fresh count is not
+                    // this pass's total (R3.7).
+                    status.total = recorded.tagged;
                     status.completed = true;
                 });
                 break;
@@ -175,11 +180,18 @@ impl Backfill {
                 }
             };
             let Some(cursor) = batch.last().cloned() else {
+                // A clear that landed since the state was read owns it now, so
+                // its pass records the completion, not this one (R3.7).
+                if self.generation.load(Ordering::SeqCst) != generation {
+                    tracing::info!("R3.7: the backfill was restarted; this pass stops");
+                    break;
+                }
                 // The end of the library: record it, so a restart does not tag
                 // the whole library again (R3.7).
                 match self.store.finish_tag_backfill(now_ns()) {
                     Ok(()) => self.publish(|status| {
                         status.tagged = recorded.tagged;
+                        status.total = recorded.tagged;
                         status.completed = true;
                     }),
                     Err(error) => {
@@ -188,7 +200,16 @@ impl Backfill {
                 }
                 break;
             };
-            match tagger.tag_batch(&batch).await {
+            let landed = tagger.tag_batch(&batch).await;
+            // R3.7: "Tag existing assets now" cleared the state while this
+            // batch was on the wire. Recording it would move the cleared cursor
+            // past the library's head, so this pass stops and the queued one
+            // starts from the first id.
+            if self.generation.load(Ordering::SeqCst) != generation {
+                tracing::info!("R3.7: the backfill was restarted; this pass stops");
+                break;
+            }
+            match landed {
                 Ok(()) => {
                     failures = 0;
                     let tagged = recorded
@@ -249,18 +270,10 @@ fn is_permanent(error: &TagError) -> bool {
     }
 }
 
-/// The current time in nanoseconds since the Unix epoch, as the state database
-/// records it.
-fn now_ns() -> i64 {
-    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        Ok(duration) => i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX),
-        Err(error) => -i64::try_from(error.duration().as_nanos()).unwrap_or(i64::MAX),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::EngineConfig;
 
     #[test]
     fn a_batch_is_a_few_hundred_ids() {
@@ -270,7 +283,7 @@ mod tests {
             (100..=1000).contains(&BACKFILL_BATCH),
             "one batch is a few hundred asset ids, not {BACKFILL_BATCH}"
         );
-        assert_eq!(BackfillPolicy::default().batch, BACKFILL_BATCH);
+        assert_eq!(EngineConfig::default().tag_batch_size, BACKFILL_BATCH);
     }
 
     #[test]
