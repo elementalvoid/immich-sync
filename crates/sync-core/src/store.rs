@@ -437,6 +437,22 @@ pub struct FolderCounts {
 /// paths that already know the outcome: a scan that read the folder and an
 /// upload that reached a terminal success. They sit on the folder row so a
 /// restart keeps them (`folder_time_tests`).
+/// One current asset of one source folder, for the folder detail's list (#44).
+///
+/// The row is the file's identity plus the asset its current version holds, so
+/// the detail can name it, size it, date it, and link it without a second read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FolderAsset {
+    /// The local path, exactly as stored. The view shows its file name.
+    pub path: String,
+    /// The size in bytes of the version the server holds.
+    pub size: u64,
+    /// The asset the item's current version holds, for its Immich link (#44).
+    pub asset_id: String,
+    /// When that version was recorded, ns since the Unix epoch.
+    pub created_at_ns: i64,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FolderTimes {
     /// When a reconciliation scan last read this folder, ns since the Unix
@@ -1792,6 +1808,90 @@ impl StateStore {
             }
         }
         Ok(counts)
+    }
+
+    /// One page of one source folder's current assets, newest first (#44).
+    ///
+    /// The rows are the items' current versions, so an edited file appears
+    /// once, with its latest asset, and an old version the Immich stack still
+    /// holds is not listed (R4.4). `recursive` follows the folder's own setting
+    /// (R2.1): a folder that does not descend into its subfolders lists its
+    /// direct children only. `offset` is the number of rows already shown, so
+    /// the next page continues where the list stopped.
+    ///
+    /// The read runs on a fresh read-only connection, so a page the detail
+    /// opens never queues behind the engine's writer (ADR 0005). It starts
+    /// from the folder's paths rather than from the version chain: the
+    /// existing `sync_item_path_key` index turns the folder into a key range,
+    /// and only the range's own versions are sorted, so a page costs the
+    /// folder's assets rather than the whole library's history.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the query fails.
+    pub fn folder_assets(
+        &self,
+        folder: &str,
+        recursive: bool,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<FolderAsset>, StoreError> {
+        let reader = self.reader()?;
+        let prefix = format!("{}/", path_key(Path::new(folder)));
+        // The prefix ends with a separator, so it is its own upper bound's
+        // predecessor: every key that starts with it sorts below the same text
+        // with that separator replaced by the next byte, and a sibling folder
+        // that merely shares the name sorts above. The range is exactly the
+        // folder's tree.
+        let mut upper = prefix.clone();
+        upper.pop();
+        upper.push('0');
+        // A direct child has nothing after the prefix; a grandchild still
+        // holds a separator. Path keys unify separators on the case-insensitive
+        // behaviour, and Linux paths use `/` anyway, so one separator test
+        // serves both.
+        let descendants = if recursive {
+            ""
+        } else {
+            " AND instr(substr(i.path_key, length(?1) + 1), '/') = 0"
+        };
+        let mut statement = reader
+            .prepare(&format!(
+                "SELECT i.path, i.size, v.asset_id, v.created_at_ns
+                 FROM sync_item i JOIN version v ON v.item_id = i.id
+                 WHERE i.path_key >= ?1 AND i.path_key < ?2 AND v.is_current = 1{descendants}
+                 ORDER BY v.created_at_ns DESC, v.item_id DESC
+                 LIMIT ?3 OFFSET ?4"
+            ))
+            .map_err(|source| self.query_error(source))?;
+        let rows = statement
+            .query_map(
+                params![
+                    prefix,
+                    upper,
+                    i64::try_from(limit).unwrap_or(i64::MAX),
+                    i64::try_from(offset).unwrap_or(i64::MAX),
+                ],
+                |row| {
+                    let size: i64 = row.get(1)?;
+                    let size = u64::try_from(size).map_err(|_| {
+                        conversion_error(
+                            1,
+                            rusqlite::types::Type::Integer,
+                            StoreError::NegativeSize,
+                        )
+                    })?;
+                    Ok(FolderAsset {
+                        path: row.get(0)?,
+                        size,
+                        asset_id: row.get(2)?,
+                        created_at_ns: row.get(3)?,
+                    })
+                },
+            )
+            .map_err(|source| self.query_error(source))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|source| self.query_error(source))
     }
 
     /// When one source folder last reconciled and last uploaded, for its

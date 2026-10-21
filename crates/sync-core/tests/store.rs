@@ -1588,3 +1588,189 @@ fn the_tag_backfill_marker_survives_a_reopen_and_the_restart_clears_it() {
         "the total counts the assets the state holds"
     );
 }
+
+/// Writes one uploaded item with one current version, the shape the folder
+/// detail lists (#44).
+fn seed_asset(store: &StateStore, path: &str, asset_id: &str, size: u64, created_at_ns: i64) {
+    let mut row = record(path, ItemState::Uploaded);
+    row.size = size;
+    row.asset_id = Some(asset_id.to_string());
+    store.record(&row).expect("write the item");
+    store
+        .record_version(&NewVersion {
+            path: path.to_string(),
+            asset_id: asset_id.to_string(),
+            sha1: hello_world_sha1(),
+            created_at_ns,
+            stack_id: None,
+        })
+        .expect("record the version");
+}
+
+/// #44: the folder detail's page is one row per current asset of the folder's
+/// own tree, newest first. An edited file appears once, with its latest asset;
+/// an older version stays in the chain and is not listed.
+#[test]
+fn the_folder_asset_page_lists_one_current_asset_per_item_newest_first() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    let photos = temp.path().join("photos");
+    let folder = photos.display().to_string();
+    let at = |index: i64| 1_700_000_000_000_000_000 + index;
+
+    seed_asset(
+        &store,
+        &photos.join("a.jpg").display().to_string(),
+        "asset-a",
+        10,
+        at(1),
+    );
+    seed_asset(
+        &store,
+        &photos.join("b.jpg").display().to_string(),
+        "asset-b",
+        20,
+        at(2),
+    );
+    // Edited once: the old asset stays recorded, the new one is current.
+    seed_asset(
+        &store,
+        &photos.join("edited.jpg").display().to_string(),
+        "asset-old",
+        30,
+        at(3),
+    );
+    store
+        .record_version(&NewVersion {
+            path: photos.join("edited.jpg").display().to_string(),
+            asset_id: "asset-new".to_string(),
+            sha1: hello_world_sha1(),
+            created_at_ns: at(5),
+            stack_id: Some("stack-1".to_string()),
+        })
+        .expect("record the edited file's latest version");
+    // A subfolder, which the folder's recursion setting decides on.
+    seed_asset(
+        &store,
+        &photos.join("sub").join("c.jpg").display().to_string(),
+        "asset-c",
+        40,
+        at(4),
+    );
+    // A sibling whose path merely shares the prefix must not count.
+    let other = temp.path().join("photos2");
+    seed_asset(
+        &store,
+        &other.join("d.jpg").display().to_string(),
+        "asset-d",
+        50,
+        at(6),
+    );
+    // A file still in flight has no asset and no version yet.
+    let mut pending = record(
+        &photos.join("pending.jpg").display().to_string(),
+        ItemState::Pending,
+    );
+    pending.asset_id = None;
+    store.record(&pending).expect("write the pending row");
+
+    let rows = store
+        .folder_assets(&folder, true, 50, 0)
+        .expect("read the folder's assets");
+    let listed: Vec<(String, String, u64)> = rows
+        .iter()
+        .map(|row| (row.path.clone(), row.asset_id.clone(), row.size))
+        .collect();
+    assert_eq!(
+        listed,
+        vec![
+            (
+                photos.join("edited.jpg").display().to_string(),
+                "asset-new".to_string(),
+                30
+            ),
+            (
+                photos.join("sub").join("c.jpg").display().to_string(),
+                "asset-c".to_string(),
+                40
+            ),
+            (
+                photos.join("b.jpg").display().to_string(),
+                "asset-b".to_string(),
+                20
+            ),
+            (
+                photos.join("a.jpg").display().to_string(),
+                "asset-a".to_string(),
+                10
+            ),
+        ],
+        "#44: newest first, one current asset per item, the folder's tree only"
+    );
+    assert_eq!(
+        rows[0].created_at_ns,
+        at(5),
+        "#44: the row carries when its current version was uploaded"
+    );
+
+    // R2.1: a folder that does not recurse lists its direct children only.
+    let direct = store
+        .folder_assets(&folder, false, 50, 0)
+        .expect("read the folder's own files");
+    assert_eq!(
+        direct.len(),
+        3,
+        "#44: a non-recursive folder leaves its subfolders' assets out"
+    );
+    assert!(
+        direct
+            .iter()
+            .all(|row| Path::new(&row.path).parent() == Some(photos.as_path())),
+        "no subfolder row belongs to a non-recursive folder"
+    );
+}
+
+/// #44: paging never repeats a row and never loses one, so Load more appends
+/// the next page of the same order.
+#[test]
+fn the_folder_asset_page_pages_without_repeating_or_losing_rows() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    let photos = temp.path().join("photos");
+    let folder = photos.display().to_string();
+    let names: Vec<String> = (0..5).map(|index| format!("{index}.jpg")).collect();
+    for (index, name) in names.iter().enumerate() {
+        let index = i64::try_from(index).expect("a small index");
+        seed_asset(
+            &store,
+            &photos.join(name).display().to_string(),
+            &format!("asset-{index}"),
+            1,
+            1_700_000_000_000_000_000 + index,
+        );
+    }
+
+    let mut listed: Vec<String> = Vec::new();
+    let mut offset = 0;
+    loop {
+        let page = store
+            .folder_assets(&folder, true, 2, offset)
+            .expect("read one page");
+        let full = page.len() == 2;
+        listed.extend(page.into_iter().map(|row| row.path));
+        if !full {
+            break;
+        }
+        offset += 2;
+    }
+
+    let expected: Vec<String> = names
+        .iter()
+        .rev()
+        .map(|name| photos.join(name).display().to_string())
+        .collect();
+    assert_eq!(
+        listed, expected,
+        "#44: the pages are the one order, once each"
+    );
+}
