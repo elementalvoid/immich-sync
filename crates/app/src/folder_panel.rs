@@ -436,7 +436,7 @@ impl Render for FolderPanel {
 mod tests {
     // GPUI's glob imports its own `test` macro, so this module names what it
     // uses and keeps Rust's `#[test]`.
-    use super::{PathProbe, already_tracked, confirmed, path_problem, probe};
+    use super::{PathProbe, already_tracked, confirmed, path_problem};
     use gpui_kit::TestAppContext;
     use std::path::Path;
     use sync_core::paths::PathCase;
@@ -506,6 +506,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_unreadable_folder_is_refused_with_its_own_reason() {
+        use super::probe;
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().expect("create a temp dir");
