@@ -34,6 +34,7 @@ use immich_sync::status;
 use immich_sync::store::StoreModel;
 use immich_sync::upload::UploadModel;
 use immich_sync::upload_view::UploadView;
+use mock_immich::{Fault, Operation};
 use sync_core::connection::{
     Attention, AuthMethod, ConnectionState, Secret, ServerProfile, SignIn,
 };
@@ -1814,7 +1815,7 @@ async fn a_limits_change_reaches_the_running_engine(cx: &mut TestAppContext) {
 
     // The shell hands the view the engine it must push changes to; this is
     // that same call.
-    cx.update(|cx| view.update(cx, |view, _| view.set_engine(engine_model.clone())));
+    cx.update(|cx| view.update(cx, |view, cx| view.set_engine(engine_model.clone(), cx)));
 
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
@@ -1856,5 +1857,339 @@ async fn a_limits_change_reaches_the_running_engine(cx: &mut TestAppContext) {
         reloaded.settings().concurrency,
         3,
         "R7.3: the concurrency limit was written back"
+    );
+}
+
+/// R3.7: the Tagging section shows the fixed tag name and opens Immich's tag
+/// page on the configured server, minus the API prefix.
+#[gpui_kit::test]
+fn the_tagging_section_shows_the_fixed_tag_and_opens_its_immich_page(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    // A reverse-proxy prefix in front of the API prefix, which is the shape
+    // the client accepts as a base URL.
+    let mut seed = SettingsStore::open(paths.config_file.clone());
+    seed.update(|settings| {
+        settings.server_url = "https://immich.example.com/immich/api".to_string();
+    })
+    .expect("seed the server URL");
+    let store = SettingsStore::open(paths.config_file.clone());
+    let window = open_settings(cx, store, paths.clone(), FakeAutostart::new());
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("settings-tag-name").label(),
+            Some("immich-sync"),
+            "R3.7: the fixed tag name is shown"
+        );
+        assert!(
+            window.find("settings-tag-prerequisite").visible(),
+            "R3.7: the section explains Immich's Tags preference"
+        );
+        assert_eq!(
+            window.find("settings-tag-upload").checked(),
+            Some(false),
+            "R3.7: the switch is present and off"
+        );
+        window.click("settings-tag-link", cx);
+    })
+    .expect("open the tag page from the settings window");
+
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://immich.example.com/immich/tags?path=immich-sync"),
+        "R3.7: the URL is the server URL minus /api, with the tag's path"
+    );
+}
+
+/// R3.7: no server URL means no View in Immich link.
+#[gpui_kit::test]
+fn the_tagging_section_has_no_immich_link_without_a_server_url(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let store = SettingsStore::open(paths.config_file.clone());
+    let window = open_settings(cx, store, paths.clone(), FakeAutostart::new());
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.find("settings-tagging").visible(),
+            "the section is there without a server"
+        );
+        assert!(
+            window.try_find("settings-tag-link").is_none(),
+            "R3.7: there is no link to open without a server URL"
+        );
+    })
+    .expect("render the settings window");
+    assert_eq!(cx.opened_url(), None, "nothing was opened");
+}
+
+/// R3.7: the switch persists the setting and moves the running engine to it
+/// without a restart, in both directions.
+#[gpui_kit::test]
+async fn the_tag_switch_persists_and_reaches_the_running_engine(cx: &mut TestAppContext) {
+    let (_runtime, server) = mock_server();
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let mut stored = SettingsStore::open(paths.config_file.clone());
+    stored
+        .update(|settings| {
+            settings.server_url = server.base_url().to_string();
+        })
+        .expect("seed the server URL");
+
+    let credentials: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+    let (window, view, connection) =
+        open_settings_view(cx, stored, paths.clone(), FakeAutostart::new(), credentials);
+
+    // Sign in on the model the view already holds, so the engine can start.
+    let profile = ServerProfile {
+        server_url: server.base_url().to_string(),
+        email: "sync@example.com".to_string(),
+        method: AuthMethod::Password,
+    };
+    cx.update(|cx| {
+        connection.update(cx, |model, cx| {
+            model.sign_in(
+                SignIn {
+                    email: profile.email.clone(),
+                    secret: Secret::new("correct horse"),
+                    method: AuthMethod::Password,
+                },
+                profile,
+                cx,
+            );
+        });
+    });
+
+    let store_model = cx.update(|cx| cx.new(|cx| StoreModel::open(&paths, cx)));
+    let engine_model = cx.update(|cx| {
+        let engine = cx.new(|cx| EngineModel::new(connection, store_model, &paths, cx));
+        engine.update(cx, |model, cx| model.start(cx));
+        engine
+    });
+    for _ in 0..600 {
+        if cx.read(|cx| engine_model.read(cx).is_running()) {
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    assert!(
+        cx.read(|cx| engine_model.read(cx).is_running()),
+        "the engine never started"
+    );
+    assert!(
+        !cx.read(|cx| engine_model.read(cx).tag_status().enabled),
+        "R3.7: the stored default is off"
+    );
+
+    // The shell hands the view the engine it must push changes to; this is
+    // that same call.
+    cx.update(|cx| view.update(cx, |view, cx| view.set_engine(engine_model.clone(), cx)));
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        tab_to(window, "settings-tag-upload", cx);
+        window.press("space", cx);
+    })
+    .expect("turn the tag on");
+
+    let saved = wait_for_settings(cx, &paths, |settings| settings.tag_uploaded_assets).await;
+    assert!(saved.tag_uploaded_assets, "R3.7: the setting persisted");
+    for _ in 0..600 {
+        if cx.read(|cx| engine_model.read(cx).tag_status().enabled) {
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    assert!(
+        cx.read(|cx| engine_model.read(cx).tag_status().enabled),
+        "R3.7: the switch reached the running engine"
+    );
+    // The engine resolved the tag on the worker runtime as part of that move.
+    for _ in 0..600 {
+        if server.tag_id(sync_core::tags::SYNC_TAG).is_some() {
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    assert!(
+        server.tag_id(sync_core::tags::SYNC_TAG).is_some(),
+        "R3.7: turning the setting on created the tag"
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        tab_to(window, "settings-tag-upload", cx);
+        window.press("space", cx);
+    })
+    .expect("turn the tag off");
+
+    let saved = wait_for_settings(cx, &paths, |settings| !settings.tag_uploaded_assets).await;
+    assert!(!saved.tag_uploaded_assets, "R3.7: turning it off persisted");
+    for _ in 0..600 {
+        if !cx.read(|cx| engine_model.read(cx).tag_status().enabled) {
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    assert!(
+        !cx.read(|cx| engine_model.read(cx).tag_status().enabled),
+        "R3.7: the engine stopped tagging"
+    );
+}
+
+/// R3.7: an API key that lacks a permission gets its name in the Tagging
+/// section, through the engine's own probe, and the section repaints itself
+/// when the probe answers: nothing else asks it to render in between.
+#[gpui_kit::test]
+async fn a_missing_tag_permission_is_named_in_the_tagging_section(cx: &mut TestAppContext) {
+    let (_runtime, server) = mock_server();
+    cx.executor().allow_parking();
+    server.set_api_key("test-key");
+    // The upload may run, so the only missing permission is the tag's.
+    server.set_api_key_permissions(&["asset.upload", "tag.create", "tag.asset"]);
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let mut stored = SettingsStore::open(paths.config_file.clone());
+    stored
+        .update(|settings| {
+            settings.server_url = server.base_url().to_string();
+        })
+        .expect("seed the server URL");
+
+    let credentials: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+    let (window, view, connection) =
+        open_settings_view(cx, stored, paths.clone(), FakeAutostart::new(), credentials);
+
+    let profile = ServerProfile {
+        server_url: server.base_url().to_string(),
+        email: "sync@example.com".to_string(),
+        method: AuthMethod::ApiKey,
+    };
+    cx.update(|cx| {
+        connection.update(cx, |model, cx| {
+            model.sign_in(
+                SignIn {
+                    email: profile.email.clone(),
+                    secret: Secret::new("test-key"),
+                    method: AuthMethod::ApiKey,
+                },
+                profile,
+                cx,
+            );
+        });
+    });
+
+    let store_model = cx.update(|cx| cx.new(|cx| StoreModel::open(&paths, cx)));
+    let engine_model = cx.update(|cx| {
+        let engine = cx.new(|cx| EngineModel::new(connection, store_model, &paths, cx));
+        engine.update(cx, |model, cx| model.start(cx));
+        engine
+    });
+    for _ in 0..600 {
+        if cx.read(|cx| engine_model.read(cx).is_running()) {
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    assert!(
+        cx.read(|cx| engine_model.read(cx).is_running()),
+        "the engine never started"
+    );
+    cx.update(|cx| view.update(cx, |view, cx| view.set_engine(engine_model.clone(), cx)));
+
+    // Hold the probe open, so the frame the toggle itself produces cannot
+    // already hold its answer.
+    server.fail(Operation::ApiKeyMe, Fault::Slow(Duration::from_secs(1)));
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        tab_to(window, "settings-tag-upload", cx);
+        window.press("space", cx);
+    })
+    .expect("turn the tag on");
+
+    // Let the setting land, then draw the frame its write produces: the switch
+    // is on and nothing is known against it yet (N2).
+    let saved = wait_for_settings(cx, &paths, |settings| settings.tag_uploaded_assets).await;
+    assert!(saved.tag_uploaded_assets, "R3.7: the setting persisted");
+    cx.update_window(window, |_, window, cx| {
+        window.draw(cx).clear(cx);
+        assert!(
+            window.try_find("settings-tag-problem").is_none(),
+            "the probe has not answered yet"
+        );
+    })
+    .expect("draw the frame the switch produced");
+
+    // The save outcome lands a tick after the file does (N2), and its `record`
+    // notifies the view. Pump it and draw that frame now, while the probe is
+    // still held, so nothing after this point owes a repaint to the save.
+    cx.executor().timer(Duration::from_millis(10)).await;
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        window.draw(cx).clear(cx);
+        assert!(
+            window.try_find("settings-tag-problem").is_none(),
+            "the save outcome arrived before the probe answered"
+        );
+    })
+    .expect("draw the frame the save outcome produced");
+
+    // The harness re-renders the root view on every `draw`, so the notice
+    // appearing in a frame does not prove the view asked for one. Watch the
+    // view's own notifications instead: from here only its observation of the
+    // engine may notify it.
+    let repaints = Rc::new(Cell::new(0));
+    let _repaint_watch = {
+        let repaints = Rc::clone(&repaints);
+        cx.update(|cx| cx.observe(&view, move |_, _| repaints.set(repaints.get() + 1)))
+    };
+
+    // The probe answers on the engine's worker runtime, and the model's poll
+    // publishes it (R3.7).
+    let mut settled = false;
+    for _ in 0..600 {
+        if cx.read(|cx| engine_model.read(cx).tag_status().problem.is_some()) {
+            settled = true;
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    assert!(settled, "the permission probe never settled");
+    assert_eq!(
+        repaints.get(),
+        1,
+        "R3.7: the section did not notify when the engine's answer arrived"
+    );
+
+    // The observation notified for that answer; this frame shows the state it
+    // exposed.
+    let label = cx
+        .update_window(window, |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window
+                .try_find("settings-tag-problem")
+                .and_then(|found| found.label().map(str::to_string))
+        })
+        .ok()
+        .flatten()
+        .expect("R3.7: the section never repainted the engine's tag problem");
+    assert!(
+        label.contains("asset.update"),
+        "R3.7: the section names the missing permission: {label}"
+    );
+    assert!(
+        server.upsert_calls().is_empty(),
+        "R3.7: a key that may not create the tag sends no upsert"
     );
 }

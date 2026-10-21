@@ -32,6 +32,7 @@ pub enum Operation {
     GetAsset,
     Copy,
     CreateStack,
+    UpsertTags,
     TagAssets,
     DeleteAssets,
     RestoreAssets,
@@ -130,9 +131,34 @@ struct Inner {
     stacks: HashMap<String, Vec<String>>,
     /// The tag ids on each asset (R4.2).
     asset_tags: HashMap<String, Vec<String>>,
+    /// The tags the double holds, by id, with their names (R3.7).
+    tags: HashMap<String, String>,
+    /// The tag ids in creation order, so `tag_names` is deterministic.
+    tag_order: Vec<String>,
+    /// Every `PUT /tags` call, in order (R3.7). A test asserts the names the
+    /// client sent, not only the id it kept.
+    upsert_calls: Vec<TagUpsertCall>,
+    /// Every `PUT /tags/assets` call, in order (R3.7).
+    tag_asset_calls: Vec<TagAssetCall>,
     /// Every `DELETE /assets` call, in order (R5.3). A test asserts the
     /// request the client sent, not only the trash state it produced.
     delete_calls: Vec<DeleteCall>,
+}
+
+/// One `PUT /tags` call, as the double received it (R3.7).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TagUpsertCall {
+    /// The tag names in the body's `tags` field.
+    pub tags: Vec<String>,
+}
+
+/// One `PUT /tags/assets` call, as the double received it (R3.7).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TagAssetCall {
+    /// The tag ids the body named.
+    pub tag_ids: Vec<String>,
+    /// The asset ids the body named.
+    pub asset_ids: Vec<String>,
 }
 
 /// One `DELETE /assets` call, as the double received it (R5.3).
@@ -268,6 +294,41 @@ impl Inner {
             }
         }
         id
+    }
+
+    /// Creates the tag `name`, or returns the id of the one already held.
+    fn upsert_tag(&mut self, name: &str) -> String {
+        if let Some(id) = self.tag_id(name) {
+            return id;
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        self.tags.insert(id.clone(), name.to_string());
+        self.tag_order.push(id.clone());
+        id
+    }
+
+    fn tag_id(&self, name: &str) -> Option<String> {
+        self.tags
+            .iter()
+            .find(|(_, known)| known.as_str() == name)
+            .map(|(id, _)| id.clone())
+    }
+
+    fn tag_names(&self) -> Vec<String> {
+        self.tag_order
+            .iter()
+            .filter_map(|id| self.tags.get(id).cloned())
+            .collect()
+    }
+
+    /// Models the user deleting the tag in Immich: the tag and the tags it
+    /// carried on assets are gone (R3.7).
+    fn delete_tag(&mut self, id: &str) {
+        self.tags.remove(id);
+        self.tag_order.retain(|known| known != id);
+        for tags in self.asset_tags.values_mut() {
+            tags.retain(|known| known != id);
+        }
     }
 
     fn tag(&mut self, asset_ids: &[String], tag_ids: &[String]) -> usize {
@@ -727,6 +788,57 @@ impl MockImmich {
             .clone()
     }
 
+    /// The id of the tag with this name, when the double holds it (R3.7).
+    #[must_use]
+    pub fn tag_id(&self, name: &str) -> Option<String> {
+        self.state
+            .inner
+            .lock()
+            .expect("mock state poisoned")
+            .tag_id(name)
+    }
+
+    /// Every tag name the double holds, in creation order (R3.7).
+    #[must_use]
+    pub fn tag_names(&self) -> Vec<String> {
+        self.state
+            .inner
+            .lock()
+            .expect("mock state poisoned")
+            .tag_names()
+    }
+
+    /// Every `PUT /tags` call, in request order (R3.7).
+    #[must_use]
+    pub fn upsert_calls(&self) -> Vec<TagUpsertCall> {
+        self.state
+            .inner
+            .lock()
+            .expect("mock state poisoned")
+            .upsert_calls
+            .clone()
+    }
+
+    /// Every `PUT /tags/assets` call, in request order (R3.7).
+    #[must_use]
+    pub fn tag_asset_calls(&self) -> Vec<TagAssetCall> {
+        self.state
+            .inner
+            .lock()
+            .expect("mock state poisoned")
+            .tag_asset_calls
+            .clone()
+    }
+
+    /// Deletes one tag the way the user can in Immich (R3.7).
+    pub fn delete_tag(&self, id: &str) {
+        self.state
+            .inner
+            .lock()
+            .expect("mock state poisoned")
+            .delete_tag(id);
+    }
+
     /// The tag ids on one asset, in the order they were applied (R4.2).
     #[must_use]
     pub fn tags_of(&self, asset_id: &str) -> Vec<String> {
@@ -791,6 +903,7 @@ impl MockImmich {
             .route("/assets/copy", put(copy_asset))
             .route("/assets/{id}", get(get_asset))
             .route("/stacks", post(create_stack))
+            .route("/tags", put(upsert_tags))
             .route("/tags/assets", put(tag_assets))
             .route("/albums", post(create_album))
             .route("/albums/{id}/assets", put(add_assets_to_album))
@@ -1518,6 +1631,36 @@ async fn create_stack(
         .into_response()
 }
 
+async fn upsert_tags(
+    AxumState(state): AxumState<Arc<State>>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if let Some(response) = guard(&state, Operation::UpsertTags).await {
+        return response;
+    }
+    let names = id_list(body.get("tags"));
+    let mut inner = state.inner.lock().expect("mock state poisoned");
+    inner.upsert_calls.push(TagUpsertCall {
+        tags: names.clone(),
+    });
+    let tags: Vec<Value> = names
+        .iter()
+        .map(|name| {
+            let id = inner.upsert_tag(name);
+            // Immich's TagResponseDto carries `name` and the full-path
+            // `value`; a flat tag has the same text in both.
+            json!({
+                "id": id,
+                "name": name,
+                "value": name,
+                "createdAt": TIMESTAMP,
+                "updatedAt": TIMESTAMP,
+            })
+        })
+        .collect();
+    Json(tags).into_response()
+}
+
 async fn tag_assets(
     AxumState(state): AxumState<Arc<State>>,
     Json(body): Json<serde_json::Value>,
@@ -1527,11 +1670,12 @@ async fn tag_assets(
     }
     let asset_ids = id_list(body.get("assetIds"));
     let tag_ids = id_list(body.get("tagIds"));
-    let count = state
-        .inner
-        .lock()
-        .expect("mock state poisoned")
-        .tag(&asset_ids, &tag_ids);
+    let mut inner = state.inner.lock().expect("mock state poisoned");
+    inner.tag_asset_calls.push(TagAssetCall {
+        tag_ids: tag_ids.clone(),
+        asset_ids: asset_ids.clone(),
+    });
+    let count = inner.tag(&asset_ids, &tag_ids);
     Json(json!({ "count": count })).into_response()
 }
 

@@ -62,8 +62,9 @@ Acceptance: a file added while the client is stopped is found at startup. A file
 - R3.4 Album mapping is opt-in per folder. The album scope is per folder: leaf folders or the whole source folder. A new folder's mapping and scope are confirmed with its other settings before it syncs.
 - R3.5 Only Immich operations with `x-immich-state: Stable` are used for sync correctness.
 - R3.6 Upload success means the server returned the asset id. Server-side processing continues asynchronously.
+- R3.7 The sync tag is opt-in in Settings, off by default. When it is on, the client upserts the fixed tag `immich-sync` with `PUT /api/tags` (`x-immich-state: Stable`) and keeps the returned id for the run, so a tag deleted in Immich is created again on the next run. Every asset an upload settles with (`created` or `duplicate`, including a changed file's new version) gets the tag with `PUT /api/tags/assets`. Tagging runs after the upload is recorded, so a tag failure leaves the item uploaded and is reported in Settings instead. With an API key, tagging needs the `tag.create`, `tag.asset`, and `asset.update` permissions; Settings names a missing one. Turning the setting off stops new tagging and deletes no tag.
 
-Acceptance: a 100-file folder syncs. Duplicate content is not uploaded twice. A mapped folder creates the expected album. A sidecar lands with its asset. Unsupported formats produce a permanent error, not a retry loop.
+Acceptance: a 100-file folder syncs. Duplicate content is not uploaded twice. A mapped folder creates the expected album. A sidecar lands with its asset. Unsupported formats produce a permanent error, not a retry loop. With the sync tag on, a new upload and a duplicate both carry it, and a tag failure leaves both uploaded.
 
 ### R4 — Changed files
 

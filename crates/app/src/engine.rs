@@ -28,6 +28,7 @@ use crate::status::DashboardModel;
 use crate::store::StoreModel;
 use sync_core::connection::{ConnectionState, SharedSession};
 use sync_core::paths::PathCase;
+use sync_core::tags::TagStatus;
 
 /// How often the dashboard picks up the engine's live counts.
 const STATUS_POLL: Duration = Duration::from_millis(250);
@@ -39,16 +40,28 @@ const STATUS_POLL: Duration = Duration::from_millis(250);
 /// this only decides how soon a parked item or a missing file shows up.
 const FAILED_POLL_TICKS: u32 = 4;
 
+/// The live settings the app pushes to a running engine (R7.1, R7.2, R3.7).
+///
+/// One channel carries both, so a change to either reaches the engine in the
+/// order the view made it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LiveSettings {
+    limits: Limits,
+    tag_uploaded_assets: bool,
+}
+
 /// The app-scoped engine and the status the views render.
 pub struct EngineModel {
     connection: Entity<ConnectionModel>,
     store_model: Entity<StoreModel>,
     paths: AppPaths,
     engine: Option<Arc<Engine>>,
-    /// The newest limit change for the running engine. One applier task per
-    /// engine drains it, so two quick edits cannot land out of order.
-    limits: Option<tokio::sync::watch::Sender<Limits>>,
+    /// The newest live-settings change for the running engine. One applier task
+    /// per engine drains it, so two quick edits cannot land out of order.
+    live: Option<tokio::sync::watch::Sender<LiveSettings>>,
     status: EngineStatus,
+    /// The sync tag's live state, which the Settings section renders (R3.7).
+    tag: TagStatus,
     /// The parked items the failed-items view lists (R6.5), re-read off the UI
     /// thread.
     failed: Vec<FailedItem>,
@@ -187,8 +200,9 @@ impl EngineModel {
             store_model,
             paths: paths.clone(),
             engine: None,
-            limits: None,
+            live: None,
             status: empty_status(),
+            tag: TagStatus::default(),
             failed: Vec::new(),
             review: Vec::new(),
             review_problem: None,
@@ -547,9 +561,10 @@ impl EngineModel {
         // A start already in flight must not install its engine over the
         // store this rebuild replaces (R10.4).
         self.start_generation = self.start_generation.wrapping_add(1);
-        self.limits = None;
+        self.live = None;
         self.rebuilding = true;
         self.status = empty_status();
+        self.tag = TagStatus::default();
         self.store_model.update(cx, |store, cx| store.rebuild(cx));
         cx.notify();
     }
@@ -587,11 +602,33 @@ impl EngineModel {
     pub fn set_limits(&mut self, bandwidth_bytes_per_second: u64, concurrency: usize) {
         // The applier task wakes on the newest value, so a change that
         // overtakes this one cannot be overwritten by it.
-        if let Some(limits) = &self.limits {
-            let _ = limits.send(Limits {
+        if let Some(live) = &self.live {
+            let mut next = *live.borrow();
+            next.limits = Limits {
                 bandwidth_bytes_per_second,
                 concurrency: concurrency.max(1),
-            });
+            };
+            live.send_replace(next);
+        }
+    }
+
+    /// The sync tag's live state, for the Settings section (R3.7).
+    ///
+    /// It comes from the engine, which did the one permission probe the view
+    /// must not repeat.
+    #[must_use]
+    pub fn tag_status(&self) -> &TagStatus {
+        &self.tag
+    }
+
+    /// Turns the sync tag on or off on the running engine without a restart
+    /// (R3.7). Before it starts this is a no-op: the settings file it reads at
+    /// start already holds the value the view wrote.
+    pub fn set_tag_uploads(&mut self, enabled: bool) {
+        if let Some(live) = &self.live {
+            let mut next = *live.borrow();
+            next.tag_uploaded_assets = enabled;
+            live.send_replace(next);
         }
     }
 
@@ -962,6 +999,8 @@ impl EngineModel {
                     ),
                     // R6.1: the attempt cap is user-settable, 8 by default.
                     attempt_cap: settings.attempt_cap.max(1),
+                    // R3.7: the sync tag is opt-in and persisted.
+                    tag_uploaded_assets: settings.tag_uploaded_assets,
                     ..EngineConfig::default()
                 };
                 match Engine::new(store, session, config) {
@@ -998,22 +1037,27 @@ impl EngineModel {
                         } else {
                             engine.resume();
                         }
-                        // One limits applier per engine (R7.1, R7.2). Its
-                        // channel lives in the model, so replacing the engine
-                        // drops the old sender and ends the old task.
+                        // One live-settings applier per engine (R7.1, R7.2,
+                        // R3.7). Its channel lives in the model, so replacing
+                        // the engine drops the old sender and ends the old
+                        // task.
                         if let Ok(runtime) = worker() {
                             let (changes, mut incoming) =
-                                tokio::sync::watch::channel(engine.limits());
+                                tokio::sync::watch::channel(LiveSettings {
+                                    limits: engine.limits(),
+                                    tag_uploaded_assets: engine.tag_status().enabled,
+                                });
                             let applier = Arc::clone(&engine);
                             runtime.spawn(async move {
                                 while incoming.changed().await.is_ok() {
                                     // Copy first: the borrow is not `Send`, so
                                     // it must not live across the await.
-                                    let limits = *incoming.borrow_and_update();
-                                    applier.set_limits(limits).await;
+                                    let live = *incoming.borrow_and_update();
+                                    applier.set_limits(live.limits).await;
+                                    applier.set_tag_uploads(live.tag_uploaded_assets).await;
                                 }
                             });
-                            model.limits = Some(changes);
+                            model.live = Some(changes);
                         }
                         model.engine = Some(engine);
                         model.problem = None;
@@ -1035,6 +1079,12 @@ impl EngineModel {
 
     /// Republishes the engine's status, or a folder-only status before it runs.
     fn refresh_status(&mut self, cx: &mut Context<Self>) {
+        self.tag = match &self.engine {
+            // R3.7: the tag state rides the same refresh, so the Settings
+            // section sees the engine's one permission probe.
+            Some(engine) => engine.tag_status(),
+            None => TagStatus::default(),
+        };
         self.status = match &self.engine {
             Some(engine) => engine.status(),
             None => {

@@ -7,5 +7,6 @@
 mod server;
 
 pub use server::{
-    AssetCopyCall, DeleteCall, Fault, MockImmich, Operation, StackCall, UploadRecord,
+    AssetCopyCall, DeleteCall, Fault, MockImmich, Operation, StackCall, TagAssetCall,
+    TagUpsertCall, UploadRecord,
 };

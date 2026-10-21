@@ -17,7 +17,7 @@ use crate::model::{
     AssetInfo, AssetInfoBody, AssetUpload, Auth, AuthStatus, BulkAction, BulkCheckBody,
     BulkCheckItem, BulkCheckResult, BulkIdsRequest, BulkTagRequest, CreateAlbumRequest,
     CreateStackRequest, LoginResponse, RejectReason, ServerAbout, SessionToken, StackBody,
-    UploadBody, UploadResponse,
+    TagUpsertBody, TagUpsertRequest, UploadBody, UploadResponse,
 };
 
 /// The longest error message body kept from the server. A reverse proxy can
@@ -663,6 +663,30 @@ impl ImmichClient {
         result
     }
 
+    /// Creates or reuses the tag `name` and returns its id (R3.7).
+    ///
+    /// `PUT /tags` is Immich's upsert: the server matches the tag by name, so
+    /// the same call creates the tag the first time and answers the existing
+    /// one's id after that. That is what makes the sync tag safe to resolve on
+    /// every run and after a failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::InvalidToken`] for a refused credential, the typed
+    /// refusal classes (R6.3), [`ClientError::Protocol`] when the answer does
+    /// not carry the tag that was asked for, and the transport variants.
+    pub async fn upsert_tag(&self, auth: Auth<'_>, name: &str) -> Result<String, ClientError> {
+        let names = [name.to_string()];
+        let response = send(
+            self.authorize(self.http.put(self.endpoint("tags")), auth)
+                .json(&TagUpsertRequest { tags: &names }),
+        )
+        .await?;
+        let result = self.read_tag(response, name).await;
+        log_outcome("upsert-tag", &result);
+        result
+    }
+
     /// Adds `tag_ids` to `asset_ids` (R4.2).
     ///
     /// One call carries the whole tag set of the old version onto the new one.
@@ -777,6 +801,27 @@ impl ImmichClient {
                 })
             })
             .collect()
+    }
+
+    /// Maps a tag-upsert response to the id of the tag that was asked for
+    /// (R3.7).
+    async fn read_tag(&self, response: Response, name: &str) -> Result<String, ClientError> {
+        let status = response.status();
+        if !status.is_success() {
+            return Err(failure(response).await);
+        }
+        let body = response
+            .json::<Vec<TagUpsertBody>>()
+            .await
+            .map_err(|error| body_failure(status, error))?;
+        body.into_iter()
+            .find(|tag| tag.name == name && !tag.id.is_empty())
+            .map(|tag| tag.id)
+            .ok_or_else(|| ClientError::Protocol {
+                status: status.as_u16(),
+                message: format!("the tag upsert returned no tag named {name}"),
+                retry_after: None,
+            })
     }
 
     /// Maps an upload response to its result (R3.6).

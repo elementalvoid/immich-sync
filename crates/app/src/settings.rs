@@ -31,6 +31,8 @@ pub struct Settings {
     pub scan_interval_minutes: u32,
     /// The retry attempt cap (SPEC R6.1).
     pub attempt_cap: u32,
+    /// Whether uploaded assets get the sync tag (SPEC R3.7). Off by default.
+    pub tag_uploaded_assets: bool,
     /// The Immich server URL (SPEC R1.1).
     pub server_url: String,
     /// The account's email address (SPEC R1.1).
@@ -49,6 +51,7 @@ impl Default for Settings {
             concurrency: 4,
             scan_interval_minutes: 30,
             attempt_cap: 8,
+            tag_uploaded_assets: false,
             server_url: String::new(),
             email: String::new(),
             auth_method: AuthMethod::Password,

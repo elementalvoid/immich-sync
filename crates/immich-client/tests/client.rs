@@ -103,6 +103,7 @@ async fn every_endpoint_the_client_builds_carries_the_api_prefix() {
     let _ = client.create_stack(auth, &[]).await;
     let _ = client.create_album(auth, "Holiday", &[]).await;
     let _ = client.copy_asset(auth, "a", "b", false).await;
+    let _ = client.upsert_tag(auth, "immich-sync").await;
     let _ = client.bulk_tag_assets(auth, &[], &[]).await;
     let _ = client.restore_assets(auth, &[]).await;
 
@@ -120,6 +121,7 @@ async fn every_endpoint_the_client_builds_carries_the_api_prefix() {
             "POST /api/stacks",
             "POST /api/albums",
             "PUT /api/assets/copy",
+            "PUT /api/tags",
             "PUT /api/tags/assets",
             "POST /api/trash/restore/assets",
         ]
