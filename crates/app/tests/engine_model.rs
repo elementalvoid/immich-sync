@@ -57,6 +57,7 @@ fn seed_failed(paths: &AppPaths, root: &Path, names: &[&str]) {
             recursive: true,
             album_mapping: false,
             album_scope: sync_core::store::AlbumScope::Leaf,
+            album_title: None,
         })
         .expect("add the source folder");
     for name in names {
@@ -265,6 +266,7 @@ async fn a_resume_during_engine_startup_leaves_uploads_flowing(cx: &mut TestAppC
             recursive: true,
             album_mapping: false,
             album_scope: sync_core::store::AlbumScope::Leaf,
+            album_title: None,
         })
         .expect("add the source folder");
 
@@ -335,6 +337,7 @@ async fn a_superseded_engine_start_leaves_exactly_one_engine_watching(cx: &mut T
             recursive: true,
             album_mapping: false,
             album_scope: sync_core::store::AlbumScope::Leaf,
+            album_title: None,
         })
         .expect("add the source folder");
 
@@ -471,6 +474,7 @@ async fn a_form_sign_in_resumes_the_engine_a_refused_session_stalled(cx: &mut Te
             recursive: true,
             album_mapping: false,
             album_scope: sync_core::store::AlbumScope::Leaf,
+            album_title: None,
         })
         .expect("add the source folder");
 
@@ -642,6 +646,7 @@ async fn the_first_attention_transition_raises_one_notification(cx: &mut TestApp
             recursive: true,
             album_mapping: false,
             album_scope: sync_core::store::AlbumScope::Leaf,
+            album_title: None,
         })
         .expect("add the source folder");
     drop(store);
@@ -717,6 +722,7 @@ async fn a_folder_error_with_zero_parked_items_raises_one_attention_notification
             recursive: true,
             album_mapping: true,
             album_scope: sync_core::store::AlbumScope::Leaf,
+            album_title: None,
         })
         .expect("add the source folder");
     // The album call is refused, but the upload still lands, so nothing is
@@ -949,6 +955,7 @@ async fn a_re_login_resumes_the_batch_a_refused_connection_left_pending(cx: &mut
             recursive: true,
             album_mapping: false,
             album_scope: sync_core::store::AlbumScope::Leaf,
+            album_title: None,
         })
         .expect("add the source folder");
 
@@ -1044,6 +1051,7 @@ async fn a_signed_out_re_add_of_a_mapped_folder_keeps_its_album_settings(cx: &mu
             recursive: true,
             album_mapping: true,
             album_scope: sync_core::store::AlbumScope::WholeFolder,
+            album_title: None,
         })
         .expect("seed the mapped folder");
 
@@ -1096,6 +1104,7 @@ async fn a_re_spelled_re_add_keeps_the_cached_counts(cx: &mut TestAppContext) {
                 recursive: true,
                 album_mapping: false,
                 album_scope: sync_core::store::AlbumScope::Leaf,
+                album_title: None,
             })
             .expect("seed the folder");
         store
@@ -1182,6 +1191,7 @@ async fn a_signed_out_client_shows_idle_not_attention(cx: &mut TestAppContext) {
                 recursive: true,
                 album_mapping: false,
                 album_scope: sync_core::store::AlbumScope::Leaf,
+                album_title: None,
             })
             .expect("seed the folder");
     }
@@ -1247,6 +1257,7 @@ async fn a_confirmed_folder_add_scans_the_folder_through_the_running_engine(
         recursive: false,
         album_mapping: true,
         album_scope: sync_core::store::AlbumScope::WholeFolder,
+        album_title: None,
     };
     let request = cx.update(|cx| {
         engine.update(cx, |model, cx| {
@@ -1349,6 +1360,7 @@ async fn an_add_before_the_store_opens_reports_that_reason(cx: &mut TestAppConte
         recursive: true,
         album_mapping: false,
         album_scope: sync_core::store::AlbumScope::Leaf,
+        album_title: None,
     };
     cx.update(|cx| {
         engine.update(cx, |model, cx| {

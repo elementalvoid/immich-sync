@@ -8,7 +8,7 @@ use std::path::Path;
 
 use crate::diagnostics::format_rate;
 use sync_core::meter::UploadTraffic;
-use sync_core::status::{Activity, Status};
+use sync_core::status::{Activity, AlbumRename, Status};
 use sync_core::store::{AlbumScope, FolderCounts};
 
 /// The activity state of the client or one source folder (SPEC R8.2).
@@ -63,6 +63,12 @@ pub struct StatusCard {
     pub album_mapping: bool,
     /// The album scope for this folder (R3.4).
     pub album_scope: AlbumScope,
+    /// The title the user chose for this folder's own album, or `None` when the
+    /// album takes the folder's name (#47). Always `None` on the global card.
+    pub album_title: Option<String>,
+    /// Why the album title is not on the server yet (#47). `None` when the
+    /// server holds it, and on the global card, which has no album.
+    pub album_rename: Option<AlbumRename>,
     /// Whether the source folder is readable (R2.5); always `true` for the
     /// global card.
     pub available: bool,
@@ -239,6 +245,8 @@ impl DashboardModel {
             recursive: false,
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
+            album_title: None,
+            album_rename: None,
         };
         let folders = status
             .folders
@@ -270,6 +278,8 @@ impl DashboardModel {
                 recursive: folder.recursive,
                 album_mapping: folder.album_mapping,
                 album_scope: folder.album_scope,
+                album_title: folder.album_title.clone(),
+                album_rename: folder.album_rename.clone(),
             })
             .collect();
         Self { global, folders }
@@ -311,6 +321,8 @@ pub fn sample() -> DashboardModel {
             recursive: false,
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
+            album_title: None,
+            album_rename: None,
         },
         folders: vec![
             StatusCard {
@@ -337,6 +349,8 @@ pub fn sample() -> DashboardModel {
                 recursive: true,
                 album_mapping: true,
                 album_scope: AlbumScope::WholeFolder,
+                album_title: None,
+                album_rename: None,
             },
             StatusCard {
                 title: "DCIM".to_string(),
@@ -358,6 +372,8 @@ pub fn sample() -> DashboardModel {
                 recursive: true,
                 album_mapping: true,
                 album_scope: AlbumScope::Leaf,
+                album_title: None,
+                album_rename: None,
             },
             StatusCard {
                 title: "Videos".to_string(),
@@ -381,6 +397,8 @@ pub fn sample() -> DashboardModel {
                 recursive: false,
                 album_mapping: true,
                 album_scope: AlbumScope::WholeFolder,
+                album_title: None,
+                album_rename: None,
             },
             StatusCard {
                 title: "Archive".to_string(),
@@ -402,6 +420,8 @@ pub fn sample() -> DashboardModel {
                 recursive: true,
                 album_mapping: false,
                 album_scope: AlbumScope::Leaf,
+                album_title: None,
+                album_rename: None,
             },
         ],
     }

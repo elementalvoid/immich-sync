@@ -97,6 +97,7 @@ fn seed(paths: &AppPaths, root: &Path) {
             recursive: true,
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
+            album_title: None,
         })
         .expect("add the source folder");
     for index in 0..SEEDED_ROWS {

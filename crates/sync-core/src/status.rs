@@ -35,6 +35,28 @@ impl Activity {
     }
 }
 
+/// Why a folder's album title is not on the server yet (#47).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AlbumRename {
+    /// The title is stored and still has to be sent, and no attempt has failed
+    /// yet.
+    Pending,
+    /// The last attempt failed with this reason, which the user can act on.
+    Failed(String),
+}
+
+impl AlbumRename {
+    /// The reason the user reads, or the pending note while nothing failed
+    /// (#47).
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::Pending => "it has not been sent yet",
+            Self::Failed(reason) => reason,
+        }
+    }
+}
+
 /// The live state of one source folder (R2.5, R8.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FolderStatus {
@@ -46,6 +68,12 @@ pub struct FolderStatus {
     pub album_mapping: bool,
     /// What the folder maps to once album mapping is on (R3.4).
     pub album_scope: AlbumScope,
+    /// The title the user chose for this folder's own album, or `None` when the
+    /// album takes the folder's name (#47).
+    pub album_title: Option<String>,
+    /// Set while the title still has to reach the server, with the reason it
+    /// has not yet (#47). `None` when the server holds the title.
+    pub album_rename: Option<AlbumRename>,
     /// Whether the folder is readable right now (R2.5).
     pub available: bool,
     /// The folder's live counts.

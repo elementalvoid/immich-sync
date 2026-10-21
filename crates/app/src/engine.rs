@@ -108,13 +108,15 @@ pub struct EngineModel {
     _poll: Task<()>,
 }
 
-/// What one album edit changes on a source folder (R3.4).
-#[derive(Clone, Copy)]
+/// What one album edit changes on a source folder (R3.4, #47).
+#[derive(Clone)]
 enum AlbumChange {
     /// Turn album mapping on or off.
     Mapping(bool),
     /// Set the album scope.
     Scope(AlbumScope),
+    /// Set the title of the folder's own album.
+    Title(String),
 }
 
 /// The outcome of one folder-setup add (#40).
@@ -835,6 +837,16 @@ impl EngineModel {
         self.change_album(path, AlbumChange::Scope(scope), cx);
     }
 
+    /// Sets the title of one source folder's own album (#47).
+    ///
+    /// A blank or whitespace-only title means the folder's name. The write
+    /// lands while the client is signed out too: the title is stored with the
+    /// folder's album row and sent by the engine's retry once one runs, so the
+    /// view never depends on a connection to keep what the user typed.
+    pub fn set_album_title(&mut self, path: String, title: String, cx: &mut Context<Self>) {
+        self.change_album(path, AlbumChange::Title(title), cx);
+    }
+
     /// Runs one album edit on the worker runtime and republishes the status.
     ///
     /// A newer edit supersedes an older result still in flight, the same way an
@@ -854,6 +866,7 @@ impl EngineModel {
                 match change {
                     AlbumChange::Mapping(enabled) => tracking.set_album_mapping(&path, enabled),
                     AlbumChange::Scope(scope) => tracking.set_album_scope(&path, scope),
+                    AlbumChange::Title(title) => tracking.set_album_title(&path, &title),
                 }
                 .map_err(|error| error.to_string())?;
                 tracking.folders().map_err(|error| error.to_string())
@@ -1030,6 +1043,12 @@ impl EngineModel {
                         recursive: folder.recursive,
                         album_mapping: folder.album_mapping,
                         album_scope: folder.album_scope,
+                        // #47: the signed-out detail still shows the title the
+                        // store holds. The row may be pending here — the desired
+                        // title is stored either way, and the rename waits for
+                        // an engine — so this view shows no rename.
+                        album_title: folder.album_title.clone(),
+                        album_rename: None,
                         available: Path::new(&folder.path).is_dir(),
                         // The last known counts from the store (R8.1).
                         counts: *counts,

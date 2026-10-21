@@ -22,6 +22,7 @@ use gpui_kit::base::SelectableText;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::Theme;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::progress::Progress;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -123,6 +124,9 @@ pub(crate) fn confirmed_folder(draft: &SourceFolder) -> Result<SourceFolder, Str
     }
     Ok(SourceFolder {
         path: path.to_string(),
+        // #47: a blank field means the folder's name, which the placeholder
+        // showed.
+        album_title: title_from(draft.album_title.as_deref().unwrap_or_default()),
         ..draft.clone()
     })
 }
@@ -152,6 +156,52 @@ pub enum FolderPanelEvent {
     Open(ViewMode, String),
 }
 
+/// The stored form of the album title field: blank means the folder's name
+/// (#47).
+fn title_from(value: &str) -> Option<String> {
+    let title = value.trim();
+    (!title.is_empty()).then(|| title.to_string())
+}
+
+/// The album title input (#47).
+///
+/// It starts on the stored title, or blank when the album takes the folder's
+/// name, and the folder's name is the placeholder either way.
+fn title_field(
+    path: &str,
+    title: Option<&str>,
+    window: &mut Window,
+    cx: &mut Context<FolderPanel>,
+) -> Entity<InputState> {
+    let placeholder = if path.is_empty() {
+        "Album title".to_string()
+    } else {
+        folder_name(path)
+    };
+    let stored = title.unwrap_or_default().to_string();
+    cx.new(|cx| {
+        InputState::new(window, cx)
+            .placeholder(placeholder)
+            .default_value(stored)
+    })
+}
+
+/// Saves the title when Enter is pressed in the field (#47).
+///
+/// A draft has nothing to save yet, so its subscription does nothing until the
+/// same panel is in detail mode.
+fn subscribe_title(
+    input: &Entity<InputState>,
+    window: &mut Window,
+    cx: &mut Context<FolderPanel>,
+) -> Subscription {
+    cx.subscribe_in(input, window, |this, _, event: &InputEvent, _, cx| {
+        if matches!(event, InputEvent::PressEnter { .. }) {
+            this.save_album_title(cx);
+        }
+    })
+}
+
 /// The folder panel: a draft's settings or one folder's live detail, inside the
 /// focus-trapped modal host.
 pub struct FolderPanel {
@@ -179,6 +229,9 @@ pub struct FolderPanel {
     /// The removal request this dialog waits for, so a status poll that lands
     /// while the write is in flight is not read as its answer (#43).
     remove_request: Option<u64>,
+    /// The album title field (#47). It is the editing surface in both modes, so
+    /// an engine refresh cannot type over what the user is entering.
+    title_input: Entity<InputState>,
     /// What "Open folder" runs (#43).
     opener: FolderOpener,
     /// The configured server URL the asset links are built from (#44).
@@ -203,23 +256,36 @@ pub struct FolderPanel {
     /// Where the inline Remove confirmation sends the keyboard.
     confirm_focus: FocusHandle,
     _subscription: Subscription,
+    _title_subscription: Subscription,
 }
 
 impl EventEmitter<FolderPanelEvent> for FolderPanel {}
 
 impl FolderPanel {
-    /// Opens the setup dialog for `path` (#40).
-    pub fn setup(engine: Entity<EngineModel>, path: String, cx: &mut Context<Self>) -> Self {
+    /// Opens the setup dialog for `path` (#40, #47).
+    ///
+    /// The album title starts blank, with the folder's name as its placeholder,
+    /// so the common case is no typing at all.
+    pub fn setup(
+        engine: Entity<EngineModel>,
+        path: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let focus = cx.focus_handle();
         let subscription = cx.observe(&engine, |this, engine, cx| this.engine_changed(&engine, cx));
+        let path = path.trim().to_string();
+        let title_input = title_field(&path, None, window, cx);
+        let title_subscription = subscribe_title(&title_input, window, cx);
         Self {
             engine,
             mode: FolderPanelMode::Draft,
             draft: SourceFolder {
-                path: path.trim().to_string(),
+                path,
                 recursive: true,
                 album_mapping: false,
                 album_scope: AlbumScope::Leaf,
+                album_title: None,
             },
             problem: None,
             pending: None,
@@ -228,6 +294,7 @@ impl FolderPanel {
             confirming: false,
             removing: false,
             remove_request: None,
+            title_input,
             opener: Arc::new(open_in_file_manager),
             server_url: String::new(),
             link_opener: asset_link::browser_opener(),
@@ -239,6 +306,7 @@ impl FolderPanel {
             focus,
             confirm_focus: cx.focus_handle(),
             _subscription: subscription,
+            _title_subscription: title_subscription,
         }
     }
 
@@ -253,6 +321,7 @@ impl FolderPanel {
         path: String,
         opener: FolderOpener,
         link_opener: LinkOpener,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let focus = cx.focus_handle();
@@ -267,7 +336,11 @@ impl FolderPanel {
             album_scope: card
                 .as_ref()
                 .map_or(AlbumScope::Leaf, |card| card.album_scope),
+            album_title: card.as_ref().and_then(|card| card.album_title.clone()),
         };
+        let stored_title = draft.album_title.clone();
+        let title_input = title_field(&path, stored_title.as_deref(), window, cx);
+        let title_subscription = subscribe_title(&title_input, window, cx);
         let uploaded = card.as_ref().map_or(0, |card| card.counts.uploaded);
         let mut panel = Self {
             engine,
@@ -280,6 +353,7 @@ impl FolderPanel {
             confirming: false,
             removing: false,
             remove_request: None,
+            title_input,
             opener,
             server_url,
             link_opener,
@@ -291,6 +365,7 @@ impl FolderPanel {
             focus,
             confirm_focus,
             _subscription: subscription,
+            _title_subscription: title_subscription,
         };
         panel.read_assets(0, ASSET_PAGE, uploaded, cx);
         panel
@@ -308,6 +383,7 @@ impl FolderPanel {
                 self.draft.recursive = card.recursive;
                 self.draft.album_mapping = card.album_mapping;
                 self.draft.album_scope = card.album_scope;
+                self.draft.album_title = card.album_title.clone();
                 self.card = Some(card);
                 self.gone = false;
             }
@@ -472,7 +548,8 @@ impl FolderPanel {
             return;
         }
         self.problem = None;
-        let draft = self.draft.clone();
+        let mut draft = self.draft.clone();
+        draft.album_title = title_from(self.title_input.read(cx).value().as_str());
         let engine = self.engine.clone();
         let request = engine.update(cx, |engine, cx| engine.add_folder_settings(draft, cx));
         self.pending = Some(request);
@@ -508,6 +585,22 @@ impl FolderPanel {
         self.engine
             .clone()
             .update(cx, |model, cx| model.set_album_scope(path, scope, cx));
+    }
+
+    /// Saves the album title the detail's field holds (#47).
+    ///
+    /// The engine stores the title and an album that already exists is renamed
+    /// by its retry, so this reports nothing: a rename that cannot reach the
+    /// server is a pending state the dialog shows, not a lost edit.
+    fn save_album_title(&mut self, cx: &mut Context<Self>) {
+        if self.mode != FolderPanelMode::Detail {
+            return;
+        }
+        let path = self.draft.path.clone();
+        let title = self.title_input.read(cx).value().to_string();
+        self.engine
+            .clone()
+            .update(cx, |model, cx| model.set_album_title(path, title, cx));
     }
 
     /// Opens the stored path in the platform's file manager (#43).
@@ -652,6 +745,47 @@ impl FolderPanel {
             .when(!selectable, |this| this.child(shown))
     }
 
+    /// The album title field (#47): the user's own name for this folder's
+    /// album, blank while the album takes the folder's name.
+    ///
+    /// The placeholder is the folder's name, so a blank field says what the
+    /// album will be called without the user typing it. In detail mode the row
+    /// saves the title; the setup dialog's Add carries it with the rest of the
+    /// draft.
+    fn album_title_field(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let detail = self.mode == FolderPanelMode::Detail;
+        let name = self.folder_name();
+        let focus = self.title_input.read(cx).focus_handle(cx);
+        let row = div()
+            .id("folder-panel-title")
+            .test_support()
+            .track_focus(&focus)
+            .aria_label(format!("Album title for {name}"))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child("Album title"),
+            )
+            .child(div().flex_1().min_w_0().child(
+                Input::new(&self.title_input).aria_label(format!("Album title for {name}")),
+            ));
+        row.when(detail, |this| {
+            this.child(
+                Button::new("folder-panel-title-save")
+                    .secondary()
+                    .label("Save title")
+                    .accessibility_label(format!("Save the album title for {name}"))
+                    .on_click(cx.listener(|this, _, _, cx| this.save_album_title(cx))),
+            )
+        })
+        .into_any_element()
+    }
+
     /// The three settings controls, shared with the folder cards (#43).
     fn settings(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let values = SettingsValues {
@@ -749,6 +883,7 @@ impl FolderPanel {
                     .child(self.draft_title()),
             )
             .child(self.path(cx))
+            .child(self.album_title_field(theme, cx))
             .child(self.settings(cx))
             .when_some(self.problem.clone(), |this, problem| {
                 this.child(notice(
@@ -916,6 +1051,22 @@ impl FolderPanel {
                     palette,
                 ))
             })
+            .child(self.album_title_field(theme, cx))
+            .when_some(
+                self.card
+                    .as_ref()
+                    .and_then(|card| card.album_rename.clone()),
+                |this, rename| {
+                    // #47: the field keeps the desired title, and this says why
+                    // the server does not hold it yet.
+                    this.child(notice(
+                        "folder-detail-album-rename",
+                        format!("Album title pending: {}.", rename.reason()),
+                        theme.warning,
+                        palette,
+                    ))
+                },
+            )
             .child(self.settings(cx))
             .when_some(last_error, |this, error| {
                 this.child(
@@ -1374,6 +1525,7 @@ mod tests {
             recursive: true,
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
+            album_title: None,
         }
     }
 
@@ -1504,6 +1656,8 @@ mod tests {
                 recursive: true,
                 album_mapping: false,
                 album_scope: AlbumScope::Leaf,
+                album_title: None,
+                album_rename: None,
                 available: true,
                 counts: FolderCounts::default(),
                 last_error: Some(ERROR.to_string()),
@@ -1524,21 +1678,8 @@ mod tests {
                 cx.new(|_| ConnectionModel::new(ServerProfile::default(), credentials));
             let store = cx.new(|cx| StoreModel::open(&paths, cx));
             let engine = cx.new(|cx| EngineModel::new(connection, store, &paths, cx));
-            let panel = cx.new(|cx| {
-                super::FolderPanel::detail(
-                    engine,
-                    card.path.clone().expect("the card is a folder"),
-                    Arc::new(|_| Ok(())),
-                    crate::asset_link::browser_opener(),
-                    cx,
-                )
-            });
-            // The engine has no status for a folder it never read, so the card
-            // the view tests is injected.
-            card.available = true;
-            panel.update(cx, |panel, _| panel.card = Some(card));
-            let root = panel.clone();
-            let (window, _root) = gpui_kit::open_window(
+            let path = card.path.clone().expect("the card is a folder");
+            let (window, panel) = gpui_kit::open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(Bounds {
                         origin: Point::default(),
@@ -1547,9 +1688,24 @@ mod tests {
                     ..Default::default()
                 },
                 cx,
-                |_, _| root,
+                |window, cx| {
+                    cx.new(|cx| {
+                        super::FolderPanel::detail(
+                            engine,
+                            path,
+                            Arc::new(|_| Ok(())),
+                            crate::asset_link::browser_opener(),
+                            window,
+                            cx,
+                        )
+                    })
+                },
             )
             .expect("open the panel's window");
+            // The engine has no status for a folder it never read, so the card
+            // the view tests is injected.
+            card.available = true;
+            panel.update(cx, |panel, _| panel.card = Some(card));
             (window, panel)
         });
 
@@ -1611,6 +1767,8 @@ mod tests {
                 recursive: true,
                 album_mapping: false,
                 album_scope: AlbumScope::Leaf,
+                album_title: None,
+                album_rename: None,
                 available: true,
                 counts: FolderCounts::default(),
                 last_error: None,
@@ -1635,19 +1793,11 @@ mod tests {
                 cx.new(|_| ConnectionModel::new(ServerProfile::default(), credentials));
             let store = cx.new(|cx| StoreModel::open(&paths, cx));
             let engine = cx.new(|cx| EngineModel::new(connection, store, &paths, cx));
+            // The engine has no status for a folder it never read, so the card
+            // the view tests is injected.
             card.available = true;
-            let panel = cx.new(|cx| {
-                super::FolderPanel::detail(
-                    engine,
-                    card.path.clone().expect("the card is a folder"),
-                    Arc::new(|_| Ok(())),
-                    crate::asset_link::browser_opener(),
-                    cx,
-                )
-            });
-            panel.update(cx, |panel, _| panel.card = Some(card));
-            let root = panel.clone();
-            let (window, _root) = gpui_kit::open_window(
+            let path = card.path.clone().expect("the card is a folder");
+            let (window, panel) = gpui_kit::open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(Bounds {
                         origin: Point::default(),
@@ -1656,9 +1806,21 @@ mod tests {
                     ..Default::default()
                 },
                 cx,
-                |_, _| root,
+                |window, cx| {
+                    cx.new(|cx| {
+                        super::FolderPanel::detail(
+                            engine,
+                            path,
+                            Arc::new(|_| Ok(())),
+                            crate::asset_link::browser_opener(),
+                            window,
+                            cx,
+                        )
+                    })
+                },
             )
             .expect("open the panel's window");
+            panel.update(cx, |panel, _| panel.card = Some(card));
             (window, panel)
         });
 
@@ -1700,6 +1862,178 @@ mod tests {
         .expect("read the rendered activity line");
     }
 
+    /// #47: the setup dialog's title field starts blank and names the folder,
+    /// so the placeholder says what the album is called without one.
+    #[gpui_kit::test]
+    fn the_setup_dialog_offers_the_folder_name_as_the_album_title(cx: &mut TestAppContext) {
+        use crate::connection::ConnectionModel;
+        use crate::engine::EngineModel;
+        use crate::paths::AppPaths;
+        use crate::store::StoreModel;
+        use gpui_kit::{AppContext as _, Bounds, Point, WindowBounds, WindowOptions, px, size};
+        use std::sync::Arc;
+        use sync_core::connection::ServerProfile;
+        use sync_core::credential::{MemoryCredentialStore, SharedCredentialStore};
+
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let paths = AppPaths {
+            config_file: temp.path().join("config").join("settings.toml"),
+            state_db: temp.path().join("data").join("state.db"),
+            autostart_dir: temp.path().join("config").join("autostart"),
+        };
+        let credentials: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            let connection =
+                cx.new(|_| ConnectionModel::new(ServerProfile::default(), credentials));
+            let store = cx.new(|cx| StoreModel::open(&paths, cx));
+            let engine = cx.new(|cx| EngineModel::new(connection, store, &paths, cx));
+            let (_, panel) = gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Point::default(),
+                        size: size(px(1200.), px(800.)),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| {
+                    cx.new(|cx| {
+                        super::FolderPanel::setup(
+                            engine,
+                            "/photos/Pictures".to_string(),
+                            window,
+                            cx,
+                        )
+                    })
+                },
+            )
+            .expect("open the panel's window");
+            let panel = panel.read(cx);
+            assert_eq!(
+                panel.title_input.read(cx).value().as_str(),
+                "",
+                "#47: the title starts blank"
+            );
+            assert_eq!(
+                panel
+                    .title_input
+                    .read(cx)
+                    .presentation()
+                    .placeholder()
+                    .as_ref(),
+                "Pictures",
+                "#47: the folder's name is the placeholder"
+            );
+        });
+    }
+
+    /// #47: a title the server does not hold yet says why the detail is showing
+    /// it as pending. In the product the state comes from the engine's album
+    /// row; a signed-out client has none, so the rendering is pinned on an
+    /// injected card.
+    #[gpui_kit::test]
+    fn a_pending_album_title_shows_its_reason(cx: &mut TestAppContext) {
+        use crate::connection::ConnectionModel;
+        use crate::engine::EngineModel;
+        use crate::paths::AppPaths;
+        use crate::status::DashboardModel;
+        use crate::store::StoreModel;
+        use gpui_kit::test::TestWindowExt as _;
+        use gpui_kit::{
+            AppContext as _, Bounds, Point, Role, WindowBounds, WindowOptions, px, size,
+        };
+        use std::sync::Arc;
+        use sync_core::connection::ServerProfile;
+        use sync_core::credential::{MemoryCredentialStore, SharedCredentialStore};
+        use sync_core::status::{Activity, AlbumRename, FolderStatus, Status};
+        use sync_core::store::FolderCounts;
+
+        const REASON: &str = "the API key is missing the album.update permission";
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let paths = AppPaths {
+            config_file: temp.path().join("config").join("settings.toml"),
+            state_db: temp.path().join("data").join("state.db"),
+            autostart_dir: temp.path().join("config").join("autostart"),
+        };
+        let status = Status {
+            activity: Activity::Idle,
+            folders: vec![FolderStatus {
+                path: "/photos".to_string(),
+                recursive: true,
+                album_mapping: true,
+                album_scope: AlbumScope::WholeFolder,
+                album_title: Some("Holiday 2024".to_string()),
+                album_rename: Some(AlbumRename::Failed(REASON.to_string())),
+                available: true,
+                counts: FolderCounts::default(),
+                last_error: None,
+                last_scan_ns: None,
+                last_upload_ns: None,
+                uploads: sync_core::meter::UploadTraffic::default(),
+            }],
+            counts: FolderCounts::default(),
+            last_error: None,
+            uploads: sync_core::meter::UploadTraffic::default(),
+        };
+        let card = DashboardModel::from_engine(&status, None).folders.remove(0);
+
+        let credentials: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+        let (window, panel) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            let connection =
+                cx.new(|_| ConnectionModel::new(ServerProfile::default(), credentials));
+            let store = cx.new(|cx| StoreModel::open(&paths, cx));
+            let engine = cx.new(|cx| EngineModel::new(connection, store, &paths, cx));
+            let path = card.path.clone().expect("the card is a folder");
+            let (window, panel) = gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Point::default(),
+                        size: size(px(1200.), px(800.)),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| {
+                    cx.new(|cx| {
+                        super::FolderPanel::detail(
+                            engine,
+                            path,
+                            Arc::new(|_| Ok(())),
+                            crate::asset_link::browser_opener(),
+                            window,
+                            cx,
+                        )
+                    })
+                },
+            )
+            .expect("open the panel's window");
+            panel.update(cx, |panel, _| panel.card = Some(card));
+            (window, panel)
+        });
+
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                window.find("folder-detail-album-rename").role(),
+                Some(Role::Alert),
+                "#47: a pending title is an alert"
+            );
+            let notice = window.find("folder-detail-album-rename");
+            let shown = notice.label().unwrap_or_default().to_string();
+            assert!(
+                shown.contains(REASON),
+                "#47: the reason the title is pending is shown: {shown:?}"
+            );
+            assert!(
+                panel.read(cx).card.is_some(),
+                "the fixture card is the one rendered"
+            );
+        })
+        .expect("read the rendered reason");
+    }
+
     /// #40 (S1): a worker answer that never arrives must not strand the setup
     /// dialog. The panel stops waiting and shows the reason, so Cancel is no
     /// longer refused and the dialog can be closed.
@@ -1730,11 +2064,7 @@ mod tests {
                 cx.new(|_| ConnectionModel::new(ServerProfile::default(), credentials));
             let store = cx.new(|cx| StoreModel::open(&paths, cx));
             let engine = cx.new(|cx| EngineModel::new(connection, store, &paths, cx));
-            let panel = cx.new(|cx| {
-                super::FolderPanel::setup(engine.clone(), "/no such folder".to_string(), cx)
-            });
-            let root = panel.clone();
-            let (window, _root) = gpui_kit::open_window(
+            let (window, panel) = gpui_kit::open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(Bounds {
                         origin: Point::default(),
@@ -1743,7 +2073,16 @@ mod tests {
                     ..Default::default()
                 },
                 cx,
-                |_, _| root,
+                |window, cx| {
+                    cx.new(|cx| {
+                        super::FolderPanel::setup(
+                            engine.clone(),
+                            "/no such folder".to_string(),
+                            window,
+                            cx,
+                        )
+                    })
+                },
             )
             .expect("open the panel's window");
             (window, panel, engine)
@@ -1788,7 +2127,7 @@ mod tests {
         use crate::engine::EngineModel;
         use crate::paths::AppPaths;
         use crate::store::StoreModel;
-        use gpui_kit::AppContext as _;
+        use gpui_kit::{AppContext as _, Bounds, Point, WindowBounds, WindowOptions, px, size};
         use std::sync::Arc;
         use sync_core::connection::ServerProfile;
         use sync_core::credential::{MemoryCredentialStore, SharedCredentialStore};
@@ -1808,15 +2147,29 @@ mod tests {
                 cx.new(|_| ConnectionModel::new(ServerProfile::default(), credentials));
             let store = cx.new(|cx| StoreModel::open(&paths, cx));
             let engine = cx.new(|cx| EngineModel::new(connection, store, &paths, cx));
-            let panel = cx.new(|cx| {
-                super::FolderPanel::detail(
-                    engine.clone(),
-                    "/photos".to_string(),
-                    Arc::new(|_| Ok(())),
-                    crate::asset_link::browser_opener(),
-                    cx,
-                )
-            });
+            let (_, panel) = gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Point::default(),
+                        size: size(px(1200.), px(800.)),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| {
+                    cx.new(|cx| {
+                        super::FolderPanel::detail(
+                            engine.clone(),
+                            "/photos".to_string(),
+                            Arc::new(|_| Ok(())),
+                            crate::asset_link::browser_opener(),
+                            window,
+                            cx,
+                        )
+                    })
+                },
+            )
+            .expect("open the panel's window");
             // The engine answers the request it is about to return, as a worker
             // that cannot start does, before the panel can record it.
             engine.update(cx, |engine, cx| engine.lose_next_remove_for_test(cx));

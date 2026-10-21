@@ -47,9 +47,9 @@ use sync_core::store::{
 };
 
 const API_KEY: &str = "api-key-abc123";
-/// The schema stands at the eleventh migration (#43 added the folder times on
-/// top of the tag backfill #46).
-const DB_MIGRATION_VERSION: i64 = 11;
+/// The schema stands at the twelfth migration (#47 added the album title on top
+/// of the folder times #43 and the tag backfill #46).
+const DB_MIGRATION_VERSION: i64 = 12;
 
 fn temporary_paths(dir: &Path) -> AppPaths {
     AppPaths {
@@ -293,6 +293,7 @@ fn seed_folder(store: &Entity<StoreModel>, cx: &mut App, path: &Path) {
             recursive: true,
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
+            album_title: None,
         })
         .expect("add the source folder");
 }
@@ -686,6 +687,7 @@ async fn a_rebuild_during_the_first_open_keeps_the_stored_folders(cx: &mut TestA
                 recursive: true,
                 album_mapping: false,
                 album_scope: AlbumScope::Leaf,
+                album_title: None,
             })
             .expect("add the source folder");
     }
