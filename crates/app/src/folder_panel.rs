@@ -407,11 +407,11 @@ impl FolderPanel {
         self.removing = true;
         self.confirming = false;
         let path = self.draft.path.clone();
-        self.remove_request = Some(
-            self.engine
-                .clone()
-                .update(cx, |model, cx| model.remove_folder(path, cx)),
-        );
+        let engine = self.engine.clone();
+        self.remove_request = Some(engine.update(cx, |model, cx| model.remove_folder(path, cx)));
+        // A failed worker reports synchronously, before the request was
+        // recorded; read the result back so that failure cannot be missed.
+        self.apply_remove_result(&engine, cx);
         cx.notify();
     }
 
@@ -1339,5 +1339,59 @@ mod tests {
             );
         })
         .expect("read the dialog after the lost answer");
+    }
+
+    /// #43 (LOW): a worker that reports before the panel records its request
+    /// must not leave `removing` set. The panel reads its own answer back, as
+    /// the setup dialog's Add does, so the reason lands either way.
+    #[gpui_kit::test]
+    fn a_remove_answered_before_its_request_is_recorded_clears_removing(cx: &mut TestAppContext) {
+        use crate::connection::{ConnectionModel, WORKER_UNAVAILABLE};
+        use crate::engine::EngineModel;
+        use crate::paths::AppPaths;
+        use crate::store::StoreModel;
+        use gpui_kit::AppContext as _;
+        use std::sync::Arc;
+        use sync_core::connection::ServerProfile;
+        use sync_core::credential::{MemoryCredentialStore, SharedCredentialStore};
+
+        // The store opens on a worker thread, a real thread.
+        cx.executor().allow_parking();
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let paths = AppPaths {
+            config_file: temp.path().join("config").join("settings.toml"),
+            state_db: temp.path().join("data").join("state.db"),
+            autostart_dir: temp.path().join("config").join("autostart"),
+        };
+        let credentials: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            let connection =
+                cx.new(|_| ConnectionModel::new(ServerProfile::default(), credentials));
+            let store = cx.new(|cx| StoreModel::open(&paths, cx));
+            let engine = cx.new(|cx| EngineModel::new(connection, store, &paths, cx));
+            let panel = cx.new(|cx| {
+                super::FolderPanel::detail(
+                    engine.clone(),
+                    "/photos".to_string(),
+                    Arc::new(|_| Ok(())),
+                    cx,
+                )
+            });
+            // The engine answers the request it is about to return, as a worker
+            // that cannot start does, before the panel can record it.
+            engine.update(cx, |engine, cx| engine.lose_next_remove_for_test(cx));
+            panel.update(cx, |panel, cx| panel.remove_confirmed(cx));
+            let panel = panel.read(cx);
+            assert!(
+                !panel.removing,
+                "#43: a synchronously reported loss does not leave `removing` set"
+            );
+            assert_eq!(
+                panel.problem.as_deref(),
+                Some(WORKER_UNAVAILABLE),
+                "#43: the detail shows why nothing was removed"
+            );
+        });
     }
 }

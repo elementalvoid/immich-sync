@@ -855,6 +855,111 @@ async fn a_refused_remove_keeps_the_detail_open_with_its_reason(cx: &mut TestApp
             "#43: Remove works again after the refusal, so the user can retry"
         );
     });
+
+    // The retry is a real Remove: with nothing left to refuse it, the write
+    // drops the folder and the detail closes.
+    {
+        let raw = rusqlite::Connection::open(&paths.state_db).expect("open the database directly");
+        raw.execute_batch("DROP TRIGGER refuse_folder_removal")
+            .expect("drop the trigger that refused the delete");
+    }
+    act(cx, window, |window, cx| {
+        window.click("folder-detail-remove-confirm", cx);
+    });
+    for _ in 0..600 {
+        if cx.read(|cx| store.read(cx).folders().is_empty()) {
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    assert!(
+        cx.read(|cx| store.read(cx).folders().is_empty()),
+        "#43: the retried Remove reaches the store and drops the folder"
+    );
+    cx.wait_for(window, Duration::from_secs(10), |window, _| {
+        window.try_find("folder-panel").is_none()
+    })
+    .await;
+}
+
+/// #43 (blocker): a settings edit while a Remove is pending is its own request.
+/// It must not drop the removal's answer, which would leave the detail stuck on
+/// `Removing…` with the store's reason never shown.
+#[gpui_kit::test]
+async fn a_setting_edit_during_a_pending_remove_still_answers_the_remove(cx: &mut TestAppContext) {
+    // A worker thread wakes the foreground executor, which the harness
+    // permits only in parking mode.
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+    seed_folder(&paths, &photos, true);
+    let (window, store, _view) = open_dashboard(cx, &paths);
+    wait_for_store(cx, &store).await;
+
+    open_detail_now(cx, window);
+    {
+        let raw = rusqlite::Connection::open(&paths.state_db).expect("open the database directly");
+        raw.execute_batch(
+            "CREATE TRIGGER refuse_folder_removal BEFORE DELETE ON source_folder
+             BEGIN SELECT RAISE(ABORT, 'the state database refused the removal'); END;",
+        )
+        .expect("install a trigger that refuses the delete");
+    }
+
+    // Hold the write lock so the Remove is still in flight when the setting is
+    // written, whatever the runtime does with the two worker jobs.
+    let lock = rusqlite::Connection::open(&paths.state_db).expect("open the database directly");
+    lock.execute_batch("BEGIN IMMEDIATE")
+        .expect("hold the write lock");
+
+    act(cx, window, |window, cx| {
+        window.click("folder-detail-remove", cx)
+    });
+    act(cx, window, |window, cx| {
+        window.click("folder-detail-remove-confirm", cx);
+    });
+    // The write lock keeps the removal pending while the detail writes a
+    // setting of its own, which is the edit that must not answer the removal.
+    act(cx, window, |window, cx| {
+        window.click("folder-panel-recursive", cx);
+    });
+    lock.execute_batch("COMMIT")
+        .expect("release the write lock");
+
+    cx.wait_for(window, Duration::from_secs(10), |window, _| {
+        window.try_find("folder-panel-problem").is_some()
+    })
+    .await;
+    read(cx, window, |window, _| {
+        let problem = label(window, "folder-panel-problem");
+        assert!(
+            problem.contains("refused the removal"),
+            "#43: the setting edit does not drop the removal's reason: {problem}"
+        );
+        assert!(
+            detail_open(window),
+            "#43: a refused Remove keeps the dialog open"
+        );
+    });
+    assert_eq!(
+        cx.read(|cx| store.read(cx).folders().len()),
+        1,
+        "#43: the refused removal left the folder in the store"
+    );
+    // A disabled control ignores the click, so the confirmation appearing is
+    // what proves the setting edit did not leave `removing` set forever.
+    act(cx, window, |window, cx| {
+        window.click("folder-detail-remove", cx)
+    });
+    read(cx, window, |window, _| {
+        assert!(
+            window.try_find("folder-detail-confirm").is_some(),
+            "#43: Remove works again after the setting edit, so `removing` was cleared"
+        );
+    });
 }
 
 #[gpui_kit::test]

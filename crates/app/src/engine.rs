@@ -91,6 +91,10 @@ pub struct EngineModel {
     /// Bumped by every folder edit, so an older edit result cannot overwrite a
     /// newer one.
     generation: u64,
+    /// Bumped by every remove, kept apart from `generation` so a settings edit
+    /// during a pending Remove cannot drop the answer the detail waits for
+    /// (#43).
+    remove_generation: u64,
     /// Bumped by every engine start attempt, kept apart from `generation` so a
     /// folder edit cannot discard an engine that is already being built.
     start_generation: u64,
@@ -209,6 +213,7 @@ impl EngineModel {
             folder_remove: None,
             add_generation: 0,
             generation: 0,
+            remove_generation: 0,
             start_generation: 0,
             store_generation: 0,
             rebuilding: false,
@@ -748,15 +753,31 @@ impl EngineModel {
         cx.notify();
     }
 
+    /// A test seam: answers the next remove now, the way a worker that could
+    /// not start answers before the caller records its request (#43).
+    #[cfg(test)]
+    pub(crate) fn lose_next_remove_for_test(&mut self, cx: &mut Context<Self>) {
+        let request = self.remove_generation.wrapping_add(1);
+        self.problem = Some(WORKER_UNAVAILABLE.to_string());
+        self.folder_remove = Some(FolderRemoveResult {
+            request,
+            problem: self.problem.clone(),
+        });
+        cx.notify();
+    }
+
     /// Removes a source folder; its items stay in the store (R2.1).
     ///
     /// The returned id tags the result, so the folder detail can wait for its
     /// own answer and stay open with the reason when the store refuses (#43).
     pub fn remove_folder(&mut self, path: String, cx: &mut Context<Self>) -> u64 {
-        // A newer edit supersedes an older result still in flight.
+        // A newer edit supersedes an older result still in flight, and a newer
+        // remove supersedes an older one; the request tag is the remove's own,
+        // so an unrelated settings edit cannot drop it (#43).
         self.generation = self.generation.wrapping_add(1);
+        self.remove_generation = self.remove_generation.wrapping_add(1);
         let tracking = self.store_model.read(cx).tracking();
-        let generation = self.generation;
+        let request = self.remove_generation;
         let result = run_on_worker(
             cx,
             move || async move {
@@ -768,7 +789,7 @@ impl EngineModel {
                 tracking.folders().map_err(|error| error.to_string())
             },
             move |model, result, cx| {
-                if model.generation != generation {
+                if model.remove_generation != request {
                     return;
                 }
                 let problem = match result {
@@ -784,10 +805,7 @@ impl EngineModel {
                         Some(problem)
                     }
                 };
-                model.folder_remove = Some(FolderRemoveResult {
-                    request: generation,
-                    problem,
-                });
+                model.folder_remove = Some(FolderRemoveResult { request, problem });
                 model.refresh_status(cx);
             },
         );
@@ -796,12 +814,12 @@ impl EngineModel {
             // The dialog waits for its own answer, so a request that never ran
             // still has to answer it: the reason is the missing worker (#43).
             self.folder_remove = Some(FolderRemoveResult {
-                request: generation,
+                request,
                 problem: self.problem.clone(),
             });
             cx.notify();
         }
-        generation
+        request
     }
 
     /// Turns album mapping on or off for one source folder (R3.4).
