@@ -594,6 +594,36 @@ impl EngineModel {
         }
     }
 
+    /// Asks the engine to tag every asset the client ever uploaded again
+    /// (R3.7: "Tag existing assets now").
+    ///
+    /// It goes through the engine, not the view: the marker is cleared on the
+    /// worker runtime (N2) and the engine's own backfill task picks the library
+    /// up, so the window stays responsive and the progress reaches the view on
+    /// the same status poll as the switch.
+    pub fn tag_existing_assets(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.engine.clone() else {
+            self.problem = Some("Sign in before tagging the existing assets.".to_string());
+            cx.notify();
+            return;
+        };
+        let result = run_on_worker(
+            cx,
+            move || async move { engine.retag_all().map_err(|error| error.to_string()) },
+            |model, result, cx| {
+                match result {
+                    Ok(()) => model.problem = None,
+                    Err(problem) => model.problem = Some(problem),
+                }
+                model.refresh_status(cx);
+            },
+        );
+        if result.is_err() {
+            self.problem = Some(WORKER_UNAVAILABLE.to_string());
+            cx.notify();
+        }
+    }
+
     /// Adds or edits a source folder and starts discovering it (R2.1).
     pub fn add_folder(&mut self, path: String, recursive: bool, cx: &mut Context<Self>) {
         let path = path.trim().to_string();

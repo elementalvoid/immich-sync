@@ -89,8 +89,12 @@ An upload request that has started and has not finished. Hashing, indexing, and 
 _Avoid_: active upload, running transfer
 
 **Sync tag**:
-The one Immich tag, `immich-sync`, that the client adds to the assets it syncs so they can be found with Immich's tag search. The user turns it on in Settings.
+The one Immich tag, `immich-sync`, that the client adds to the assets it syncs so they can be found with Immich's tag search. The user turns it on in Settings; the client then tags new uploads and backfills the tag onto the assets it uploaded before.
 _Avoid_: upload tag, source tag
+
+**Backfill**:
+The pass that adds the sync tag to the assets the client uploaded before the setting was turned on: every current asset, every old version, and every duplicate, a batch of ids per request. Its progress and completion are recorded, so a restart resumes it instead of starting over.
+_Avoid_: re-tag, scan
 
 ### Immich
 

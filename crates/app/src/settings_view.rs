@@ -25,7 +25,7 @@ use gpui_kit::component::switch::Switch;
 use gpui_kit::*;
 use sync_core::connection::{AuthMethod, ConnectionState, ServerProfile, SignIn};
 use sync_core::credential::Secret;
-use sync_core::tags::{SYNC_TAG, TagStatus};
+use sync_core::tags::{BackfillStatus, SYNC_TAG, TagStatus};
 
 /// The number of bytes in a displayed megabyte. The stored limit stays bytes
 /// per second (SPEC R7.1); the UI shows MB/s with up to six decimals, which is
@@ -680,7 +680,9 @@ impl SettingsView {
     ///
     /// The engine is moved only after the write lands, so a failed save cannot
     /// leave the engine tagging while the file says off. Turning it off stops
-    /// new tagging; nothing untags an asset and the tag is not deleted.
+    /// new tagging and pauses the backfill at its next batch; nothing untags an
+    /// asset and the tag is not deleted. Turning it on again resumes the
+    /// backfill where it stopped.
     fn toggle_tag_uploads(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.save_settings(
             cx,
@@ -694,6 +696,17 @@ impl SettingsView {
                 view.record(SAVE_PROBLEM, result, cx);
             },
         );
+    }
+
+    /// Asks the running engine to tag every existing asset again (R3.7).
+    ///
+    /// The action goes through the engine model, which owns the engine and its
+    /// runtime: the view never opens the database or sends a request itself
+    /// (N2).
+    fn tag_existing_assets(&mut self, cx: &mut Context<Self>) {
+        if let Some(engine) = self.engine.clone() {
+            engine.update(cx, |model, cx| model.tag_existing_assets(cx));
+        }
     }
 
     /// Applies the autostart setting to the OS, then records it.
@@ -1171,6 +1184,47 @@ impl SettingsView {
                 .into_any_element(),
             );
         }
+        // R3.7: the backfill's progress arrives on the engine's status poll, so
+        // the section has no timer of its own; the counts only change when a
+        // batch lands.
+        if let Some(progress) = backfill_text(&self.tag.backfill, enabled) {
+            rows.push(
+                div()
+                    .id("settings-tag-backfill")
+                    .test_support()
+                    .aria_label(progress.clone())
+                    .text_xs()
+                    .text_color(palette.meta)
+                    .child(progress)
+                    .into_any_element(),
+            );
+        }
+        if enabled && self.engine.is_some() {
+            rows.push(
+                div()
+                    .id("settings-tag-now-row")
+                    .test_support()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap_6()
+                    .min_h(rems(2.25))
+                    .child(field_text(
+                        "Tag existing assets now",
+                        "Tags every asset the client has uploaded, including the ones that were \
+                         uploaded before the switch was on.",
+                        &palette,
+                    ))
+                    .child(
+                        Button::new("settings-tag-now")
+                            .label("Tag existing assets now")
+                            .accessibility_label("Tag every existing asset with immich-sync")
+                            .on_click(cx.listener(|this, _, _, cx| this.tag_existing_assets(cx))),
+                    )
+                    .into_any_element(),
+            );
+        }
         section(
             "settings-tagging",
             "Tagging",
@@ -1415,6 +1469,45 @@ pub(crate) fn section(
         .into_any_element()
 }
 
+/// The backfill progress line the Tagging section shows (R3.7).
+///
+/// `None` when there is nothing to say: the switch is off, or the library has
+/// no asset to tag yet. The three states are the ones a user acts on: the run
+/// working through the library, the run stopped with the batches that already
+/// landed, and the run finished.
+#[must_use]
+pub fn backfill_text(status: &BackfillStatus, enabled: bool) -> Option<String> {
+    if !enabled || status.total == 0 {
+        return None;
+    }
+    let counts = format!(
+        "{} of {}",
+        group_digits(status.tagged),
+        group_digits(status.total)
+    );
+    Some(if status.completed {
+        format!("Existing assets tagged: {counts}")
+    } else if status.running {
+        format!("Tagging existing assets: {counts}")
+    } else {
+        format!("Tagging stopped: {counts}")
+    })
+}
+
+/// `48320` as `48,320`, so a library the size of a photo collection reads at a
+/// glance (R3.7).
+fn group_digits(value: u32) -> String {
+    let digits = value.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
+}
+
 /// The Immich web address of the sync tag's page (R3.7).
 ///
 /// The configured value is the API base, so a trailing `/api` is dropped
@@ -1460,7 +1553,71 @@ pub(crate) fn notice(
 
 #[cfg(test)]
 mod tests {
-    use super::sync_tag_url;
+    use super::{backfill_text, group_digits, sync_tag_url};
+    use sync_core::tags::BackfillStatus;
+
+    /// R3.7: the Tagging section says where the backfill stands: working, at
+    /// rest, or finished, with the counts grouped.
+    #[test]
+    fn the_backfill_line_reports_progress_and_completion() {
+        let running = BackfillStatus {
+            tagged: 12_340,
+            total: 48_000,
+            running: true,
+            completed: false,
+        };
+        assert_eq!(
+            backfill_text(&running, true).as_deref(),
+            Some("Tagging existing assets: 12,340 of 48,000")
+        );
+        assert_eq!(
+            backfill_text(&running, false),
+            None,
+            "R3.7: the switch off hides the progress it paused"
+        );
+        assert_eq!(
+            backfill_text(
+                &BackfillStatus {
+                    tagged: 2,
+                    total: 4,
+                    running: false,
+                    completed: false,
+                },
+                true,
+            )
+            .as_deref(),
+            Some("Tagging stopped: 2 of 4"),
+            "R3.7: a stopped run keeps and shows what it reached"
+        );
+        assert_eq!(
+            backfill_text(
+                &BackfillStatus {
+                    tagged: 4,
+                    total: 4,
+                    running: false,
+                    completed: true,
+                },
+                true,
+            )
+            .as_deref(),
+            Some("Existing assets tagged: 4 of 4"),
+            "R3.7: the finished state"
+        );
+        assert_eq!(
+            backfill_text(&BackfillStatus::default(), true),
+            None,
+            "an empty library has nothing to report"
+        );
+    }
+
+    #[test]
+    fn the_count_is_grouped_in_thousands() {
+        assert_eq!(group_digits(0), "0");
+        assert_eq!(group_digits(999), "999");
+        assert_eq!(group_digits(1_000), "1,000");
+        assert_eq!(group_digits(48_320), "48,320");
+        assert_eq!(group_digits(1_234_567), "1,234,567");
+    }
 
     #[test]
     fn the_tag_url_drops_a_trailing_api_and_keeps_a_prefix() {

@@ -16,6 +16,8 @@
 //!    server is back (R6.1, R6.5, R6.6).
 //! 6. Pause holds new upload requests inside the acceptance window; an upload
 //!    already on the wire finishes (R8.7).
+//! 7. The sync tag follows every settled upload, and one task backfills it onto
+//!    the assets that were uploaded before the setting was turned on (R3.7).
 //!
 //! The engine has no UI imports (N6, PLAN). The shell reads [`Engine::status`]
 //! for the dashboard and the tray.
@@ -31,6 +33,7 @@ use tokio::sync::{Mutex as AsyncMutex, Notify, Semaphore, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::albums::AlbumMapper;
+use crate::backfill::{BACKFILL_BATCH, Backfill, BackfillPolicy};
 use crate::backoff::RetryPolicy;
 use crate::breaker::CircuitBreaker;
 use crate::connection::SharedSession;
@@ -99,6 +102,10 @@ pub struct EngineConfig {
     /// Whether uploaded assets get the sync tag (R3.7). Off by default;
     /// [`Engine::set_tag_uploads`] is the live path.
     pub tag_uploaded_assets: bool,
+    /// How many asset ids one backfill request carries (R3.7). Default
+    /// [`BACKFILL_BATCH`]; a test lowers it so a small library needs more than
+    /// one request.
+    pub tag_batch_size: usize,
 }
 
 impl Default for EngineConfig {
@@ -116,6 +123,7 @@ impl Default for EngineConfig {
             attention_threshold: 3,
             breaker_cooldown: Duration::from_secs(10),
             tag_uploaded_assets: false,
+            tag_batch_size: BACKFILL_BATCH,
         }
     }
 }
@@ -213,6 +221,12 @@ struct EngineInner {
     versions: Versioner,
     /// Applies the sync tag to a settled asset (R3.7).
     tags: Tagger,
+    /// Backfills the tag onto the library that was uploaded before the tag was
+    /// turned on (R3.7).
+    backfill: Backfill,
+    /// Wakes the backfill task: the setting was turned on or the user asked
+    /// for the library to be tagged again (R3.7).
+    tag_wake: Notify,
     config: EngineConfig,
     gate: UploadGate,
     /// Trips after a run of connection failures (R6.6).
@@ -325,6 +339,16 @@ impl Engine {
         // setting and is moved live by `set_tag_uploads`.
         let tags = Tagger::new(session.clone());
         tags.set_enabled(config.tag_uploaded_assets);
+        // R3.7: the backfill reads its recorded progress at construction, so a
+        // restart publishes where the last run stopped before this one starts.
+        let backfill = Backfill::new(
+            store.clone(),
+            BackfillPolicy {
+                batch: config.tag_batch_size.max(1),
+                attempts: config.attempt_cap.max(1),
+                retry: config.retry,
+            },
+        )?;
         let breaker = CircuitBreaker::new(config.breaker_threshold, config.breaker_cooldown);
         // R1.4: the attention run is its own, shorter number. A refused batch
         // spends up to two failures, so the default of three keeps one batch
@@ -337,6 +361,8 @@ impl Engine {
             albums,
             versions,
             tags,
+            backfill,
+            tag_wake: Notify::new(),
             breaker,
             upload_slots: Mutex::new(Arc::new(Semaphore::new(config.concurrency.max(1)))),
             bandwidth,
@@ -380,18 +406,17 @@ impl Engine {
         let Some(queue_rx) = queue_rx else {
             return;
         };
-        // R3.7: resolve the tag once at start, so an API key that is missing a
-        // permission reaches Settings before the first upload does, and so the
-        // tag exists for the first asset that needs it.
-        if self.inner.tags.enabled() {
-            let inner = Arc::clone(&self.inner);
-            let prepare = tokio::spawn(async move { inner.tags.prepare().await });
-            self.inner
-                .tasks
-                .lock()
-                .expect("the task list")
-                .push(prepare);
-        }
+        // R3.7: the tag's backfill has one task of its own, woken by the
+        // setting and by "Tag existing assets now". The first run starts now,
+        // so an API key that is missing a permission reaches Settings before
+        // the first upload does.
+        let backfill = tokio::spawn(tag_backfill_loop(Arc::clone(&self.inner)));
+        self.inner
+            .tasks
+            .lock()
+            .expect("the task list")
+            .push(backfill);
+        self.inner.tag_wake.notify_one();
         let inner = Arc::clone(&self.inner);
         let dispatcher = tokio::spawn({
             let inner = Arc::clone(&inner);
@@ -559,24 +584,50 @@ impl Engine {
     /// The sync tag's live state, for the Settings section (R3.7).
     ///
     /// The engine model polls this with the rest of the status, so the view
-    /// never makes a second permission probe of its own.
+    /// never makes a second permission probe of its own, and the backfill's
+    /// progress rides the same poll.
     #[must_use]
     pub fn tag_status(&self) -> TagStatus {
-        self.inner.tags.status()
+        TagStatus {
+            backfill: self.inner.backfill.status(),
+            ..self.inner.tags.status()
+        }
     }
 
     /// Turns the sync tag on or off while the engine runs (R3.7).
     ///
-    /// Turning it on resolves the tag once, so an API key missing a permission
-    /// is reported to Settings before the first upload rather than after it.
-    /// Turning it off stops new tagging: assets that already carry the tag keep
-    /// it, and the tag itself is not deleted.
+    /// Turning it on wakes the backfill, which resolves the tag again before its
+    /// first batch: an API key missing a permission is reported to Settings
+    /// before the first upload, and a tag the user deleted and recreated in
+    /// Immich is upserted again, so the new id replaces the cached one.
+    /// Turning it off stops new tagging and pauses the backfill at its next
+    /// batch boundary: assets that already carry the tag keep it, and the tag
+    /// itself is not deleted.
     pub async fn set_tag_uploads(&self, enabled: bool) {
         let changed = self.inner.tags.set_enabled(enabled);
         if changed && enabled {
-            self.inner.tags.prepare().await;
+            self.inner.tag_wake.notify_one();
         }
         tracing::info!(enabled, "R3.7: the sync tag setting changed");
+    }
+
+    /// Tags every asset the client ever uploaded again (R3.7: "Tag existing
+    /// assets now").
+    ///
+    /// The recorded completion is cleared and the published progress starts
+    /// over, then the backfill picks the library up at its first batch. It is
+    /// safe on assets that already carry the tag, which is what makes it the
+    /// answer to a tag that was deleted in Immich or a permission that was
+    /// fixed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the backfill state cannot be cleared.
+    pub fn retag_all(&self) -> Result<(), StoreError> {
+        self.inner.backfill.restart()?;
+        self.inner.tag_wake.notify_one();
+        tracing::info!("R3.7: the library was asked to be tagged again");
+        Ok(())
     }
 
     /// Adds a source folder and scans it (R2.1).
@@ -2077,6 +2128,22 @@ pub(crate) fn now_ns() -> i64 {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(duration) => i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX),
         Err(error) => -i64::try_from(error.duration().as_nanos()).unwrap_or(i64::MAX),
+    }
+}
+
+/// Runs the sync tag's backfill whenever the setting or "Tag existing assets
+/// now" asks for it (R3.7).
+///
+/// One task owns the whole backfill, so a library of any size costs one loop and
+/// one request per batch instead of a task per asset, and uploads keep the pool
+/// they would have without it. Each wake resolves the tag again, which is what a
+/// deleted and recreated tag needs, and then walks the library from the cursor
+/// the state database recorded.
+async fn tag_backfill_loop(inner: Arc<EngineInner>) {
+    loop {
+        inner.tag_wake.notified().await;
+        inner.tags.prepare().await;
+        inner.backfill.run(&inner.tags).await;
     }
 }
 
