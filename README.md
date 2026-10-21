@@ -168,14 +168,19 @@ a key from Immich's account settings.
 ### Add folders
 
 1. On the **Dashboard**, type or paste a folder path into **Add a folder to
-   sync** (or click **Browse…** and pick it), then click **Add folder**.
-2. The folder is watched recursively, and a status card shows its activity
-   (idle, syncing, paused, needs attention), upload progress, and item counts.
-3. **Album mapping** is off by default. Switch it on for a folder to put its
-   uploads into an album, and choose the scope: **One album per folder** (one
-   album per leaf folder), or **One album for this folder**.
-4. **Remove** on a folder card stops syncing that folder. Nothing is deleted
-   from the server.
+   sync**, or click **Browse…** and pick it. Enter, **Browse…**, and **Add
+   folder** all open **Folder setup**; none of them adds the folder yet.
+2. **Folder setup** shows the path and four choices: **Recursive** (on by
+   default), **Album mapping** (off by default), **Album scope** (**One album
+   per folder**, one album per leaf folder, by default; or **One album for
+   this folder**), and **Album title** (blank means the album takes the
+   folder's name).
+3. **Add** records the path and all four choices in one write, and the folder's
+   status card appears on the **Dashboard**; **Cancel** writes nothing. Clicking
+   the new card, or its **Details** control, opens **Folder detail**.
+4. **Remove**, on a folder card or in **Folder detail**, stops syncing that
+   folder; the detail asks for confirmation first. Nothing is deleted from the
+   server: the folder's uploaded assets stay there.
 
 Hidden files and folders, symlinks, temporary/partial files, and system files
 are skipped by design. A source folder that is unplugged shows as unavailable on
@@ -193,21 +198,29 @@ its card instead of producing one error per file.
 - **Views.** *Dashboard* (status and folders), *Upload* (send one file now to
   test the pipeline; type the path or click **Browse…**), *Failed items* (files
   the client gave up on, with **Retry**), *Review* (see below), *Settings*,
-  *Logs*, *Diagnostics*.
+  *Logs*, *Diagnostics*. **Failed items** and **Review** each have a folder
+  filter: **All folders**, or one source folder with a clearable chip.
 - **Deletion review.** A tracked local file that disappears appears in
   **Review**; nothing changes on the server until you choose **Keep** or
   **Trash** for it. A rename is recognized by content and is not a deletion.
 - **Settings.** Changes save immediately. General holds **Autostart at login**
-  (off by default); Limits holds the bandwidth limit (0 means unlimited),
-  concurrent uploads, the reconciliation scan interval, and the retry attempt
-  cap.
+  (off by default); Limits holds the bandwidth limit (0 means unlimited) and
+  concurrent uploads; Sync holds the reconciliation scan interval and the retry
+  attempt cap; Tagging holds **Tag uploaded assets** (off by default), which
+  adds the fixed tag `immich-sync` to every asset the client uploads. The same
+  section shows the backfill's progress and **Tag existing assets now**, which
+  tags every asset the client has already uploaded, and **View in Immich**
+  (with a server URL set) opens the tag's page. Immich hides tags until **Tags**
+  is enabled in your Immich account features (Account Settings → Features).
 - **Diagnostics.** Client and server versions and permissions, the state
   database and its integrity, the last error per class, throughput, a
   **Collect bundle** action, and a **Rebuild** action that starts the state over
   and rescans every folder.
 - **Logs.** The tail of the log file, selectable for copying, the level control,
-  and a **Copy all** control that copies every line shown. The log never
-  contains the password, API key, or session token.
+  and a **Copy all** control that copies every line shown. The tail follows the
+  newest file while the view is open; scrolling up pauses it and shows the new
+  line count with **Jump to latest**, and **Refresh** re-reads the tail once.
+  The log never contains the password, API key, or session token.
 - The theme follows the system theme.
 
 ## Where everything lives

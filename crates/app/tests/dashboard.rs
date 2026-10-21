@@ -1003,7 +1003,7 @@ fn row_text_input(
 }
 
 #[gpui_kit::test]
-async fn browsing_for_a_folder_fills_the_field_and_add_folder_adds_it(cx: &mut TestAppContext) {
+async fn browsing_for_a_folder_fills_the_field_and_opens_the_setup_dialog(cx: &mut TestAppContext) {
     cx.executor().allow_parking();
     let temp = tempfile::tempdir().expect("create a temp dir");
     let photos = temp.path().join("photos");
