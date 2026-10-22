@@ -1,10 +1,10 @@
 //! The three per-folder settings controls, rendered in one place (#43).
 //!
-//! A folder card and the folder detail's settings show the same stored row:
+//! Folder setup and the folder detail's settings show the same stored row:
 //! Recursive, Album mapping, and Album scope. The controls, their layout, and
 //! their accessible names live here, so the two surfaces cannot drift apart.
-//! The owner supplies the handlers, which is what lets the card write through
-//! the same engine request the panel uses.
+//! The owner supplies the handlers, which is what lets the detail write each
+//! change through the engine while the setup dialog keeps its draft.
 
 use std::rc::Rc;
 
@@ -74,8 +74,8 @@ where
         }
     }
 
-    /// The rows: each control keeps its own label, and the group wraps instead
-    /// of clipping in a narrow card.
+    /// The rows: one setting each, label left and control right, so a reader
+    /// can see where one setting ends and the next begins (#57).
     ///
     /// The scope stays choosable while the mapping is off: it is the folder's
     /// stored scope (R3.4) and takes effect as soon as the mapping is on, and
@@ -83,64 +83,87 @@ where
     /// would read as an enabled one (N5).
     pub(crate) fn render(self, muted: Hsla) -> AnyElement {
         let label = |text: &'static str| div().text_xs().text_color(muted).child(text);
+        // The house settings row: the label on the left and the control on the
+        // right, with the row's height from Settings' own rows.
+        let row = || {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap_6()
+                .min_h(rems(2.25))
+        };
         div()
             .flex()
-            .flex_row()
-            .flex_wrap()
-            .items_center()
+            .flex_col()
             .gap_2()
-            .child(label("Recursive"))
+            .w_full()
             .child(
-                Switch::new(self.ids.recursive)
-                    .checked(self.values.recursive)
-                    .accessibility_label(format!("Sync {} recursively", self.name))
-                    .on_click(move |recursive, window, cx| {
-                        (self.on_recursive)(recursive, window, cx);
-                    }),
-            )
-            .child(label("Album mapping"))
-            .child(
-                Switch::new(self.ids.album_mapping)
-                    .checked(self.values.album_mapping)
-                    .accessibility_label(format!("Album mapping for {}", self.name))
-                    .on_click(move |enabled, window, cx| {
-                        (self.on_album_mapping)(enabled, window, cx);
-                    }),
-            )
-            .child(label("Album scope"))
-            .child(
-                Radio::new(self.ids.album_leaf)
-                    .label(AlbumScope::Leaf.label())
-                    .accessibility_label(format!(
-                        "Album scope for {}: one album per folder",
-                        self.name
-                    ))
-                    .checked(self.values.album_scope == AlbumScope::Leaf)
-                    .on_change({
-                        let scope = Rc::clone(&self.on_album_scope);
-                        move |checked, window, cx| {
-                            if *checked {
-                                scope(&AlbumScope::Leaf, window, cx);
-                            }
-                        }
-                    }),
+                row().child(label("Recursive")).child(
+                    Switch::new(self.ids.recursive)
+                        .checked(self.values.recursive)
+                        .accessibility_label(format!("Sync {} recursively", self.name))
+                        .on_click(move |recursive, window, cx| {
+                            (self.on_recursive)(recursive, window, cx);
+                        }),
+                ),
             )
             .child(
-                Radio::new(self.ids.album_whole)
-                    .label(AlbumScope::WholeFolder.label())
-                    .accessibility_label(format!(
-                        "Album scope for {}: one album for this folder",
-                        self.name
-                    ))
-                    .checked(self.values.album_scope == AlbumScope::WholeFolder)
-                    .on_change({
-                        let scope = Rc::clone(&self.on_album_scope);
-                        move |checked, window, cx| {
-                            if *checked {
-                                scope(&AlbumScope::WholeFolder, window, cx);
-                            }
-                        }
-                    }),
+                row().child(label("Album mapping")).child(
+                    Switch::new(self.ids.album_mapping)
+                        .checked(self.values.album_mapping)
+                        .accessibility_label(format!("Album mapping for {}", self.name))
+                        .on_click(move |enabled, window, cx| {
+                            (self.on_album_mapping)(enabled, window, cx);
+                        }),
+                ),
+            )
+            .child(
+                row().child(label("Album scope")).child(
+                    // The two visible labels are long, so the radios stack as one
+                    // right-aligned block instead of splitting a line at the
+                    // narrow dialog width.
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_start()
+                        .gap_2()
+                        .child(
+                            Radio::new(self.ids.album_leaf)
+                                .label(AlbumScope::Leaf.label())
+                                .accessibility_label(format!(
+                                    "Album scope for {}: one album per folder",
+                                    self.name
+                                ))
+                                .checked(self.values.album_scope == AlbumScope::Leaf)
+                                .on_change({
+                                    let scope = Rc::clone(&self.on_album_scope);
+                                    move |checked, window, cx| {
+                                        if *checked {
+                                            scope(&AlbumScope::Leaf, window, cx);
+                                        }
+                                    }
+                                }),
+                        )
+                        .child(
+                            Radio::new(self.ids.album_whole)
+                                .label(AlbumScope::WholeFolder.label())
+                                .accessibility_label(format!(
+                                    "Album scope for {}: one album for this folder",
+                                    self.name
+                                ))
+                                .checked(self.values.album_scope == AlbumScope::WholeFolder)
+                                .on_change({
+                                    let scope = Rc::clone(&self.on_album_scope);
+                                    move |checked, window, cx| {
+                                        if *checked {
+                                            scope(&AlbumScope::WholeFolder, window, cx);
+                                        }
+                                    }
+                                }),
+                        ),
+                ),
             )
             .into_any_element()
     }
