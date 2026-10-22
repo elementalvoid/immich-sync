@@ -1699,6 +1699,12 @@ async fn a_failed_tail_read_keeps_its_notice_and_paused_row_inside_the_card(
             .expect("create a temp dir");
         let paths = temporary_paths(temp.path());
         let directory = paths.log_directory();
+        // The prefix's 200 bytes plus tempfile's 6 stay under NAME_MAX (255),
+        // and a shorter path here would silently stop unguarding the clamp.
+        assert!(
+            directory.as_os_str().len() > 150,
+            "the log directory {directory:?} is too short to wrap the notice past the floor"
+        );
         write_lines(&paths, &long_tail(200));
         let store = SettingsStore::open(paths.config_file.clone());
         let (window, _shell) = open_shell_at(cx, store, paths.clone(), window_size);
