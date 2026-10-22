@@ -1619,43 +1619,46 @@ async fn a_short_window_keeps_the_tail_on_screen_and_scrolls_the_cards_above_it(
 /// enough for the paused row plus the tail's own minimum (#54).
 #[gpui_kit::test]
 async fn a_paused_tail_keeps_the_jump_control_inside_a_short_window(cx: &mut TestAppContext) {
-    let temp = tempfile::tempdir().expect("create a temp dir");
-    let paths = temporary_paths(temp.path());
-    write_lines(&paths, &long_tail(200));
-    let store = SettingsStore::open(paths.config_file.clone());
-    let (window, _shell) = open_shell_at(cx, store, paths, (900., 600.));
-    show_logs(cx, window);
+    // 900x600 is the window the review measured, and 720x480 is the shell's
+    // minimum: the narrowest window wraps the paused row's labels the most.
+    for window_size in [(900., 600.), (720., 480.)] {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let paths = temporary_paths(temp.path());
+        write_lines(&paths, &long_tail(200));
+        let store = SettingsStore::open(paths.config_file.clone());
+        let (window, _shell) = open_shell_at(cx, store, paths, window_size);
+        show_logs(cx, window);
 
-    // A wheel up in the tail pauses the live tail on the next poll tick, which
-    // adds the paused row and its jump control below the lines.
-    cx.update_window(window, |_, window, cx| {
-        window.scroll(
-            "logs-lines",
-            ScrollDelta::Pixels(point(px(0.), px(400.))),
-            cx,
-        );
-    })
-    .expect("update the shell window");
-    tick_live(cx, window);
+        // A wheel up in the tail pauses the live tail on the next poll tick,
+        // which adds the paused row and its jump control below the lines.
+        cx.update_window(window, |_, window, cx| {
+            window.scroll(
+                "logs-lines",
+                ScrollDelta::Pixels(point(px(0.), px(400.))),
+                cx,
+            );
+        })
+        .expect("update the shell window");
+        tick_live(cx, window);
 
-    cx.update_window(window, |_, window, _| {
-        assert!(
-            window.find("logs-paused").visible(),
-            "the paused tail draws its paused row"
-        );
-        let jump = window.find("logs-jump-latest").bounds();
-        let viewport = window.viewport_size();
-        let (jump_right, jump_bottom) = (
-            f32::from(jump.origin.x + jump.size.width),
-            f32::from(jump.origin.y + jump.size.height),
-        );
-        assert!(
-            jump_bottom <= f32::from(viewport.height) && jump_right <= f32::from(viewport.width),
-            "the jump control at {jump:?} is fully inside the {viewport:?} viewport, not clipped \
-             by the page"
-        );
-    })
-    .expect("update the shell window");
+        cx.update_window(window, |_, window, _| {
+            assert!(
+                window.find("logs-paused").visible(),
+                "the paused tail draws its paused row"
+            );
+            let jump = window.find("logs-jump-latest").bounds();
+            let viewport = window.viewport_size();
+            let (jump_right, jump_bottom) = (
+                f32::from(jump.origin.x + jump.size.width),
+                f32::from(jump.origin.y + jump.size.height),
+            );
+            assert!(
+                jump_bottom <= f32::from(viewport.height) && jump_right <= f32::from(viewport.width),
+                "the jump control at {jump:?} is fully inside the {viewport:?} viewport at {window_size:?}, not clipped by the page"
+            );
+        })
+        .expect("update the shell window");
+    }
 }
 
 /// The strip above the tail is the page's fallback scroll when the window is
