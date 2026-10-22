@@ -1101,7 +1101,7 @@ impl SettingsView {
                 .min_h(rems(2.25))
                 .child(field_text(
                     "Tag uploaded assets",
-                    "Adds the tag to every asset the client uploads. Off by default.",
+                    "Adds the tag to every asset the client uploads. On by default.",
                     &palette,
                 ))
                 .child(

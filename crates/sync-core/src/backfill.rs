@@ -12,7 +12,8 @@
 //! Every completed batch moves the cursor and the count in one store write, so
 //! an interruption resumes at the last completed batch instead of starting the
 //! library over. Reaching the end records the completion, which keeps a restart
-//! from tagging the library again; the record survives both a restart and a
+//! from tagging the library again - unless the library is empty, since an empty
+//! pass is not a finished backfill. The record survives both a restart and a
 //! toggle, and only "Tag existing assets now" clears it.
 //!
 //! A transient batch failure is retried with the engine's retry policy (R6.1).
@@ -140,6 +141,13 @@ impl Backfill {
                 return;
             }
         };
+        // R3.7: an empty library is not a finished backfill. Recording the
+        // completion would spend the one automatic pass before the first upload
+        // exists, so a fresh install that starts with the tag on would never
+        // tag the files it uploads next.
+        if total == 0 {
+            return;
+        }
         self.publish(|status| {
             status.running = true;
             status.total = total;

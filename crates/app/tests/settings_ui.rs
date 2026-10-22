@@ -1891,8 +1891,8 @@ fn the_tagging_section_shows_the_fixed_tag_and_opens_its_immich_page(cx: &mut Te
         );
         assert_eq!(
             window.find("settings-tag-upload").checked(),
-            Some(false),
-            "R3.7: the switch is present and off"
+            Some(true),
+            "R3.7: a fresh install shows the switch on"
         );
         window.click("settings-tag-link", cx);
     })
@@ -1928,8 +1928,9 @@ fn the_tagging_section_has_no_immich_link_without_a_server_url(cx: &mut TestAppC
     assert_eq!(cx.opened_url(), None, "nothing was opened");
 }
 
-/// R3.7: the switch persists the setting and moves the running engine to it
-/// without a restart, in both directions.
+/// R3.7: a fresh store starts with the tag on, and the switch persists the
+/// setting and moves the running engine to it without a restart, in both
+/// directions.
 #[gpui_kit::test]
 async fn the_tag_switch_persists_and_reaches_the_running_engine(cx: &mut TestAppContext) {
     let (_runtime, server) = mock_server();
@@ -1985,35 +1986,10 @@ async fn the_tag_switch_persists_and_reaches_the_running_engine(cx: &mut TestApp
         "the engine never started"
     );
     assert!(
-        !cx.read(|cx| engine_model.read(cx).tag_status().enabled),
-        "R3.7: the stored default is off"
-    );
-
-    // The shell hands the view the engine it must push changes to; this is
-    // that same call.
-    cx.update(|cx| view.update(cx, |view, cx| view.set_engine(engine_model.clone(), cx)));
-
-    cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
-        tab_to(window, "settings-tag-upload", cx);
-        window.press("space", cx);
-    })
-    .expect("turn the tag on");
-
-    let saved = wait_for_settings(cx, &paths, |settings| settings.tag_uploaded_assets).await;
-    assert!(saved.tag_uploaded_assets, "R3.7: the setting persisted");
-    for _ in 0..600 {
-        if cx.read(|cx| engine_model.read(cx).tag_status().enabled) {
-            break;
-        }
-        cx.executor().timer(Duration::from_millis(10)).await;
-        cx.run_until_parked();
-    }
-    assert!(
         cx.read(|cx| engine_model.read(cx).tag_status().enabled),
-        "R3.7: the switch reached the running engine"
+        "R3.7: a fresh install starts with the tag on"
     );
-    // The engine resolved the tag on the worker runtime as part of that move.
+    // The engine resolved the tag on the worker runtime as part of the start.
     for _ in 0..600 {
         if server.tag_id(sync_core::tags::SYNC_TAG).is_some() {
             break;
@@ -2023,8 +1999,12 @@ async fn the_tag_switch_persists_and_reaches_the_running_engine(cx: &mut TestApp
     }
     assert!(
         server.tag_id(sync_core::tags::SYNC_TAG).is_some(),
-        "R3.7: turning the setting on created the tag"
+        "R3.7: a fresh install created the tag"
     );
+
+    // The shell hands the view the engine it must push changes to; this is
+    // that same call.
+    cx.update(|cx| view.update(cx, |view, cx| view.set_engine(engine_model.clone(), cx)));
 
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
@@ -2045,6 +2025,27 @@ async fn the_tag_switch_persists_and_reaches_the_running_engine(cx: &mut TestApp
     assert!(
         !cx.read(|cx| engine_model.read(cx).tag_status().enabled),
         "R3.7: the engine stopped tagging"
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        tab_to(window, "settings-tag-upload", cx);
+        window.press("space", cx);
+    })
+    .expect("turn the tag on");
+
+    let saved = wait_for_settings(cx, &paths, |settings| settings.tag_uploaded_assets).await;
+    assert!(saved.tag_uploaded_assets, "R3.7: turning it on persisted");
+    for _ in 0..600 {
+        if cx.read(|cx| engine_model.read(cx).tag_status().enabled) {
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    assert!(
+        cx.read(|cx| engine_model.read(cx).tag_status().enabled),
+        "R3.7: the switch reached the running engine"
     );
 }
 
@@ -2082,6 +2083,9 @@ async fn the_tagging_section_shows_the_backfill_and_tags_the_library_again(
     stored
         .update(|settings| {
             settings.server_url = server.base_url().to_string();
+            // An install that turned the tag off before the default changed:
+            // the flow below turns it on and expects the backfill to run.
+            settings.tag_uploaded_assets = false;
         })
         .expect("seed the server URL");
 
@@ -2205,6 +2209,8 @@ async fn a_missing_tag_permission_is_named_in_the_tagging_section(cx: &mut TestA
     stored
         .update(|settings| {
             settings.server_url = server.base_url().to_string();
+            // Start off, so the toggle below is the one that probes the key.
+            settings.tag_uploaded_assets = false;
         })
         .expect("seed the server URL");
 

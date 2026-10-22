@@ -99,7 +99,8 @@ pub struct EngineConfig {
     /// How long the queue waits between credential probes while the breaker is
     /// open (R6.6).
     pub breaker_cooldown: Duration,
-    /// Whether uploaded assets get the sync tag (R3.7). Off by default;
+    /// Whether uploaded assets get the sync tag (R3.7). The library default is
+    /// off; the app passes the user's on-by-default setting.
     /// [`Engine::set_tag_uploads`] is the live path.
     pub tag_uploaded_assets: bool,
     /// How many asset ids one backfill request carries (R3.7). Default
@@ -345,8 +346,9 @@ impl Engine {
         // them spends the one re-login the engine already shares.
         let albums = AlbumMapper::new(session.clone(), store.clone());
         let versions = Versioner::new(session.clone(), store.clone());
-        // R3.7: the sync tag is opt-in. The tagger starts with the stored
-        // setting and is moved live by `set_tag_uploads`.
+        // R3.7: the tagger starts with the caller's setting (the library
+        // default keeps it off; the app's stored value is on by default) and is
+        // moved live by `set_tag_uploads`.
         let tags = Tagger::new(session.clone());
         tags.set_enabled(config.tag_uploaded_assets);
         // R3.7: the backfill reads its recorded progress at construction, so a
@@ -2672,7 +2674,7 @@ mod tests {
         assert_eq!(config.watch_debounce, Duration::from_secs(2));
         assert!(
             !config.tag_uploaded_assets,
-            "R3.7: the sync tag is off by default"
+            "R3.7: the library default keeps the sync tag off; the app's setting is on"
         );
     }
 
