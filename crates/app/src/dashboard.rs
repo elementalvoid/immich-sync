@@ -634,7 +634,7 @@ impl Render for Dashboard {
         let header = self.header(cx);
 
         let folder_bar = self.folder_bar(cx);
-        let removed = self.engine.is_some();
+        let live = self.engine.is_some();
 
         div()
             .id("dashboard-scroll")
@@ -673,29 +673,40 @@ impl Render for Dashboard {
                         .map(|(index, folder)| {
                             let path = folder.path.clone().unwrap_or_default();
                             let title = folder.title.clone();
-                            let album = removed.then(|| {
+                            let album = live.then(|| {
                                 self.folder_controls(index, folder, cx).into_any_element()
                             });
                             let details_focus = self.details_focus(&path, cx);
-                            // #53: the card's only control row is Details. Removal
-                            // is the detail's confirmed action, so no card exposes
-                            // a one-click removal.
-                            let footer = removed.then(|| {
+                            // #53: removal is the detail's confirmed action.
+                            let footer = live.then(|| {
                                 let path = path.clone();
                                 div()
-                                    .id(("folder-details-anchor", index))
-                                    .test_support()
-                                    .track_focus(&details_focus)
-                                    .tab_stop(false)
+                                    .flex()
+                                    .flex_row()
                                     .child(
-                                        Button::new(("folder-details", index))
-                                            .secondary()
-                                            .label("Details")
-                                            .accessibility_label(format!("Details for {title}"))
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                cx.stop_propagation();
-                                                this.open_folder_detail(path.clone(), window, cx);
-                                            })),
+                                        div()
+                                            .id(("folder-details-anchor", index))
+                                            .test_support()
+                                            .track_focus(&details_focus)
+                                            .tab_stop(false)
+                                            .child(
+                                                Button::new(("folder-details", index))
+                                                    .secondary()
+                                                    .label("Details")
+                                                    .accessibility_label(format!(
+                                                        "Details for {title}"
+                                                    ))
+                                                    .on_click(cx.listener(
+                                                        move |this, _, window, cx| {
+                                                            cx.stop_propagation();
+                                                            this.open_folder_detail(
+                                                                path.clone(),
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        },
+                                                    )),
+                                            ),
                                     )
                                     .into_any_element()
                             });
@@ -706,7 +717,7 @@ impl Render for Dashboard {
                                 .flex()
                                 // #43: the card opens the folder's detail; its
                                 // controls stop the click at themselves.
-                                .when(removed, |this| {
+                                .when(live, |this| {
                                     let path = path.clone();
                                     this.on_click(cx.listener(move |this, _, window, cx| {
                                         this.open_folder_detail(path.clone(), window, cx);

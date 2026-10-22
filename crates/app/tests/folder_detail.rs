@@ -287,19 +287,26 @@ async fn a_card_click_and_its_details_control_open_the_detail_but_its_settings_d
     wait_for_store(cx, &store).await;
 
     read(cx, window, |window, cx| {
+        // #53: the footer row keeps Details hugging its label at the card's
+        // left edge, not stretched across the card.
+        let details = f32::from(window.find(("folder-details", 0_usize)).bounds().size.width);
+        let card = f32::from(window.find(("folder-card", 0_usize)).bounds().size.width);
+        assert!(
+            details < card / 2.,
+            "#53: Details hugs its label ({details}px) instead of filling the card ({card}px)"
+        );
         // N5: the Details control is a keyboard-reachable tab stop of the card,
         // not only a pointer target.
         tab_to(window, ("folder-details", 0_usize), cx);
-        // #53: with the card's Remove gone, Details is the card's last tab stop.
+        // #53: Details is the card's last tab stop, so Tab wraps to the
+        // Dashboard's first control; any control after Details takes that stop.
         window.focus_next(cx);
         window.render_frame(cx);
-        for control in ["folder-recursive", "folder-album", "folder-details"] {
-            assert_ne!(
-                window.find((control, 0_usize)).focused(),
-                Some(true),
-                "#53: {control} is not after Details in the card's tab order"
-            );
-        }
+        assert_eq!(
+            window.find("dashboard-sync-now").focused(),
+            Some(true),
+            "#53: Tab after the card's last control wraps to the Dashboard's first"
+        );
     });
     act(cx, window, |window, cx| window.blur(cx));
     // R8.1, #43: a press on the card's own surface opens its detail.
