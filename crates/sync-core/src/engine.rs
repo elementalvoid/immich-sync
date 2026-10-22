@@ -316,12 +316,17 @@ impl Engine {
         // One limit for the whole client (R7.1), viewed once per folder so a
         // card can read its own share of the bytes it meters (R8.1).
         let bandwidth = BandwidthLimit::new(config.bandwidth_bytes_per_second);
-        let mut entries = Vec::new();
-        for folder in store.folders()? {
-            let counts = store.folder_counts(&folder.path).unwrap_or_else(|error| {
-                tracing::warn!(folder = %folder.path, error = %error, "the folder counts could not be read");
-                FolderCounts::default()
+        // #52: the counts are seeded with the ownership rule, over the one
+        // ordered folder list, so a nested folder's card matches its meter.
+        let stored_folders = store.folders()?;
+        let counts = store
+            .folder_counts_by_owner(&stored_folders)
+            .unwrap_or_else(|error| {
+                tracing::warn!(error = %error, "the folder counts could not be read");
+                vec![FolderCounts::default(); stored_folders.len()]
             });
+        let mut entries = Vec::new();
+        for (folder, counts) in stored_folders.into_iter().zip(counts) {
             // #43: the folder detail keeps its timestamps across a restart.
             let times = store.folder_times(&folder.path).unwrap_or_else(|error| {
                 tracing::warn!(folder = %folder.path, error = %error, "the folder times could not be read");
@@ -979,24 +984,17 @@ impl Observer for EngineObserver {
                 // R8.1: a folder new to this engine starts from what the store
                 // already holds for it; a zeroed card would never fill, because
                 // the rows are settled and `prepare` does not count them again.
-                let counts = inner
-                    .store
-                    .folder_counts(&stored.path)
-                    .unwrap_or_else(|error| {
-                        tracing::warn!(
-                            folder = %stored.path,
-                            error = %error,
-                            "the folder counts could not be read"
-                        );
-                        FolderCounts::default()
-                    });
+                // #52: the seed is the ownership read over this live list with
+                // the new folder at its end, so a nested folder counts only the
+                // rows no earlier folder owns. Entries before it are unaffected:
+                // appending cannot take a row from an entry that already owns it.
                 // #43: a folder new to this engine starts from the times
                 // the store already holds for it.
                 let times = inner.store.folder_times(&stored.path).unwrap_or_default();
                 folders.push(FolderEntry {
                     available,
                     folder: stored.clone(),
-                    counts,
+                    counts: FolderCounts::default(),
                     last_error: None,
                     last_scan_ns: times.last_scan_ns,
                     last_upload_ns: times.last_upload_ns,
@@ -1007,6 +1005,22 @@ impl Observer for EngineObserver {
                     // the store already holds for it.
                     album: album_of_store(&inner.store, &stored),
                 });
+                let ordered: Vec<SourceFolder> =
+                    folders.iter().map(|entry| entry.folder.clone()).collect();
+                match inner.store.folder_counts_by_owner(&ordered) {
+                    Ok(counts) => {
+                        if let (Some(entry), Some(seed)) = (folders.last_mut(), counts.last()) {
+                            entry.counts = *seed;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            folder = %stored.path,
+                            error = %error,
+                            "the folder counts could not be read"
+                        );
+                    }
+                }
             }
         }
         drop(folders);
@@ -1095,6 +1109,27 @@ impl Observer for EngineObserver {
             return;
         }
         folders.retain(|entry| path_key(Path::new(&entry.folder.path)) != key);
+        // #52: the removed folder's rows now belong to the next folder that
+        // contains them, so the remaining cards are read by the ownership rule
+        // instead of keeping the counts they had while it was there.
+        if !folders.is_empty() {
+            let ordered: Vec<SourceFolder> =
+                folders.iter().map(|entry| entry.folder.clone()).collect();
+            match inner.store.folder_counts_by_owner(&ordered) {
+                Ok(counts) => {
+                    for (entry, counts) in folders.iter_mut().zip(counts) {
+                        entry.counts = counts;
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        folder = %path,
+                        error = %error,
+                        "the folder counts could not be read"
+                    );
+                }
+            }
+        }
         drop(folders);
         let mut watcher = inner.watcher.lock().expect("the watcher lock");
         if let Some(watcher) = watcher.as_mut() {
@@ -1188,9 +1223,9 @@ impl EngineInner {
     /// The owning folder is the first entry that contains the path, as
     /// [`folder_index_in`] decides, so the path is metered once.
     ///
-    /// Note for #44: the pending count seeds from a pure prefix query, so a
-    /// file under a folder and one of its subfolders is counted on both cards
-    /// while its bytes land once.
+    /// #52: the counts seed by the same rule
+    /// ([`crate::store::StateStore::folder_counts_by_owner`]), so a nested
+    /// source folder's card and its meter name one owner.
     ///
     /// A path no folder owns — its folder was removed while the item was
     /// queued — is metered on no card, but its bytes still count in the
@@ -3048,6 +3083,80 @@ mod tests {
             (queued, queued),
             "R8.1: the owner counted every file handed to it"
         );
+    }
+
+    /// #52: removing an outer source folder hands its rows to the next folder
+    /// that contains them, so the card the user keeps counts them at once
+    /// instead of showing nothing until the next start.
+    #[test]
+    fn removing_an_outer_folder_hands_its_rows_to_the_next_owner() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let store =
+            Arc::new(StateStore::open(temp.path().join("state.db")).expect("open the state store"));
+        let outer = temp.path().join("photos");
+        let inner = outer.join("2024");
+        for root in [&outer, &inner] {
+            std::fs::create_dir_all(root).expect("create the folder");
+            store
+                .add_folder(&SourceFolder {
+                    path: root.display().to_string(),
+                    recursive: true,
+                    album_mapping: false,
+                    album_scope: AlbumScope::default(),
+                    album_title: None,
+                })
+                .expect("add the folder");
+        }
+        store
+            .record(&ItemRecord {
+                path: inner.join("photo.jpg").display().to_string(),
+                size: 1,
+                mtime_ns: 0,
+                sha1: Sha1::from_slice(&[0; 20]).expect("a full digest"),
+                asset_id: Some("asset-1".to_string()),
+                state: ItemState::Uploaded,
+                error_class: None,
+                error_message: None,
+                attempts: 0,
+                sidecar: None,
+            })
+            .expect("write the uploaded row");
+        // The session is never used: this test sends no request.
+        let session = crate::connection::Connection::new(
+            "http://127.0.0.1:1",
+            Arc::new(crate::credential::MemoryCredentialStore::new()),
+        )
+        .expect("a valid URL")
+        .shared();
+        let engine = Engine::new(
+            Arc::new(Tracking::new(store)),
+            session,
+            EngineConfig::default(),
+        )
+        .expect("build the engine");
+        assert_eq!(
+            engine.status().folders[0].counts.uploaded,
+            1,
+            "the outer folder is first in path order and owns the row"
+        );
+        assert_eq!(
+            engine.status().folders[1].counts,
+            FolderCounts::default(),
+            "the nested folder owns nothing while the outer folder is there"
+        );
+
+        engine
+            .remove_folder(&outer.display().to_string())
+            .expect("remove the outer folder");
+
+        let folders = engine.status().folders;
+        assert_eq!(folders.len(), 1, "only the nested folder is left");
+        assert_eq!(
+            folders[0].counts.uploaded, 1,
+            "#52: the nested folder owns the row the removed folder held"
+        );
+        assert_eq!(engine.status().counts.uploaded, 1, "the total is unchanged");
+        engine.stop();
     }
 
     #[test]

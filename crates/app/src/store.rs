@@ -66,10 +66,7 @@ impl StoreModel {
                     // thread, so the first dashboard frame is populated (N2).
                     match store.folders() {
                         Ok(folders) => {
-                            let counts = folders
-                                .iter()
-                                .map(|folder| store.folder_counts(&folder.path).unwrap_or_default())
-                                .collect();
+                            let counts = owned_counts(&store, &folders);
                             let times = folders
                                 .iter()
                                 .map(|folder| store.folder_times(&folder.path).unwrap_or_default())
@@ -218,8 +215,9 @@ impl StoreModel {
         &self.times
     }
 
-    /// Replaces the cached folder list after an add or a remove, keeping the
-    /// counts of the folders that are still there.
+    /// Replaces the cached folder list after an add or a remove, keeping each
+    /// surviving folder's counts and times while the ownership read for the new
+    /// list runs off the UI thread (N2, #52).
     pub fn set_folders(&mut self, folders: Vec<SourceFolder>, cx: &mut Context<Self>) {
         // R2.4: the cache must keep a folder's counts and times across a
         // re-add that spells the path differently, the same comparison the
@@ -253,11 +251,40 @@ impl StoreModel {
         self.counts = counts;
         self.times = times;
         cx.notify();
+        // #52: a folder's counts depend on the folders before it, so a nested
+        // add or remove makes the kept values wrong: the outer card still holds
+        // the new inner folder's rows, and a new outer folder shows none. The
+        // ownership read is the one rule, and it runs off the UI thread (N2).
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        let ordered = self.folders.clone();
+        let read_folders = ordered.clone();
+        let read = cx
+            .background_executor()
+            .spawn(async move { owned_counts(&store, &read_folders) });
+        cx.spawn(async move |this, cx| {
+            let counts = read.await;
+            let _ = this.update(cx, |model, cx| {
+                // A later add or remove replaced the list and spawned its own
+                // read, whose answer is the newer one.
+                if model.folders != ordered {
+                    return;
+                }
+                model.counts = counts;
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
-    /// Re-reads one folder's counts from the store after a review decision
-    /// made with no engine running (R5.4), so the cache a later status refresh
-    /// reads cannot resurrect the decided item.
+    /// Re-reads the cached counts from the store after a review decision made
+    /// with no engine running (R5.4), so the cache a later status refresh reads
+    /// cannot resurrect the decided item.
+    ///
+    /// The decision changes one row, which one folder owns, so only that
+    /// folder's card is replaced; its counts still come from the ownership read
+    /// over the whole list (#52), because that is what says the row is its own.
     pub fn refresh_counts(&mut self, path: &str, cx: &mut Context<Self>) {
         let Some(store) = self.store.clone() else {
             return;
@@ -277,20 +304,28 @@ impl StoreModel {
         else {
             return;
         };
-        let read_folder = folder.clone();
+        let ordered = self.folders.clone();
+        let read_folders = ordered.clone();
         let read = cx
             .background_executor()
-            .spawn(async move { store.folder_counts(&read_folder) });
+            .spawn(async move { owned_counts(&store, &read_folders) });
         cx.spawn(async move |this, cx| {
             let counts = read.await;
             let _ = this.update(cx, |model, cx| {
-                let Ok(counts) = counts else {
+                // The folder list can change while the read runs: a changed one
+                // has its own read, so only the list this read counted is safe
+                // to write.
+                if model.folders != ordered {
+                    return;
+                }
+                // The list is unchanged, so its order is the read's order: the
+                // folder that owns the path owns this entry.
+                let Some(index) = model.folders.iter().position(|entry| entry.path == folder)
+                else {
                     return;
                 };
-                // The folder list can change while the read runs: find the
-                // folder by path, not by the index found before it.
-                if let Some(index) = model.folders.iter().position(|entry| entry.path == folder) {
-                    model.counts[index] = counts;
+                if let Some(counts) = counts.get(index) {
+                    model.counts[index] = *counts;
                     cx.notify();
                 }
             });
@@ -361,10 +396,7 @@ fn rebuild_store(path: &Path, folders: &[SourceFolder]) -> anyhow::Result<Opened
     let store = Arc::new(store);
     let tracking = Arc::new(Tracking::new(Arc::clone(&store)));
     let folders = store.folders().context("read the restored folders")?;
-    let counts = folders
-        .iter()
-        .map(|folder| store.folder_counts(&folder.path).unwrap_or_default())
-        .collect();
+    let counts = owned_counts(&store, &folders);
     let times = folders
         .iter()
         .map(|folder| store.folder_times(&folder.path).unwrap_or_default())
@@ -376,6 +408,17 @@ fn rebuild_store(path: &Path, folders: &[SourceFolder]) -> anyhow::Result<Opened
         counts,
         times,
     })
+}
+
+/// The per-folder counts with the ownership rule (#52), or a zeroed card per
+/// folder when the read fails: a count is not worth stopping the dashboard for.
+fn owned_counts(store: &StateStore, folders: &[SourceFolder]) -> Vec<FolderCounts> {
+    store
+        .folder_counts_by_owner(folders)
+        .unwrap_or_else(|error| {
+            tracing::warn!(error = %error, "the folder counts could not be read");
+            vec![FolderCounts::default(); folders.len()]
+        })
 }
 
 /// Removes the database file and its WAL sidecars.
