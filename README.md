@@ -178,9 +178,9 @@ a key from Immich's account settings.
 3. **Add** records the path and all four choices in one write, and the folder's
    status card appears on the **Dashboard**; **Cancel** writes nothing. Clicking
    the new card, or its **Details** control, opens **Folder detail**.
-4. **Remove**, on a folder card or in **Folder detail**, stops syncing that
-   folder; the detail asks for confirmation first. Nothing is deleted from the
-   server: the folder's uploaded assets stay there.
+4. **Remove**, in **Folder detail**, stops syncing that folder; the detail asks
+   for confirmation first. Nothing is deleted from the server: the folder's
+   uploaded assets stay there.
 
 Hidden files and folders, symlinks, temporary/partial files, and system files
 are skipped by design. A source folder that is unplugged shows as unavailable on
