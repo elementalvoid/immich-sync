@@ -67,9 +67,10 @@ exclusive.
 
 Some tests in `crates/sync-core/tests/` are wall-clock budgets rather than
 progress-bounded waits: `a_folder_with_100_files_syncs_without_manual_action`,
-the re-login budget tests in `engine.rs`, the pacing test in `limits.rs`, and
-the port race in `connection.rs`. They can starve under heavy parallel load; run
-one alone before treating a failure as a regression.
+the re-login budget tests in `engine.rs`,
+`a_server_that_stops_answering_produces_backoff_not_a_hot_loop`, the pacing
+test in `limits.rs`, and the port race in `connection.rs`. They can starve under
+heavy parallel load; run one alone before treating a failure as a regression.
 
 ## Where the design lives
 
