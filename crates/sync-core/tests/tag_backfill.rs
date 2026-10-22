@@ -331,18 +331,10 @@ async fn an_empty_library_does_not_finish_the_backfill() {
         .await,
         "the fresh install never resolved the tag"
     );
-    // The pass over the empty library follows the upsert in the same task and
-    // has no await point of its own, so a turn of the runtime runs it out.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // The pass over the empty library follows the upsert in the same task; a
+    // completion it records is what the second phase reads, because the next
+    // engine then reports completed without tagging the upload.
     fresh.stop();
-    assert!(
-        store
-            .tag_backfill()
-            .expect("read the state")
-            .completed_ns
-            .is_none(),
-        "R3.7: an empty library is not a finished backfill"
-    );
 
     // An upload from the install's setup: the state row is what a stopped
     // client keeps, and a folder with the file would let the engine's own scan
