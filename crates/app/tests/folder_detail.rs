@@ -5,10 +5,13 @@
 //! state database, the real engine model, and the view's own click and keyboard
 //! handling.
 
+mod common;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use common::scroll_dashboard_into_view;
 use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
 use gpui_kit::{
     AnyWindowHandle, App, AppContext as _, ElementId, Entity, Point, ScrollDelta, TestAppContext,
@@ -256,30 +259,6 @@ fn scroll_into_view(window: &mut Window, cx: &mut App, id: impl Into<ElementId>)
         );
     }
     panic!("{id:?} never became visible in the dialog");
-}
-
-/// Scrolls the dashboard until the element with `id` is on screen.
-///
-/// #56: the global card carries the reconciliation scan line, so on a short
-/// window a card's footer sits below the fold; a control is clicked only after
-/// it is really visible.
-fn scroll_dashboard_into_view(window: &mut Window, cx: &mut App, id: impl Into<ElementId>) {
-    let id = id.into();
-    window.render_frame(cx);
-    for _ in 0..60 {
-        if window
-            .try_find(id.clone())
-            .is_some_and(|target| target.visible())
-        {
-            return;
-        }
-        window.scroll(
-            "dashboard-scroll",
-            ScrollDelta::Pixels(point(px(0.), px(-120.))),
-            cx,
-        );
-    }
-    panic!("{id:?} never became visible on the dashboard");
 }
 
 /// Opens the detail and waits for it to be on screen.
