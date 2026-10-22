@@ -141,6 +141,10 @@ pub enum SyncNowOutcome {
 impl SyncNowOutcome {
     /// The reason the user reads, or `None` when the click reached the scan
     /// (#56).
+    ///
+    /// [`EngineModel::sync_now_reason`] is what the dashboard shows: it also
+    /// drops a reason that no longer holds, and names the store's own problem
+    /// when the database is what stopped the click.
     #[must_use]
     pub fn reason(self) -> Option<&'static str> {
         match self {
@@ -523,17 +527,20 @@ impl EngineModel {
             self.refresh_status(cx);
             return SyncNowOutcome::Rebuilding;
         }
+        // #56: the folder list is empty until the first open lands, and stays
+        // empty if the open failed, so before the store is usable the database
+        // is the reason a click cannot scan (R9.2).
+        if self.engine.is_none() && !self.store_ready(cx) {
+            self.refresh_status(cx);
+            return SyncNowOutcome::NotReady;
+        }
         // A scan with no source folder walks nothing, so the click is refused
         // rather than leaving a "Checking…" that proves nothing (#56). The
         // running engine answers from its own folder list: a store cache that
         // has not caught up must never refuse a scan that would find files.
         // An engine already running keeps running either way: its queued rows
         // still upload (R6.7).
-        let no_folders = match &self.engine {
-            Some(_) => self.status.folders.is_empty(),
-            None => self.store_model.read(cx).folders().is_empty(),
-        };
-        if no_folders {
+        if self.folders_empty(cx) {
             self.refresh_status(cx);
             return SyncNowOutcome::NoFolder;
         }
@@ -549,6 +556,48 @@ impl EngineModel {
             SyncNowOutcome::Requested
         } else {
             SyncNowOutcome::NotReady
+        }
+    }
+
+    /// The sentence a refused "Sync now" click shows, or `None` once its reason
+    /// no longer holds (#56).
+    ///
+    /// The dashboard keeps the outcome rather than the sentence, so a notice
+    /// cannot outlive its cause and contradict the card and the control. A
+    /// store that failed to open names its own problem: "no folder" would
+    /// point the user at a folder that was never the obstacle.
+    #[must_use]
+    pub fn sync_now_reason(&self, outcome: SyncNowOutcome, cx: &App) -> Option<String> {
+        let holds = match outcome {
+            SyncNowOutcome::Requested => false,
+            SyncNowOutcome::Rebuilding => self.rebuilding,
+            SyncNowOutcome::NoFolder => self.folders_empty(cx),
+            SyncNowOutcome::NotConnected => !self.connection.read(cx).state().is_connected(),
+            SyncNowOutcome::NotReady => !self.store_ready(cx),
+        };
+        if !holds {
+            return None;
+        }
+        if outcome == SyncNowOutcome::NotReady
+            && let Some(problem) = self.store_model.read(cx).problem()
+        {
+            return Some(problem.to_string());
+        }
+        outcome.reason().map(str::to_string)
+    }
+
+    /// Whether the store is open and usable, so a scan could read folders
+    /// (#56, R9.2).
+    fn store_ready(&self, cx: &App) -> bool {
+        let store = self.store_model.read(cx);
+        store.settled() && store.tracking().is_some()
+    }
+
+    /// Whether the folder list a scan would walk is empty (#56).
+    fn folders_empty(&self, cx: &App) -> bool {
+        match &self.engine {
+            Some(_) => self.status.folders.is_empty(),
+            None => self.store_model.read(cx).folders().is_empty(),
         }
     }
 

@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::asset_link::{self, LinkOpener};
-use crate::engine::EngineModel;
+use crate::engine::{EngineModel, SyncNowOutcome};
 use crate::folder_controls::{SettingsControls, SettingsIds, SettingsValues};
 use crate::folder_panel::{FolderOpener, FolderPanel, FolderPanelEvent};
 use crate::path_picker::{self, Picked};
@@ -50,8 +50,9 @@ pub struct Dashboard {
     paused: bool,
     /// The notice a failed Browse… left behind (#30).
     pick_notice: Option<String>,
-    /// The reason the last "Sync now" click could not scan (#56).
-    sync_notice: Option<String>,
+    /// The reason the last "Sync now" click could not scan (#56). The outcome,
+    /// not its sentence: the header drops it once the reason no longer holds.
+    sync_notice: Option<SyncNowOutcome>,
     /// The open folder panel: the setup dialog (#40) or a folder's live detail
     /// (#43). The dashboard owns whether it is open; the panel owns the state
     /// inside it.
@@ -161,7 +162,7 @@ impl Dashboard {
                 let outcome = engine.update(cx, |model, cx| model.sync_now(cx));
                 // #56: a click that cannot scan says why, so the control never
                 // swallows it. A click that lands clears the last reason.
-                self.sync_notice = outcome.reason().map(str::to_string);
+                self.sync_notice = (outcome != SyncNowOutcome::Requested).then_some(outcome);
                 cx.notify();
             }
             None => {
@@ -589,6 +590,13 @@ impl Dashboard {
         let palette = CardPalette::new(cx.theme());
         let paused = self.is_paused(cx);
         let (sync_label, sync_name) = crate::status::sync_now_copy(self.model.scanning);
+        // #56: the reason is asked for again on every frame, so a notice that
+        // outlived its cause cannot stay on screen beside the card that
+        // answered it.
+        let sync_notice = match (&self.engine, self.sync_notice) {
+            (Some(engine), Some(outcome)) => engine.read(cx).sync_now_reason(outcome, cx),
+            _ => None,
+        };
         let (pause_label, pause_name) = if paused {
             ("Resume", "Resume syncing")
         } else {
@@ -650,7 +658,7 @@ impl Dashboard {
             )
             // #56: a click that cannot scan says why, in the same notice idiom
             // the folder bar uses.
-            .when_some(self.sync_notice.clone(), |this, notice| {
+            .when_some(sync_notice, |this, notice| {
                 this.child(crate::settings_view::notice(
                     "dashboard-sync-notice",
                     notice,

@@ -1458,6 +1458,98 @@ async fn a_click_with_no_source_folder_reports_the_missing_folder(cx: &mut TestA
     );
 }
 
+/// #56: acceptance bullet 1 at the model layer. `Requested` means the start
+/// request reached the scan loop, not that the walk has begun; the flag is the
+/// proof the scan ran.
+///
+/// A walk of a small folder finishes in microseconds, far inside the model's
+/// 250 ms poll, so the fixture gives the pass real work: a tracked item whose
+/// file vanished, next to a same-size candidate the reconciliation hashes.
+#[gpui_kit::test]
+async fn a_click_on_a_running_engine_starts_a_scan(cx: &mut TestAppContext) {
+    let (_runtime, server) = mock_server();
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+    // Big enough that hashing it outlasts the model's status poll in a debug
+    // build; small enough that the upload the pass queues stays cheap.
+    const SIZE: usize = 32 * 1024 * 1024;
+    std::fs::write(photos.join("candidate.jpg"), vec![0_u8; SIZE])
+        .expect("write the same-size candidate");
+    {
+        let store = StateStore::open(&paths.state_db).expect("open the state database");
+        store
+            .add_folder(&SourceFolder {
+                path: photos.display().to_string(),
+                recursive: true,
+                album_mapping: false,
+                album_scope: sync_core::store::AlbumScope::Leaf,
+                album_title: None,
+            })
+            .expect("seed the folder");
+        // The file is gone, so the pass hashes every same-size candidate while
+        // looking for the rename that never happened.
+        store
+            .record(&ItemRecord {
+                path: photos.join("gone.jpg").display().to_string(),
+                size: SIZE as u64,
+                mtime_ns: 1_700_000_000_000_000_000,
+                sha1: Sha1::from_hex("2aae6c35c94fcfb415dbe95f408b9ce91ee846ed")
+                    .expect("a hex SHA-1"),
+                asset_id: Some("asset-1".to_string()),
+                state: ItemState::Uploaded,
+                error_class: None,
+                error_message: None,
+                attempts: 1,
+                sidecar: None,
+            })
+            .expect("seed the vanished item");
+    }
+
+    let connection = signed_in(cx, &server);
+    let store = cx.update(|cx| cx.new(|cx| StoreModel::open(&paths, cx)));
+    wait_for_inputs(cx, &connection, &store).await;
+    let engine = cx.update(|cx| cx.new(|cx| EngineModel::new(connection, store, &paths, cx)));
+    cx.update(|cx| engine.update(cx, |model, cx| model.start(cx)));
+    // The engine's start runs a pass of its own. Waiting for it to be published
+    // makes the flag below unambiguously the click's.
+    assert!(
+        pump_until(cx, |cx| {
+            cx.read(|cx| {
+                let status = engine.read(cx).status();
+                !status.scanning
+                    && status
+                        .folders
+                        .first()
+                        .is_some_and(|folder| folder.last_scan_ns.is_some())
+            })
+        }),
+        "the engine's own scan never settled"
+    );
+    let before = cx.read(|cx| engine.read(cx).status().folders[0].last_scan_ns);
+
+    let outcome = cx.update(|cx| engine.update(cx, |model, cx| model.sync_now(cx)));
+    assert_eq!(
+        outcome,
+        SyncNowOutcome::Requested,
+        "#56: a click on a running engine asks the scan loop for a pass"
+    );
+    assert!(
+        pump_until(cx, |cx| cx.read(|cx| engine.read(cx).status().scanning)),
+        "#56: the click's scan must publish itself"
+    );
+    assert!(
+        pump_until(cx, |cx| !cx.read(|cx| engine.read(cx).status().scanning)),
+        "#56: the flag must clear once the scan has finished"
+    );
+    assert!(
+        cx.read(|cx| engine.read(cx).status().folders[0].last_scan_ns) > before,
+        "#56: the click's scan recorded a newer scan time"
+    );
+}
+
 /// #56: signed out is the reachable field case. The store holds the folder, so
 /// the reason names the connection rather than the list.
 #[gpui_kit::test]
@@ -1512,6 +1604,111 @@ async fn a_signed_out_click_reports_the_missing_connection(cx: &mut TestAppConte
         cx.read(|cx| engine.read(cx).status().folders.len()),
         1,
         "the refused click still republishes the store-backed status"
+    );
+}
+
+/// #56: the first open runs `quick_check` and the migrations, so for a moment
+/// the folder list is empty for a reason that is not "no folder". A click then
+/// names the database, not a folder the user never forgot to add.
+#[gpui_kit::test]
+async fn a_click_before_the_store_opens_reports_the_database(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+
+    let connection = cx.update(|cx| {
+        let credentials: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+        cx.new(|_| ConnectionModel::new(ServerProfile::default(), credentials))
+    });
+    let store = cx.update(|cx| cx.new(|cx| StoreModel::open(&paths, cx)));
+    assert!(
+        cx.read(|cx| !store.read(cx).settled()),
+        "the store must still be opening when the click lands"
+    );
+    let engine =
+        cx.update(|cx| cx.new(|cx| EngineModel::new(connection, store.clone(), &paths, cx)));
+
+    let (outcome, reason) = cx.update(|cx| {
+        engine.update(cx, |model, cx| {
+            let outcome = model.sync_now(cx);
+            (outcome, model.sync_now_reason(outcome, cx))
+        })
+    });
+    assert_eq!(
+        outcome,
+        SyncNowOutcome::NotReady,
+        "#56: an empty list before the first open is the database, not a missing folder"
+    );
+    assert_eq!(
+        reason.as_deref(),
+        Some("The state database is still opening. Try again in a moment."),
+        "#56: the notice names the database, not a folder"
+    );
+    assert!(
+        !cx.read(|cx| engine.read(cx).dashboard_model(cx).scanning),
+        "#56: the control must never read Checking… for this click"
+    );
+
+    // The open landing is what the notice promised, so the sentence goes with
+    // its reason instead of staying on screen.
+    assert!(
+        pump_until(cx, |cx| cx.read(|cx| store.read(cx).settled())),
+        "the store never settled"
+    );
+    assert_eq!(
+        cx.read(|cx| engine
+            .read(cx)
+            .sync_now_reason(SyncNowOutcome::NotReady, cx)),
+        None,
+        "#56: a reason that no longer holds is not shown"
+    );
+}
+
+/// #56: an open that failed leaves the folder list empty forever, so only the
+/// store's own problem can explain why a click cannot scan.
+#[gpui_kit::test]
+async fn a_click_after_a_failed_open_reports_the_database(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    // A directory where the database file goes: the open fails, as a damaged
+    // or unreadable database would.
+    std::fs::create_dir_all(&paths.state_db).expect("put a directory at the database path");
+
+    let connection = cx.update(|cx| {
+        let credentials: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+        cx.new(|_| ConnectionModel::new(ServerProfile::default(), credentials))
+    });
+    let store = cx.update(|cx| cx.new(|cx| StoreModel::open(&paths, cx)));
+    assert!(
+        pump_until(cx, |cx| cx.read(|cx| store.read(cx).problem().is_some())),
+        "the open never failed"
+    );
+    let engine =
+        cx.update(|cx| cx.new(|cx| EngineModel::new(connection, store.clone(), &paths, cx)));
+
+    let (outcome, reason) = cx.update(|cx| {
+        engine.update(cx, |model, cx| {
+            let outcome = model.sync_now(cx);
+            (outcome, model.sync_now_reason(outcome, cx))
+        })
+    });
+    assert_eq!(
+        outcome,
+        SyncNowOutcome::NotReady,
+        "#56: a store that never opened is not an empty folder list"
+    );
+    let problem = cx
+        .read(|cx| store.read(cx).problem().map(str::to_string))
+        .expect("the failed open names its problem");
+    assert_eq!(
+        reason.as_deref(),
+        Some(problem.as_str()),
+        "#56: the notice shows the database's own problem, not a missing folder"
+    );
+    assert!(
+        !cx.read(|cx| engine.read(cx).dashboard_model(cx).scanning),
+        "#56: the control must never read Checking… for this click"
     );
 }
 

@@ -450,6 +450,18 @@ fn dashboard_shows_named_controls_and_one_card_per_folder(cx: &mut TestAppContex
 
         let global = window.find("status-global");
         assert!(global.visible(), "the global card is visible");
+        // #56: the global card carries the reconciliation scan line, the same
+        // sentence the folder detail shows for one folder.
+        let scan = window.find((ElementId::from("status-global"), "scan"));
+        let scan = scan.label().unwrap_or_default();
+        assert!(
+            scan.starts_with("Last reconciliation scan: "),
+            "#56: the global card names the pass the folder detail names: {scan}"
+        );
+        assert!(
+            scan.contains(" · "),
+            "#56: the line carries the moment, not only the label: {scan}"
+        );
 
         let model = sample();
         for (index, folder) in model.folders.iter().enumerate() {
@@ -486,6 +498,8 @@ fn the_sync_control_reports_a_running_scan(cx: &mut TestAppContext) {
             Some("Checking the source folders"),
             "#56: the control is named for the scan it is running"
         );
+        // The harness reads the accessible name; the visible "Checking…" that
+        // pairs with it is pinned by `status::tests::the_sync_control_renames_itself_while_it_scans`.
         assert_eq!(
             window.find("dashboard-pause").label(),
             Some("Pause syncing"),
@@ -530,6 +544,61 @@ async fn a_click_with_no_source_folder_shows_the_reason(cx: &mut TestAppContext)
         );
     })
     .expect("click Sync now with no source folder");
+}
+
+/// #56: a notice must not outlive the reason it names. A folder that arrives
+/// after a refused click answers the notice's own advice, so the notice goes
+/// instead of contradicting the card that now lists the folder.
+#[gpui_kit::test]
+async fn a_notice_clears_when_the_folder_arrives(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the fixture folder");
+    let (window, store, _view) = open_live_dashboard(cx, temp.path());
+    wait_for_store(cx, &store).await;
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("dashboard-sync-now", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("dashboard-sync-notice").label(),
+            Some("No source folder to scan. Add a folder first."),
+            "#56: the click says what is missing"
+        );
+    })
+    .expect("click Sync now with no source folder");
+
+    let folder = sync_core::store::SourceFolder {
+        path: photos.display().to_string(),
+        recursive: true,
+        album_mapping: false,
+        album_scope: sync_core::store::AlbumScope::Leaf,
+        album_title: None,
+    };
+    cx.update(|cx| {
+        store
+            .read(cx)
+            .store()
+            .expect("the store is open")
+            .add_folder(&folder)
+            .expect("seed the source folder");
+        store.update(cx, |store, cx| store.set_folders(vec![folder], cx));
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find(("status-folder", 0_usize)).is_some(),
+            "#56: the card for the added folder renders"
+        );
+        assert!(
+            window.try_find("dashboard-sync-notice").is_none(),
+            "#56: the notice must not outlive the reason it named"
+        );
+    })
+    .expect("render after the folder arrived");
 }
 
 /// #56: signed out is the reachable field case: the folders are known, the
