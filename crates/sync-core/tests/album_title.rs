@@ -135,8 +135,16 @@ fn rename_settled(
     file: &Path,
     title: &str,
 ) -> bool {
-    !album_of(store, photos).rename_pending
-        && server.album_for_asset(&asset_id_of(store, file)).as_deref() == Some(title)
+    let Some(asset) = store
+        .item(&file.display().to_string())
+        .ok()
+        .flatten()
+        .and_then(|row| row.asset_id)
+    else {
+        return false;
+    };
+    server.album_for_asset(&asset).as_deref() == Some(title)
+        && !album_of(store, photos).rename_pending
 }
 
 /// #47: a new album is created with the title the user chose.
@@ -315,15 +323,13 @@ async fn clearing_the_title_renames_the_album_back_to_the_folder_name() {
 
     assert!(
         wait_until(
-            || server
-                .album_for_asset(&asset_id_of(&store, &file))
-                .as_deref()
-                == Some("Pictures"),
+            || rename_settled(&store, &server, &photos, &file, "Pictures"),
             Duration::from_secs(15)
         )
         .await,
-        "the album was not renamed back: {:?}",
-        server.album_rename_calls()
+        "the album was not renamed back: {:?} {:?}",
+        server.album_rename_calls(),
+        album_of(&store, &photos)
     );
     assert_eq!(
         album_of(&store, &photos),
@@ -698,10 +704,7 @@ async fn the_title_survives_a_restart_a_toggle_and_a_re_add() {
         .expect("set the title");
     assert!(
         wait_until(
-            || server
-                .album_for_asset(&asset_id_of(&store, &file))
-                .as_deref()
-                == Some("Holiday 2024"),
+            || rename_settled(&store, &server, &photos, &file, "Holiday 2024"),
             Duration::from_secs(15)
         )
         .await
