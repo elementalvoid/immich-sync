@@ -206,7 +206,9 @@ fn open_shell(
 /// The probe is the bottom-most element the view registers, so it only becomes
 /// visible when the scroll actually reaches the content's end. Upload is short
 /// enough to fit at the test height, so its probe must be visible without
-/// scrolling; that still catches a clipped control.
+/// scrolling; that still catches a clipped control. The Logs tail is also on
+/// screen without a page scroll (#54): its own box takes the height the cards
+/// above it leave, and it opens at its newest line.
 fn surface_probe(mode: ViewMode) -> (ElementId, ElementId, bool) {
     match mode {
         ViewMode::Dashboard => (
@@ -230,7 +232,11 @@ fn surface_probe(mode: ViewMode) -> (ElementId, ElementId, bool) {
             format!("review-trash-{}", SEEDED_ROWS - 1).into(),
             true,
         ),
-        ViewMode::Logs => ("logs-view".into(), "logs-lines".into(), true),
+        ViewMode::Logs => (
+            "logs-lines".into(),
+            ElementId::from(format!("logs-line-{}", SEEDED_LINES - 1)),
+            false,
+        ),
         ViewMode::Diagnostics => (
             "diagnostics-view".into(),
             "diagnostics-errors-empty".into(),
@@ -357,10 +363,13 @@ async fn the_log_tail_scrolls_inside_its_own_container(cx: &mut TestAppContext) 
     shell.update(cx, |shell, cx| shell.show(ViewMode::Logs, cx));
     wait_for_element(cx, window, newest.clone()).await;
     cx.update_window(window, |_, window, cx| {
-        // The outer surface brings the tail card into view...
-        scroll_until_visible(window, cx, &"logs-view".into(), &"logs-lines".into(), -4.);
-        // ...and the live tail opens at its newest line, so the oldest rows sit
-        // above the box's top edge.
+        // The tail is on screen without the page scrolling first (#54), and the
+        // live tail opens at its newest line, so the oldest rows sit above the
+        // box's top edge.
+        assert!(
+            window.find("logs-lines").visible(),
+            "the tail is on screen at a short window without a page scroll"
+        );
         let box_top = window.find("logs-lines").bounds().origin.y;
         assert!(
             window.find(oldest.clone()).bounds().origin.y < box_top,
