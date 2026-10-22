@@ -1011,6 +1011,17 @@ impl Observer for EngineObserver {
             // added after the folder that contains it owns the same rows a
             // restart gives it.
             folders.sort_by(|left, right| left.folder.path.cmp(&right.folder.path));
+        }
+        // #52: a row moves cards only between a folder and one that contains
+        // it or lies inside it. A re-spell with no such neighbour keeps every
+        // live counter it has: the read would replace them with a store
+        // snapshot that lags an upload already in flight.
+        let moves_rows = respelled
+            && folders.iter().any(|entry| {
+                let other = path_key(Path::new(&entry.folder.path));
+                other != key && (key_is_within(&other, &key) || key_is_within(&key, &other))
+            });
+        if existing.is_none() || moves_rows {
             // #52: the seed is the ownership read over this list. It scans the
             // table, so it runs with the folder lock released: a status poll
             // never queues behind it (N2).
@@ -3480,6 +3491,79 @@ mod tests {
                 .map(|(folder, counts)| (folder.path.clone(), counts))
                 .collect::<Vec<_>>(),
             "#52: the live cards must own what the stored ones own, in the same order"
+        );
+        engine.stop();
+    }
+
+    /// #52: a re-spelled re-add of a folder that contains no other and lies
+    /// inside none moves no row, so the live counters stay. The ownership read
+    /// would replace them with a store snapshot that lags an upload already in
+    /// flight, and the folder has no neighbour to take a row from anyway.
+    #[test]
+    fn a_respelled_re_add_that_cannot_move_rows_keeps_the_live_counts() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let store =
+            Arc::new(StateStore::open(temp.path().join("state.db")).expect("open the state store"));
+        let photos = temp.path().join("photos");
+        std::fs::create_dir_all(&photos).expect("create the folder");
+        store
+            .add_folder(&SourceFolder {
+                path: photos.display().to_string(),
+                recursive: true,
+                album_mapping: false,
+                album_scope: AlbumScope::default(),
+                album_title: None,
+            })
+            .expect("add the folder");
+        store
+            .record(&ItemRecord {
+                path: photos.join("queued.jpg").display().to_string(),
+                size: 1,
+                mtime_ns: 0,
+                sha1: Sha1::from_slice(&[0; 20]).expect("a full digest"),
+                asset_id: None,
+                state: ItemState::Pending,
+                error_class: None,
+                error_message: None,
+                attempts: 0,
+                sidecar: None,
+            })
+            .expect("write the pending row");
+        // The session is never used: this test sends no request.
+        let session = crate::connection::Connection::new(
+            "http://127.0.0.1:1",
+            Arc::new(crate::credential::MemoryCredentialStore::new()),
+        )
+        .expect("a valid URL")
+        .shared();
+        let engine = Engine::new(
+            Arc::new(Tracking::new(store)),
+            session,
+            EngineConfig::default(),
+        )
+        .expect("build the engine");
+        assert_eq!(engine.status().folders[0].counts.pending, 1);
+        // In flight: the store already holds the row and the live counter has
+        // moved past it.
+        engine.inner.note_pending(&photos.join("queued.jpg"), None);
+        assert_eq!(engine.status().folders[0].counts.pending, 2);
+
+        // The trailing separator is the same path under R2.4 and sorts after
+        // it; the folder is the only entry, so no row can change cards.
+        engine
+            .add_folder(&format!("{}/", photos.display()), true)
+            .expect("re-add the folder with another spelling");
+
+        let folders = engine.status().folders;
+        assert_eq!(folders.len(), 1, "the re-add is the same folder");
+        assert_eq!(
+            folders[0].path,
+            format!("{}/", photos.display()),
+            "the live entry took the spelling the store wrote"
+        );
+        assert_eq!(
+            folders[0].counts.pending, 2,
+            "#52: a re-spell that moves no row replaced a live count with an older snapshot"
         );
         engine.stop();
     }
