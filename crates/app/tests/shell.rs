@@ -12,7 +12,7 @@ use std::sync::Arc;
 use common::scroll_dashboard_into_view;
 use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
 use gpui_kit::{
-    Action, AnyWindowHandle, AppContext as _, Bounds, MenuItem, Point, TestAppContext, Window,
+    Action, AnyWindowHandle, AppContext as _, Bounds, MenuItem, Point, TestAppContext,
     WindowBounds, WindowOptions, px, size,
 };
 use immich_sync::connection::ConnectionModel;
