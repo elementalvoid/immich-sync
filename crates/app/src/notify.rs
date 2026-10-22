@@ -198,6 +198,7 @@ mod tests {
             },
             last_error: None,
             uploads: UploadTraffic::default(),
+            scanning: false,
         }
     }
 

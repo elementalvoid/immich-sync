@@ -38,7 +38,24 @@ fn inputs(folders: Vec<FolderStatus>) -> StatusInputs {
         connection: ConnectionHealth::Ready,
         review_total: None,
         last_error: None,
+        scanning: false,
     }
+}
+
+/// #56: the scan lifecycle is derived like every other field, so the engine's
+/// live flag and a store-only client share one shape the views can read.
+#[test]
+fn the_scan_flag_rides_the_derived_status() {
+    let mut given = inputs(Vec::new());
+    given.scanning = true;
+    assert!(
+        Status::derive(given).scanning,
+        "#56: a running scan must be published"
+    );
+    assert!(
+        !Status::derive(inputs(Vec::new())).scanning,
+        "#56: an idle client is not scanning"
+    );
 }
 
 #[test]

@@ -5,10 +5,13 @@
 //! state database, the real engine model, and the view's own click and keyboard
 //! handling.
 
+mod common;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use common::scroll_dashboard_into_view;
 use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
 use gpui_kit::{
     AnyWindowHandle, App, AppContext as _, ElementId, Entity, Point, ScrollDelta, TestAppContext,
@@ -261,6 +264,7 @@ fn scroll_into_view(window: &mut Window, cx: &mut App, id: impl Into<ElementId>)
 /// Opens the detail and waits for it to be on screen.
 fn open_detail_now(cx: &mut TestAppContext, window: AnyWindowHandle) {
     act(cx, window, |window, cx| {
+        scroll_dashboard_into_view(window, cx, ("folder-details", 0_usize));
         window.click(("folder-details", 0_usize), cx);
     });
     read(cx, window, |window, _| {
@@ -1210,6 +1214,7 @@ fn a_folder_status_carries_its_times_into_the_detail_card() {
         counts: FolderCounts::default(),
         last_error: None,
         uploads: sync_core::meter::UploadTraffic::default(),
+        scanning: false,
     };
 
     let model = immich_sync::status::DashboardModel::from_engine(&status, None);
@@ -1222,8 +1227,9 @@ fn a_folder_status_carries_its_times_into_the_detail_card() {
         Some(1_700_000_001_000_000_000)
     );
     assert_eq!(
-        model.global.last_scan_ns, None,
-        "the global card is not a folder and has no folder times"
+        model.global.last_scan_ns,
+        Some(1_700_000_000_000_000_000),
+        "#56: the global card carries the newest folder's scan"
     );
 }
 

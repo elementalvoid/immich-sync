@@ -190,7 +190,12 @@ fn resume(_: &Resume, cx: &mut App) {
 }
 
 fn sync_now(_: &SyncNow, cx: &mut App) {
-    with_engine(cx, |engine, cx| engine.sync_now(cx));
+    // #56: the tray runs the same model call the dashboard does, so the window
+    // reports the click. A native menu cannot paint the reason a click could
+    // not scan; the window is where that answer belongs.
+    with_engine(cx, |engine, cx| {
+        let _ = engine.sync_now(cx);
+    });
 }
 
 /// Runs `change` on the app-scoped engine, when one exists.

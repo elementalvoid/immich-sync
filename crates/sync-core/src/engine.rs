@@ -259,6 +259,10 @@ struct EngineInner {
     tasks: Mutex<Vec<JoinHandle<()>>>,
     /// Set by `stop` before it aborts, so no worker is spawned afterwards.
     stopped: AtomicBool,
+    /// Whether `scan_once` is walking the folders right now (#56). The status
+    /// poll reads it, so the dashboard can report the click; `stop` leaves it
+    /// to the aborted pass's guard.
+    scanning: AtomicBool,
     /// The upload workers the dispatcher spawned, so `stop` can abort the ones
     /// still on the wire instead of leaving them running after the engine.
     uploads: Mutex<JoinSet<()>>,
@@ -397,6 +401,7 @@ impl Engine {
             watcher: Mutex::new(None),
             tasks: Mutex::new(Vec::new()),
             stopped: AtomicBool::new(false),
+            scanning: AtomicBool::new(false),
             uploads: Mutex::new(JoinSet::new()),
             absences: Mutex::new(Vec::new()),
             reconcile: Notify::new(),
@@ -805,6 +810,9 @@ impl Engine {
                 .lock()
                 .expect("the error lock")
                 .clone(),
+            // #56: the scan publishes itself here; the 250 ms poll is the
+            // transport, so no notify and no timer is needed.
+            scanning: self.inner.scanning.load(Ordering::SeqCst),
         })
     }
 
@@ -2376,6 +2384,13 @@ async fn scan_loop(inner: Arc<EngineInner>) {
 /// across folders is seen: the reconciliation has the whole picture, not one
 /// folder at a time.
 async fn scan_once(inner: &Arc<EngineInner>) {
+    // #56: the dashboard reads this while the pass walks and after it queues,
+    // so a click that finds nothing still shows the scan it ran. The guard
+    // clears it on every way out, including a task abort or an unwind; a
+    // stopped engine's scan dies with the task, so the flag is never read
+    // afterwards.
+    inner.scanning.store(true, Ordering::SeqCst);
+    let _scanning = ScanInProgress(&inner.scanning);
     // R3.3: a new pass pairs against fresh listings, not the previous pass's.
     *inner.index_cache.lock().expect("the index cache lock") = FolderIndex::default();
     let folders: Vec<SourceFolder> = inner
@@ -2435,6 +2450,16 @@ async fn scan_once(inner: &Arc<EngineInner>) {
     // from the upload path or a timer of its own.
     settle_album_titles(inner).await;
     tracing::info!(queued, "the reconciliation scan finished");
+}
+
+/// Clears the scan flag when it leaves scope, so every exit from [`scan_once`]
+/// publishes the end of the scan (#56).
+struct ScanInProgress<'a>(&'a AtomicBool);
+
+impl Drop for ScanInProgress<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 /// Decides what each tracked disappearance under the scanned folders is
@@ -3584,6 +3609,7 @@ mod tests {
             counts: FolderCounts::default(),
             last_error: None,
             uploads: UploadTraffic::default(),
+            scanning: false,
         };
         assert_eq!(status.progress(), 0.0);
         status.counts.uploaded = 3;
