@@ -206,6 +206,15 @@ fn label(window: &Window, id: impl Into<ElementId>) -> String {
     window.find(id).label().unwrap_or_default().to_string()
 }
 
+/// The settings line one folder card states (#57).
+fn card_settings(window: &Window, index: usize) -> String {
+    window
+        .find((ElementId::from(("status-folder", index)), "settings"))
+        .label()
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// Runs one action inside a window update.
 ///
 /// A click or a key press queues its effect — the dialog closing, a focus
@@ -241,14 +250,16 @@ fn read<R>(
 ///
 /// The detail card scrolls its body when the window is short (#43), and the
 /// album title field above the list pushes Load more below the fold, so a
-/// control is clicked only after it is really visible.
+/// control is clicked only after its center is really on screen: a sliver
+/// peeking past the card's edge would put the click on the backdrop.
 fn scroll_into_view(window: &mut Window, cx: &mut App, id: impl Into<ElementId>) {
     let id = id.into();
     window.render_frame(cx);
     for _ in 0..60 {
+        let card = window.find("folder-panel").bounds();
         if window
             .try_find(id.clone())
-            .is_some_and(|target| target.visible())
+            .is_some_and(|target| card.contains(&target.bounds().center()))
         {
             return;
         }
@@ -276,9 +287,7 @@ fn open_detail_now(cx: &mut TestAppContext, window: AnyWindowHandle) {
 }
 
 #[gpui_kit::test]
-async fn a_card_click_and_its_details_control_open_the_detail_but_its_settings_do_not(
-    cx: &mut TestAppContext,
-) {
+async fn a_card_click_and_its_details_control_open_the_detail(cx: &mut TestAppContext) {
     // A worker thread wakes the foreground executor, which the harness
     // permits only in parking mode.
     cx.executor().allow_parking();
@@ -360,23 +369,23 @@ async fn a_card_click_and_its_details_control_open_the_detail_but_its_settings_d
         assert!(!detail_open(window), "Escape closes it again");
     });
 
-    // #43: a card control never opens it, with the pointer or the keyboard.
-    for control in ["folder-recursive", "folder-album"] {
-        act(cx, window, |window, cx| {
-            window.click((control, 0_usize), cx)
-        });
-        read(cx, window, |window, _| {
-            assert!(!detail_open(window), "{control} must not open the detail");
-        });
-    }
-    act(cx, window, |window, cx| {
-        tab_to(window, ("folder-recursive", 0_usize), cx);
-        window.press("space", cx);
-    });
+    // #57: the card states the settings and offers no control of its own, so
+    // the only interactive parts are the card itself and Details.
     read(cx, window, |window, _| {
+        let card = ElementId::from(("folder-card", 0_usize));
+        let controls: Vec<_> = gpui_kit::base::test_support::snapshots(window)
+            .into_iter()
+            .filter(|snapshot| snapshot.path().contains(&card))
+            .filter_map(|snapshot| snapshot.role())
+            .filter(|role| matches!(role, gpui_kit::Role::Switch | gpui_kit::Role::RadioButton))
+            .collect();
+        assert!(
+            controls.is_empty(),
+            "#57: the card has no switch or radio: {controls:?}"
+        );
         assert!(
             !detail_open(window),
-            "Space on a card control must not open the detail"
+            "nothing on the card opened the detail"
         );
     });
 }
@@ -486,20 +495,124 @@ async fn the_detail_shows_the_live_fields_and_writes_every_setting(cx: &mut Test
     });
     assert!(stored.album_mapping);
 
-    // R8.1: the card behind the dialog shows the same values once it closes.
+    // R8.1, #57: the card behind the dialog states the same values once it
+    // closes.
     act(cx, window, |window, cx| window.press("escape", cx));
     read(cx, window, |window, _| {
         assert!(!detail_open(window));
         assert_eq!(
-            window.find(("folder-recursive", 0_usize)).checked(),
-            Some(false)
-        );
-        assert_eq!(window.find(("folder-album", 0_usize)).checked(), Some(true));
-        assert_eq!(
-            window.find(("folder-album-whole", 0_usize)).selected(),
-            Some(true)
+            card_settings(window, 0),
+            "Recursive: off · Album mapping: on · Album scope: One album for this folder"
         );
     });
+}
+
+#[gpui_kit::test]
+async fn the_detail_gives_each_setting_its_own_row(cx: &mut TestAppContext) {
+    // A worker thread wakes the foreground executor, which the harness
+    // permits only in parking mode.
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+    seed_folder(&paths, &photos, true);
+    let (window, store, _view) = open_dashboard(cx, &paths);
+    wait_for_store(cx, &store).await;
+
+    open_detail_now(cx, window);
+    read(cx, window, |window, _| {
+        // #57: one setting per row, so each control starts below the one
+        // before it and the two scopes sit together on the scope's row.
+        let recursive = window.find("folder-panel-recursive").bounds();
+        let mapping = window.find("folder-panel-album").bounds();
+        let leaf = window.find("folder-panel-album-leaf").bounds();
+        let whole = window.find("folder-panel-album-whole").bounds();
+        assert!(
+            recursive.bottom() <= mapping.top(),
+            "#57: Recursive gets its own row: {recursive:?}"
+        );
+        assert!(
+            mapping.bottom() <= leaf.top().min(whole.top()),
+            "#57: Album mapping gets its own row: {mapping:?}"
+        );
+        assert!(
+            leaf.bottom() <= whole.top(),
+            "#57: the two scopes sit together in the scope's row: {leaf:?} vs {whole:?}"
+        );
+        assert!(
+            (leaf.left() - whole.left()).abs() <= px(0.5),
+            "#57: the scopes line up as one control block: {leaf:?} vs {whole:?}"
+        );
+    });
+}
+
+#[gpui_kit::test]
+async fn the_detail_settings_reach_the_store_by_pointer_and_by_keyboard(cx: &mut TestAppContext) {
+    // A worker thread wakes the foreground executor, which the harness
+    // permits only in parking mode.
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+    seed_folder(&paths, &photos, true);
+    let (window, store, _view) = open_dashboard(cx, &paths);
+    wait_for_store(cx, &store).await;
+
+    open_detail_now(cx, window);
+    // #57: the card no longer carries the settings, so the detail is where
+    // each one is turned by pointer and by keyboard (N5).
+    act(cx, window, |window, cx| {
+        tab_to(window, "folder-panel-album", cx);
+        window.press("space", cx);
+    });
+    let mapped = wait_for_folder(cx, &store, |folder| folder.album_mapping).await;
+    assert_eq!(
+        mapped.album_scope,
+        AlbumScope::Leaf,
+        "R3.4: the scope is per folder and starts at one album per folder"
+    );
+
+    // With the mapping on, the scope radios take focus and answer the keyboard.
+    act(cx, window, |window, cx| {
+        tab_to(window, "folder-panel-album-whole", cx);
+        window.press("enter", cx);
+    });
+    let whole = wait_for_folder(cx, &store, |folder| {
+        folder.album_scope == AlbumScope::WholeFolder
+    })
+    .await;
+    assert!(whole.album_mapping, "the mapping is still on");
+
+    // The pointer chooses the other scope without touching the mapping.
+    act(cx, window, |window, cx| {
+        window.click("folder-panel-album-leaf", cx);
+    });
+    let leaf = wait_for_folder(cx, &store, |folder| folder.album_scope == AlbumScope::Leaf).await;
+    assert!(leaf.album_mapping);
+
+    // R2.1: recursion toggles by pointer and by keyboard, and neither the
+    // mapping nor the scope moves with it.
+    act(cx, window, |window, cx| {
+        window.click("folder-panel-recursive", cx);
+    });
+    let flat = wait_for_folder(cx, &store, |folder| !folder.recursive).await;
+    assert!(
+        flat.album_mapping,
+        "R2.1: the pointer toggle keeps the mapping"
+    );
+    assert_eq!(flat.album_scope, AlbumScope::Leaf);
+
+    act(cx, window, |window, cx| {
+        tab_to(window, "folder-panel-recursive", cx);
+        window.press("space", cx);
+    });
+    let recursive = wait_for_folder(cx, &store, |folder| folder.recursive).await;
+    assert!(
+        recursive.album_mapping,
+        "R2.1: the keyboard toggle keeps the mapping"
+    );
 }
 
 #[gpui_kit::test]
@@ -521,12 +634,7 @@ async fn the_detail_traps_focus_and_every_control_is_keyboard_reachable(cx: &mut
         // controls behind the backdrop.
         for _ in 0..16 {
             window.press("tab", cx);
-            for behind in [
-                "dashboard-folder-path",
-                "dashboard-add-folder",
-                "folder-recursive",
-                "folder-album",
-            ] {
+            for behind in ["dashboard-folder-path", "dashboard-add-folder"] {
                 let focused = window
                     .try_find(behind)
                     .and_then(|snapshot| snapshot.focused());
@@ -910,9 +1018,11 @@ async fn a_refused_remove_keeps_the_detail_open_with_its_reason(cx: &mut TestApp
     }
 
     act(cx, window, |window, cx| {
+        scroll_into_view(window, cx, "folder-detail-remove");
         window.click("folder-detail-remove", cx)
     });
     act(cx, window, |window, cx| {
+        scroll_into_view(window, cx, "folder-detail-remove-confirm");
         window.click("folder-detail-remove-confirm", cx);
     });
 
@@ -934,6 +1044,7 @@ async fn a_refused_remove_keeps_the_detail_open_with_its_reason(cx: &mut TestApp
     // The button is usable again, not stuck on Removing…: a disabled control
     // ignores the click, so the confirmation appearing is what proves it.
     act(cx, window, |window, cx| {
+        scroll_into_view(window, cx, "folder-detail-remove");
         window.click("folder-detail-remove", cx)
     });
     read(cx, window, |window, _| {
@@ -951,6 +1062,7 @@ async fn a_refused_remove_keeps_the_detail_open_with_its_reason(cx: &mut TestApp
             .expect("drop the trigger that refused the delete");
     }
     act(cx, window, |window, cx| {
+        scroll_into_view(window, cx, "folder-detail-remove-confirm");
         window.click("folder-detail-remove-confirm", cx);
     });
     for _ in 0..600 {

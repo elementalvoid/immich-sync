@@ -242,7 +242,7 @@ fn folder_progress_survives_counts_above_a_u16() {
 }
 
 #[gpui_kit::test]
-fn the_album_line_reads_the_scope_whether_the_mapping_is_on_or_off() {
+fn the_card_states_the_folder_settings_once() {
     use sync_core::store::AlbumScope;
 
     let model = sample();
@@ -252,8 +252,9 @@ fn the_album_line_reads_the_scope_whether_the_mapping_is_on_or_off() {
         .find(|folder| folder.album_mapping && folder.album_scope == AlbumScope::WholeFolder)
         .expect("the sample data has a mapped folder");
     assert_eq!(
-        mapped.content().album.as_deref(),
-        Some("Albums: One album for this folder")
+        mapped.content().settings.as_deref(),
+        Some("Recursive: on · Album mapping: on · Album scope: One album for this folder"),
+        "#57: the card states recursion, mapping, and scope once each"
     );
 
     let off = model
@@ -262,16 +263,15 @@ fn the_album_line_reads_the_scope_whether_the_mapping_is_on_or_off() {
         .find(|folder| !folder.album_mapping)
         .expect("the sample data has an unmapped folder");
     assert_eq!(
-        off.content().album.as_deref(),
-        Some("Albums: off"),
-        "R3.4: the scope radios change what the folder will map to, so the card says which \
-         scope is stored even while the mapping is off"
+        off.content().settings.as_deref(),
+        Some("Recursive: on · Album mapping: off"),
+        "#57: the scope is left out while the mapping is not in force"
     );
 
     assert_eq!(
-        model.global.content().album,
+        model.global.content().settings,
         None,
-        "the all-folders card is not one folder's album"
+        "the all-folders card is not one folder"
     );
 }
 
@@ -1088,7 +1088,7 @@ async fn wait_for_folder(
 }
 
 #[gpui_kit::test]
-async fn a_folder_card_names_the_album_mapping_and_its_scope(cx: &mut TestAppContext) {
+async fn a_folder_card_states_its_settings_and_offers_no_controls(cx: &mut TestAppContext) {
     cx.executor().allow_parking();
     let temp = tempfile::tempdir().expect("create a temp dir");
     let photos = temp.path().join("photos");
@@ -1098,160 +1098,45 @@ async fn a_folder_card_names_the_album_mapping_and_its_scope(cx: &mut TestAppCon
 
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
-        // N5: every control carries an accessible name, and the album scope
-        // says which folder it belongs to.
+        // #57: the card states the stored settings, and the scope is left out
+        // while the mapping is not in force (R3.4).
         assert_eq!(
-            window.find(("folder-album", 0_usize)).label(),
-            Some("Album mapping for photos")
+            card_settings(window, 0),
+            "Recursive: on · Album mapping: off",
+            "the new folder's card states what the store holds"
         );
-        assert_eq!(
-            window.find(("folder-album-leaf", 0_usize)).label(),
-            Some("Album scope for photos: one album per folder")
+        // #57: a read-only card has no control that would need to stop a click
+        // from reaching it; its only controls are the card and Details.
+        assert!(
+            control_roles(window, ("folder-card", 0_usize)).is_empty(),
+            "#57: the card carries no switch and no radio"
         );
-        assert_eq!(
-            window.find(("folder-album-whole", 0_usize)).label(),
-            Some("Album scope for photos: one album for this folder")
-        );
-        // R3.4: the mapping is opt-in, so it starts off and the scope it would
-        // use is not yet in force.
-        assert_eq!(
-            window.find(("folder-album", 0_usize)).checked(),
-            Some(false),
-            "album mapping starts off"
-        );
-        assert_eq!(
-            window.find(("folder-album-leaf", 0_usize)).selected(),
-            Some(true),
-            "the leaf scope is the default"
-        );
-        // The scope stays choosable before the mapping is on: it is the
-        // folder's stored scope and applies once the mapping is on (R3.4).
-        assert_eq!(
-            window.find(("folder-album-whole", 0_usize)).checked(),
-            Some(false),
-            "the other scope is not chosen"
+        assert!(
+            window.find(("folder-details", 0_usize)).visible(),
+            "#53: the card keeps its Details control"
         );
     })
-    .expect("read the album controls");
+    .expect("read the folder card");
 }
 
-#[gpui_kit::test]
-async fn the_album_controls_reach_the_store_by_pointer_and_by_keyboard(cx: &mut TestAppContext) {
-    cx.executor().allow_parking();
-    let temp = tempfile::tempdir().expect("create a temp dir");
-    let photos = temp.path().join("photos");
-    std::fs::create_dir_all(&photos).expect("create the fixture folder");
-    let (window, store, _view) = open_live_dashboard(cx, temp.path());
-    add_folder_through_ui(cx, window, &store, &photos).await;
-
-    // The switch is a tab stop that activates with Space (N5).
-    cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
-        tab_to(window, ("folder-album", 0_usize), cx);
-        window.press("space", cx);
-    })
-    .expect("turn album mapping on with the keyboard");
-    let mapped = wait_for_folder(cx, &store, |folder| folder.album_mapping).await;
-    assert_eq!(
-        mapped.album_scope,
-        sync_core::store::AlbumScope::Leaf,
-        "R3.4: the scope is per folder and starts at one album per folder"
-    );
-
-    // With mapping on, the scope radios take focus and answer the keyboard.
-    cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
-        assert_eq!(
-            window.find(("folder-album", 0_usize)).checked(),
-            Some(true),
-            "the switch shows the mapping the store holds"
-        );
-        tab_to(window, ("folder-album-whole", 0_usize), cx);
-        window.press("enter", cx);
-    })
-    .expect("choose the whole-folder scope with the keyboard");
-    let whole = wait_for_folder(cx, &store, |folder| {
-        folder.album_scope == sync_core::store::AlbumScope::WholeFolder
-    })
-    .await;
-    assert!(whole.album_mapping, "the mapping is still on");
-
-    cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
-        assert_eq!(
-            window.find(("folder-album-whole", 0_usize)).checked(),
-            Some(true),
-            "the radio shows the scope the store holds"
-        );
-        window.click(("folder-album-leaf", 0_usize), cx);
-    })
-    .expect("choose the leaf scope with the pointer");
-    let leaf = wait_for_folder(cx, &store, |folder| {
-        folder.album_scope == sync_core::store::AlbumScope::Leaf
-    })
-    .await;
-    assert!(leaf.album_mapping);
+/// The settings line one folder card states (#57).
+fn card_settings(window: &Window, index: usize) -> String {
+    window
+        .find((ElementId::from(("status-folder", index)), "settings"))
+        .label()
+        .unwrap_or_default()
+        .to_string()
 }
 
-#[gpui_kit::test]
-async fn the_recursive_switch_reaches_the_store_by_pointer_and_by_keyboard(
-    cx: &mut TestAppContext,
-) {
-    cx.executor().allow_parking();
-    let temp = tempfile::tempdir().expect("create a temp dir");
-    let photos = temp.path().join("photos");
-    std::fs::create_dir_all(&photos).expect("create the fixture folder");
-    let (window, store, _view) = open_live_dashboard(cx, temp.path());
-    add_folder_through_ui(cx, window, &store, &photos).await;
-
-    // R2.1: the field adds a folder recursively, and the card's switch shows
-    // and changes the flag the store holds.
-    cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
-        assert_eq!(
-            window.find(("folder-recursive", 0_usize)).label(),
-            Some("Sync photos recursively")
-        );
-        assert_eq!(
-            window.find(("folder-recursive", 0_usize)).checked(),
-            Some(true),
-            "a folder added through the field starts recursive"
-        );
-    })
-    .expect("read the recursion switch");
-
-    // Turn album mapping on first: the recursion toggle must not disturb it.
-    cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
-        window.click(("folder-album", 0_usize), cx);
-    })
-    .expect("turn album mapping on");
-    wait_for_folder(cx, &store, |folder| folder.album_mapping).await;
-
-    // The switch is a tab stop that activates with Space (N5).
-    cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
-        tab_to(window, ("folder-recursive", 0_usize), cx);
-        window.press("space", cx);
-    })
-    .expect("turn recursion off with the keyboard");
-    let flat = wait_for_folder(cx, &store, |folder| !folder.recursive).await;
-    assert!(
-        flat.album_mapping,
-        "R2.1: the recursion toggle keeps the album mapping"
-    );
-
-    // And back on by pointer, still preserving the other per-folder settings.
-    cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
-        window.click(("folder-recursive", 0_usize), cx);
-    })
-    .expect("turn recursion on with the pointer");
-    let recursive = wait_for_folder(cx, &store, |folder| folder.recursive).await;
-    assert!(
-        recursive.album_mapping,
-        "R2.1: the switch back keeps the album mapping"
-    );
+/// The switch and radio roles inside one element's subtree (#57).
+fn control_roles(window: &Window, scope: impl Into<ElementId>) -> Vec<Role> {
+    let scope = scope.into();
+    gpui_kit::base::test_support::snapshots(window)
+        .into_iter()
+        .filter(|snapshot| snapshot.path().contains(&scope))
+        .filter_map(|snapshot| snapshot.role())
+        .filter(|role| matches!(role, Role::Switch | Role::RadioButton))
+        .collect()
 }
 
 /// The text input the kit nests inside the row `id`.
@@ -1598,17 +1483,51 @@ async fn add_writes_the_path_and_all_three_settings_in_one_request(cx: &mut Test
             window.find(("status-folder", 0_usize)).visible(),
             "the new folder has a card"
         );
+        // #57: the card states the settings the setup dialog confirmed, once
+        // each, instead of offering controls of its own.
         assert_eq!(
-            window.find(("folder-recursive", 0_usize)).checked(),
-            Some(false)
-        );
-        assert_eq!(window.find(("folder-album", 0_usize)).checked(), Some(true));
-        assert_eq!(
-            window.find(("folder-album-whole", 0_usize)).selected(),
-            Some(true)
+            card_settings(window, 0),
+            "Recursive: off · Album mapping: on · Album scope: One album for this folder"
         );
     })
     .expect("read the new folder's card");
+}
+
+#[gpui_kit::test]
+async fn the_setup_dialog_gives_each_setting_its_own_row(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the fixture folder");
+    let (window, store, _view) = open_live_dashboard(cx, temp.path());
+    wait_for_store(cx, &store).await;
+
+    cx.update_window(window, |_, window, cx| {
+        open_setup_through_the_field(window, &photos.display().to_string(), cx);
+        // #57: one setting per row, so each control starts below the one
+        // before it and the two scopes sit together on the scope's row.
+        let recursive = window.find("folder-panel-recursive").bounds();
+        let mapping = window.find("folder-panel-album").bounds();
+        let leaf = window.find("folder-panel-album-leaf").bounds();
+        let whole = window.find("folder-panel-album-whole").bounds();
+        assert!(
+            recursive.bottom() <= mapping.top(),
+            "#57: Recursive gets its own row: {recursive:?}"
+        );
+        assert!(
+            mapping.bottom() <= leaf.top().min(whole.top()),
+            "#57: Album mapping gets its own row: {mapping:?}"
+        );
+        assert!(
+            leaf.bottom() <= whole.top(),
+            "#57: the two scopes sit together in the scope's row: {leaf:?} vs {whole:?}"
+        );
+        assert!(
+            (leaf.left() - whole.left()).abs() <= px(0.5),
+            "#57: the scopes line up as one control block: {leaf:?} vs {whole:?}"
+        );
+    })
+    .expect("read the setup dialog layout");
 }
 
 #[gpui_kit::test]

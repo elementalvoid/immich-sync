@@ -102,9 +102,10 @@ pub struct CardContent {
     pub progress_percent: String,
     pub counts: String,
     pub review: Option<String>,
-    /// The album line: `None` only on the card that has no folder of its own
-    /// (R3.4).
-    pub album: Option<String>,
+    /// The folder's stored settings in one line: recursion, album mapping,
+    /// and, only while the mapping is on, the scope (#57). `None` on the card
+    /// that has no folder of its own.
+    pub settings: Option<String>,
     /// Whether the folder is readable; the counts line says so when it is not.
     pub available: bool,
     /// The upload line, on the global card (R8.1): the rate and the uploads on
@@ -143,15 +144,20 @@ impl StatusCard {
             },
             review: (self.review_count > 0)
                 .then(|| format!("{} missing files to review", self.review_count)),
-            // The line is always there for a folder: the scope radios change
-            // what the folder will map to, so the card must show the stored
-            // scope while the mapping is still off (R3.4).
-            album: self.path.as_ref().map(|_| {
+            // The line is always there for a folder: a folder that stops
+            // mapping still has a recursion flag the card must state. The
+            // scope is left out while the mapping is off, because it is not in
+            // force yet (R3.4).
+            settings: self.path.as_ref().map(|_| {
+                let mut line = format!(
+                    "Recursive: {} · Album mapping: {}",
+                    if self.recursive { "on" } else { "off" },
+                    if self.album_mapping { "on" } else { "off" }
+                );
                 if self.album_mapping {
-                    format!("Albums: {}", self.album_scope.label())
-                } else {
-                    "Albums: off".to_string()
+                    line.push_str(&format!(" · Album scope: {}", self.album_scope.label()));
                 }
+                line
             }),
             available: self.available,
             // R8.1: the line sums the folders, so it belongs to the card that
