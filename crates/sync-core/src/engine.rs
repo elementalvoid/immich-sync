@@ -99,7 +99,8 @@ pub struct EngineConfig {
     /// How long the queue waits between credential probes while the breaker is
     /// open (R6.6).
     pub breaker_cooldown: Duration,
-    /// Whether uploaded assets get the sync tag (R3.7). Off by default;
+    /// Whether uploaded assets get the sync tag (R3.7). The library default is
+    /// off; the app passes the user's on-by-default setting.
     /// [`Engine::set_tag_uploads`] is the live path.
     pub tag_uploaded_assets: bool,
     /// How many asset ids one backfill request carries (R3.7). Default
