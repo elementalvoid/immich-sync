@@ -150,6 +150,23 @@ async fn wait_for_review_count(
     panic!("the tray never showed {count} items to review");
 }
 
+/// Pumps the executor until the first folder's card shows `count` items to
+/// review.
+async fn wait_for_card_review_count(
+    cx: &mut TestAppContext,
+    engine: &gpui_kit::Entity<EngineModel>,
+    count: u32,
+) {
+    for _ in 0..600 {
+        if cx.read(|cx| engine.read(cx).status().folders[0].counts.review) == count {
+            return;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    panic!("the folder card never showed {count} items to review");
+}
+
 /// Moves focus to the next tab stop, as the Root's Tab binding does.
 fn tab(window: &mut Window, cx: &mut App) {
     window.focus_next(cx);
@@ -413,11 +430,16 @@ async fn a_later_status_refresh_must_not_resurrect_a_decided_item(cx: &mut TestA
     .expect("click Keep");
     wait_for_rows(cx, window, 1).await;
     wait_for_review_count(cx, &engine, 1).await;
+    // The decision refreshed the folder's cached counts, so its card no longer
+    // holds the item the store dropped (R5.4).
+    wait_for_card_review_count(cx, &engine, 1).await;
 
-    // Any later status refresh re-reads the counts the store cached at open.
+    // Any later count refresh re-reads the folder the decision touched from
+    // the store, which no longer lists the item; the tray must stay at one.
+    let decided = photos.join("keep.jpg").display().to_string();
     cx.update(|cx| {
         store_model.update(cx, |store, cx| {
-            store.set_folders(store.folders().to_vec(), cx);
+            store.refresh_counts(&decided, cx);
         });
     });
     cx.run_until_parked();

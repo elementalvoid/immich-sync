@@ -252,12 +252,14 @@ impl StoreModel {
             })
             .collect();
         // #52: only a changed path list can move a row between cards, so an
-        // album, scope, or recursive edit keeps the counts it has.
-        let case = sync_core::paths::PathCase::for_platform();
+        // album, scope, or recursive edit keeps the counts it has. The raw
+        // spelling is part of it: the store orders by that column, so a
+        // re-spelled path is a change even when it names the same folder.
         let unchanged = folders.len() == self.folders.len()
-            && folders.iter().zip(&self.folders).all(|(new, old)| {
-                sync_core::paths::equal(Path::new(&new.path), Path::new(&old.path), case)
-            });
+            && folders
+                .iter()
+                .zip(&self.folders)
+                .all(|(new, old)| new.path == old.path);
         self.folders = folders;
         self.counts = counts;
         self.times = times;
