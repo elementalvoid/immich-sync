@@ -1040,21 +1040,14 @@ impl Observer for EngineObserver {
             let ordered: Vec<SourceFolder> =
                 folders.iter().map(|entry| entry.folder.clone()).collect();
             drop(folders);
-            let counts = inner.store.folder_counts_by_owner(&ordered);
+            let counts = owned_counts(&inner, &ordered, &stored.path);
             folders = inner.folders.lock().expect("the folder lock");
             // The list the read counted: a later add or remove replaced it and
             // has a read of its own, whose answer is the newer one.
-            if same_paths(&folders, &ordered) {
-                match counts {
-                    Ok(counts) => apply_owned_counts(&mut folders, &key, counts),
-                    Err(error) => {
-                        tracing::warn!(
-                            folder = %stored.path,
-                            error = %error,
-                            "the folder counts could not be read"
-                        );
-                    }
-                }
+            if same_paths(&folders, &ordered)
+                && let Some(counts) = counts
+            {
+                apply_owned_counts(&mut folders, &key, counts);
             }
         }
         drop(folders);
@@ -1157,21 +1150,14 @@ impl Observer for EngineObserver {
             // The read scans the table, so it runs with the folder lock
             // released: a status poll never queues behind it (N2).
             drop(folders);
-            let counts = inner.store.folder_counts_by_owner(&ordered);
+            let counts = owned_counts(&inner, &ordered, path);
             folders = inner.folders.lock().expect("the folder lock");
             // The list the read counted: a later add or remove replaced it and
             // has a read of its own, whose answer is the newer one.
-            if same_paths(&folders, &ordered) {
-                match counts {
-                    Ok(counts) => apply_owned_counts(&mut folders, &key, counts),
-                    Err(error) => {
-                        tracing::warn!(
-                            folder = %path,
-                            error = %error,
-                            "the folder counts could not be read"
-                        );
-                    }
-                }
+            if same_paths(&folders, &ordered)
+                && let Some(counts) = counts
+            {
+                apply_owned_counts(&mut folders, &key, counts);
             }
         }
         drop(folders);
@@ -2687,6 +2673,30 @@ fn folder_entry_mut<'a>(folders: &'a mut [FolderEntry], path: &str) -> Option<&'
     folders
         .iter_mut()
         .find(|entry| path_key(Path::new(&entry.folder.path)) == key)
+}
+
+/// The ownership read over `ordered`, with a failed read logged against the
+/// folder whose edit asked for it (#52).
+///
+/// `None` is a read that could not be answered: the caller leaves the live
+/// counts as they are. Both call sites read it before taking the folder lock,
+/// so the table scan never holds it (N2).
+fn owned_counts(
+    inner: &EngineInner,
+    ordered: &[SourceFolder],
+    folder: &str,
+) -> Option<Vec<FolderCounts>> {
+    match inner.store.folder_counts_by_owner(ordered) {
+        Ok(counts) => Some(counts),
+        Err(error) => {
+            tracing::warn!(
+                folder = %folder,
+                error = %error,
+                "the folder counts could not be read"
+            );
+            None
+        }
+    }
 }
 
 /// Whether the live list still holds the paths the ownership read counted.
