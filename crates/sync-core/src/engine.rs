@@ -972,6 +972,10 @@ impl Observer for EngineObserver {
         let existing = folders
             .iter()
             .position(|entry| path_key(Path::new(&entry.folder.path)) == key);
+        // #52: the store upserts the raw `path` and orders by that column, so a
+        // re-add that spells the path differently can move the folder in the
+        // list. For the order and the counts that is an insert.
+        let respelled = existing.is_some_and(|index| folders[index].folder.path != stored.path);
         if let Some(index) = existing {
             // The whole row is taken, so the spelling the store wrote is
             // the one the live entry holds, and no field is left stale.
@@ -1000,6 +1004,8 @@ impl Observer for EngineObserver {
                 // the store already holds for it.
                 album: album_of_store(&inner.store, &stored),
             });
+        }
+        if existing.is_none() || respelled {
             // N1: `store.folders()` orders by path, and the first-owner rule
             // follows that order, so the live list keeps it: a nested folder
             // added after the folder that contains it owns the same rows a
@@ -1015,11 +1021,7 @@ impl Observer for EngineObserver {
             folders = inner.folders.lock().expect("the folder lock");
             // The list the read counted: a later add or remove replaced it and
             // has a read of its own, whose answer is the newer one.
-            let unchanged = folders
-                .iter()
-                .map(|entry| entry.folder.clone())
-                .eq(ordered.iter().cloned());
-            if unchanged {
+            if same_paths(&folders, &ordered) {
                 match counts {
                     Ok(counts) => apply_owned_counts(&mut folders, &key, counts),
                     Err(error) => {
@@ -1136,16 +1138,8 @@ impl Observer for EngineObserver {
             folders = inner.folders.lock().expect("the folder lock");
             // The list the read counted: a later add or remove replaced it and
             // has a read of its own, whose answer is the newer one.
-            let unchanged = folders
-                .iter()
-                .map(|entry| entry.folder.clone())
-                .eq(ordered.iter().cloned());
-            if unchanged {
+            if same_paths(&folders, &ordered) {
                 match counts {
-                    // shortcut: a row written just before this read and counted
-                    // on its card just after it lands twice until the next
-                    // start; upgrade if a live card must never be off by the
-                    // items in flight.
                     Ok(counts) => apply_owned_counts(&mut folders, &key, counts),
                     Err(error) => {
                         tracing::warn!(
@@ -2655,6 +2649,17 @@ fn folder_entry_mut<'a>(folders: &'a mut [FolderEntry], path: &str) -> Option<&'
         .find(|entry| path_key(Path::new(&entry.folder.path)) == key)
 }
 
+/// Whether the live list still holds the paths the ownership read counted.
+///
+/// Only the ordered raw paths decide a row's owner, so an edit to a folder's
+/// other fields inside the read window keeps the answer (#52).
+fn same_paths(folders: &[FolderEntry], ordered: &[SourceFolder]) -> bool {
+    folders
+        .iter()
+        .map(|entry| entry.folder.path.as_str())
+        .eq(ordered.iter().map(|folder| folder.path.as_str()))
+}
+
 /// Applies an ownership read to the live entries a folder edit can move rows
 /// between (#52): `key`'s entry and every entry that contains it or lies inside
 /// it.
@@ -2662,6 +2667,10 @@ fn folder_entry_mut<'a>(folders: &'a mut [FolderEntry], path: &str) -> Option<&'
 /// A row changes cards only when two folders contain one another, so every
 /// other card keeps its live count: replacing it with the store's snapshot
 /// could lose an increment that landed after the read.
+///
+/// shortcut: a row written just before the read and counted on its card just
+/// after it lands twice until the next start; upgrade if a live card must never
+/// be off by the items in flight.
 fn apply_owned_counts(folders: &mut [FolderEntry], key: &str, counts: Vec<FolderCounts>) {
     for (entry, counts) in folders.iter_mut().zip(counts) {
         let other = path_key(Path::new(&entry.folder.path));
@@ -3187,14 +3196,17 @@ mod tests {
             FolderCounts::default(),
             "the nested folder owns nothing while the outer folder is there"
         );
-        // #52: the file's bytes and its row land on one card, so the meter's
-        // owner is the card that counted it.
-        assert_eq!(
-            folder_index_in(
-                &engine.inner.folders.lock().expect("the folder lock"),
-                &inner.join("photo.jpg")
+        // #52: the file's bytes and its row land on one card, so the meter
+        // `meter_for` hands out is the card's own.
+        let owner_meter = {
+            let folders = engine.inner.folders.lock().expect("the folder lock");
+            Arc::clone(&folders[0].meter)
+        };
+        assert!(
+            Arc::ptr_eq(
+                &engine.inner.meter_for(&inner.join("photo.jpg")),
+                &owner_meter
             ),
-            Some(0),
             "#52: the meter and the counts must name the same owner"
         );
 
@@ -3354,6 +3366,108 @@ mod tests {
         let counts = store
             .folder_counts_by_owner(&stored)
             .expect("read the stored counts");
+        assert_eq!(
+            status
+                .folders
+                .iter()
+                .map(|folder| (folder.path.clone(), folder.counts))
+                .collect::<Vec<_>>(),
+            stored
+                .iter()
+                .zip(counts)
+                .map(|(folder, counts)| (folder.path.clone(), counts))
+                .collect::<Vec<_>>(),
+            "#52: the live cards must own what the stored ones own, in the same order"
+        );
+        engine.stop();
+    }
+
+    /// #52: a re-add that spells the path differently rewrites the stored
+    /// `path`, and the store orders by that raw column. The live list must
+    /// re-sort and re-read with it, or its cards and meters name another owner
+    /// than the next start does.
+    ///
+    /// The re-spelled path sorts after the nested one, so the nested folder
+    /// becomes the owner. Windows folds case (R2.4); on Linux a trailing
+    /// separator is dropped from the key and sorts after the nested path's
+    /// separator.
+    #[test]
+    fn a_respelled_re_add_keeps_the_live_counts_in_store_order() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let store =
+            Arc::new(StateStore::open(temp.path().join("state.db")).expect("open the state store"));
+        let outer = temp.path().join("photos");
+        let inner = outer.join("2024");
+        std::fs::create_dir_all(&inner).expect("create the folder");
+        // The raw spellings the store keys as one folder: `before` is stored,
+        // `after` is the re-add, and both sort after the nested path.
+        let (before, inner_path, after) = if cfg!(windows) {
+            let before = outer.with_file_name("PHOTOS").display().to_string();
+            let inner_path = format!("{before}\\2024");
+            (before, inner_path, outer.display().to_string())
+        } else {
+            let before = outer.display().to_string();
+            let inner_path = format!("{before}/2024");
+            let after = format!("{before}\\");
+            (before, inner_path, after)
+        };
+        for path in [&before, &inner_path] {
+            store
+                .add_folder(&SourceFolder {
+                    path: path.clone(),
+                    recursive: true,
+                    album_mapping: false,
+                    album_scope: AlbumScope::default(),
+                    album_title: None,
+                })
+                .expect("add the folder");
+        }
+        store
+            .record(&ItemRecord {
+                path: format!("{inner_path}/photo.jpg"),
+                size: 1,
+                mtime_ns: 0,
+                sha1: Sha1::from_slice(&[0; 20]).expect("a full digest"),
+                asset_id: Some("asset-1".to_string()),
+                state: ItemState::Uploaded,
+                error_class: None,
+                error_message: None,
+                attempts: 0,
+                sidecar: None,
+            })
+            .expect("write the uploaded row");
+        // The session is never used: this test sends no request.
+        let session = crate::connection::Connection::new(
+            "http://127.0.0.1:1",
+            Arc::new(crate::credential::MemoryCredentialStore::new()),
+        )
+        .expect("a valid URL")
+        .shared();
+        let engine = Engine::new(
+            Arc::new(Tracking::new(Arc::clone(&store))),
+            session,
+            EngineConfig::default(),
+        )
+        .expect("build the engine");
+        assert_eq!(
+            engine.status().folders[0].counts.uploaded,
+            1,
+            "the outer folder is first in the stored order and owns the row"
+        );
+
+        engine
+            .add_folder(&after, true)
+            .expect("re-add the outer folder with another spelling");
+
+        let status = engine.status();
+        let stored = store.folders().expect("read the stored folders");
+        let counts = store
+            .folder_counts_by_owner(&stored)
+            .expect("read the stored counts");
+        assert_eq!(
+            status.folders[0].path, inner_path,
+            "the re-spelled outer path sorts after the nested one"
+        );
         assert_eq!(
             status
                 .folders

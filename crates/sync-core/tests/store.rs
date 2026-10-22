@@ -1090,8 +1090,8 @@ fn nested_folders_each_own_their_rows_once() {
         "the cards sum to the rows that belong to a folder, each counted once"
     );
 
-    // The engine's live list is in the order the folders were added, so the
-    // first entry in that order owns, whatever the paths say.
+    // A caller that passes another order owns by that order: the first entry
+    // in the list owns, whatever the paths say.
     let reversed: Vec<SourceFolder> = folders.iter().rev().cloned().collect();
     let counts = store
         .folder_counts_by_owner(&reversed)
