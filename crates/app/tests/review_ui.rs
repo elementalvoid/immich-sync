@@ -158,7 +158,15 @@ async fn wait_for_card_review_count(
     count: u32,
 ) {
     for _ in 0..600 {
-        if cx.read(|cx| engine.read(cx).status().folders[0].counts.review) == count {
+        let shown = cx.read(|cx| {
+            engine
+                .read(cx)
+                .status()
+                .folders
+                .first()
+                .map(|folder| folder.counts.review)
+        });
+        if shown == Some(count) {
             return;
         }
         cx.executor().timer(Duration::from_millis(10)).await;
@@ -443,10 +451,20 @@ async fn a_later_status_refresh_must_not_resurrect_a_decided_item(cx: &mut TestA
         });
     });
     cx.run_until_parked();
+    // R5.4: the cached card is the field a later status refresh reads, so the
+    // refresh must leave it at one. The tray could never show the
+    // resurrection: `Status::derive` overwrites its review count with the
+    // length of the list (#52).
     assert_eq!(
-        cx.read(|cx| engine.read(cx).status().counts.review),
-        1,
-        "the tray count must not resurrect a decided item while the list shows one"
+        cx.read(|cx| {
+            store_model
+                .read(cx)
+                .folder_counts()
+                .first()
+                .map(|counts| counts.review)
+        }),
+        Some(1),
+        "the cached card must not resurrect a decided item"
     );
 }
 
