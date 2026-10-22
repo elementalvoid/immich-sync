@@ -1679,70 +1679,92 @@ async fn a_paused_tail_keeps_the_jump_control_inside_a_short_window(cx: &mut Tes
 /// paused row sits below the tail. At the shell's minimum window each of those
 /// rows is taller than the floor the other states left, so the card's floor must
 /// cover every row it shows (#54).
+///
+/// The notice quotes the path of the failed log directory, and a long data
+/// directory wraps it to more lines. The test builds a long one rather than
+/// trusting `TMPDIR`, so the clamp and the geometry below do not depend on it.
 #[gpui_kit::test]
 async fn a_failed_tail_read_keeps_its_notice_and_paused_row_inside_the_card(
     cx: &mut TestAppContext,
 ) {
-    let temp = tempfile::tempdir().expect("create a temp dir");
-    let paths = temporary_paths(temp.path());
-    write_lines(&paths, &long_tail(200));
-    let store = SettingsStore::open(paths.config_file.clone());
-    let (window, _shell) = open_shell_at(cx, store, paths.clone(), (720., 480.));
-    show_logs(cx, window);
+    // 900x600 is the window the review measured, and 720x480 is the shell's
+    // minimum: the narrowest window wraps the notice and the paused row most.
+    for window_size in [(900., 600.), (720., 480.)] {
+        // A long prefix stands in for a long data directory, so the notice wraps
+        // further than the floor's two lines while its full text stays announced.
+        let temp = tempfile::Builder::new()
+            .prefix(&"long-data-directory-".repeat(3))
+            .tempdir()
+            .expect("create a temp dir");
+        let paths = temporary_paths(temp.path());
+        let directory = paths.log_directory();
+        write_lines(&paths, &long_tail(200));
+        let store = SettingsStore::open(paths.config_file.clone());
+        let (window, _shell) = open_shell_at(cx, store, paths.clone(), window_size);
+        show_logs(cx, window);
 
-    // The log directory stops being a directory, and the poll reports the
-    // failed read on the surface while the tail still follows it.
-    let directory = paths.log_directory();
-    fs::remove_dir_all(&directory).expect("remove the log directory");
-    fs::write(&directory, "not a directory").expect("replace the directory with a file");
-    tick_live(cx, window);
+        // The log directory stops being a directory, and the poll reports the
+        // failed read on the surface while the tail still follows it.
+        fs::remove_dir_all(&directory).expect("remove the log directory");
+        fs::write(&directory, "not a directory").expect("replace the directory with a file");
+        tick_live(cx, window);
 
-    cx.update_window(window, |_, window, _| {
-        assert!(
-            window.try_find("logs-paused").is_none(),
-            "a failed read alone does not pause the tail"
-        );
-        // The notice and the tail both end inside the card: the floor covers
-        // the row the notice adds, or the tail would paint over the border.
-        assert_inside_card(window, "logs-problem", window_rect(window, "logs-problem"));
-        assert_inside_card(window, "logs-lines", window_rect(window, "logs-lines"));
-    })
-    .expect("update the shell window");
+        cx.update_window(window, |_, window, _| {
+            assert!(
+                window.try_find("logs-paused").is_none(),
+                "a failed read alone does not pause the tail"
+            );
+            // The clamp is visual: the full message still names the path.
+            assert!(
+                window
+                    .find("logs-problem")
+                    .label()
+                    .unwrap_or_default()
+                    .contains(&directory.display().to_string()),
+                "the notice still announces the whole message, including the log directory"
+            );
+            // The notice and the tail both end inside the card: the floor covers
+            // the row the notice adds, or the tail would paint over the border.
+            assert_inside_card(window, "logs-problem", window_rect(window, "logs-problem"));
+            assert_inside_card(window, "logs-lines", window_rect(window, "logs-lines"));
+        })
+        .expect("update the shell window");
 
-    // Wheel up: the next poll pauses the tail, and the failed read keeps its
-    // notice above the paused row.
-    cx.update_window(window, |_, window, cx| {
-        window.scroll(
-            "logs-lines",
-            ScrollDelta::Pixels(point(px(0.), px(400.))),
-            cx,
-        );
-    })
-    .expect("update the shell window");
-    tick_live(cx, window);
+        // Wheel up: the next poll pauses the tail, and the failed read keeps its
+        // notice above the paused row.
+        cx.update_window(window, |_, window, cx| {
+            window.scroll(
+                "logs-lines",
+                ScrollDelta::Pixels(point(px(0.), px(400.))),
+                cx,
+            );
+        })
+        .expect("update the shell window");
+        tick_live(cx, window);
 
-    cx.update_window(window, |_, window, _| {
-        let paused = window_rect(window, "logs-paused");
-        let notice = window_rect(window, "logs-problem");
-        assert_eq!(
-            window.find("logs-jump-latest").label(),
-            Some("Jump to latest"),
-            "the paused row is on screen with a read problem"
-        );
-        assert!(
-            notice.1 + notice.3 <= paused.1,
-            "the notice at {notice:?} sits above the paused row at {paused:?}"
-        );
-        for id in [
-            "logs-problem",
-            "logs-lines",
-            "logs-paused",
-            "logs-jump-latest",
-        ] {
-            assert_inside_card(window, id, window_rect(window, id));
-        }
-    })
-    .expect("update the shell window");
+        cx.update_window(window, |_, window, _| {
+            let paused = window_rect(window, "logs-paused");
+            let notice = window_rect(window, "logs-problem");
+            assert_eq!(
+                window.find("logs-jump-latest").label(),
+                Some("Jump to latest"),
+                "the paused row is on screen with a read problem"
+            );
+            assert!(
+                notice.1 + notice.3 <= paused.1,
+                "the notice at {notice:?} sits above the paused row at {paused:?}"
+            );
+            for id in [
+                "logs-problem",
+                "logs-lines",
+                "logs-paused",
+                "logs-jump-latest",
+            ] {
+                assert_inside_card(window, id, window_rect(window, id));
+            }
+        })
+        .expect("update the shell window");
+    }
 }
 
 /// Asserts a row ends inside the Recent lines card's body and the viewport.
