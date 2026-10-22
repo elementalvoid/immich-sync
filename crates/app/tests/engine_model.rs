@@ -20,7 +20,7 @@ use sync_core::connection::{
 use sync_core::credential::{MemoryCredentialStore, SharedCredentialStore};
 use sync_core::hash::Sha1;
 use sync_core::status::Activity;
-use sync_core::store::{ItemRecord, ItemState, SourceFolder, StateStore};
+use sync_core::store::{FolderCounts, ItemRecord, ItemState, SourceFolder, StateStore};
 
 /// The path layout the other app tests use, so the engine gets a temp
 /// database and settings file.
@@ -45,6 +45,33 @@ fn failed(path: &str) -> ItemRecord {
         error_message: Some("the server refused the upload".to_string()),
         attempts: 1,
         sidecar: None,
+    }
+}
+
+/// One row in `state`, written straight to the store, for the tests that only
+/// need the card's buckets (#52).
+fn row(path: &Path, state: ItemState) -> ItemRecord {
+    ItemRecord {
+        path: path.display().to_string(),
+        size: 1024,
+        mtime_ns: 1_700_000_000_000_000_000,
+        sha1: Sha1::from_hex("2aae6c35c94fcfb415dbe95f408b9ce91ee846ed").expect("a hex SHA-1"),
+        asset_id: Some("asset-1".to_string()),
+        state,
+        error_class: None,
+        error_message: None,
+        attempts: 0,
+        sidecar: None,
+    }
+}
+
+/// The card counts, named so an expectation reads like the card (#52).
+fn counts_of(pending: u32, uploaded: u32, failed: u32, review: u32) -> FolderCounts {
+    FolderCounts {
+        pending,
+        uploaded,
+        failed,
+        review,
     }
 }
 
@@ -1176,6 +1203,221 @@ async fn a_re_spelled_re_add_keeps_the_cached_counts(cx: &mut TestAppContext) {
         cx.read(|cx| store.read(cx).folder_counts()[0].uploaded),
         1,
         "R8.1: the re-add reset the cached counts to zero"
+    );
+}
+
+/// R8.1, #52: the store-backed cards own a row the way the engine's meters do.
+/// The nested folder is the one the client knows first and the outer folder is
+/// added later, which makes the outer folder the first owner of every row
+/// under it: the nested card must stop counting them, and the global card must
+/// stay the sum of the folder cards.
+#[gpui_kit::test]
+async fn adding_a_nested_outer_folder_moves_the_rows_to_its_card(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let outer = temp.path().join("photos");
+    let inner = outer.join("2024");
+    std::fs::create_dir_all(&inner).expect("create the source folder");
+    {
+        let store = StateStore::open(&paths.state_db).expect("open the state database");
+        store
+            .add_folder(&SourceFolder {
+                path: inner.display().to_string(),
+                recursive: true,
+                album_mapping: false,
+                album_scope: sync_core::store::AlbumScope::Leaf,
+                album_title: None,
+            })
+            .expect("seed the nested folder");
+        for (name, state) in [
+            ("one.jpg", ItemState::Uploaded),
+            ("two.jpg", ItemState::Pending),
+            ("three.jpg", ItemState::FailedPermanent),
+        ] {
+            store
+                .record(&row(&inner.join(name), state))
+                .expect("seed the row");
+        }
+    }
+
+    let connection = cx.update(|cx| {
+        let credentials: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+        cx.new(|_| ConnectionModel::new(ServerProfile::default(), credentials))
+    });
+    let store = cx.update(|cx| cx.new(|cx| StoreModel::open(&paths, cx)));
+    for _ in 0..600 {
+        if cx.read(|cx| store.read(cx).store().is_some()) {
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    let engine =
+        cx.update(|cx| cx.new(|cx| EngineModel::new(connection, store.clone(), &paths, cx)));
+    assert_eq!(
+        cx.read(|cx| store.read(cx).folder_counts().to_vec()),
+        vec![counts_of(1, 1, 1, 0)],
+        "one source folder counts every row under it"
+    );
+
+    // The add lands on the worker and the model replaces the cached list, the
+    // path a signed-out client takes.
+    cx.update(|cx| {
+        engine.update(cx, |model, cx| {
+            model.add_folder(outer.display().to_string(), true, cx);
+        });
+    });
+    let settled = pump_until(cx, |cx| {
+        cx.read(|cx| {
+            store.read(cx).folder_counts().to_vec()
+                == vec![counts_of(1, 1, 1, 0), FolderCounts::default()]
+        })
+    });
+    assert!(
+        settled,
+        "the added outer folder never took the rows from the nested card: {:?}",
+        cx.read(|cx| store.read(cx).folder_counts().to_vec())
+    );
+
+    // The store-backed status a signed-out client reads: no engine runs, so
+    // these are the cached counts over the store's folder order.
+    cx.update(|cx| engine.update(cx, |model, cx| model.sync_now(cx)));
+    let status = cx.read(|cx| engine.read(cx).status().clone());
+    assert_eq!(status.folders.len(), 2, "the store-backed cards arrived");
+    assert_eq!(
+        status.folders[0].counts,
+        counts_of(1, 1, 1, 0),
+        "the outer folder is first in path order and owns every row under it"
+    );
+    assert_eq!(
+        status.folders[1].counts,
+        FolderCounts::default(),
+        "#52: the nested folder counts nothing the outer folder owns"
+    );
+    assert_eq!(
+        status.counts,
+        counts_of(1, 1, 1, 0),
+        "the global card is the sum of the folder cards, each row once"
+    );
+}
+
+/// R8.1, #52: an edit that keeps the raw path list must not discard the count
+/// read an add started, or the cards keep the pre-add zeroes until the next
+/// edit or a restart.
+///
+/// The album edit lands on the UI thread while the read runs on the background
+/// executor: the read's list still names the same folders in the same order,
+/// so its answer is the one that counts.
+#[gpui_kit::test]
+async fn an_album_edit_keeps_the_counts_an_add_asked_for(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+    {
+        // The rows arrive before the folder does: the signed-out client adds
+        // the folder over rows the store already holds.
+        let store = StateStore::open(&paths.state_db).expect("open the state database");
+        store
+            .record(&row(&photos.join("one.jpg"), ItemState::Uploaded))
+            .expect("seed the uploaded row");
+    }
+    let store = cx.update(|cx| cx.new(|cx| StoreModel::open(&paths, cx)));
+    for _ in 0..600 {
+        if cx.read(|cx| store.read(cx).store().is_some()) {
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    let folder = SourceFolder {
+        path: photos.display().to_string(),
+        recursive: true,
+        album_mapping: false,
+        album_scope: sync_core::store::AlbumScope::Leaf,
+        album_title: None,
+    };
+    let mut mapped = folder.clone();
+    mapped.album_mapping = true;
+    // The add, then the album edit, before the read can land.
+    cx.update(|cx| {
+        store.update(cx, |store, cx| store.set_folders(vec![folder], cx));
+        store.update(cx, |store, cx| store.set_folders(vec![mapped], cx));
+    });
+
+    let filled = pump_until(cx, |cx| {
+        cx.read(|cx| store.read(cx).folder_counts().to_vec()) == vec![counts_of(0, 1, 0, 0)]
+    });
+    assert!(
+        filled,
+        "#52: the album edit discarded the add's counts: {:?}",
+        cx.read(|cx| store.read(cx).folder_counts().to_vec())
+    );
+}
+
+/// R5.4, #52: an edit that keeps the raw path list must not discard the count
+/// refresh a review decision asked for, or the card keeps counting the item
+/// the store already decided.
+#[gpui_kit::test]
+async fn an_album_edit_keeps_the_refresh_a_review_decision_asked_for(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+    {
+        let store = StateStore::open(&paths.state_db).expect("open the state database");
+        store
+            .add_folder(&SourceFolder {
+                path: photos.display().to_string(),
+                recursive: true,
+                album_mapping: false,
+                album_scope: sync_core::store::AlbumScope::Leaf,
+                album_title: None,
+            })
+            .expect("seed the folder");
+        for name in ["keep.jpg", "other.jpg"] {
+            store
+                .record(&row(&photos.join(name), ItemState::Missing))
+                .expect("seed the missing row");
+        }
+    }
+    let store = cx.update(|cx| cx.new(|cx| StoreModel::open(&paths, cx)));
+    for _ in 0..600 {
+        if cx.read(|cx| store.read(cx).store().is_some()) {
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        cx.read(|cx| store.read(cx).folder_counts().to_vec()),
+        vec![counts_of(0, 0, 0, 2)],
+        "the card starts with both items to review"
+    );
+    // The decision lands in the store; the card still counts the item until
+    // the refresh it asked for comes back.
+    cx.read(|cx| store.read(cx).store().expect("the store is open"))
+        .record(&row(&photos.join("keep.jpg"), ItemState::ReviewKeep))
+        .expect("write the decision");
+    let mut mapped = cx.read(|cx| store.read(cx).folders().to_vec());
+    mapped[0].album_mapping = true;
+    let decided = photos.join("keep.jpg").display().to_string();
+    // The refresh, then the album edit, before the read can land.
+    cx.update(|cx| {
+        store.update(cx, |store, cx| store.refresh_counts(&decided, cx));
+        store.update(cx, |store, cx| store.set_folders(mapped, cx));
+    });
+
+    let refreshed = pump_until(cx, |cx| {
+        cx.read(|cx| store.read(cx).folder_counts().to_vec()) == vec![counts_of(0, 1, 0, 1)]
+    });
+    assert!(
+        refreshed,
+        "#52: the card kept the decided item: {:?}",
+        cx.read(|cx| store.read(cx).folder_counts().to_vec())
     );
 }
 
