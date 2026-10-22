@@ -626,14 +626,18 @@ impl LogsView {
                     .into_any_element(),
             );
         }
+        // The read notice and the paused row each sit inside the card beside
+        // the tail, and each wraps at the narrowest window, so the floor covers
+        // them too: 16rem, plus 4rem for every extra row the body shows (#54).
+        let floor_rem = 16.
+            + if self.read_problem.is_some() { 4. } else { 0. }
+            + if self.paused { 4. } else { 0. };
         filling_section(
             "logs-lines-section",
             "Recent lines",
             "The newest file's last lines. They follow the file while this surface is open.",
             body,
-            // The paused row sits below the tail, so the card needs a taller
-            // floor while it is there (#54).
-            if self.paused { 20. } else { 16. },
+            floor_rem,
             cx,
         )
     }

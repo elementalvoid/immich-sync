@@ -1448,6 +1448,13 @@ fn window_rect(window: &Window, id: &'static str) -> (f32, f32, f32, f32) {
 const PAGE_PADDING: f32 = 16.;
 const CARD_PADDING: f32 = 12.;
 
+/// Where the Recent lines card's body ends: its outside bottom, less the card's
+/// padding and its 1px border.
+fn pane_inner_bottom(window: &Window) -> f32 {
+    let pane = window_rect(window, "logs-lines-section");
+    pane.1 + pane.3 - CARD_PADDING - 1.
+}
+
 /// The tail pane owns the height the header, the location card, and the level
 /// control leave, and the page around it has nothing left to scroll: the newest
 /// line is on screen with no page scroll and no window resize (#54).
@@ -1646,6 +1653,13 @@ async fn a_paused_tail_keeps_the_jump_control_inside_a_short_window(cx: &mut Tes
                 window.find("logs-paused").visible(),
                 "the paused tail draws its paused row"
             );
+            let paused = window_rect(window, "logs-paused");
+            assert!(
+                paused.1 + paused.3 <= pane_inner_bottom(window) + 0.5,
+                "the paused row ends at {} inside the card's body, which ends at {}",
+                paused.1 + paused.3,
+                pane_inner_bottom(window)
+            );
             let jump = window.find("logs-jump-latest").bounds();
             let viewport = window.viewport_size();
             let (jump_right, jump_bottom) = (
@@ -1659,6 +1673,92 @@ async fn a_paused_tail_keeps_the_jump_control_inside_a_short_window(cx: &mut Tes
         })
         .expect("update the shell window");
     }
+}
+
+/// A tail read that fails draws a notice inside the Recent lines card, and the
+/// paused row sits below the tail. At the shell's minimum window each of those
+/// rows is taller than the floor the other states left, so the card's floor must
+/// cover every row it shows (#54).
+#[gpui_kit::test]
+async fn a_failed_tail_read_keeps_its_notice_and_paused_row_inside_the_card(
+    cx: &mut TestAppContext,
+) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    write_lines(&paths, &long_tail(200));
+    let store = SettingsStore::open(paths.config_file.clone());
+    let (window, _shell) = open_shell_at(cx, store, paths.clone(), (720., 480.));
+    show_logs(cx, window);
+
+    // The log directory stops being a directory, and the poll reports the
+    // failed read on the surface while the tail still follows it.
+    let directory = paths.log_directory();
+    fs::remove_dir_all(&directory).expect("remove the log directory");
+    fs::write(&directory, "not a directory").expect("replace the directory with a file");
+    tick_live(cx, window);
+
+    cx.update_window(window, |_, window, _| {
+        assert!(
+            window.try_find("logs-paused").is_none(),
+            "a failed read alone does not pause the tail"
+        );
+        // The notice and the tail both end inside the card: the floor covers
+        // the row the notice adds, or the tail would paint over the border.
+        assert_inside_card(window, "logs-problem", window_rect(window, "logs-problem"));
+        assert_inside_card(window, "logs-lines", window_rect(window, "logs-lines"));
+    })
+    .expect("update the shell window");
+
+    // Wheel up: the next poll pauses the tail, and the failed read keeps its
+    // notice above the paused row.
+    cx.update_window(window, |_, window, cx| {
+        window.scroll(
+            "logs-lines",
+            ScrollDelta::Pixels(point(px(0.), px(400.))),
+            cx,
+        );
+    })
+    .expect("update the shell window");
+    tick_live(cx, window);
+
+    cx.update_window(window, |_, window, _| {
+        let paused = window_rect(window, "logs-paused");
+        let notice = window_rect(window, "logs-problem");
+        assert_eq!(
+            window.find("logs-jump-latest").label(),
+            Some("Jump to latest"),
+            "the paused row is on screen with a read problem"
+        );
+        assert!(
+            notice.1 + notice.3 <= paused.1,
+            "the notice at {notice:?} sits above the paused row at {paused:?}"
+        );
+        for id in [
+            "logs-problem",
+            "logs-lines",
+            "logs-paused",
+            "logs-jump-latest",
+        ] {
+            assert_inside_card(window, id, window_rect(window, id));
+        }
+    })
+    .expect("update the shell window");
+}
+
+/// Asserts a row ends inside the Recent lines card's body and the viewport.
+fn assert_inside_card(window: &Window, id: &'static str, rect: (f32, f32, f32, f32)) {
+    let inner_bottom = pane_inner_bottom(window);
+    let viewport_bottom = f32::from(window.viewport_size().height);
+    let bottom = rect.1 + rect.3;
+    assert!(
+        bottom <= inner_bottom + 0.5,
+        "{id} ends at {bottom}, below the card's body which ends at {inner_bottom}: the \
+         floor does not cover every row the card shows"
+    );
+    assert!(
+        bottom <= viewport_bottom,
+        "{id} ends at {bottom}, below the {viewport_bottom}px viewport"
+    );
 }
 
 /// The strip above the tail is the page's fallback scroll when the window is
