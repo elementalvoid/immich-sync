@@ -930,8 +930,7 @@ impl FolderPanel {
             self.card.as_ref().and_then(|card| card.last_upload_ns),
             now_ns,
         );
-        let scan_line = times::moment_line(
-            "Last reconciliation scan",
+        let scan_line = times::scan_line(
             self.card.as_ref().and_then(|card| card.last_scan_ns),
             now_ns,
         );
@@ -1668,6 +1667,7 @@ mod tests {
             counts: FolderCounts::default(),
             last_error: Some(ERROR.to_string()),
             uploads: sync_core::meter::UploadTraffic::default(),
+            scanning: false,
         };
         let mut card = DashboardModel::from_engine(&status, None).folders.remove(0);
 
@@ -1783,6 +1783,7 @@ mod tests {
             counts: FolderCounts::default(),
             last_error: None,
             uploads: UploadTraffic::default(),
+            scanning: false,
         };
         let mut card = DashboardModel::from_engine(&status, None).folders.remove(0);
 
@@ -1975,6 +1976,7 @@ mod tests {
             counts: FolderCounts::default(),
             last_error: None,
             uploads: sync_core::meter::UploadTraffic::default(),
+            scanning: false,
         };
         let card = DashboardModel::from_engine(&status, None).folders.remove(0);
 

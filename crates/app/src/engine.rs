@@ -119,6 +119,42 @@ enum AlbumChange {
     Title(String),
 }
 
+/// What one "Sync now" click did (#56).
+///
+/// The dashboard shows the reason a click could not scan, so a control that
+/// looks live never swallows the click. A click that lands on a running engine
+/// is harmless: it re-notifies the scan loop, which walks the folders again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncNowOutcome {
+    /// The scan was asked for.
+    Requested,
+    /// No source folder is recorded, so a scan would walk nothing (R2.1).
+    NoFolder,
+    /// No session, so no engine runs and none can start (R1.3).
+    NotConnected,
+    /// A state rebuild holds the store (R10.4).
+    Rebuilding,
+    /// The store is still opening, so the folders cannot be read yet (R9.2).
+    NotReady,
+}
+
+impl SyncNowOutcome {
+    /// The reason the user reads, or `None` when the click reached the scan
+    /// (#56).
+    #[must_use]
+    pub fn reason(self) -> Option<&'static str> {
+        match self {
+            Self::Requested => None,
+            Self::NoFolder => Some("No source folder to scan. Add a folder first."),
+            Self::NotConnected => Some("Not connected to the server, so no scan can start."),
+            Self::Rebuilding => {
+                Some("A state rebuild is running. Sync now works again when it finishes.")
+            }
+            Self::NotReady => Some("The state database is still opening. Try again in a moment."),
+        }
+    }
+}
+
 /// The outcome of one folder-setup add (#40).
 ///
 /// The request id lets the dialog that sent the add recognise its own result,
@@ -168,7 +204,9 @@ impl EngineModel {
                 this.refresh_review(cx);
                 this.refresh_failed(cx);
             }),
-            cx.observe(&connection, |this, _, cx| this.try_start_engine(cx)),
+            cx.observe(&connection, |this, _, cx| {
+                this.try_start_engine(cx);
+            }),
         ];
         let poll = cx.spawn(async move |this, cx| {
             let mut ticks = 0_u32;
@@ -474,12 +512,43 @@ impl EngineModel {
         self.paused
     }
 
-    /// Asks for a reconciliation scan now (R8.3).
-    pub fn sync_now(&mut self, cx: &mut Context<Self>) {
+    /// Asks for a reconciliation scan now (R8.3, #56).
+    ///
+    /// The outcome names why nothing started, so the dashboard can show the
+    /// reason instead of a click that vanished. A click while a scan runs is
+    /// harmless: it re-notifies the engine, which walks the folders again.
+    pub fn sync_now(&mut self, cx: &mut Context<Self>) -> SyncNowOutcome {
+        // A rebuild owns the store until its fresh one lands (R10.4).
+        if self.rebuilding {
+            self.refresh_status(cx);
+            return SyncNowOutcome::Rebuilding;
+        }
+        // A scan with no source folder walks nothing, so the click is refused
+        // rather than leaving a "Checking…" that proves nothing (#56). The
+        // running engine answers from its own folder list: a store cache that
+        // has not caught up must never refuse a scan that would find files.
+        // An engine already running keeps running either way: its queued rows
+        // still upload (R6.7).
+        let no_folders = match &self.engine {
+            Some(_) => self.status.folders.is_empty(),
+            None => self.store_model.read(cx).folders().is_empty(),
+        };
+        if no_folders {
+            self.refresh_status(cx);
+            return SyncNowOutcome::NoFolder;
+        }
         if let Some(engine) = &self.engine {
             engine.sync_now();
+            return SyncNowOutcome::Requested;
+        }
+        if !self.connection.read(cx).state().is_connected() {
+            self.refresh_status(cx);
+            return SyncNowOutcome::NotConnected;
+        }
+        if self.try_start_engine(cx) {
+            SyncNowOutcome::Requested
         } else {
-            self.try_start_engine(cx);
+            SyncNowOutcome::NotReady
         }
     }
 
@@ -894,15 +963,21 @@ impl EngineModel {
     }
 
     /// Starts the engine when it is not running yet and both inputs exist.
-    fn try_start_engine(&mut self, cx: &mut Context<Self>) {
+    ///
+    /// Returns whether the model has an engine or a start in flight afterwards,
+    /// so "Sync now" can tell a start from a click that went nowhere (#56).
+    fn try_start_engine(&mut self, cx: &mut Context<Self>) -> bool {
         // A rebuild owns the store until its fresh one lands (R10.4); starting
         // over the old store would leave the engine watching a replaced file.
         if self.rebuilding {
-            return;
+            return false;
         }
         let connected = self.connection.read(cx).state().is_connected();
         if self.engine.is_some() {
-            if connected {
+            // #56: a scan with no source folder walks nothing, so a reconnect
+            // wakes none. The engine's own list answers, not the store's cache
+            // (a cache that lags would skip a wake that finds real files).
+            if connected && !self.status.folders.is_empty() {
                 // R1.4: a connection that comes back resumes the rows a refused
                 // credential left pending. Without this they wait for the next
                 // reconciliation scan, 30 minutes away by default.
@@ -911,19 +986,19 @@ impl EngineModel {
                 }
             }
             self.refresh_status(cx);
-            return;
+            return true;
         }
         if !connected {
             self.refresh_status(cx);
-            return;
+            return false;
         }
         let Some(tracking) = self.store_model.read(cx).tracking() else {
             self.refresh_status(cx);
-            return;
+            return false;
         };
         let Some(session) = self.connection.read(cx).session() else {
             self.refresh_status(cx);
-            return;
+            return false;
         };
         let config_file = self.paths.config_file.clone();
         let paused = self.paused;
@@ -1019,6 +1094,7 @@ impl EngineModel {
             self.problem = Some(WORKER_UNAVAILABLE.to_string());
             cx.notify();
         }
+        result.is_ok()
     }
 
     /// Republishes the engine's status, or a folder-only status before it runs.
@@ -1071,6 +1147,9 @@ impl EngineModel {
                     // the total the engine would have read.
                     review_total: Some(u32::try_from(self.review.len()).unwrap_or(u32::MAX)),
                     last_error: None,
+                    // The store-only path never walks folders; a scan runs on
+                    // a live engine alone (#56).
+                    scanning: false,
                 })
             }
         };
@@ -1125,5 +1204,6 @@ fn empty_status() -> Status {
         counts: FolderCounts::default(),
         last_error: None,
         uploads: UploadTraffic::default(),
+        scanning: false,
     }
 }

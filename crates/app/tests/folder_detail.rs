@@ -258,9 +258,34 @@ fn scroll_into_view(window: &mut Window, cx: &mut App, id: impl Into<ElementId>)
     panic!("{id:?} never became visible in the dialog");
 }
 
+/// Scrolls the dashboard until the element with `id` is on screen.
+///
+/// #56: the global card carries the reconciliation scan line, so on a short
+/// window a card's footer sits below the fold; a control is clicked only after
+/// it is really visible.
+fn scroll_dashboard_into_view(window: &mut Window, cx: &mut App, id: impl Into<ElementId>) {
+    let id = id.into();
+    window.render_frame(cx);
+    for _ in 0..60 {
+        if window
+            .try_find(id.clone())
+            .is_some_and(|target| target.visible())
+        {
+            return;
+        }
+        window.scroll(
+            "dashboard-scroll",
+            ScrollDelta::Pixels(point(px(0.), px(-120.))),
+            cx,
+        );
+    }
+    panic!("{id:?} never became visible on the dashboard");
+}
+
 /// Opens the detail and waits for it to be on screen.
 fn open_detail_now(cx: &mut TestAppContext, window: AnyWindowHandle) {
     act(cx, window, |window, cx| {
+        scroll_dashboard_into_view(window, cx, ("folder-details", 0_usize));
         window.click(("folder-details", 0_usize), cx);
     });
     read(cx, window, |window, _| {
@@ -1186,6 +1211,7 @@ fn a_folder_status_carries_its_times_into_the_detail_card() {
         counts: FolderCounts::default(),
         last_error: None,
         uploads: sync_core::meter::UploadTraffic::default(),
+        scanning: false,
     };
 
     let model = immich_sync::status::DashboardModel::from_engine(&status, None);
@@ -1198,8 +1224,9 @@ fn a_folder_status_carries_its_times_into_the_detail_card() {
         Some(1_700_000_001_000_000_000)
     );
     assert_eq!(
-        model.global.last_scan_ns, None,
-        "the global card is not a folder and has no folder times"
+        model.global.last_scan_ns,
+        Some(1_700_000_000_000_000_000),
+        "#56: the global card carries the newest folder's scan"
     );
 }
 

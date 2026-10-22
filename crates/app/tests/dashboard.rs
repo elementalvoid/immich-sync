@@ -228,6 +228,7 @@ fn folder_progress_survives_counts_above_a_u16() {
         counts,
         last_error: None,
         uploads: sync_core::meter::UploadTraffic::default(),
+        scanning: false,
     };
 
     let model = DashboardModel::from_engine(&status, None);
@@ -468,6 +469,114 @@ fn dashboard_shows_named_controls_and_one_card_per_folder(cx: &mut TestAppContex
     .expect("update the dashboard window");
 }
 
+/// #56: a click has to report itself. `scanning` rides the engine's status
+/// poll, so the view only paints what the model carries; the element id stays
+/// because the tests and the tray's path reference it.
+#[gpui_kit::test]
+fn the_sync_control_reports_a_running_scan(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut model = sample();
+    model.scanning = true;
+    let window = open_dashboard(cx, model);
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("dashboard-sync-now").label(),
+            Some("Checking the source folders"),
+            "#56: the control is named for the scan it is running"
+        );
+        assert_eq!(
+            window.find("dashboard-pause").label(),
+            Some("Pause syncing"),
+            "the neighbouring control keeps its copy"
+        );
+    })
+    .expect("update the dashboard window");
+}
+
+/// #56: a click that cannot scan says why, in the notice idiom the folder bar
+/// already uses, and never leaves the control claiming to check anything.
+#[gpui_kit::test]
+async fn a_click_with_no_source_folder_shows_the_reason(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let (window, store, _view) = open_live_dashboard(cx, temp.path());
+    wait_for_store(cx, &store).await;
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("dashboard-sync-notice").is_none(),
+            "#56: no notice before a click"
+        );
+        window.click("dashboard-sync-now", cx);
+        window.render_frame(cx);
+        let notice = window.find("dashboard-sync-notice");
+        assert_eq!(
+            notice.role(),
+            Some(Role::Alert),
+            "#56: the reason is announced"
+        );
+        assert_eq!(
+            notice.label(),
+            Some("No source folder to scan. Add a folder first."),
+            "#56: the notice says which reason the click hit"
+        );
+        assert_eq!(
+            window.find("dashboard-sync-now").label(),
+            Some("Sync now"),
+            "#56: a refused click never claims to be checking"
+        );
+    })
+    .expect("click Sync now with no source folder");
+}
+
+/// #56: signed out is the reachable field case: the folders are known, the
+/// scan is not possible, and the click says so.
+#[gpui_kit::test]
+async fn a_signed_out_click_says_it_cannot_connect(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the fixture folder");
+    let (window, store, _view) = open_live_dashboard(cx, temp.path());
+    wait_for_store(cx, &store).await;
+    let folder = sync_core::store::SourceFolder {
+        path: photos.display().to_string(),
+        recursive: true,
+        album_mapping: false,
+        album_scope: sync_core::store::AlbumScope::Leaf,
+        album_title: None,
+    };
+    cx.update(|cx| {
+        store
+            .read(cx)
+            .store()
+            .expect("the store is open")
+            .add_folder(&folder)
+            .expect("seed the source folder");
+        store.update(cx, |store, cx| store.set_folders(vec![folder], cx));
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("dashboard-sync-now", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("dashboard-sync-notice").label(),
+            Some("Not connected to the server, so no scan can start."),
+            "#56: a signed-out click names the missing connection"
+        );
+        assert_eq!(
+            window.find("dashboard-sync-now").label(),
+            Some("Sync now"),
+            "#56: a refused click never claims to be checking"
+        );
+    })
+    .expect("click Sync now while signed out");
+}
+
 #[gpui_kit::test]
 fn pause_control_renames_itself_and_flips_the_global_state(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
@@ -632,6 +741,7 @@ fn engine_status_maps_to_the_global_card_and_one_card_per_folder() {
             bytes_per_second: 2_516_582,
             in_flight: 2,
         },
+        scanning: false,
     };
 
     let model = DashboardModel::from_engine(&status, Some("Connected".to_string()));

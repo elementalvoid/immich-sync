@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
 use gpui_kit::{
-    Action, AnyWindowHandle, AppContext as _, Bounds, MenuItem, Point, TestAppContext,
-    WindowBounds, WindowOptions, px, size,
+    Action, AnyWindowHandle, App, AppContext as _, Bounds, ElementId, MenuItem, Point, ScrollDelta,
+    TestAppContext, Window, WindowBounds, WindowOptions, point, px, size,
 };
 use immich_sync::connection::ConnectionModel;
 use immich_sync::dashboard::Dashboard;
@@ -283,6 +283,29 @@ fn temporary_paths(dir: &Path) -> AppPaths {
     }
 }
 
+/// Scrolls the dashboard until the element with `id` is on screen.
+///
+/// #56: the global card carries the scan line, so on a short window a card's
+/// footer sits below the fold; a control is clicked only after it is visible.
+fn scroll_dashboard_into_view(window: &mut Window, cx: &mut App, id: impl Into<ElementId>) {
+    let id = id.into();
+    window.render_frame(cx);
+    for _ in 0..60 {
+        if window
+            .try_find(id.clone())
+            .is_some_and(|target| target.visible())
+        {
+            return;
+        }
+        window.scroll(
+            "dashboard-scroll",
+            ScrollDelta::Pixels(point(px(0.), px(-120.))),
+            cx,
+        );
+    }
+    panic!("{id:?} never became visible on the dashboard");
+}
+
 /// Opens a shell over a temporary state database, the way `open_main_window`
 /// builds it, and returns the shell entity so a test can drive it.
 fn open_shell(
@@ -374,6 +397,11 @@ async fn the_folder_detail_links_open_a_filtered_view(cx: &mut TestAppContext) {
     })
     .await;
     cx.update_window(window, |_, window, cx| {
+        // #56: the global card carries the scan line, so on a short window the
+        // card's Details control sits below the fold. Scroll it into view the
+        // way a person would before clicking it.
+        scroll_dashboard_into_view(window, cx, ("folder-details", 0_usize));
+        scroll_dashboard_into_view(window, cx, ("folder-details", 0_usize));
         window.click(("folder-details", 0_usize), cx);
     })
     .expect("open the folder detail");
@@ -411,7 +439,7 @@ async fn the_folder_detail_links_open_a_filtered_view(cx: &mut TestAppContext) {
     })
     .expect("back to the dashboard");
     cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
+        scroll_dashboard_into_view(window, cx, ("folder-details", 0_usize));
         window.click(("folder-details", 0_usize), cx);
     })
     .expect("open the folder detail again");

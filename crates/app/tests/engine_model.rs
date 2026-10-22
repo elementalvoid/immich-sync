@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use gpui_kit::{AppContext as _, Entity, TestAppContext};
 use immich_sync::connection::ConnectionModel;
-use immich_sync::engine::EngineModel;
+use immich_sync::engine::{EngineModel, SyncNowOutcome};
 use immich_sync::paths::AppPaths;
 use immich_sync::store::StoreModel;
 use mock_immich::{Fault, MockImmich, Operation};
@@ -1394,5 +1394,175 @@ async fn an_add_before_the_store_opens_reports_that_reason(cx: &mut TestAppConte
         cx.read(|cx| engine.read(cx).problem().map(str::to_string)),
         None,
         "#40: a refused add is the dialog's reason, not an engine problem"
+    );
+}
+
+/// #56: a click that cannot scan reports why. A connected client with no
+/// source folder would only walk an empty list, so the click is refused
+/// instead of starting an engine whose scan proves nothing.
+#[gpui_kit::test]
+async fn a_click_with_no_source_folder_reports_the_missing_folder(cx: &mut TestAppContext) {
+    let (_runtime, server) = mock_server();
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+
+    let connection = signed_in(cx, &server);
+    let store = cx.update(|cx| cx.new(|cx| StoreModel::open(&paths, cx)));
+    wait_for_inputs(cx, &connection, &store).await;
+    let engine = cx.update(|cx| cx.new(|cx| EngineModel::new(connection, store, &paths, cx)));
+
+    let outcome = cx.update(|cx| engine.update(cx, |model, cx| model.sync_now(cx)));
+    assert_eq!(outcome, SyncNowOutcome::NoFolder, "#56: no folder, no scan");
+    assert_eq!(
+        outcome.reason(),
+        Some("No source folder to scan. Add a folder first."),
+        "#56: the click says what is missing"
+    );
+    // Nothing may build an engine or start a scan behind the refused click.
+    for _ in 0..50 {
+        cx.executor().advance_clock(Duration::from_millis(10));
+        cx.run_until_parked();
+    }
+    assert!(
+        !cx.read(|cx| engine.read(cx).is_running()),
+        "#56: an empty folder list starts no engine"
+    );
+    assert!(
+        !cx.read(|cx| engine.read(cx).dashboard_model(cx).scanning),
+        "#56: the control must never read Checking… for this click"
+    );
+
+    // An engine that already runs with no folder keeps running: R6.7 re-queues
+    // its unfinished rows, which needs no folder list. The click is still
+    // refused, so the control never claims to check anything.
+    cx.update(|cx| engine.update(cx, |model, cx| model.start(cx)));
+    assert!(
+        pump_until(cx, |cx| cx.read(|cx| engine.read(cx).is_running())),
+        "the folder-less engine never started"
+    );
+    let outcome = cx.update(|cx| engine.update(cx, |model, cx| model.sync_now(cx)));
+    assert_eq!(
+        outcome,
+        SyncNowOutcome::NoFolder,
+        "#56: a running engine's click is refused the same way"
+    );
+    assert!(
+        cx.read(|cx| engine.read(cx).is_running()),
+        "#56: the refused click leaves the running engine alone"
+    );
+    assert!(
+        pump_until(cx, |cx| !cx
+            .read(|cx| engine.read(cx).dashboard_model(cx).scanning)),
+        "#56: no scan is left running behind the refused click"
+    );
+}
+
+/// #56: signed out is the reachable field case. The store holds the folder, so
+/// the reason names the connection rather than the list.
+#[gpui_kit::test]
+async fn a_signed_out_click_reports_the_missing_connection(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+    {
+        let store = StateStore::open(&paths.state_db).expect("open the state database");
+        store
+            .add_folder(&SourceFolder {
+                path: photos.display().to_string(),
+                recursive: true,
+                album_mapping: false,
+                album_scope: sync_core::store::AlbumScope::Leaf,
+                album_title: None,
+            })
+            .expect("seed the folder");
+    }
+
+    let connection = cx.update(|cx| {
+        let credentials: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+        cx.new(|_| ConnectionModel::new(ServerProfile::default(), credentials))
+    });
+    let store = cx.update(|cx| cx.new(|cx| StoreModel::open(&paths, cx)));
+    for _ in 0..600 {
+        if cx.read(|cx| store.read(cx).store().is_some()) {
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    let engine = cx.update(|cx| cx.new(|cx| EngineModel::new(connection, store, &paths, cx)));
+
+    let outcome = cx.update(|cx| engine.update(cx, |model, cx| model.sync_now(cx)));
+    assert_eq!(
+        outcome,
+        SyncNowOutcome::NotConnected,
+        "#56: a signed-out click cannot scan"
+    );
+    assert_eq!(
+        outcome.reason(),
+        Some("Not connected to the server, so no scan can start.")
+    );
+    assert!(
+        !cx.read(|cx| engine.read(cx).dashboard_model(cx).scanning),
+        "#56: the control must never read Checking… for this click"
+    );
+    assert_eq!(
+        cx.read(|cx| engine.read(cx).status().folders.len()),
+        1,
+        "the refused click still republishes the store-backed status"
+    );
+}
+
+/// #56: a rebuild holds the store, so the click says so rather than asking for
+/// a scan the engine cannot run. The engine is stopped for the rebuild, so
+/// nothing can flip the control to Checking… either.
+#[gpui_kit::test]
+async fn a_click_during_a_rebuild_reports_the_rebuild(cx: &mut TestAppContext) {
+    let (_runtime, server) = mock_server();
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+    {
+        let store = StateStore::open(&paths.state_db).expect("open the state database");
+        store
+            .add_folder(&SourceFolder {
+                path: photos.display().to_string(),
+                recursive: true,
+                album_mapping: false,
+                album_scope: sync_core::store::AlbumScope::Leaf,
+                album_title: None,
+            })
+            .expect("seed the folder");
+    }
+
+    let connection = signed_in(cx, &server);
+    let store = cx.update(|cx| cx.new(|cx| StoreModel::open(&paths, cx)));
+    wait_for_inputs(cx, &connection, &store).await;
+    let engine = cx.update(|cx| cx.new(|cx| EngineModel::new(connection, store, &paths, cx)));
+
+    // The rebuild lands its fresh store on the worker, so the click in the same
+    // step is the one a user makes while the rebuild runs.
+    let outcome = cx.update(|cx| {
+        engine.update(cx, |model, cx| {
+            model.rebuild(cx);
+            model.sync_now(cx)
+        })
+    });
+    assert_eq!(
+        outcome,
+        SyncNowOutcome::Rebuilding,
+        "#56: a rebuild is a reason, not a silent click"
+    );
+    assert_eq!(
+        outcome.reason(),
+        Some("A state rebuild is running. Sync now works again when it finishes.")
+    );
+    assert!(
+        !cx.read(|cx| engine.read(cx).dashboard_model(cx).scanning),
+        "#56: the control must never read Checking… for this click"
     );
 }

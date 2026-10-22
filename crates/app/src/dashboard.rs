@@ -50,6 +50,8 @@ pub struct Dashboard {
     paused: bool,
     /// The notice a failed Browse… left behind (#30).
     pick_notice: Option<String>,
+    /// The reason the last "Sync now" click could not scan (#56).
+    sync_notice: Option<String>,
     /// The open folder panel: the setup dialog (#40) or a folder's live detail
     /// (#43). The dashboard owns whether it is open; the panel owns the state
     /// inside it.
@@ -85,6 +87,7 @@ impl Dashboard {
             folder_input: None,
             paused: false,
             pick_notice: None,
+            sync_notice: None,
             panel: None,
             panel_subscription: None,
             detail_return: None,
@@ -118,6 +121,7 @@ impl Dashboard {
             folder_input: Some(folder_input),
             paused: false,
             pick_notice: None,
+            sync_notice: None,
             panel: None,
             panel_subscription: None,
             detail_return: None,
@@ -153,7 +157,13 @@ impl Dashboard {
 
     fn sync_now(&mut self, cx: &mut Context<Self>) {
         match &self.engine {
-            Some(engine) => engine.update(cx, |model, cx| model.sync_now(cx)),
+            Some(engine) => {
+                let outcome = engine.update(cx, |model, cx| model.sync_now(cx));
+                // #56: a click that cannot scan says why, so the control never
+                // swallows it. A click that lands clears the last reason.
+                self.sync_notice = outcome.reason().map(str::to_string);
+                cx.notify();
+            }
             None => {
                 self.paused = false;
                 self.model.global.activity = ActivityState::Syncing;
@@ -575,7 +585,10 @@ impl Dashboard {
 
     fn header(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let muted = cx.theme().muted_foreground;
+        let accent = cx.theme().warning;
+        let palette = CardPalette::new(cx.theme());
         let paused = self.is_paused(cx);
+        let (sync_label, sync_name) = crate::status::sync_now_copy(self.model.scanning);
         let (pause_label, pause_name) = if paused {
             ("Resume", "Resume syncing")
         } else {
@@ -584,48 +597,67 @@ impl Dashboard {
 
         div()
             .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .gap_4()
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_0p5()
-                    .child(
-                        div()
-                            .text_2xl()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Immich Sync"),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(muted)
-                            .child("Upload status for every source folder"),
-                    ),
-            )
+            .flex_col()
+            .gap_2()
             .child(
                 div()
                     .flex()
                     .flex_row()
-                    .gap_2()
+                    .items_center()
+                    .justify_between()
+                    .gap_4()
                     .child(
-                        Button::new("dashboard-sync-now")
-                            .primary()
-                            .label("Sync now")
-                            .accessibility_label("Sync now")
-                            .on_click(cx.listener(|this, _, _, cx| this.sync_now(cx))),
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .child(
+                                div()
+                                    .text_2xl()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Immich Sync"),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(muted)
+                                    .child("Upload status for every source folder"),
+                            ),
                     )
                     .child(
-                        Button::new("dashboard-pause")
-                            .secondary()
-                            .label(pause_label)
-                            .accessibility_label(pause_name)
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_paused(cx))),
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_2()
+                            .child(
+                                // #56: the control reports the scan it started,
+                                // and a click during a scan is harmless: it
+                                // re-notifies the engine.
+                                Button::new("dashboard-sync-now")
+                                    .primary()
+                                    .label(sync_label)
+                                    .accessibility_label(sync_name)
+                                    .on_click(cx.listener(|this, _, _, cx| this.sync_now(cx))),
+                            )
+                            .child(
+                                Button::new("dashboard-pause")
+                                    .secondary()
+                                    .label(pause_label)
+                                    .accessibility_label(pause_name)
+                                    .on_click(cx.listener(|this, _, _, cx| this.toggle_paused(cx))),
+                            ),
                     ),
             )
+            // #56: a click that cannot scan says why, in the same notice idiom
+            // the folder bar uses.
+            .when_some(self.sync_notice.clone(), |this, notice| {
+                this.child(crate::settings_view::notice(
+                    "dashboard-sync-notice",
+                    notice,
+                    accent,
+                    &palette,
+                ))
+            })
     }
 }
 
@@ -919,6 +951,20 @@ fn status_card(
                     .text_sm()
                     .text_color(palette.meta)
                     .child(uploads),
+            )
+        })
+        .when_some(content.scan.clone(), |this, scan| {
+            // #56: the global card's reconciliation scan, in the folder
+            // detail's own words. A label, not a control: nothing new to
+            // operate or to skip.
+            this.child(
+                div()
+                    .id((id.clone(), "scan"))
+                    .test_support()
+                    .aria_label(scan.clone())
+                    .text_sm()
+                    .text_color(palette.meta)
+                    .child(scan),
             )
         })
         .when_some(content.album.clone(), |this, album| {
