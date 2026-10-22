@@ -145,6 +145,7 @@ impl Backfill {
         // completion would spend the one automatic pass before the first upload
         // exists, so a fresh install that starts with the tag on would never
         // tag the files it uploads next.
+        // `tests/tag_backfill.rs::an_empty_library_does_not_finish_the_backfill` pins this return.
         if total == 0 {
             return;
         }
