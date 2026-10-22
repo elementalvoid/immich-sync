@@ -27,7 +27,7 @@ pub fn now_ns() -> i64 {
 ///
 /// GLOSSARY names the pass; one constant keeps the two surfaces from drifting
 /// into "rescan" or "poll".
-pub const SCAN_LABEL: &str = "Last reconciliation scan";
+const SCAN_LABEL: &str = "Last reconciliation scan";
 
 /// One detail line: the label, then the relative and exact time, or
 /// [`NOT_YET`].
