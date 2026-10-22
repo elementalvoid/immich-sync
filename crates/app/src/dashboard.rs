@@ -410,13 +410,6 @@ impl Dashboard {
         }
     }
 
-    /// Removes one source folder (R2.1).
-    fn remove_folder(&mut self, path: String, cx: &mut Context<Self>) {
-        if let Some(engine) = &self.engine {
-            engine.update(cx, |model, cx| model.remove_folder(path, cx));
-        }
-    }
-
     /// Turns recursive discovery on or off for one source folder (R2.1).
     ///
     /// The engine model treats this as the folder's own edit, updates the
@@ -680,25 +673,14 @@ impl Render for Dashboard {
                         .map(|(index, folder)| {
                             let path = folder.path.clone().unwrap_or_default();
                             let title = folder.title.clone();
-                            let remove = removed.then(|| {
-                                let path = path.clone();
-                                Button::new(("folder-remove", index))
-                                    .ghost()
-                                    .label("Remove")
-                                    .accessibility_label(format!("Remove {title}"))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        // #43: a card control never opens the
-                                        // detail the card itself opens.
-                                        cx.stop_propagation();
-                                        this.remove_folder(path.clone(), cx);
-                                    }))
-                                    .into_any_element()
-                            });
                             let album = removed.then(|| {
                                 self.folder_controls(index, folder, cx).into_any_element()
                             });
                             let details_focus = self.details_focus(&path, cx);
-                            let details = removed.then(|| {
+                            // #53: the card's only control row is Details. Removal
+                            // is the detail's confirmed action, so no card exposes
+                            // a one-click removal.
+                            let footer = removed.then(|| {
                                 let path = path.clone();
                                 div()
                                     .id(("folder-details-anchor", index))
@@ -715,19 +697,6 @@ impl Render for Dashboard {
                                                 this.open_folder_detail(path.clone(), window, cx);
                                             })),
                                     )
-                                    .into_any_element()
-                            });
-                            let footer = removed.then(|| {
-                                let remove = remove.unwrap_or_else(|| div().into_any_element());
-                                let details = details.unwrap_or_else(|| div().into_any_element());
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .justify_between()
-                                    .gap_2()
-                                    .child(details)
-                                    .child(remove)
                                     .into_any_element()
                             });
                             div()
@@ -814,7 +783,7 @@ pub fn state_border(state: ActivityState, theme: &Theme) -> Hsla {
 }
 
 /// One status card. The text comes from [`StatusCard::content`], so the view
-/// does no formatting. `footer` is the card's controls row — Details and Remove
+/// does no formatting. `footer` is the card's control row — its Details control
 /// on a folder card, when the dashboard is attached to an engine (#43, R2.1) —
 /// and `album` the per-folder settings controls (R3.4).
 fn status_card(
