@@ -13,11 +13,12 @@ use gpui_kit::base::{Disableable as _, SelectableText, TextSelection};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::Button;
 use gpui_kit::component::radio::Radio;
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::*;
 
 use crate::dashboard::CardPalette;
 use crate::logging::{self, LogLevel, TAIL_LINES};
-use crate::settings_view::{SettingsView, field_text, notice, section};
+use crate::settings_view::{SettingsView, field_text, filling_section, notice, section};
 
 /// How often the live tail re-reads the newest log file while the Logs surface
 /// is visible.
@@ -539,20 +540,41 @@ impl LogsView {
                 .collect();
             let focus = self.lines_focus.clone();
             body.push(
+                // The scrollbar overlays this row rather than the scroll box, so
+                // it stays put while the lines move. It reads the view's own
+                // handle: following is that handle's distance from the bottom.
                 div()
-                    .id("logs-lines")
-                    .test_support()
-                    .track_focus(&self.lines_focus)
-                    .track_scroll(&self.scroll)
-                    .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                        window.focus(&focus, cx);
-                    })
                     .flex()
                     .flex_col()
-                    .gap_0p5()
-                    .max_h(rems(24.))
-                    .overflow_y_scroll()
-                    .children(lines)
+                    .flex_1()
+                    .min_h(rems(8.))
+                    .relative()
+                    .child(
+                        div()
+                            .id("logs-lines")
+                            .test_support()
+                            .track_focus(&self.lines_focus)
+                            .track_scroll(&self.scroll)
+                            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                                window.focus(&focus, cx);
+                            })
+                            // The wheel over the tail is the tail's: GPUI applies
+                            // the delta to every scroll hitbox under the pointer,
+                            // so without this any scrolling ancestor would move
+                            // by the same delta (#54).
+                            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .size_full()
+                            // Room for the scrollbar track over the right edge,
+                            // so it cannot cover a truncated line's ending.
+                            .pr_4()
+                            .overflow_y_scroll()
+                            .children(lines)
+                            .into_any_element(),
+                    )
+                    .vertical_scrollbar(&self.scroll)
                     .into_any_element(),
             );
         }
@@ -588,7 +610,7 @@ impl LogsView {
                     .into_any_element(),
             );
         }
-        section(
+        filling_section(
             "logs-lines-section",
             "Recent lines",
             "The newest file's last lines. They follow the file while this surface is open.",
@@ -632,12 +654,38 @@ impl Render for LogsView {
             .size_full()
             .bg(background)
             .text_color(foreground)
-            .overflow_y_scroll()
+            // Clipped, so the page keeps the window's height for the tail to
+            // divide instead of growing with the cards' content.
+            .overflow_hidden()
             .p_4()
             .gap_2()
-            .child(Self::header(cx))
-            .child(location)
-            .child(level)
+            .child(
+                // The header, the location and the level control keep their
+                // natural height, and the tail takes what is left of the
+                // window. A window too short for both scrolls this strip rather
+                // than squeezing the tail away; a page-level scroll could not
+                // do it, because a column inside a scroll area has no height to
+                // divide (#54).
+                div()
+                    .id("logs-cards")
+                    .test_support()
+                    .flex()
+                    .flex_col()
+                    .min_h_0()
+                    .child(
+                        div()
+                            .id("logs-card-list")
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_h_0()
+                            .gap_2()
+                            .overflow_y_scroll()
+                            .child(Self::header(cx))
+                            .child(location)
+                            .child(level),
+                    ),
+            )
             .child(lines)
     }
 }

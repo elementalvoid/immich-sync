@@ -16,6 +16,7 @@ use crate::logging::LogLevel;
 use crate::paths::AppPaths;
 use crate::settings::{Settings, SettingsStore};
 
+use gpui_kit::base::ObservedElement;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::Theme;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -1437,6 +1438,38 @@ pub(crate) fn section(
     rows: Vec<AnyElement>,
     cx: &App,
 ) -> AnyElement {
+    card(id, title, description, rows, cx).into_any_element()
+}
+
+/// One card of related settings that takes the page height the cards above it
+/// leave, for a card whose body is the page's scroll area (the Logs tail, #54).
+///
+/// The explicit floor is what a window too short for the card keeps: it is at
+/// least as tall as the card's own rows plus the body's minimum, and nothing
+/// squeezes the body to nothing.
+pub(crate) fn filling_section(
+    id: &'static str,
+    title: &'static str,
+    description: &'static str,
+    rows: Vec<AnyElement>,
+    cx: &App,
+) -> AnyElement {
+    card(id, title, description, rows, cx)
+        .flex_1()
+        // An explicit floor replaces the card's automatic minimum, which is its
+        // body's whole content height: 16rem leaves the Logs tail its own
+        // 8rem below the card's header and rows.
+        .min_h(rems(16.))
+        .into_any_element()
+}
+
+fn card(
+    id: &'static str,
+    title: &'static str,
+    description: &'static str,
+    rows: Vec<AnyElement>,
+    cx: &App,
+) -> ObservedElement<Stateful<Div>> {
     let theme = cx.theme();
     let palette = CardPalette::new(theme);
     div()
@@ -1466,7 +1499,6 @@ pub(crate) fn section(
                 .child(div().text_xs().text_color(palette.meta).child(description)),
         )
         .children(rows)
-        .into_any_element()
 }
 
 /// The backfill progress line the Tagging section shows (R3.7).
