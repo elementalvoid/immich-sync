@@ -601,6 +601,82 @@ async fn a_notice_clears_when_the_folder_arrives(cx: &mut TestAppContext) {
     .expect("render after the folder arrived");
 }
 
+/// #56: an answered notice stays gone. The view drops the stored outcome once
+/// its reason no longer holds, so a later change cannot bring the old sentence
+/// back with no click behind it.
+#[gpui_kit::test]
+async fn a_satisfied_notice_does_not_come_back(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the fixture folder");
+    let (window, store, _view) = open_live_dashboard(cx, temp.path());
+    wait_for_store(cx, &store).await;
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("dashboard-sync-now", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("dashboard-sync-notice").label(),
+            Some("No source folder to scan. Add a folder first."),
+            "#56: the click says what is missing"
+        );
+    })
+    .expect("click Sync now with no source folder");
+
+    let folder = sync_core::store::SourceFolder {
+        path: photos.display().to_string(),
+        recursive: true,
+        album_mapping: false,
+        album_scope: sync_core::store::AlbumScope::Leaf,
+        album_title: None,
+    };
+    let path = folder.path.clone();
+    cx.update(|cx| {
+        store
+            .read(cx)
+            .store()
+            .expect("the store is open")
+            .add_folder(&folder)
+            .expect("seed the source folder");
+        store.update(cx, |store, cx| store.set_folders(vec![folder], cx));
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("dashboard-sync-notice").is_none(),
+            "#56: the arrived folder answers the notice"
+        );
+    })
+    .expect("render after the folder arrived");
+
+    cx.update(|cx| {
+        store
+            .read(cx)
+            .store()
+            .expect("the store is open")
+            .remove_folder(&path)
+            .expect("remove the source folder");
+        store.update(cx, |store, cx| store.set_folders(Vec::new(), cx));
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("dashboard-sync-notice").is_none(),
+            "#56: the answered notice must not return with no click behind it"
+        );
+        assert_eq!(
+            window.find("dashboard-sync-now").label(),
+            Some("Sync now"),
+            "#56: and the control stays quiet"
+        );
+    })
+    .expect("render after the folder left");
+}
+
 /// #56: signed out is the reachable field case: the folders are known, the
 /// scan is not possible, and the click says so.
 #[gpui_kit::test]

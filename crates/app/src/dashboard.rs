@@ -577,7 +577,7 @@ impl Dashboard {
         .render(cx.theme().muted_foreground)
     }
 
-    fn header(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn header(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let muted = cx.theme().muted_foreground;
         let accent = cx.theme().warning;
         let palette = CardPalette::new(cx.theme());
@@ -585,11 +585,17 @@ impl Dashboard {
         let (sync_label, sync_name) = crate::status::sync_now_copy(self.model.scanning);
         // #56: the reason is asked for again on every frame, so a notice that
         // outlived its cause cannot stay on screen beside the card that
-        // answered it.
+        // answered it. The stored outcome goes with the reason: keeping it
+        // would let a later change bring the old sentence back with no click
+        // behind it. Nothing tells the window, because the notice was already
+        // hidden on the frame that drops it.
         let sync_notice = match (&self.engine, self.sync_notice) {
             (Some(engine), Some(outcome)) => engine.read(cx).sync_now_reason(outcome, cx),
             _ => None,
         };
+        if sync_notice.is_none() {
+            self.sync_notice = None;
+        }
         let (pause_label, pause_name) = if paused {
             ("Resume", "Resume syncing")
         } else {
