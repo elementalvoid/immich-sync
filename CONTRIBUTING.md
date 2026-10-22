@@ -118,6 +118,9 @@ dbus-run-session -- xvfb-run -a -s "-screen 0 1440x1000x24" bash -c '
   sleep 10
   WIN=$(xwininfo -root -tree | awk "/900x650/ {print \$1; exit}")
   xdotool windowsize "$WIN" 1200 900
+  # The window opens centred, which would push its lower right past the
+  # screen; at the origin the whole frame is captured.
+  xdotool windowmove "$WIN" 0 0
   sleep 3
   import -window "$WIN" ../docs/screenshot.png
   kill $APP
