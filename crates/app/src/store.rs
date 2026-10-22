@@ -66,10 +66,11 @@ impl StoreModel {
                     // thread, so the first dashboard frame is populated (N2).
                     match store.folders() {
                         Ok(folders) => {
-                            let counts = folders
-                                .iter()
-                                .map(|folder| store.folder_counts(&folder.path).unwrap_or_default())
-                                .collect();
+                            // A zeroed card is the fallback here: nothing is
+                            // cached yet, so a failed read must still show the
+                            // folders.
+                            let counts = owned_counts(&store, &folders)
+                                .unwrap_or_else(|| vec![FolderCounts::default(); folders.len()]);
                             let times = folders
                                 .iter()
                                 .map(|folder| store.folder_times(&folder.path).unwrap_or_default())
@@ -218,8 +219,9 @@ impl StoreModel {
         &self.times
     }
 
-    /// Replaces the cached folder list after an add or a remove, keeping the
-    /// counts of the folders that are still there.
+    /// Replaces the cached folder list after an add or a remove, keeping each
+    /// surviving folder's counts and times while the ownership read for the new
+    /// list runs off the UI thread (N2, #52).
     pub fn set_folders(&mut self, folders: Vec<SourceFolder>, cx: &mut Context<Self>) {
         // R2.4: the cache must keep a folder's counts and times across a
         // re-add that spells the path differently, the same comparison the
@@ -249,15 +251,60 @@ impl StoreModel {
                     .unwrap_or_default()
             })
             .collect();
+        // #52: only a changed path list can move a row between cards, so an
+        // album, scope, or recursive edit keeps the counts it has. The raw
+        // spelling is part of it: the store orders by that column, so a
+        // re-spelled path is a change even when it names the same folder.
+        let unchanged = folders.len() == self.folders.len()
+            && folders
+                .iter()
+                .zip(&self.folders)
+                .all(|(new, old)| new.path == old.path);
         self.folders = folders;
         self.counts = counts;
         self.times = times;
         cx.notify();
+        if unchanged {
+            return;
+        }
+        // #52: a folder's counts depend on the folders before it, so a nested
+        // add or remove makes the kept values wrong: the outer card still holds
+        // the new inner folder's rows, and a new outer folder shows none. The
+        // ownership read is the one rule, and it runs off the UI thread (N2).
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        let ordered = self.folders.clone();
+        let read_folders = ordered.clone();
+        let read = cx
+            .background_executor()
+            .spawn(async move { owned_counts(&store, &read_folders) });
+        cx.spawn(async move |this, cx| {
+            let Some(counts) = read.await else {
+                return;
+            };
+            let _ = this.update(cx, |model, cx| {
+                // A later add or remove replaced the list and spawned its own
+                // read, whose answer is the newer one. An edit that kept the
+                // paths left every owner as it was, so this answer still
+                // holds (#52).
+                if !same_paths(&model.folders, &ordered) {
+                    return;
+                }
+                model.counts = counts;
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
-    /// Re-reads one folder's counts from the store after a review decision
-    /// made with no engine running (R5.4), so the cache a later status refresh
-    /// reads cannot resurrect the decided item.
+    /// Re-reads the cached counts from the store after a review decision made
+    /// with no engine running (R5.4), so the cache a later status refresh reads
+    /// cannot resurrect the decided item.
+    ///
+    /// The decision changes one row, which one folder owns, so only that
+    /// folder's card is replaced; its counts still come from the ownership read
+    /// over the whole list (#52), because that is what says the row is its own.
     pub fn refresh_counts(&mut self, path: &str, cx: &mut Context<Self>) {
         let Some(store) = self.store.clone() else {
             return;
@@ -277,20 +324,31 @@ impl StoreModel {
         else {
             return;
         };
-        let read_folder = folder.clone();
+        let ordered = self.folders.clone();
+        let read_folders = ordered.clone();
         let read = cx
             .background_executor()
-            .spawn(async move { store.folder_counts(&read_folder) });
+            .spawn(async move { owned_counts(&store, &read_folders) });
         cx.spawn(async move |this, cx| {
-            let counts = read.await;
+            let Some(counts) = read.await else {
+                return;
+            };
             let _ = this.update(cx, |model, cx| {
-                let Ok(counts) = counts else {
+                // The folder list can change while the read runs: a list with
+                // other paths has its own read, so only the paths this read
+                // counted are safe to write. An edit that kept them did not
+                // move the row (#52).
+                if !same_paths(&model.folders, &ordered) {
+                    return;
+                }
+                // The paths are unchanged, so their order is the read's order:
+                // the folder that owns the path owns this entry.
+                let Some(index) = model.folders.iter().position(|entry| entry.path == folder)
+                else {
                     return;
                 };
-                // The folder list can change while the read runs: find the
-                // folder by path, not by the index found before it.
-                if let Some(index) = model.folders.iter().position(|entry| entry.path == folder) {
-                    model.counts[index] = counts;
+                if let Some(counts) = counts.get(index) {
+                    model.counts[index] = *counts;
                     cx.notify();
                 }
             });
@@ -361,10 +419,8 @@ fn rebuild_store(path: &Path, folders: &[SourceFolder]) -> anyhow::Result<Opened
     let store = Arc::new(store);
     let tracking = Arc::new(Tracking::new(Arc::clone(&store)));
     let folders = store.folders().context("read the restored folders")?;
-    let counts = folders
-        .iter()
-        .map(|folder| store.folder_counts(&folder.path).unwrap_or_default())
-        .collect();
+    let counts = owned_counts(&store, &folders)
+        .unwrap_or_else(|| vec![FolderCounts::default(); folders.len()]);
     let times = folders
         .iter()
         .map(|folder| store.folder_times(&folder.path).unwrap_or_default())
@@ -376,6 +432,30 @@ fn rebuild_store(path: &Path, folders: &[SourceFolder]) -> anyhow::Result<Opened
         counts,
         times,
     })
+}
+
+/// Whether the cache still holds the ordered raw paths a count read counted.
+///
+/// Only the ordered raw paths decide which card owns a row, so an album, scope,
+/// or recursive edit inside the read window keeps the answer (#52).
+fn same_paths(cache: &[SourceFolder], ordered: &[SourceFolder]) -> bool {
+    cache
+        .iter()
+        .map(|folder| folder.path.as_str())
+        .eq(ordered.iter().map(|folder| folder.path.as_str()))
+}
+
+/// The per-folder counts with the ownership rule (#52), or `None` when the
+/// read fails: the caller keeps the counts it has instead of overwriting good
+/// ones with zeroes.
+fn owned_counts(store: &StateStore, folders: &[SourceFolder]) -> Option<Vec<FolderCounts>> {
+    match store.folder_counts_by_owner(folders) {
+        Ok(counts) => Some(counts),
+        Err(error) => {
+            tracing::warn!(error = %error, "the folder counts could not be read");
+            None
+        }
+    }
 }
 
 /// Removes the database file and its WAL sidecars.
