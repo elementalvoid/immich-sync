@@ -122,6 +122,31 @@ async fn wait_for_albums(store: &StateStore, server: &MockImmich, files: &[PathB
     .await
 }
 
+/// The two facts a settled rename leaves behind: the server holds `title` for
+/// the album of `file`, and the store no longer owes the rename.
+///
+/// The server applies the rename before the client can record the answer, so a
+/// test that watched only the server would read a store row that is still
+/// pending (#51).
+fn rename_settled(
+    store: &StateStore,
+    server: &MockImmich,
+    photos: &Path,
+    file: &Path,
+    title: &str,
+) -> bool {
+    let Some(asset) = store
+        .item(&file.display().to_string())
+        .ok()
+        .flatten()
+        .and_then(|row| row.asset_id)
+    else {
+        return false;
+    };
+    server.album_for_asset(&asset).as_deref() == Some(title)
+        && !album_of(store, photos).rename_pending
+}
+
 /// #47: a new album is created with the title the user chose.
 #[tokio::test]
 async fn a_new_album_is_created_with_the_custom_title() {
@@ -298,15 +323,13 @@ async fn clearing_the_title_renames_the_album_back_to_the_folder_name() {
 
     assert!(
         wait_until(
-            || server
-                .album_for_asset(&asset_id_of(&store, &file))
-                .as_deref()
-                == Some("Pictures"),
+            || rename_settled(&store, &server, &photos, &file, "Pictures"),
             Duration::from_secs(15)
         )
         .await,
-        "the album was not renamed back: {:?}",
-        server.album_rename_calls()
+        "the album was not renamed back: {:?} {:?}",
+        server.album_rename_calls(),
+        album_of(&store, &photos)
     );
     assert_eq!(
         album_of(&store, &photos),
@@ -402,15 +425,13 @@ async fn an_offline_rename_is_retried_on_the_next_scan_and_the_title_stays() {
     engine.sync_now();
     assert!(
         wait_until(
-            || server
-                .album_for_asset(&asset_id_of(&store, &file))
-                .as_deref()
-                == Some("Holiday 2024"),
+            || rename_settled(&store, &server, &photos, &file, "Holiday 2024"),
             Duration::from_secs(15)
         )
         .await,
-        "the retry did not rename the album: {:?}",
-        server.album_rename_calls()
+        "the retry did not confirm the rename: {:?} {:?}",
+        server.album_rename_calls(),
+        album_of(&store, &photos)
     );
     let album = album_of(&store, &photos);
     assert!(!album.rename_pending, "the retry settled the rename");
@@ -458,15 +479,13 @@ async fn a_pending_title_is_sent_on_the_next_start() {
     .await;
     assert!(
         wait_until(
-            || server
-                .album_for_asset(&asset_id_of(&store, &file))
-                .as_deref()
-                == Some("Holiday 2024"),
+            || rename_settled(&store, &server, &photos, &file, "Holiday 2024"),
             Duration::from_secs(20)
         )
         .await,
-        "#47: a start retries the stored title: {:?}",
-        server.album_rename_calls()
+        "#47: a start retries the stored title: {:?} {:?}",
+        server.album_rename_calls(),
+        album_of(&store, &photos)
     );
     assert!(!album_of(&store, &photos).rename_pending);
     engine.stop();
@@ -685,10 +704,7 @@ async fn the_title_survives_a_restart_a_toggle_and_a_re_add() {
         .expect("set the title");
     assert!(
         wait_until(
-            || server
-                .album_for_asset(&asset_id_of(&store, &file))
-                .as_deref()
-                == Some("Holiday 2024"),
+            || rename_settled(&store, &server, &photos, &file, "Holiday 2024"),
             Duration::from_secs(15)
         )
         .await
