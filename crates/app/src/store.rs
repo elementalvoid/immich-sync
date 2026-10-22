@@ -285,8 +285,10 @@ impl StoreModel {
             };
             let _ = this.update(cx, |model, cx| {
                 // A later add or remove replaced the list and spawned its own
-                // read, whose answer is the newer one.
-                if model.folders != ordered {
+                // read, whose answer is the newer one. An edit that kept the
+                // paths left every owner as it was, so this answer still
+                // holds (#52).
+                if !same_paths(&model.folders, &ordered) {
                     return;
                 }
                 model.counts = counts;
@@ -332,14 +334,15 @@ impl StoreModel {
                 return;
             };
             let _ = this.update(cx, |model, cx| {
-                // The folder list can change while the read runs: a changed one
-                // has its own read, so only the list this read counted is safe
-                // to write.
-                if model.folders != ordered {
+                // The folder list can change while the read runs: a list with
+                // other paths has its own read, so only the paths this read
+                // counted are safe to write. An edit that kept them did not
+                // move the row (#52).
+                if !same_paths(&model.folders, &ordered) {
                     return;
                 }
-                // The list is unchanged, so its order is the read's order: the
-                // folder that owns the path owns this entry.
+                // The paths are unchanged, so their order is the read's order:
+                // the folder that owns the path owns this entry.
                 let Some(index) = model.folders.iter().position(|entry| entry.path == folder)
                 else {
                     return;
@@ -429,6 +432,17 @@ fn rebuild_store(path: &Path, folders: &[SourceFolder]) -> anyhow::Result<Opened
         counts,
         times,
     })
+}
+
+/// Whether the cache still holds the ordered raw paths a count read counted.
+///
+/// Only the ordered raw paths decide which card owns a row, so an album, scope,
+/// or recursive edit inside the read window keeps the answer (#52).
+fn same_paths(cache: &[SourceFolder], ordered: &[SourceFolder]) -> bool {
+    cache
+        .iter()
+        .map(|folder| folder.path.as_str())
+        .eq(ordered.iter().map(|folder| folder.path.as_str()))
 }
 
 /// The per-folder counts with the ownership rule (#52), or `None` when the

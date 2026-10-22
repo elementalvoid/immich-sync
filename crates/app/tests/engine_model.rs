@@ -1302,6 +1302,125 @@ async fn adding_a_nested_outer_folder_moves_the_rows_to_its_card(cx: &mut TestAp
     );
 }
 
+/// R8.1, #52: an edit that keeps the raw path list must not discard the count
+/// read an add started, or the cards keep the pre-add zeroes until the next
+/// edit or a restart.
+///
+/// The album edit lands on the UI thread while the read runs on the background
+/// executor: the read's list still names the same folders in the same order,
+/// so its answer is the one that counts.
+#[gpui_kit::test]
+async fn an_album_edit_keeps_the_counts_an_add_asked_for(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+    {
+        // The rows arrive before the folder does: the signed-out client adds
+        // the folder over rows the store already holds.
+        let store = StateStore::open(&paths.state_db).expect("open the state database");
+        store
+            .record(&row(&photos.join("one.jpg"), ItemState::Uploaded))
+            .expect("seed the uploaded row");
+    }
+    let store = cx.update(|cx| cx.new(|cx| StoreModel::open(&paths, cx)));
+    for _ in 0..600 {
+        if cx.read(|cx| store.read(cx).store().is_some()) {
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    let folder = SourceFolder {
+        path: photos.display().to_string(),
+        recursive: true,
+        album_mapping: false,
+        album_scope: sync_core::store::AlbumScope::Leaf,
+        album_title: None,
+    };
+    let mut mapped = folder.clone();
+    mapped.album_mapping = true;
+    // The add, then the album edit, before the read can land.
+    cx.update(|cx| {
+        store.update(cx, |store, cx| store.set_folders(vec![folder], cx));
+        store.update(cx, |store, cx| store.set_folders(vec![mapped], cx));
+    });
+
+    let filled = pump_until(cx, |cx| {
+        cx.read(|cx| store.read(cx).folder_counts().to_vec()) == vec![counts_of(0, 1, 0, 0)]
+    });
+    assert!(
+        filled,
+        "#52: the album edit discarded the add's counts: {:?}",
+        cx.read(|cx| store.read(cx).folder_counts().to_vec())
+    );
+}
+
+/// R5.4, #52: an edit that keeps the raw path list must not discard the count
+/// refresh a review decision asked for, or the card keeps counting the item
+/// the store already decided.
+#[gpui_kit::test]
+async fn an_album_edit_keeps_the_refresh_a_review_decision_asked_for(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+    {
+        let store = StateStore::open(&paths.state_db).expect("open the state database");
+        store
+            .add_folder(&SourceFolder {
+                path: photos.display().to_string(),
+                recursive: true,
+                album_mapping: false,
+                album_scope: sync_core::store::AlbumScope::Leaf,
+                album_title: None,
+            })
+            .expect("seed the folder");
+        for name in ["keep.jpg", "other.jpg"] {
+            store
+                .record(&row(&photos.join(name), ItemState::Missing))
+                .expect("seed the missing row");
+        }
+    }
+    let store = cx.update(|cx| cx.new(|cx| StoreModel::open(&paths, cx)));
+    for _ in 0..600 {
+        if cx.read(|cx| store.read(cx).store().is_some()) {
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        cx.read(|cx| store.read(cx).folder_counts().to_vec()),
+        vec![counts_of(0, 0, 0, 2)],
+        "the card starts with both items to review"
+    );
+    // The decision lands in the store; the card still counts the item until
+    // the refresh it asked for comes back.
+    cx.read(|cx| store.read(cx).store().expect("the store is open"))
+        .record(&row(&photos.join("keep.jpg"), ItemState::ReviewKeep))
+        .expect("write the decision");
+    let mut mapped = cx.read(|cx| store.read(cx).folders().to_vec());
+    mapped[0].album_mapping = true;
+    let decided = photos.join("keep.jpg").display().to_string();
+    // The refresh, then the album edit, before the read can land.
+    cx.update(|cx| {
+        store.update(cx, |store, cx| store.refresh_counts(&decided, cx));
+        store.update(cx, |store, cx| store.set_folders(mapped, cx));
+    });
+
+    let refreshed = pump_until(cx, |cx| {
+        cx.read(|cx| store.read(cx).folder_counts().to_vec()) == vec![counts_of(0, 1, 0, 1)]
+    });
+    assert!(
+        refreshed,
+        "#52: the card kept the decided item: {:?}",
+        cx.read(|cx| store.read(cx).folder_counts().to_vec())
+    );
+}
+
 /// R8.2: with no engine and no session, the derived status is idle, not
 /// attention. The connection is a status input now, so a client that has not
 /// signed in does not read as a problem.
