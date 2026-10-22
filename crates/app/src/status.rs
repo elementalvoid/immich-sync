@@ -84,7 +84,8 @@ pub struct StatusCard {
     /// `None` on the global card, which is not a folder.
     pub last_upload_ns: Option<i64>,
     /// When a reconciliation scan last read this folder, ns since the Unix
-    /// epoch (#43). `None` on the global card.
+    /// epoch (#43). On the global card it is the newest of the folders' values
+    /// (#56).
     pub last_scan_ns: Option<i64>,
 }
 
@@ -112,6 +113,10 @@ pub struct CardContent {
     pub uploads: Option<String>,
     /// The connection line, on the global card.
     pub connection: Option<String>,
+    /// The reconciliation scan line, on the global card (#56): the newest of
+    /// the folders' scans. This is what proves a click did something when the
+    /// scan finds nothing.
+    pub scan: Option<String>,
     pub error: Option<String>,
 }
 
@@ -153,6 +158,12 @@ impl StatusCard {
             // is the sum.
             uploads: self.path.is_none().then(|| upload_line(self.uploads)),
             connection: self.connection.clone(),
+            // #56: the same sentence the folder detail shows for one folder,
+            // so a click that found nothing still moves something.
+            scan: self
+                .path
+                .is_none()
+                .then(|| crate::times::scan_line(self.last_scan_ns, crate::times::now_ns())),
             error: self.last_error.clone(),
         }
     }
@@ -215,6 +226,19 @@ pub fn folder_name(path: &str) -> String {
     )
 }
 
+/// The "Sync now" control's visible label and accessible name (#56).
+///
+/// One place, so the button cannot read one thing to a person and another to a
+/// screen reader while the scan runs.
+#[must_use]
+pub fn sync_now_copy(scanning: bool) -> (&'static str, &'static str) {
+    if scanning {
+        ("Checking…", "Checking the source folders")
+    } else {
+        ("Sync now", "Sync now")
+    }
+}
+
 /// The upload progress for one folder, 0.0 to 1.0.
 fn folder_progress(counts: FolderCounts) -> f32 {
     let total = counts.uploaded + counts.pending;
@@ -241,7 +265,13 @@ impl DashboardModel {
             connection,
             last_error: status.last_error.clone(),
             last_upload_ns: None,
-            last_scan_ns: None,
+            // #56: the newest folder scan, so the global card's line advances
+            // whenever any folder was scanned.
+            last_scan_ns: status
+                .folders
+                .iter()
+                .filter_map(|folder| folder.last_scan_ns)
+                .max(),
             recursive: false,
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
@@ -282,7 +312,11 @@ impl DashboardModel {
                 album_rename: folder.album_rename.clone(),
             })
             .collect();
-        Self { global, folders }
+        Self {
+            global,
+            folders,
+            scanning: status.scanning,
+        }
     }
 }
 
@@ -291,12 +325,16 @@ impl DashboardModel {
 pub struct DashboardModel {
     pub global: StatusCard,
     pub folders: Vec<StatusCard>,
+    /// Whether a reconciliation scan is walking the folders (#56), from the
+    /// engine's status. The header's "Sync now" control reports it.
+    pub scanning: bool,
 }
 
 /// Fake data that exercises the dashboard layout until the engine exists.
 #[must_use]
 pub fn sample() -> DashboardModel {
     DashboardModel {
+        scanning: false,
         global: StatusCard {
             title: "All folders".to_string(),
             path: None,
@@ -317,7 +355,7 @@ pub fn sample() -> DashboardModel {
             connection: Some("Connected".to_string()),
             last_error: None,
             last_upload_ns: None,
-            last_scan_ns: None,
+            last_scan_ns: Some(1_700_000_060_000_000_000),
             recursive: false,
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
@@ -429,8 +467,102 @@ pub fn sample() -> DashboardModel {
 
 #[cfg(test)]
 mod tests {
-    use super::upload_line;
+    use super::{DashboardModel, sync_now_copy, upload_line};
+    use crate::times;
     use sync_core::meter::UploadTraffic;
+    use sync_core::status::{Activity, FolderStatus, Status};
+    use sync_core::store::FolderCounts;
+
+    /// One status with a folder per scan time, so a test reads the newest of
+    /// several folder values.
+    fn status_with_scans(scans: &[Option<i64>]) -> Status {
+        Status {
+            activity: Activity::Idle,
+            folders: scans
+                .iter()
+                .enumerate()
+                .map(|(index, last_scan_ns)| FolderStatus {
+                    path: format!("/photos/{index}"),
+                    recursive: true,
+                    album_mapping: false,
+                    album_scope: sync_core::store::AlbumScope::Leaf,
+                    album_title: None,
+                    album_rename: None,
+                    available: true,
+                    counts: FolderCounts::default(),
+                    last_error: None,
+                    last_scan_ns: *last_scan_ns,
+                    last_upload_ns: None,
+                    uploads: UploadTraffic::default(),
+                })
+                .collect(),
+            counts: FolderCounts::default(),
+            last_error: None,
+            uploads: UploadTraffic::default(),
+            scanning: false,
+        }
+    }
+
+    /// #56: a scan that finds nothing still has to move something the user can
+    /// see, so the global card carries the newest folder's scan and the same
+    /// label the folder detail uses.
+    #[test]
+    fn the_global_card_takes_the_newest_folder_scan() {
+        let model = DashboardModel::from_engine(
+            &status_with_scans(&[Some(1_000), Some(3_000), None]),
+            None,
+        );
+        assert_eq!(
+            model.global.last_scan_ns,
+            Some(3_000),
+            "#56: the newest folder scan is the global card's"
+        );
+        let scan = model
+            .global
+            .content()
+            .scan
+            .expect("the global card shows the scan line");
+        assert!(
+            scan.starts_with("Last reconciliation scan: "),
+            "#56: the global card and the folder detail share one label: {scan}"
+        );
+        assert!(
+            !scan.ends_with(times::NOT_YET),
+            "#56: a folder has scanned, so the line shows when: {scan}"
+        );
+        assert_eq!(
+            model.folders[0].content().scan,
+            None,
+            "the line belongs to the card that sums the folders"
+        );
+    }
+
+    /// #56: with no scan yet the line still names the work that has not
+    /// happened, so the card reads "not yet" instead of going blank.
+    #[test]
+    fn the_global_card_says_not_yet_when_no_folder_has_scanned() {
+        let expected = format!("Last reconciliation scan: {}", times::NOT_YET);
+        for scans in [vec![], vec![None, None]] {
+            let model = DashboardModel::from_engine(&status_with_scans(&scans), None);
+            assert_eq!(model.global.last_scan_ns, None);
+            assert_eq!(
+                model.global.content().scan.as_deref(),
+                Some(expected.as_str())
+            );
+        }
+    }
+
+    /// #56: the visible label and the accessible name change together, so the
+    /// control cannot read one thing to a person and another to a screen
+    /// reader.
+    #[test]
+    fn the_sync_control_renames_itself_while_it_scans() {
+        assert_eq!(sync_now_copy(false), ("Sync now", "Sync now"));
+        assert_eq!(
+            sync_now_copy(true),
+            ("Checking…", "Checking the source folders")
+        );
+    }
 
     /// A burst shorter than the poll interval leaves a rate with no upload on
     /// the wire: the window still holds its bytes, so the line must show the

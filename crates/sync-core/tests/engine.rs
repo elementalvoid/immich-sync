@@ -271,6 +271,51 @@ async fn a_folder_records_its_last_scan_and_upload() {
     engine.stop();
 }
 
+/// #56: the dashboard can only report a click that scans if the status says a
+/// scan is walking. The flag is up from the first folder of a pass until the
+/// last one is queued, so a pass over a folder big enough to observe is the
+/// faithful signal: both edges are read from the live status.
+#[tokio::test]
+async fn the_status_reports_a_scan_from_its_first_folder_to_its_last() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+    // The walk is what has to be observable, and these entries keep it long
+    // without putting an upload on the wire: the skip rules refuse every one.
+    for index in 0..4000_u32 {
+        std::fs::write(photos.join(format!(".thumb-{index:04}.tmp")), b"x")
+            .expect("write the fixture entry");
+    }
+    add_folder(&store, &photos, true);
+
+    let engine = start_engine(&server, &store, EngineConfig::default()).await;
+    // The start runs a pass of its own. Waiting for it to finish first makes
+    // the observation below unambiguous: the flag has to go up again.
+    assert!(
+        wait_until(|| !engine.status().scanning, Duration::from_secs(20)).await,
+        "the start's own scan never finished"
+    );
+
+    engine.sync_now();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut started = false;
+    while Instant::now() < deadline {
+        if engine.status().scanning {
+            started = true;
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(started, "#56: a walking scan must publish itself");
+    assert!(
+        wait_until(|| !engine.status().scanning, Duration::from_secs(20)).await,
+        "#56: the flag must clear once the scan has finished"
+    );
+    engine.stop();
+}
+
 #[tokio::test]
 async fn the_batch_size_is_configurable() {
     let server = MockImmich::start().await;

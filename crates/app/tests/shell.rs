@@ -4,9 +4,12 @@
 //! cannot observe, so those are checked by the probe and the GUI smoke job.
 //! The state-to-tooltip mapping is pure, so it is tested here.
 
+mod common;
+
 use std::path::Path;
 use std::sync::Arc;
 
+use common::scroll_dashboard_into_view;
 use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
 use gpui_kit::{
     Action, AnyWindowHandle, AppContext as _, Bounds, MenuItem, Point, TestAppContext,
@@ -374,6 +377,10 @@ async fn the_folder_detail_links_open_a_filtered_view(cx: &mut TestAppContext) {
     })
     .await;
     cx.update_window(window, |_, window, cx| {
+        // #56: the global card carries the scan line, so on a short window the
+        // card's Details control sits below the fold. Scroll it into view the
+        // way a person would before clicking it.
+        scroll_dashboard_into_view(window, cx, ("folder-details", 0_usize));
         window.click(("folder-details", 0_usize), cx);
     })
     .expect("open the folder detail");
@@ -411,7 +418,7 @@ async fn the_folder_detail_links_open_a_filtered_view(cx: &mut TestAppContext) {
     })
     .expect("back to the dashboard");
     cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
+        scroll_dashboard_into_view(window, cx, ("folder-details", 0_usize));
         window.click(("folder-details", 0_usize), cx);
     })
     .expect("open the folder detail again");

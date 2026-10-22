@@ -111,7 +111,7 @@ Acceptance: a sync at a 1 MB/s limit produces near-limit observed throughput. Ra
 
 ### R8 — Shell and user experience
 
-- R8.1 The config window is a dashboard with status cards: one global card and one per source folder. A source folder's card opens its detail: the full path, its live state, progress, and counts, its own upload activity, its settings, its full last error, the last successful upload and last reconciliation scan, the list of the assets it has uploaded, an Open folder action, links into the Failed and Review views filtered to that folder, and Remove behind a confirmation.
+- R8.1 The config window is a dashboard with status cards: one global card and one per source folder. The global card shows the activity state, the progress and counts across every folder, the upload rate and the uploads on the wire, the connection state, the last error, and the last reconciliation scan, which is the newest of the folders' scans. While a reconciliation scan runs, **Sync now** reads "Checking…". A source folder's card opens its detail: the full path, its live state, progress, and counts, its own upload activity, its settings, its full last error, the last successful upload and last reconciliation scan, the list of the assets it has uploaded, an Open folder action, links into the Failed and Review views filtered to that folder, and Remove behind a confirmation.
 - R8.2 The tray icon shows the activity state (idle, syncing, paused, needs attention), the review count, upload progress, and the last error in its tooltip.
 - R8.3 The tray menu offers Show, Pause, Resume, Sync now, and Quit.
 - R8.4 Closing the window hides it. Quit exits the client. A second launch focuses the first instance.
