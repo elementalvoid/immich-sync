@@ -1690,10 +1690,11 @@ async fn a_failed_tail_read_keeps_its_notice_and_paused_row_inside_the_card(
     // 900x600 is the window the review measured, and 720x480 is the shell's
     // minimum: the narrowest window wraps the notice and the paused row most.
     for window_size in [(900., 600.), (720., 480.)] {
-        // A long prefix stands in for a long data directory, so the notice wraps
-        // further than the floor's two lines while its full text stays announced.
+        // A long prefix stands in for a long data directory, and it is long
+        // enough that the unclamped notice wraps to four lines at both sizes,
+        // two more than the floor covers. Its full text stays announced.
         let temp = tempfile::Builder::new()
-            .prefix(&"long-data-directory-".repeat(3))
+            .prefix(&"long-data-directory-".repeat(10))
             .tempdir()
             .expect("create a temp dir");
         let paths = temporary_paths(temp.path());
