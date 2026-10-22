@@ -329,8 +329,12 @@ impl Engine {
                 tracing::warn!(error = %error, "the folder counts could not be read");
                 vec![FolderCounts::default(); stored_folders.len()]
             });
+        // A store read that returned fewer counts than folders must not vanish
+        // a folder's card, so the count is looked up per folder.
+        debug_assert_eq!(counts.len(), stored_folders.len());
         let mut entries = Vec::new();
-        for (folder, counts) in stored_folders.into_iter().zip(counts) {
+        for (index, folder) in stored_folders.into_iter().enumerate() {
+            let counts = counts.get(index).copied().unwrap_or_default();
             // #43: the folder detail keeps its timestamps across a restart.
             let times = store.folder_times(&folder.path).unwrap_or_else(|error| {
                 tracing::warn!(folder = %folder.path, error = %error, "the folder times could not be read");
