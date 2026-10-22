@@ -580,16 +580,15 @@ impl LogsView {
                             .into_any_element(),
                     )
                     .child(
-                        div().absolute().inset_0().child(
-                            // Always: the bar shows while the lines overflow
-                            // and hides only because they fit, not two seconds
-                            // after the last wheel (#54). It reads the view's
-                            // own handle, so the drag and the wheel write the
-                            // same offset that following measures.
-                            Scrollbar::vertical(&self.scroll)
-                                .mode(ScrollbarMode::Always)
-                                .viewport_from_layout(),
-                        ),
+                        // Always: the bar shows while the lines overflow
+                        // and hides only because they fit, not two seconds
+                        // after the last wheel (#54). It reads the view's
+                        // own handle, so the drag and the wheel write the
+                        // same offset that following measures. The bar lays
+                        // itself out over the relative box above.
+                        Scrollbar::vertical(&self.scroll)
+                            .mode(ScrollbarMode::Always)
+                            .viewport_from_layout(),
                     )
                     .into_any_element(),
             );
@@ -695,6 +694,7 @@ impl Render for LogsView {
                     .flex()
                     .flex_col()
                     .min_h_0()
+                    .relative()
                     .child(
                         div()
                             .id("logs-card-list")
@@ -710,13 +710,11 @@ impl Render for LogsView {
                             .child(level),
                     )
                     .child(
-                        div().absolute().inset_0().child(
-                            // The strip is the fallback scroll at a short
-                            // window, so it needs the affordance too (#54).
-                            Scrollbar::vertical(&self.cards_scroll)
-                                .mode(ScrollbarMode::Always)
-                                .viewport_from_layout(),
-                        ),
+                        // The strip is the fallback scroll at a short window,
+                        // so it needs the affordance too (#54).
+                        Scrollbar::vertical(&self.cards_scroll)
+                            .mode(ScrollbarMode::Always)
+                            .viewport_from_layout(),
                     ),
             )
             .child(lines)
