@@ -41,12 +41,16 @@ fn temporary_paths(dir: &Path) -> AppPaths {
 }
 
 fn window_options() -> WindowOptions {
+    window_options_at(1200., 1400.)
+}
+
+fn window_options_at(width: f32, height: f32) -> WindowOptions {
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds {
             origin: Point::default(),
             // Tall enough for the location card, the level control, and some
             // log lines at once.
-            size: size(px(1200.), px(1400.)),
+            size: size(px(width), px(height)),
         })),
         ..Default::default()
     }
@@ -88,6 +92,17 @@ fn open_shell(
     store: SettingsStore,
     paths: AppPaths,
 ) -> (AnyWindowHandle, Entity<AppShell>) {
+    open_shell_at(cx, store, paths, (1200., 1400.))
+}
+
+/// The same shell in a window of the given size, so a test can check what the
+/// layout does at 900x600 and in a window too short for the whole page.
+fn open_shell_at(
+    cx: &mut TestAppContext,
+    store: SettingsStore,
+    paths: AppPaths,
+    (width, height): (f32, f32),
+) -> (AnyWindowHandle, Entity<AppShell>) {
     let upload_paths = paths.clone();
     cx.update(|cx| {
         gpui_kit::init(cx);
@@ -96,7 +111,7 @@ fn open_shell(
             let credentials: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
             ConnectionModel::new(profile, credentials)
         });
-        gpui_kit::open_window(window_options(), cx, |window, cx| {
+        gpui_kit::open_window(window_options_at(width, height), cx, |window, cx| {
             let dashboard = cx.new(|_| Dashboard::new(status::sample()));
             let settings = cx.new(|cx| {
                 SettingsView::new(store, paths, autostart(), connection.clone(), window, cx)
@@ -454,10 +469,17 @@ async fn ten_refreshes_keep_every_row_at_full_height(cx: &mut TestAppContext) {
                     );
                 }
             }
-            let cap = f32::from(window.rem_size()) * 24.;
+            // The tail no longer has a fixed cap (#54): it takes the height
+            // the Recent lines card has left below its rows, so it ends at
+            // that card's inner bottom rather than at 24rem.
+            let card = window.find("logs-lines-section").bounds();
+            let tail = window.find("logs-lines").bounds();
+            let card_inner_bottom =
+                f32::from(card.origin.y + card.size.height) - CARD_PADDING - 1.;
             assert!(
-                f32::from(window.find("logs-lines").bounds().size.height) <= cap + 0.5,
-                "round {round}: the tail keeps its 24rem cap"
+                (f32::from(tail.origin.y + tail.size.height) - card_inner_bottom).abs() <= 2.,
+                "round {round}: the tail ends at {}, the inner bottom of the card, not {card_inner_bottom}",
+                f32::from(tail.origin.y + tail.size.height)
             );
         })
         .expect("update the shell window");
@@ -1403,6 +1425,631 @@ async fn a_hidden_surface_reads_no_log_file(cx: &mut TestAppContext) {
         assert!(
             window.find("logs-problem").visible(),
             "showing the surface reads, and a read that fails says so"
+        );
+    })
+    .expect("update the shell window");
+}
+
+/// The window rectangle an element occupies, in window pixels.
+///
+/// The harness cannot read a scroll offset, but it can read where an element
+/// was laid out, and every layout fact in this file is one of those.
+fn window_rect(window: &Window, id: &'static str) -> (f32, f32, f32, f32) {
+    let bounds = window.find(id).bounds();
+    (
+        f32::from(bounds.origin.x),
+        f32::from(bounds.origin.y),
+        f32::from(bounds.size.width),
+        f32::from(bounds.size.height),
+    )
+}
+
+/// The Logs page pads its content by `p_4`, and a section card by `p_3`.
+const PAGE_PADDING: f32 = 16.;
+const CARD_PADDING: f32 = 12.;
+
+/// Where the Recent lines card's body ends: its outside bottom, less the card's
+/// padding and its 1px border.
+fn pane_inner_bottom(window: &Window) -> f32 {
+    let pane = window_rect(window, "logs-lines-section");
+    pane.1 + pane.3 - CARD_PADDING - 1.
+}
+
+/// The tail pane owns the height the header, the location card, and the level
+/// control leave, and the page around it has nothing left to scroll: the newest
+/// line is on screen with no page scroll and no window resize (#54).
+///
+/// 900x1000 is the window the issue measured: with the 24rem cap the page
+/// overflowed by ~209px, so the newest line sat below the window's edge.
+#[gpui_kit::test]
+async fn the_tail_pane_fills_the_height_left_below_the_level_control(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let lines = long_tail(200);
+    write_lines(&paths, &lines);
+    let store = SettingsStore::open(paths.config_file.clone());
+    let (window, _shell) = open_shell_at(cx, store, paths, (900., 1000.));
+    show_logs(cx, window);
+
+    cx.update_window(window, |_, window, _| {
+        let view = window_rect(window, "logs-view");
+        let level = window_rect(window, "logs-level");
+        let pane = window_rect(window, "logs-lines-section");
+        let tail = window_rect(window, "logs-lines");
+        let (view_top, view_bottom) = (view.1, view.1 + view.3);
+        let level_bottom = level.1 + level.3;
+        let tail_bottom = tail.1 + tail.3;
+        let pane_bottom = pane.1 + pane.3;
+
+        assert!(
+            tail.1 >= level_bottom,
+            "the tail pane begins at y={} below the level control, which ends at {level_bottom}",
+            tail.1
+        );
+        assert!(
+            tail.3 > 150.,
+            "the tail pane takes the remaining height, not the old 384px cap: it is {}px tall",
+            tail.3
+        );
+        assert!(
+            (pane_bottom - (view_bottom - PAGE_PADDING)).abs() <= 2.,
+            "the Recent lines card ends at {pane_bottom}, at the bottom of the {view_top}..{view_bottom} page"
+        );
+        // The card pads its body by `p_3` and draws a 1px border.
+        assert!(
+            (tail_bottom - (pane_bottom - CARD_PADDING - 1.)).abs() <= 2.,
+            "the tail box ends at {tail_bottom}, inside the card that ends at {pane_bottom}"
+        );
+
+        let newest = window.find(ElementId::Name(format!("logs-line-{}", lines.len() - 1).into()));
+        assert!(
+            newest.visible(),
+            "the newest line is on screen at 900x1000 without scrolling the page first"
+        );
+    })
+    .expect("update the shell window");
+}
+
+/// The scrollbar thumb a scroll box painted, as the frame painted it.
+///
+/// The bar is an overlay the harness cannot find by id, so this reads the quads
+/// the frame painted: the thumb is the only filled strip narrower than the
+/// 16px track at the box's right edge. A hidden bar is painted off the edge,
+/// and a bar with nothing to scroll is not painted at all.
+fn scrollbar_thumb(window: &Window, area: (f32, f32, f32, f32)) -> Option<(f32, f32, f32, f32)> {
+    // The painted frame is in device pixels and the layout bounds are logical
+    // ones, so the strip is measured in device pixels and reported in logical.
+    let scale = window.scale_factor();
+    let (left, top, width, height) = (
+        area.0 * scale,
+        area.1 * scale,
+        area.2 * scale,
+        area.3 * scale,
+    );
+    let (right, bottom) = (left + width, top + height);
+    let track = 16. * scale;
+    window.painted_quads().into_iter().find_map(|quad| {
+        let (x, y) = (quad.bounds.origin.x.as_f32(), quad.bounds.origin.y.as_f32());
+        let (w, h) = (
+            quad.bounds.size.width.as_f32(),
+            quad.bounds.size.height.as_f32(),
+        );
+        let in_track = w <= track / 2. && x >= right - track && x + w <= right + 0.5;
+        let in_area = y >= top - 1. && y + h <= bottom + 1.;
+        (in_track && in_area && h > 0.).then_some((x / scale, y / scale, w / scale, h / scale))
+    })
+}
+
+/// At 900x600 the cards above the tail do not fit in the window, so that strip
+/// scrolls as the fallback and the tail keeps its own minimum height: the
+/// newest line is on screen without a resize and without scrolling first (#54).
+#[gpui_kit::test]
+async fn a_short_window_keeps_the_tail_on_screen_and_scrolls_the_cards_above_it(
+    cx: &mut TestAppContext,
+) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let lines = long_tail(200);
+    write_lines(&paths, &lines);
+    let store = SettingsStore::open(paths.config_file.clone());
+    let (window, _shell) = open_shell_at(cx, store, paths, (900., 600.));
+    show_logs(cx, window);
+
+    cx.update_window(window, |_, window, cx| {
+        let cards = window_rect(window, "logs-cards");
+        let tail = window_rect(window, "logs-lines");
+        assert!(
+            cards.3 < 400.,
+            "the cards above the tail are shorter than their content, so that strip scrolls: {}px",
+            cards.3
+        );
+        assert!(
+            cards.1 + cards.3 + 8. <= tail.1 + 1.,
+            "the cards strip ends at {} above the tail, which starts at {}",
+            cards.1 + cards.3,
+            tail.1
+        );
+        assert!(
+            tail.3 >= 126.,
+            "the tail never collapses: it keeps at least its 8rem, and is {}px here",
+            tail.3
+        );
+        let newest = window.find(ElementId::Name(
+            format!("logs-line-{}", lines.len() - 1).into(),
+        ));
+        assert!(
+            newest.visible(),
+            "the newest line is on screen at 900x600 without resizing the window"
+        );
+        let level_before = window_rect(window, "logs-level");
+        assert!(
+            level_before.1 + level_before.3 > tail.1,
+            "the level control is taller than the strip, so it is the part that scrolls"
+        );
+
+        // Two wheels down over the cards reach the strip's end, and the level
+        // control then sits right above the tail: the fallback scroll keeps
+        // every control reachable.
+        for _ in 0..2 {
+            window.scroll(
+                "logs-cards",
+                ScrollDelta::Pixels(point(px(0.), px(-240.))),
+                cx,
+            );
+        }
+        let level = window_rect(window, "logs-level");
+        assert!(
+            level.1 + level.3 <= window_rect(window, "logs-lines").1 + 1.,
+            "the level control ends at {} where the tail begins",
+            level.1 + level.3
+        );
+        assert_eq!(
+            window_rect(window, "logs-lines"),
+            tail,
+            "scrolling the cards leaves the tail where it is"
+        );
+        assert_eq!(
+            window
+                .find(ElementId::Name(
+                    format!("logs-line-{}", lines.len() - 1).into()
+                ))
+                .bounds(),
+            newest.bounds(),
+            "and leaves the newest line on screen"
+        );
+    })
+    .expect("update the shell window");
+}
+
+/// At 900x600 the paused row appears below the tail, and its jump control must
+/// stay fully inside the window: the Recent lines card keeps a floor tall
+/// enough for the paused row plus the tail's own minimum (#54).
+#[gpui_kit::test]
+async fn a_paused_tail_keeps_the_jump_control_inside_a_short_window(cx: &mut TestAppContext) {
+    // 900x600 is the window the review measured, and 720x480 is the shell's
+    // minimum: the narrowest window wraps the paused row's labels the most.
+    for window_size in [(900., 600.), (720., 480.)] {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let paths = temporary_paths(temp.path());
+        write_lines(&paths, &long_tail(200));
+        let store = SettingsStore::open(paths.config_file.clone());
+        let (window, _shell) = open_shell_at(cx, store, paths, window_size);
+        show_logs(cx, window);
+
+        // A wheel up in the tail pauses the live tail on the next poll tick,
+        // which adds the paused row and its jump control below the lines.
+        cx.update_window(window, |_, window, cx| {
+            window.scroll(
+                "logs-lines",
+                ScrollDelta::Pixels(point(px(0.), px(400.))),
+                cx,
+            );
+        })
+        .expect("update the shell window");
+        tick_live(cx, window);
+
+        cx.update_window(window, |_, window, _| {
+            assert!(
+                window.find("logs-paused").visible(),
+                "the paused tail draws its paused row"
+            );
+            let paused = window_rect(window, "logs-paused");
+            assert!(
+                paused.1 + paused.3 <= pane_inner_bottom(window) + 0.5,
+                "the paused row ends at {} inside the card's body, which ends at {}",
+                paused.1 + paused.3,
+                pane_inner_bottom(window)
+            );
+            let jump = window.find("logs-jump-latest").bounds();
+            let viewport = window.viewport_size();
+            let (jump_right, jump_bottom) = (
+                f32::from(jump.origin.x + jump.size.width),
+                f32::from(jump.origin.y + jump.size.height),
+            );
+            assert!(
+                jump_bottom <= f32::from(viewport.height) && jump_right <= f32::from(viewport.width),
+                "the jump control at {jump:?} is fully inside the {viewport:?} viewport at {window_size:?}, not clipped by the page"
+            );
+        })
+        .expect("update the shell window");
+    }
+}
+
+/// A tail read that fails draws a notice inside the Recent lines card, and the
+/// paused row sits below the tail. At the shell's minimum window each of those
+/// rows is taller than the floor the other states left, so the card's floor must
+/// cover every row it shows (#54).
+///
+/// The notice quotes the path of the failed log directory, and a long data
+/// directory wraps it to more lines. The test builds a long one rather than
+/// trusting `TMPDIR`, so the clamp and the geometry below do not depend on it.
+#[gpui_kit::test]
+async fn a_failed_tail_read_keeps_its_notice_and_paused_row_inside_the_card(
+    cx: &mut TestAppContext,
+) {
+    // 900x600 is the window the review measured, and 720x480 is the shell's
+    // minimum: the narrowest window wraps the notice and the paused row most.
+    for window_size in [(900., 600.), (720., 480.)] {
+        // A long prefix stands in for a long data directory, and it is long
+        // enough that the unclamped notice wraps to four lines at both sizes,
+        // two more than the floor covers. Its full text stays announced.
+        let temp = tempfile::Builder::new()
+            .prefix(&"long-data-directory-".repeat(10))
+            .tempdir()
+            .expect("create a temp dir");
+        let paths = temporary_paths(temp.path());
+        let directory = paths.log_directory();
+        // The prefix's 200 bytes plus tempfile's 6 stay under NAME_MAX (255),
+        // and a shorter path here would silently stop unguarding the clamp.
+        assert!(
+            directory.as_os_str().len() > 150,
+            "the log directory {directory:?} is too short to wrap the notice past the floor"
+        );
+        write_lines(&paths, &long_tail(200));
+        let store = SettingsStore::open(paths.config_file.clone());
+        let (window, _shell) = open_shell_at(cx, store, paths.clone(), window_size);
+        show_logs(cx, window);
+
+        // The log directory stops being a directory, and the poll reports the
+        // failed read on the surface while the tail still follows it.
+        fs::remove_dir_all(&directory).expect("remove the log directory");
+        fs::write(&directory, "not a directory").expect("replace the directory with a file");
+        tick_live(cx, window);
+
+        cx.update_window(window, |_, window, _| {
+            assert!(
+                window.try_find("logs-paused").is_none(),
+                "a failed read alone does not pause the tail"
+            );
+            // The clamp is visual: the full message still names the path.
+            assert!(
+                window
+                    .find("logs-problem")
+                    .label()
+                    .unwrap_or_default()
+                    .contains(&directory.display().to_string()),
+                "the notice still announces the whole message, including the log directory"
+            );
+            // The notice and the tail both end inside the card: the floor covers
+            // the row the notice adds, or the tail would paint over the border.
+            assert_inside_card(window, "logs-problem", window_rect(window, "logs-problem"));
+            assert_inside_card(window, "logs-lines", window_rect(window, "logs-lines"));
+        })
+        .expect("update the shell window");
+
+        // Wheel up: the next poll pauses the tail, and the failed read keeps its
+        // notice above the paused row.
+        cx.update_window(window, |_, window, cx| {
+            window.scroll(
+                "logs-lines",
+                ScrollDelta::Pixels(point(px(0.), px(400.))),
+                cx,
+            );
+        })
+        .expect("update the shell window");
+        tick_live(cx, window);
+
+        cx.update_window(window, |_, window, _| {
+            let paused = window_rect(window, "logs-paused");
+            let notice = window_rect(window, "logs-problem");
+            assert_eq!(
+                window.find("logs-jump-latest").label(),
+                Some("Jump to latest"),
+                "the paused row is on screen with a read problem"
+            );
+            assert!(
+                notice.1 + notice.3 <= paused.1,
+                "the notice at {notice:?} sits above the paused row at {paused:?}"
+            );
+            for id in [
+                "logs-problem",
+                "logs-lines",
+                "logs-paused",
+                "logs-jump-latest",
+            ] {
+                assert_inside_card(window, id, window_rect(window, id));
+            }
+        })
+        .expect("update the shell window");
+    }
+}
+
+/// Asserts a row ends inside the Recent lines card's body and the viewport.
+fn assert_inside_card(window: &Window, id: &'static str, rect: (f32, f32, f32, f32)) {
+    let inner_bottom = pane_inner_bottom(window);
+    let viewport_bottom = f32::from(window.viewport_size().height);
+    let bottom = rect.1 + rect.3;
+    assert!(
+        bottom <= inner_bottom + 0.5,
+        "{id} ends at {bottom}, below the card's body which ends at {inner_bottom}: the \
+         floor does not cover every row the card shows"
+    );
+    assert!(
+        bottom <= viewport_bottom,
+        "{id} ends at {bottom}, below the {viewport_bottom}px viewport"
+    );
+}
+
+/// The strip above the tail is the page's fallback scroll when the window is
+/// too short for the cards, so it draws a bar of its own while it overflows and
+/// none when everything fits (#54).
+#[gpui_kit::test]
+async fn the_cards_strip_draws_its_own_scrollbar_while_it_overflows(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let store = SettingsStore::open(paths.config_file.clone());
+    let (window, _shell) = open_shell_at(cx, store, paths, (900., 600.));
+    show_logs(cx, window);
+    cx.update_window(window, |_, window, cx| {
+        let cards = window_rect(window, "logs-cards");
+        let thumb = scrollbar_thumb(window, cards)
+            .expect("the cards strip draws a scrollbar while its controls overflow");
+        assert!(
+            thumb.1 - cards.1 <= 6.,
+            "the strip opens at its top, so the thumb starts at the track's start: {thumb:?} in \
+             {cards:?}"
+        );
+        window.scroll(
+            "logs-cards",
+            ScrollDelta::Pixels(point(px(0.), px(-400.))),
+            cx,
+        );
+        let moved =
+            scrollbar_thumb(window, cards).expect("the scrollbar is still drawn at the end");
+        assert!(
+            moved.1 > thumb.1 + 4.,
+            "a wheel down the strip moves the thumb with the offset: {thumb:?} -> {moved:?}"
+        );
+    })
+    .expect("update the shell window");
+
+    // Everything fits in a tall window, so the strip draws no bar.
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let store = SettingsStore::open(paths.config_file.clone());
+    let (window, _shell) = open_shell_at(cx, store, paths, (1200., 1400.));
+    show_logs(cx, window);
+    cx.update_window(window, |_, window, _| {
+        let cards = window_rect(window, "logs-cards");
+        assert!(
+            scrollbar_thumb(window, cards).is_none(),
+            "a cards strip whose controls fit draws no scrollbar"
+        );
+    })
+    .expect("update the shell window");
+}
+
+/// The wheel belongs to whatever the pointer is over: over the tail it moves
+/// the tail and nothing else, over the cards it moves the cards (#54).
+#[gpui_kit::test]
+async fn a_wheel_over_the_tail_moves_the_tail_and_a_wheel_over_the_cards_moves_the_cards(
+    cx: &mut TestAppContext,
+) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    write_lines(&paths, &long_tail(200));
+    let store = SettingsStore::open(paths.config_file.clone());
+    let (window, _shell) = open_shell_at(cx, store, paths, (900., 600.));
+    show_logs(cx, window);
+
+    cx.update_window(window, |_, window, cx| {
+        let tail = window_rect(window, "logs-lines");
+        let cards = window_rect(window, "logs-cards");
+        let rows_before = shown_rows(window, 200);
+        assert!(!rows_before.is_empty(), "the tail shows lines");
+
+        window.scroll(
+            "logs-lines",
+            ScrollDelta::Pixels(point(px(0.), px(240.))),
+            cx,
+        );
+        let rows_after = shown_rows(window, 200);
+        assert_ne!(
+            rows_before, rows_after,
+            "a wheel over the tail moves the tail"
+        );
+        assert_eq!(
+            window_rect(window, "logs-cards"),
+            cards,
+            "and leaves the cards above it where they are"
+        );
+        assert_eq!(
+            window_rect(window, "logs-lines"),
+            tail,
+            "and leaves the tail's own box where it is"
+        );
+
+        let level_before = window_rect(window, "logs-level");
+        window.scroll(
+            "logs-cards",
+            ScrollDelta::Pixels(point(px(0.), px(-240.))),
+            cx,
+        );
+        assert!(
+            window_rect(window, "logs-level").1 < level_before.1,
+            "a wheel over the cards moves the cards"
+        );
+        assert_eq!(
+            shown_rows(window, 200),
+            rows_after,
+            "and leaves the tail where it is"
+        );
+        assert_eq!(
+            window_rect(window, "logs-lines"),
+            tail,
+            "the tail box stays"
+        );
+
+        // At the end of the tail a further wheel down stays in the tail: the
+        // tail's box does not move and the cards do not either.
+        let level_at_end = window_rect(window, "logs-level");
+        window.scroll(
+            "logs-lines",
+            ScrollDelta::Pixels(point(px(0.), px(-5000.))),
+            cx,
+        );
+        assert_eq!(
+            window_rect(window, "logs-level").1,
+            level_at_end.1,
+            "a wheel at the tail's end does not move the cards"
+        );
+        assert!(
+            window
+                .find(ElementId::Name("logs-line-199".into()))
+                .visible(),
+            "it lands the tail back on its newest line"
+        );
+    })
+    .expect("update the shell window");
+}
+/// The tail draws its own scrollbar from the view's own scroll handle: it
+/// shows while the lines overflow, follows the offset a wheel or the jump
+/// control sets, drags to any offset, and is not drawn at all when the lines
+/// fit (#54).
+#[gpui_kit::test]
+async fn the_tail_scrollbar_follows_the_scroll_handle_it_was_given(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    write_lines(&paths, &long_tail(200));
+    let store = SettingsStore::open(paths.config_file.clone());
+    let (window, _shell) = open_shell_at(cx, store, paths, (1200., 1400.));
+    // The bar slides in and out. The test reads where it was painted, so the
+    // motion is off and every frame is a settled one.
+    cx.update(|cx| cx.set_reduce_motion(true));
+    show_logs(cx, window);
+    // The bar is on screen while the lines overflow, not for two seconds after
+    // the last wheel: past the idle a Scrolling-mode bar hides on, an
+    // overflowing tail still paints it (#54). The bar's idle reads the real
+    // clock, which `advance_clock` does not move, so the test waits it out.
+    std::thread::sleep(Duration::from_millis(2500));
+    settle(cx, window);
+
+    let at_end = cx
+        .update_window(window, |_, window, cx| {
+            let tail = window_rect(window, "logs-lines");
+            let thumb = scrollbar_thumb(window, tail)
+                .expect("the tail draws a scrollbar while its lines overflow");
+            assert!(
+                tail.1 + tail.3 - (thumb.1 + thumb.3) <= 6.,
+                "the view opens on the newest line, so the thumb starts at the track's end: {thumb:?} in {tail:?}"
+            );
+
+            // A wheel to the top moves the thumb to the track's start, and a
+            // wheel back moves it down: the bar reads the offset the wheel set.
+            window.scroll(
+                "logs-lines",
+                ScrollDelta::Pixels(point(px(0.), px(4000.))),
+                cx,
+            );
+            let top = scrollbar_thumb(window, tail).expect("the scrollbar is still drawn at the top");
+            assert!(
+                top.1 - tail.1 <= 6.,
+                "a wheel to the tail's start moves the thumb to the track's start: {top:?} in {tail:?}"
+            );
+            window.scroll(
+                "logs-lines",
+                ScrollDelta::Pixels(point(px(0.), px(-600.))),
+                cx,
+            );
+            let moved =
+                scrollbar_thumb(window, tail).expect("the scrollbar is still drawn mid-way down");
+            assert!(
+                moved.1 > top.1 + 4.,
+                "a wheel down moves the thumb with the offset: {top:?} -> {moved:?}"
+            );
+            (tail, moved)
+        })
+        .expect("update the shell window");
+
+    // Scrolling up paused the live tail, so the jump control is there: it lands
+    // the tail on its newest line, and the thumb follows to the track's end.
+    tick_live(cx, window);
+    cx.update_window(window, |_, window, cx| window.click("logs-jump-latest", cx))
+        .expect("update the shell window");
+    settle(cx, window);
+    cx.update_window(window, |_, window, cx| {
+        let (tail, _) = at_end;
+        let jumped =
+            scrollbar_thumb(window, tail).expect("the scrollbar is still drawn after the jump");
+        assert!(
+            tail.1 + tail.3 - (jumped.1 + jumped.3) <= 6.,
+            "the jump control reaches the tail's end and the thumb follows it: {jumped:?} in {tail:?}"
+        );
+
+        // Dragging the thumb is a real offset: the same handle the wheel and
+        // the jump use, so the tail lands where the pointer leaves it.
+        let column = tail.0 + tail.2 - 8.;
+        window.drag(
+            point(px(column), px(jumped.1 + jumped.3 / 2.)),
+            point(px(column), px(tail.1 + 6.)),
+            cx,
+        );
+        assert!(
+            window.find("logs-line-0").visible(),
+            "dragging the thumb to the track's start reaches the oldest line"
+        );
+        let dragged = scrollbar_thumb(window, tail).expect("the scrollbar is still drawn");
+        window.drag(
+            point(px(column), px(dragged.1 + dragged.3 / 2.)),
+            point(px(column), px(tail.1 + tail.3 - 6.)),
+            cx,
+        );
+        assert!(
+            window
+                .find(ElementId::Name("logs-line-199".into()))
+                .visible(),
+            "and dragging it back to the track's end reaches the newest line"
+        );
+    })
+    .expect("update the shell window");
+
+    // A tail whose lines all fit draws no bar, and a drag where the bar would
+    // be moves nothing: the bar is the only thing that turns a drag there into
+    // an offset.
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    write_lines(&paths, &long_tail(3));
+    let store = SettingsStore::open(paths.config_file.clone());
+    let (window, _shell) = open_shell_at(cx, store, paths, (1200., 1400.));
+    show_logs(cx, window);
+    cx.update_window(window, |_, window, cx| {
+        let tail = window_rect(window, "logs-lines");
+        assert!(
+            scrollbar_thumb(window, tail).is_none(),
+            "a tail whose lines fit draws no scrollbar"
+        );
+        let rows = shown_rows(window, 3);
+        assert_eq!(rows.len(), 3, "every line of the short tail is on screen");
+        let column = tail.0 + tail.2 - 8.;
+        window.drag(
+            point(px(column), px(tail.1 + 6.)),
+            point(px(column), px(tail.1 + tail.3 - 6.)),
+            cx,
+        );
+        assert_eq!(
+            shown_rows(window, 3),
+            rows,
+            "a drag where the bar would be leaves a tail that fits where it is"
         );
     })
     .expect("update the shell window");

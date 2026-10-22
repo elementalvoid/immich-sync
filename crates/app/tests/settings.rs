@@ -266,8 +266,8 @@ fn default_settings_match_the_spec() {
         "R6.1: the attempt cap defaults to 8"
     );
     assert!(
-        !settings.tag_uploaded_assets,
-        "R3.7: the sync tag is off by default"
+        settings.tag_uploaded_assets,
+        "R3.7: the sync tag is on by default"
     );
     assert!(settings.server_url.is_empty(), "R1.1: no server yet");
     assert!(settings.email.is_empty(), "R1.1: no account yet");
@@ -310,6 +310,67 @@ fn a_missing_file_loads_the_defaults_without_a_problem() {
 
     assert_eq!(store.settings(), &Settings::default());
     assert!(store.problem().is_none(), "a first run is not a failure");
+}
+
+/// R3.7: an install that saved the switch off keeps it off after the default
+/// changed, so nobody's choice moves.
+#[test]
+fn a_settings_file_that_says_off_loads_off() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let path = temp.path().join("settings.toml");
+    // The shape an install that connected while the default was off has on
+    // disk: every field serialized, with the tag false.
+    fs::write(
+        &path,
+        "autostart = false\n\
+         bandwidth_bytes_per_second = 0\n\
+         concurrency = 4\n\
+         scan_interval_minutes = 30\n\
+         attempt_cap = 8\n\
+         tag_uploaded_assets = false\n\
+         server_url = \"https://immich.example.com\"\n\
+         email = \"sync@example.com\"\n\
+         auth_method = \"password\"\n\
+         log_level = \"info\"\n",
+    )
+    .expect("write the settings file");
+
+    let store = SettingsStore::open(path);
+
+    assert!(
+        !store.settings().tag_uploaded_assets,
+        "R3.7: the saved choice stays off"
+    );
+    assert!(store.problem().is_none());
+}
+
+/// R3.7: a settings file that predates the sync tag setting, or one written by
+/// hand without it, loads with the new default on.
+#[test]
+fn a_settings_file_without_the_tag_setting_loads_it_on() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let path = temp.path().join("settings.toml");
+    fs::write(
+        &path,
+        "autostart = false\n\
+         bandwidth_bytes_per_second = 0\n\
+         concurrency = 4\n\
+         scan_interval_minutes = 30\n\
+         attempt_cap = 8\n\
+         server_url = \"https://immich.example.com\"\n\
+         email = \"sync@example.com\"\n\
+         auth_method = \"password\"\n\
+         log_level = \"info\"\n",
+    )
+    .expect("write the settings file");
+
+    let store = SettingsStore::open(path);
+
+    assert!(
+        store.settings().tag_uploaded_assets,
+        "R3.7: a missing setting takes the on default"
+    );
+    assert!(store.problem().is_none());
 }
 
 #[test]

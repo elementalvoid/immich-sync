@@ -178,9 +178,9 @@ a key from Immich's account settings.
 3. **Add** records the path and all four choices in one write, and the folder's
    status card appears on the **Dashboard**; **Cancel** writes nothing. Clicking
    the new card, or its **Details** control, opens **Folder detail**.
-4. **Remove**, on a folder card or in **Folder detail**, stops syncing that
-   folder; the detail asks for confirmation first. Nothing is deleted from the
-   server: the folder's uploaded assets stay there.
+4. **Remove**, in **Folder detail**, stops syncing that folder; the detail asks
+   for confirmation first. Nothing is deleted from the server: the folder's
+   uploaded assets stay there.
 
 Hidden files and folders, symlinks, temporary/partial files, and system files
 are skipped by design. A source folder that is unplugged shows as unavailable on
@@ -206,12 +206,14 @@ its card instead of producing one error per file.
 - **Settings.** Changes save immediately. General holds **Autostart at login**
   (off by default); Limits holds the bandwidth limit (0 means unlimited) and
   concurrent uploads; Sync holds the reconciliation scan interval and the retry
-  attempt cap; Tagging holds **Tag uploaded assets** (off by default), which
-  adds the fixed tag `immich-sync` to every asset the client uploads. The same
-  section shows the backfill's progress and **Tag existing assets now**, which
-  tags every asset the client has already uploaded, and **View in Immich**
-  (with a server URL set) opens the tag's page. Immich hides tags until **Tags**
-  is enabled in your Immich account features (Account Settings → Features).
+  attempt cap; Tagging holds **Tag uploaded assets** (on by default), which adds
+  the fixed tag `immich-sync` to every asset the client uploads. With an API
+  key, tagging needs the `tag.create`, `tag.asset`, and `asset.update`
+  permissions. The same section shows the backfill's progress and **Tag existing
+  assets now**, which tags every asset the client has already uploaded, and
+  **View in Immich** (with a server URL set) opens the tag's page. Immich hides
+  tags until **Tags** is enabled in your Immich account features (Account
+  Settings → Features).
 - **Diagnostics.** Client and server versions and permissions, the state
   database and its integrity, the last error per class, throughput, a
   **Collect bundle** action, and a **Rebuild** action that starts the state over

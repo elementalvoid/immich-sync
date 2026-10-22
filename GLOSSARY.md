@@ -10,6 +10,10 @@ An Immich desktop sync client for Windows. The client uploads files from user-se
 A local directory that the user selected for upload.
 _Avoid_: sync root, watched folder, library
 
+**Owner**:
+The one source folder a sync item belongs to: the first source folder in the client's folder list that contains the item's path. That folder's card counts the item and its traffic meter counts its bytes, so a nested folder owns only the files no folder before it contains.
+_Avoid_: parent folder, matching folder
+
 **Sync item**:
 One local file that the client tracks from discovery to upload result.
 _Avoid_: job, task, file record
@@ -89,7 +93,7 @@ An upload request that has started and has not finished. Hashing, indexing, and 
 _Avoid_: active upload, running transfer
 
 **Sync tag**:
-The one Immich tag, `immich-sync`, that the client adds to the assets it syncs so they can be found with Immich's tag search. The user turns it on in Settings; the client then tags new uploads and backfills the tag onto the assets it uploaded before.
+The one Immich tag, `immich-sync`, that the client adds to the assets it syncs so they can be found with Immich's tag search. It is on by default; the user can turn it off in Settings. While it is on, the client tags new uploads and backfills the tag onto the assets it uploaded before.
 _Avoid_: upload tag, source tag
 
 **Backfill**:

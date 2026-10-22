@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::asset_link::{self, LinkOpener};
-use crate::engine::EngineModel;
+use crate::engine::{EngineModel, SyncNowOutcome};
 use crate::folder_controls::{SettingsControls, SettingsIds, SettingsValues};
 use crate::folder_panel::{FolderOpener, FolderPanel, FolderPanelEvent};
 use crate::path_picker::{self, Picked};
@@ -50,6 +50,9 @@ pub struct Dashboard {
     paused: bool,
     /// The notice a failed Browse… left behind (#30).
     pick_notice: Option<String>,
+    /// The reason the last "Sync now" click could not scan (#56). The outcome,
+    /// not its sentence: the header drops it once the reason no longer holds.
+    sync_notice: Option<SyncNowOutcome>,
     /// The open folder panel: the setup dialog (#40) or a folder's live detail
     /// (#43). The dashboard owns whether it is open; the panel owns the state
     /// inside it.
@@ -85,6 +88,7 @@ impl Dashboard {
             folder_input: None,
             paused: false,
             pick_notice: None,
+            sync_notice: None,
             panel: None,
             panel_subscription: None,
             detail_return: None,
@@ -118,6 +122,7 @@ impl Dashboard {
             folder_input: Some(folder_input),
             paused: false,
             pick_notice: None,
+            sync_notice: None,
             panel: None,
             panel_subscription: None,
             detail_return: None,
@@ -153,7 +158,13 @@ impl Dashboard {
 
     fn sync_now(&mut self, cx: &mut Context<Self>) {
         match &self.engine {
-            Some(engine) => engine.update(cx, |model, cx| model.sync_now(cx)),
+            Some(engine) => {
+                let outcome = engine.update(cx, |model, cx| model.sync_now(cx));
+                // #56: a click that cannot scan says why, so the control never
+                // swallows it. A click that lands clears the last reason.
+                self.sync_notice = (outcome != SyncNowOutcome::Requested).then_some(outcome);
+                cx.notify();
+            }
             None => {
                 self.paused = false;
                 self.model.global.activity = ActivityState::Syncing;
@@ -410,13 +421,6 @@ impl Dashboard {
         }
     }
 
-    /// Removes one source folder (R2.1).
-    fn remove_folder(&mut self, path: String, cx: &mut Context<Self>) {
-        if let Some(engine) = &self.engine {
-            engine.update(cx, |model, cx| model.remove_folder(path, cx));
-        }
-    }
-
     /// Turns recursive discovery on or off for one source folder (R2.1).
     ///
     /// The engine model treats this as the folder's own edit, updates the
@@ -573,9 +577,25 @@ impl Dashboard {
         .render(cx.theme().muted_foreground)
     }
 
-    fn header(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn header(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let muted = cx.theme().muted_foreground;
+        let accent = cx.theme().warning;
+        let palette = CardPalette::new(cx.theme());
         let paused = self.is_paused(cx);
+        let (sync_label, sync_name) = crate::status::sync_now_copy(self.model.scanning);
+        // #56: the reason is asked for again on every frame, so a notice that
+        // outlived its cause cannot stay on screen beside the card that
+        // answered it. The stored outcome goes with the reason: keeping it
+        // would let a later change bring the old sentence back with no click
+        // behind it. Nothing tells the window, because the notice was already
+        // hidden on the frame that drops it.
+        let sync_notice = match (&self.engine, self.sync_notice) {
+            (Some(engine), Some(outcome)) => engine.read(cx).sync_now_reason(outcome, cx),
+            _ => None,
+        };
+        if sync_notice.is_none() {
+            self.sync_notice = None;
+        }
         let (pause_label, pause_name) = if paused {
             ("Resume", "Resume syncing")
         } else {
@@ -584,48 +604,67 @@ impl Dashboard {
 
         div()
             .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .gap_4()
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_0p5()
-                    .child(
-                        div()
-                            .text_2xl()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Immich Sync"),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(muted)
-                            .child("Upload status for every source folder"),
-                    ),
-            )
+            .flex_col()
+            .gap_2()
             .child(
                 div()
                     .flex()
                     .flex_row()
-                    .gap_2()
+                    .items_center()
+                    .justify_between()
+                    .gap_4()
                     .child(
-                        Button::new("dashboard-sync-now")
-                            .primary()
-                            .label("Sync now")
-                            .accessibility_label("Sync now")
-                            .on_click(cx.listener(|this, _, _, cx| this.sync_now(cx))),
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .child(
+                                div()
+                                    .text_2xl()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Immich Sync"),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(muted)
+                                    .child("Upload status for every source folder"),
+                            ),
                     )
                     .child(
-                        Button::new("dashboard-pause")
-                            .secondary()
-                            .label(pause_label)
-                            .accessibility_label(pause_name)
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_paused(cx))),
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_2()
+                            .child(
+                                // #56: the control reports the scan it started,
+                                // and a click during a scan is harmless: it
+                                // re-notifies the engine.
+                                Button::new("dashboard-sync-now")
+                                    .primary()
+                                    .label(sync_label)
+                                    .accessibility_label(sync_name)
+                                    .on_click(cx.listener(|this, _, _, cx| this.sync_now(cx))),
+                            )
+                            .child(
+                                Button::new("dashboard-pause")
+                                    .secondary()
+                                    .label(pause_label)
+                                    .accessibility_label(pause_name)
+                                    .on_click(cx.listener(|this, _, _, cx| this.toggle_paused(cx))),
+                            ),
                     ),
             )
+            // #56: a click that cannot scan says why, in the same notice idiom
+            // the folder bar uses.
+            .when_some(sync_notice, |this, notice| {
+                this.child(crate::settings_view::notice(
+                    "dashboard-sync-notice",
+                    notice,
+                    accent,
+                    &palette,
+                ))
+            })
     }
 }
 
@@ -641,7 +680,7 @@ impl Render for Dashboard {
         let header = self.header(cx);
 
         let folder_bar = self.folder_bar(cx);
-        let removed = self.engine.is_some();
+        let live = self.engine.is_some();
 
         div()
             .id("dashboard-scroll")
@@ -680,54 +719,41 @@ impl Render for Dashboard {
                         .map(|(index, folder)| {
                             let path = folder.path.clone().unwrap_or_default();
                             let title = folder.title.clone();
-                            let remove = removed.then(|| {
-                                let path = path.clone();
-                                Button::new(("folder-remove", index))
-                                    .ghost()
-                                    .label("Remove")
-                                    .accessibility_label(format!("Remove {title}"))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        // #43: a card control never opens the
-                                        // detail the card itself opens.
-                                        cx.stop_propagation();
-                                        this.remove_folder(path.clone(), cx);
-                                    }))
-                                    .into_any_element()
-                            });
-                            let album = removed.then(|| {
+                            let album = live.then(|| {
                                 self.folder_controls(index, folder, cx).into_any_element()
                             });
                             let details_focus = self.details_focus(&path, cx);
-                            let details = removed.then(|| {
+                            // #53: removal is the detail's confirmed action.
+                            let footer = live.then(|| {
                                 let path = path.clone();
-                                div()
-                                    .id(("folder-details-anchor", index))
-                                    .test_support()
-                                    .track_focus(&details_focus)
-                                    .tab_stop(false)
-                                    .child(
-                                        Button::new(("folder-details", index))
-                                            .secondary()
-                                            .label("Details")
-                                            .accessibility_label(format!("Details for {title}"))
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                cx.stop_propagation();
-                                                this.open_folder_detail(path.clone(), window, cx);
-                                            })),
-                                    )
-                                    .into_any_element()
-                            });
-                            let footer = removed.then(|| {
-                                let remove = remove.unwrap_or_else(|| div().into_any_element());
-                                let details = details.unwrap_or_else(|| div().into_any_element());
                                 div()
                                     .flex()
                                     .flex_row()
-                                    .items_center()
-                                    .justify_between()
-                                    .gap_2()
-                                    .child(details)
-                                    .child(remove)
+                                    .child(
+                                        div()
+                                            .id(("folder-details-anchor", index))
+                                            .test_support()
+                                            .track_focus(&details_focus)
+                                            .tab_stop(false)
+                                            .child(
+                                                Button::new(("folder-details", index))
+                                                    .secondary()
+                                                    .label("Details")
+                                                    .accessibility_label(format!(
+                                                        "Details for {title}"
+                                                    ))
+                                                    .on_click(cx.listener(
+                                                        move |this, _, window, cx| {
+                                                            cx.stop_propagation();
+                                                            this.open_folder_detail(
+                                                                path.clone(),
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        },
+                                                    )),
+                                            ),
+                                    )
                                     .into_any_element()
                             });
                             div()
@@ -737,7 +763,7 @@ impl Render for Dashboard {
                                 .flex()
                                 // #43: the card opens the folder's detail; its
                                 // controls stop the click at themselves.
-                                .when(removed, |this| {
+                                .when(live, |this| {
                                     let path = path.clone();
                                     this.on_click(cx.listener(move |this, _, window, cx| {
                                         this.open_folder_detail(path.clone(), window, cx);
@@ -814,7 +840,7 @@ pub fn state_border(state: ActivityState, theme: &Theme) -> Hsla {
 }
 
 /// One status card. The text comes from [`StatusCard::content`], so the view
-/// does no formatting. `footer` is the card's controls row — Details and Remove
+/// does no formatting. `footer` is the card's control row — its Details control
 /// on a folder card, when the dashboard is attached to an engine (#43, R2.1) —
 /// and `album` the per-folder settings controls (R3.4).
 fn status_card(
@@ -919,6 +945,20 @@ fn status_card(
                     .text_sm()
                     .text_color(palette.meta)
                     .child(uploads),
+            )
+        })
+        .when_some(content.scan.clone(), |this, scan| {
+            // #56: the global card's reconciliation scan, in the folder
+            // detail's own words. A label, not a control: nothing new to
+            // operate or to skip.
+            this.child(
+                div()
+                    .id((id.clone(), "scan"))
+                    .test_support()
+                    .aria_label(scan.clone())
+                    .text_sm()
+                    .text_color(palette.meta)
+                    .child(scan),
             )
         })
         .when_some(content.album.clone(), |this, album| {

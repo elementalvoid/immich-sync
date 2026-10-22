@@ -65,11 +65,16 @@ headless GPUI tests green; `cargo test -p immich-sync --test dashboard`,
 `--all-features` is invalid here: the three `gpui-tray` backends are mutually
 exclusive.
 
-Some tests in `crates/sync-core/tests/` are wall-clock budgets rather than
-progress-bounded waits: `a_folder_with_100_files_syncs_without_manual_action`,
-the re-login budget tests in `engine.rs`, the pacing test in `limits.rs`, and
-the port race in `connection.rs`. They can starve under heavy parallel load; run
-one alone before treating a failure as a regression.
+Some tests are wall-clock budgets rather than progress-bounded waits:
+`a_folder_with_100_files_syncs_without_manual_action`, the re-login budget
+tests in `engine.rs`,
+`a_server_that_stops_answering_produces_backoff_not_a_hot_loop`, the pacing
+test in `limits.rs`, and the port race in `connection.rs`. In
+`crates/app/tests/engine_model.rs`,
+`a_click_on_a_running_engine_starts_a_scan` is one too: it hashes a 64 MiB
+fixture so the scan outlives the 250 ms status poll that carries the scan flag,
+and `EngineModel`'s surface has no deterministic barrier. They can starve under
+heavy parallel load; run one alone before treating a failure as a regression.
 
 ## Where the design lives
 
@@ -113,6 +118,9 @@ dbus-run-session -- xvfb-run -a -s "-screen 0 1440x1000x24" bash -c '
   sleep 10
   WIN=$(xwininfo -root -tree | awk "/900x650/ {print \$1; exit}")
   xdotool windowsize "$WIN" 1200 900
+  # The window opens centred, which would push its lower right past the
+  # screen; at the origin the whole frame is captured.
+  xdotool windowmove "$WIN" 0 0
   sleep 3
   import -window "$WIN" ../docs/screenshot.png
   kill $APP

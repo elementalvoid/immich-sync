@@ -228,6 +228,7 @@ fn folder_progress_survives_counts_above_a_u16() {
         counts,
         last_error: None,
         uploads: sync_core::meter::UploadTraffic::default(),
+        scanning: false,
     };
 
     let model = DashboardModel::from_engine(&status, None);
@@ -449,6 +450,18 @@ fn dashboard_shows_named_controls_and_one_card_per_folder(cx: &mut TestAppContex
 
         let global = window.find("status-global");
         assert!(global.visible(), "the global card is visible");
+        // #56: the global card carries the reconciliation scan line, the same
+        // sentence the folder detail shows for one folder.
+        let scan = window.find((ElementId::from("status-global"), "scan"));
+        let scan = scan.label().unwrap_or_default();
+        assert!(
+            scan.starts_with("Last reconciliation scan: "),
+            "#56: the global card names the pass the folder detail names: {scan}"
+        );
+        assert!(
+            scan.contains(" · "),
+            "#56: the line carries the moment, not only the label: {scan}"
+        );
 
         let model = sample();
         for (index, folder) in model.folders.iter().enumerate() {
@@ -466,6 +479,247 @@ fn dashboard_shows_named_controls_and_one_card_per_folder(cx: &mut TestAppContex
         }
     })
     .expect("update the dashboard window");
+}
+
+/// #56: a click has to report itself. `scanning` rides the engine's status
+/// poll, so the view only paints what the model carries; the element id stays
+/// because the tests and the tray's path reference it.
+#[gpui_kit::test]
+fn the_sync_control_reports_a_running_scan(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let mut model = sample();
+    model.scanning = true;
+    let window = open_dashboard(cx, model);
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("dashboard-sync-now").label(),
+            Some("Checking the source folders"),
+            "#56: the control is named for the scan it is running"
+        );
+        // The harness reads the accessible name; the visible "Checking…" that
+        // pairs with it is pinned by `status::tests::the_sync_control_renames_itself_while_it_scans`.
+        assert_eq!(
+            window.find("dashboard-pause").label(),
+            Some("Pause syncing"),
+            "the neighbouring control keeps its copy"
+        );
+    })
+    .expect("update the dashboard window");
+}
+
+/// #56: a click that cannot scan says why, in the notice idiom the folder bar
+/// already uses, and never leaves the control claiming to check anything.
+#[gpui_kit::test]
+async fn a_click_with_no_source_folder_shows_the_reason(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let (window, store, _view) = open_live_dashboard(cx, temp.path());
+    wait_for_store(cx, &store).await;
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("dashboard-sync-notice").is_none(),
+            "#56: no notice before a click"
+        );
+        window.click("dashboard-sync-now", cx);
+        window.render_frame(cx);
+        let notice = window.find("dashboard-sync-notice");
+        assert_eq!(
+            notice.role(),
+            Some(Role::Alert),
+            "#56: the reason is announced"
+        );
+        assert_eq!(
+            notice.label(),
+            Some("No source folder to scan. Add a folder first."),
+            "#56: the notice says which reason the click hit"
+        );
+        assert_eq!(
+            window.find("dashboard-sync-now").label(),
+            Some("Sync now"),
+            "#56: a refused click never claims to be checking"
+        );
+    })
+    .expect("click Sync now with no source folder");
+}
+
+/// #56: a notice must not outlive the reason it names. A folder that arrives
+/// after a refused click answers the notice's own advice, so the notice goes
+/// instead of contradicting the card that now lists the folder.
+#[gpui_kit::test]
+async fn a_notice_clears_when_the_folder_arrives(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the fixture folder");
+    let (window, store, _view) = open_live_dashboard(cx, temp.path());
+    wait_for_store(cx, &store).await;
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("dashboard-sync-now", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("dashboard-sync-notice").label(),
+            Some("No source folder to scan. Add a folder first."),
+            "#56: the click says what is missing"
+        );
+    })
+    .expect("click Sync now with no source folder");
+
+    let folder = sync_core::store::SourceFolder {
+        path: photos.display().to_string(),
+        recursive: true,
+        album_mapping: false,
+        album_scope: sync_core::store::AlbumScope::Leaf,
+        album_title: None,
+    };
+    cx.update(|cx| {
+        store
+            .read(cx)
+            .store()
+            .expect("the store is open")
+            .add_folder(&folder)
+            .expect("seed the source folder");
+        store.update(cx, |store, cx| store.set_folders(vec![folder], cx));
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find(("status-folder", 0_usize)).is_some(),
+            "#56: the card for the added folder renders"
+        );
+        assert!(
+            window.try_find("dashboard-sync-notice").is_none(),
+            "#56: the notice must not outlive the reason it named"
+        );
+    })
+    .expect("render after the folder arrived");
+}
+
+/// #56: an answered notice stays gone. The view drops the stored outcome once
+/// its reason no longer holds, so a later change cannot bring the old sentence
+/// back with no click behind it.
+#[gpui_kit::test]
+async fn a_satisfied_notice_does_not_come_back(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the fixture folder");
+    let (window, store, _view) = open_live_dashboard(cx, temp.path());
+    wait_for_store(cx, &store).await;
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("dashboard-sync-now", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("dashboard-sync-notice").label(),
+            Some("No source folder to scan. Add a folder first."),
+            "#56: the click says what is missing"
+        );
+    })
+    .expect("click Sync now with no source folder");
+
+    let folder = sync_core::store::SourceFolder {
+        path: photos.display().to_string(),
+        recursive: true,
+        album_mapping: false,
+        album_scope: sync_core::store::AlbumScope::Leaf,
+        album_title: None,
+    };
+    let path = folder.path.clone();
+    cx.update(|cx| {
+        store
+            .read(cx)
+            .store()
+            .expect("the store is open")
+            .add_folder(&folder)
+            .expect("seed the source folder");
+        store.update(cx, |store, cx| store.set_folders(vec![folder], cx));
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("dashboard-sync-notice").is_none(),
+            "#56: the arrived folder answers the notice"
+        );
+    })
+    .expect("render after the folder arrived");
+
+    cx.update(|cx| {
+        store
+            .read(cx)
+            .store()
+            .expect("the store is open")
+            .remove_folder(&path)
+            .expect("remove the source folder");
+        store.update(cx, |store, cx| store.set_folders(Vec::new(), cx));
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("dashboard-sync-notice").is_none(),
+            "#56: the answered notice must not return with no click behind it"
+        );
+        assert_eq!(
+            window.find("dashboard-sync-now").label(),
+            Some("Sync now"),
+            "#56: and the control stays quiet"
+        );
+    })
+    .expect("render after the folder left");
+}
+
+/// #56: signed out is the reachable field case: the folders are known, the
+/// scan is not possible, and the click says so.
+#[gpui_kit::test]
+async fn a_signed_out_click_says_it_cannot_connect(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the fixture folder");
+    let (window, store, _view) = open_live_dashboard(cx, temp.path());
+    wait_for_store(cx, &store).await;
+    let folder = sync_core::store::SourceFolder {
+        path: photos.display().to_string(),
+        recursive: true,
+        album_mapping: false,
+        album_scope: sync_core::store::AlbumScope::Leaf,
+        album_title: None,
+    };
+    cx.update(|cx| {
+        store
+            .read(cx)
+            .store()
+            .expect("the store is open")
+            .add_folder(&folder)
+            .expect("seed the source folder");
+        store.update(cx, |store, cx| store.set_folders(vec![folder], cx));
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("dashboard-sync-now", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("dashboard-sync-notice").label(),
+            Some("Not connected to the server, so no scan can start."),
+            "#56: a signed-out click names the missing connection"
+        );
+        assert_eq!(
+            window.find("dashboard-sync-now").label(),
+            Some("Sync now"),
+            "#56: a refused click never claims to be checking"
+        );
+    })
+    .expect("click Sync now while signed out");
 }
 
 #[gpui_kit::test]
@@ -632,6 +886,7 @@ fn engine_status_maps_to_the_global_card_and_one_card_per_folder() {
             bytes_per_second: 2_516_582,
             in_flight: 2,
         },
+        scanning: false,
     };
 
     let model = DashboardModel::from_engine(&status, Some("Connected".to_string()));
@@ -686,7 +941,7 @@ fn engine_status_maps_to_the_global_card_and_one_card_per_folder() {
 }
 
 #[gpui_kit::test]
-async fn folder_add_and_remove_controls_reach_the_store(cx: &mut TestAppContext) {
+async fn the_add_control_and_the_detail_remove_reach_the_store(cx: &mut TestAppContext) {
     cx.executor().allow_parking();
     let temp = tempfile::tempdir().expect("create a temp dir");
     let photos = temp.path().join("photos");
@@ -746,14 +1001,22 @@ async fn folder_add_and_remove_controls_reach_the_store(cx: &mut TestAppContext)
         window.render_frame(cx);
         let card = window.find(("status-folder", 0_usize));
         assert!(card.visible(), "the new folder has a card");
-        assert_eq!(
-            window.find(("folder-remove", 0_usize)).label(),
-            Some("Remove photos"),
-            "the remove control is named for assistive technology"
+        assert!(
+            window.try_find(("folder-remove", 0_usize)).is_none(),
+            "#53: a source folder card has no Remove control"
         );
-        window.click(("folder-remove", 0_usize), cx);
+        assert!(
+            window.try_find(("folder-details", 0_usize)).is_some(),
+            "#53: the card's footer keeps Details"
+        );
+        // #53: the detail's confirmed Remove is the only removal path.
+        window.click(("folder-details", 0_usize), cx);
+        window.render_frame(cx);
+        window.click("folder-detail-remove", cx);
+        window.render_frame(cx);
+        window.click("folder-detail-remove-confirm", cx);
     })
-    .expect("remove the folder through the dashboard");
+    .expect("remove the folder through its detail");
 
     let mut removed = false;
     for _ in 0..600 {
@@ -766,7 +1029,10 @@ async fn folder_add_and_remove_controls_reach_the_store(cx: &mut TestAppContext)
             .await;
         cx.run_until_parked();
     }
-    assert!(removed, "R2.1: the remove control deleted the folder");
+    assert!(
+        removed,
+        "R2.1: the detail's confirmed Remove deleted the folder"
+    );
 }
 
 /// Adds one source folder through the dashboard controls and waits until the

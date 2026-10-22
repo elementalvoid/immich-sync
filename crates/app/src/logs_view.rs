@@ -13,11 +13,12 @@ use gpui_kit::base::{Disableable as _, SelectableText, TextSelection};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::Button;
 use gpui_kit::component::radio::Radio;
+use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_kit::*;
 
 use crate::dashboard::CardPalette;
 use crate::logging::{self, LogLevel, TAIL_LINES};
-use crate::settings_view::{SettingsView, field_text, notice, section};
+use crate::settings_view::{SettingsView, field_text, filling_section, notice, section};
 
 /// How often the live tail re-reads the newest log file while the Logs surface
 /// is visible.
@@ -50,6 +51,10 @@ pub struct LogsView {
     /// Where the tail is scrolled to. Following is this handle's distance from
     /// the bottom, never a line count.
     scroll: ScrollHandle,
+    /// Where the cards above the tail are scrolled to. The strip only scrolls
+    /// when the window is too short for them, and this is what its scrollbar
+    /// draws while it does (#54).
+    cards_scroll: ScrollHandle,
     /// Whether the user scrolled away from the newest lines, which pauses
     /// following. A poll sets it from the scroll handle, and a poll reads that
     /// handle after the frame that moved it, so a scroll this view asked for can
@@ -109,6 +114,7 @@ impl LogsView {
             _subscriptions: vec![subscription],
             lines_focus: cx.focus_handle(),
             scroll: ScrollHandle::new(),
+            cards_scroll: ScrollHandle::new(),
             paused: false,
             new_lines: 0,
             live: None,
@@ -488,7 +494,18 @@ impl LogsView {
         );
         if let Some(problem) = &self.read_problem {
             body.push(
-                notice("logs-problem", problem.clone(), theme.danger, &palette).into_any_element(),
+                div()
+                    // The message quotes the log directory, so it wraps further
+                    // on a long path. Clamped to the two lines the floor's 4rem
+                    // covers; the accessible label keeps the whole text (#54).
+                    .line_clamp(2)
+                    .child(notice(
+                        "logs-problem",
+                        problem.clone(),
+                        theme.danger,
+                        &palette,
+                    ))
+                    .into_any_element(),
             );
         }
         if self.lines.is_empty() {
@@ -539,20 +556,51 @@ impl LogsView {
                 .collect();
             let focus = self.lines_focus.clone();
             body.push(
+                // The scrollbar overlays this row rather than the scroll box, so
+                // it stays put while the lines move. It reads the view's own
+                // handle: following is that handle's distance from the bottom.
                 div()
-                    .id("logs-lines")
-                    .test_support()
-                    .track_focus(&self.lines_focus)
-                    .track_scroll(&self.scroll)
-                    .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                        window.focus(&focus, cx);
-                    })
                     .flex()
                     .flex_col()
-                    .gap_0p5()
-                    .max_h(rems(24.))
-                    .overflow_y_scroll()
-                    .children(lines)
+                    .flex_1()
+                    .min_h(rems(8.))
+                    .relative()
+                    .child(
+                        div()
+                            .id("logs-lines")
+                            .test_support()
+                            .track_focus(&self.lines_focus)
+                            .track_scroll(&self.scroll)
+                            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                                window.focus(&focus, cx);
+                            })
+                            // The wheel over the tail is the tail's: GPUI applies
+                            // the delta to every scroll hitbox under the pointer,
+                            // so without this any scrolling ancestor would move
+                            // by the same delta (#54).
+                            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .size_full()
+                            // Room for the scrollbar track over the right edge,
+                            // so it cannot cover a truncated line's ending.
+                            .pr_4()
+                            .overflow_y_scroll()
+                            .children(lines)
+                            .into_any_element(),
+                    )
+                    .child(
+                        // Always: the bar shows while the lines overflow
+                        // and hides only because they fit, not two seconds
+                        // after the last wheel (#54). It reads the view's
+                        // own handle, so the drag and the wheel write the
+                        // same offset that following measures. The bar lays
+                        // itself out over the relative box above.
+                        Scrollbar::vertical(&self.scroll)
+                            .mode(ScrollbarMode::Always)
+                            .viewport_from_layout(),
+                    )
                     .into_any_element(),
             );
         }
@@ -588,11 +636,18 @@ impl LogsView {
                     .into_any_element(),
             );
         }
-        section(
+        // The read notice and the paused row each sit inside the card beside
+        // the tail, and each wraps at the narrowest window, so the floor covers
+        // them too: 16rem, plus 4rem for every extra row the body shows (#54).
+        let floor_rem = 16.
+            + if self.read_problem.is_some() { 4. } else { 0. }
+            + if self.paused { 4. } else { 0. };
+        filling_section(
             "logs-lines-section",
             "Recent lines",
             "The newest file's last lines. They follow the file while this surface is open.",
             body,
+            floor_rem,
             cx,
         )
     }
@@ -632,12 +687,47 @@ impl Render for LogsView {
             .size_full()
             .bg(background)
             .text_color(foreground)
-            .overflow_y_scroll()
+            // Clipped, so the page keeps the window's height for the tail to
+            // divide instead of growing with the cards' content.
+            .overflow_hidden()
             .p_4()
             .gap_2()
-            .child(Self::header(cx))
-            .child(location)
-            .child(level)
+            .child(
+                // The header, the location and the level control keep their
+                // natural height, and the tail takes what is left of the
+                // window. A window too short for both scrolls this strip rather
+                // than squeezing the tail away; a page-level scroll could not
+                // do it, because a column inside a scroll area has no height to
+                // divide (#54).
+                div()
+                    .id("logs-cards")
+                    .test_support()
+                    .flex()
+                    .flex_col()
+                    .min_h_0()
+                    .relative()
+                    .child(
+                        div()
+                            .id("logs-card-list")
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_h_0()
+                            .gap_2()
+                            .track_scroll(&self.cards_scroll)
+                            .overflow_y_scroll()
+                            .child(Self::header(cx))
+                            .child(location)
+                            .child(level),
+                    )
+                    .child(
+                        // The strip is the fallback scroll at a short window,
+                        // so it needs the affordance too (#54).
+                        Scrollbar::vertical(&self.cards_scroll)
+                            .mode(ScrollbarMode::Always)
+                            .viewport_from_layout(),
+                    ),
+            )
             .child(lines)
     }
 }

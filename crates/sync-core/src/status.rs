@@ -108,6 +108,10 @@ pub struct Status {
     /// and how many uploads are on the wire. Like the counts, it is the sum of
     /// the folders'.
     pub uploads: UploadTraffic,
+    /// Whether a reconciliation scan is walking the folders right now (#56).
+    /// The dashboard renames its "Sync now" control on it and the card reads
+    /// the scan's own timestamp; the store-only status is never scanning.
+    pub scanning: bool,
 }
 
 impl Status {
@@ -120,6 +124,7 @@ impl Status {
             connection,
             review_total,
             last_error,
+            scanning,
         } = inputs;
         let mut counts = FolderCounts::default();
         let mut uploads = UploadTraffic::default();
@@ -158,6 +163,7 @@ impl Status {
             counts,
             last_error,
             uploads,
+            scanning,
         }
     }
 
@@ -211,4 +217,6 @@ pub struct StatusInputs {
     pub review_total: Option<u32>,
     /// The last failure, for the global card.
     pub last_error: Option<String>,
+    /// Whether a reconciliation scan is walking the folders (#56).
+    pub scanning: bool,
 }

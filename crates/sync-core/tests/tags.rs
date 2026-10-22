@@ -172,7 +172,10 @@ fn chain_len(store: &StateStore, file: &Path) -> usize {
         .len()
 }
 
-/// A config with the sync tag off, the default (R3.7).
+/// A config with the sync tag off, set explicitly rather than read from the
+/// library default: `engine.rs`'s `the_default_config_matches_the_spec` pins that
+/// default (R3.7). The app's stored setting is on by default; these tests cover
+/// the off path.
 fn untagged_config() -> EngineConfig {
     EngineConfig {
         tag_uploaded_assets: false,

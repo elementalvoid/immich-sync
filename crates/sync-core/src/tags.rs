@@ -1,11 +1,13 @@
 //! The sync tag (SPEC R3.7, GLOSSARY "Sync tag").
 //!
-//! The setting is opt-in. When it is on, the engine upserts the one tag
-//! `immich-sync` with `PUT /tags`, keeps the id the server answered for the
-//! whole run, and adds that tag to every asset an upload settles with
-//! `PUT /tags/assets`. A duplicate the server already held is tagged too, and a
-//! new version of an edited file is tagged after the version flow finished, so
-//! the chain keeps the tag.
+//! The app's setting is on by default and its stored value wins; this crate's
+//! `EngineConfig::default()` keeps the tag off, and only the caller's setting
+//! turns it on. When it is on, the engine upserts the one tag `immich-sync`
+//! with `PUT /tags`, keeps the id the server answered for the whole run, and
+//! adds that tag to every asset an upload settles with `PUT /tags/assets`. A
+//! duplicate the server already held is tagged too, and a new version of an
+//! edited file is tagged after the version flow finished, so the chain keeps
+//! the tag.
 //!
 //! Tagging is auxiliary. It runs after the item is recorded as uploaded, and a
 //! failure here is recorded for the Settings section instead of reaching the

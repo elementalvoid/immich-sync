@@ -5,10 +5,13 @@
 //! state database, the real engine model, and the view's own click and keyboard
 //! handling.
 
+mod common;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use common::scroll_dashboard_into_view;
 use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
 use gpui_kit::{
     AnyWindowHandle, App, AppContext as _, ElementId, Entity, Point, ScrollDelta, TestAppContext,
@@ -261,6 +264,7 @@ fn scroll_into_view(window: &mut Window, cx: &mut App, id: impl Into<ElementId>)
 /// Opens the detail and waits for it to be on screen.
 fn open_detail_now(cx: &mut TestAppContext, window: AnyWindowHandle) {
     act(cx, window, |window, cx| {
+        scroll_dashboard_into_view(window, cx, ("folder-details", 0_usize));
         window.click(("folder-details", 0_usize), cx);
     });
     read(cx, window, |window, _| {
@@ -287,9 +291,26 @@ async fn a_card_click_and_its_details_control_open_the_detail_but_its_settings_d
     wait_for_store(cx, &store).await;
 
     read(cx, window, |window, cx| {
+        // #53: the footer row keeps Details hugging its label at the card's
+        // left edge, not stretched across the card.
+        let details = f32::from(window.find(("folder-details", 0_usize)).bounds().size.width);
+        let card = f32::from(window.find(("folder-card", 0_usize)).bounds().size.width);
+        assert!(
+            details < card / 2.,
+            "#53: Details hugs its label ({details}px) instead of filling the card ({card}px)"
+        );
         // N5: the Details control is a keyboard-reachable tab stop of the card,
         // not only a pointer target.
         tab_to(window, ("folder-details", 0_usize), cx);
+        // #53: Details is the card's last tab stop, so Tab wraps to the
+        // Dashboard's first control; any control after Details takes that stop.
+        window.focus_next(cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("dashboard-sync-now").focused(),
+            Some(true),
+            "#53: Tab after the card's last control wraps to the Dashboard's first"
+        );
     });
     act(cx, window, |window, cx| window.blur(cx));
     // R8.1, #43: a press on the card's own surface opens its detail.
@@ -356,15 +377,6 @@ async fn a_card_click_and_its_details_control_open_the_detail_but_its_settings_d
         assert!(
             !detail_open(window),
             "Space on a card control must not open the detail"
-        );
-    });
-    act(cx, window, |window, cx| {
-        window.click(("folder-remove", 0_usize), cx)
-    });
-    read(cx, window, |window, _| {
-        assert!(
-            !detail_open(window),
-            "the Remove control must not open the detail"
         );
     });
 }
@@ -513,7 +525,7 @@ async fn the_detail_traps_focus_and_every_control_is_keyboard_reachable(cx: &mut
                 "dashboard-folder-path",
                 "dashboard-add-folder",
                 "folder-recursive",
-                "folder-remove",
+                "folder-album",
             ] {
                 let focused = window
                     .try_find(behind)
@@ -754,6 +766,18 @@ async fn the_remove_confirmation_asks_twice_and_says_what_stays_on_the_server(
     let (window, store, _view) = open_dashboard(cx, &paths);
     wait_for_store(cx, &store).await;
 
+    // #53: the card offers no Remove, so the detail is the only way in.
+    read(cx, window, |window, _| {
+        assert!(
+            window.try_find(("folder-remove", 0_usize)).is_none(),
+            "#53: a source folder card has no Remove control"
+        );
+        assert!(
+            window.try_find(("folder-details", 0_usize)).is_some(),
+            "#53: the card's footer keeps Details"
+        );
+    });
+
     open_detail_now(cx, window);
     act(cx, window, |window, cx| {
         window.click("folder-detail-remove", cx)
@@ -762,6 +786,10 @@ async fn the_remove_confirmation_asks_twice_and_says_what_stays_on_the_server(
         assert!(
             detail_open(window),
             "#43: the first Remove asks instead of removing"
+        );
+        assert!(
+            window.try_find(("folder-remove", 0_usize)).is_none(),
+            "#53: no card state offers a second, unconfirmed removal path"
         );
         assert_eq!(
             label(window, "folder-detail-confirm"),
@@ -1186,6 +1214,7 @@ fn a_folder_status_carries_its_times_into_the_detail_card() {
         counts: FolderCounts::default(),
         last_error: None,
         uploads: sync_core::meter::UploadTraffic::default(),
+        scanning: false,
     };
 
     let model = immich_sync::status::DashboardModel::from_engine(&status, None);
@@ -1198,8 +1227,9 @@ fn a_folder_status_carries_its_times_into_the_detail_card() {
         Some(1_700_000_001_000_000_000)
     );
     assert_eq!(
-        model.global.last_scan_ns, None,
-        "the global card is not a folder and has no folder times"
+        model.global.last_scan_ns,
+        Some(1_700_000_000_000_000_000),
+        "#56: the global card carries the newest folder's scan"
     );
 }
 

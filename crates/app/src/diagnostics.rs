@@ -118,6 +118,7 @@ impl DiagnosticsModel {
                 counts: sync_core::store::FolderCounts::default(),
                 last_error: None,
                 uploads: sync_core::meter::UploadTraffic::default(),
+                scanning: false,
             },
             throughput: Throughput::default(),
             problem: None,

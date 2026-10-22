@@ -312,6 +312,78 @@ async fn the_backfill_tags_every_asset_the_client_ever_uploaded() {
     engine.stop();
 }
 
+/// R3.7: a fresh install starts with the tag on and has uploaded nothing yet.
+/// The pass over that empty library must not record the completion, or the one
+/// automatic backfill is spent before the first asset exists and the uploads
+/// that follow are never tagged.
+#[tokio::test]
+async fn an_empty_library_does_not_finish_the_backfill() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+
+    let fresh = start_engine(&server, &store, backfill_config(2)).await;
+    assert!(
+        wait_until(
+            || !server.upsert_calls().is_empty(),
+            Duration::from_secs(20)
+        )
+        .await,
+        "the fresh install never resolved the tag"
+    );
+    // The pass over the empty library follows the upsert in the same task; a
+    // completion it records is what the second phase reads, because the next
+    // engine then reports completed without tagging the upload.
+    fresh.stop();
+
+    // An upload from the install's setup: the state row is what a stopped
+    // client keeps, and a folder with the file would let the engine's own scan
+    // tag the new upload directly instead of the backfill.
+    store
+        .record(&sync_core::store::ItemRecord {
+            path: temp
+                .path()
+                .join("elsewhere/first.jpg")
+                .display()
+                .to_string(),
+            size: 5,
+            mtime_ns: 1,
+            sha1: sync_core::hash::Sha1::from_hex("2aae6c35c94fcfb415dbe95f408b9ce91ee846ed")
+                .expect("a hex SHA-1"),
+            asset_id: Some("asset-uploaded-before-the-tag-was-on".to_string()),
+            state: ItemState::Uploaded,
+            error_class: None,
+            error_message: None,
+            attempts: 0,
+            sidecar: None,
+        })
+        .expect("record the upload the empty pass did not see");
+
+    let tagged = start_engine(&server, &store, backfill_config(2)).await;
+    assert!(
+        wait_until(
+            || tagged.tag_status().backfill.completed,
+            Duration::from_secs(20)
+        )
+        .await,
+        "R3.7: the backfill never tagged the first upload: {:?}",
+        tagged.tag_status().backfill
+    );
+    assert_eq!(
+        server.tag_asset_calls(),
+        vec![TagAssetCall {
+            tag_ids: vec![
+                server
+                    .tag_id(SYNC_TAG)
+                    .expect("the run created the sync tag")
+            ],
+            asset_ids: vec!["asset-uploaded-before-the-tag-was-on".to_string()],
+        }],
+        "R3.7: the upload the empty install made is tagged by the backfill"
+    );
+    tagged.stop();
+}
+
 /// R3.7: progress is published while the run is going, with the count the
 /// library has and how many assets are already tagged, and it reaches a
 /// completed state.

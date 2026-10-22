@@ -5,8 +5,8 @@ use std::path::Path;
 use sync_core::failure::FailureClass;
 use sync_core::hash::Sha1;
 use sync_core::store::{
-    AlbumScope, AttemptOutcome, AttemptRecord, ItemRecord, ItemState, NewVersion, ReviewDecision,
-    SidecarDigest, SourceFolder, StateStore, StoreError, TagBackfill,
+    AlbumScope, AttemptOutcome, AttemptRecord, FolderCounts, ItemRecord, ItemState, NewVersion,
+    ReviewDecision, SidecarDigest, SourceFolder, StateStore, StoreError, TagBackfill,
 };
 
 /// `sha1("hello world")`, hex.
@@ -986,8 +986,16 @@ fn folder_counts_bucket_the_states() {
         .expect("write the outside row");
 
     let counts = store
-        .folder_counts(&folder.display().to_string())
+        .folder_counts_by_owner(&[SourceFolder {
+            path: folder.display().to_string(),
+            recursive: true,
+            album_mapping: false,
+            album_scope: AlbumScope::Leaf,
+            album_title: None,
+        }])
         .expect("read the counts");
+    assert_eq!(counts.len(), 1, "one card per folder");
+    let counts = counts[0];
 
     assert_eq!(
         counts.uploaded, 3,
@@ -998,6 +1006,105 @@ fn folder_counts_bucket_the_states() {
     assert_eq!(
         counts.review, 1,
         "R5.4: only the missing item waits for a decision"
+    );
+}
+
+/// The counts as one card shows them, with the fields named, so the expectation
+/// reads like the card rather than like the struct (#52).
+fn counts_of(pending: u32, uploaded: u32, failed: u32, review: u32) -> FolderCounts {
+    FolderCounts {
+        pending,
+        uploaded,
+        failed,
+        review,
+    }
+}
+
+/// R8.1, #52: a row belongs to the first source folder that contains it, the
+/// same owner the engine meters its upload by, so a nested source folder never
+/// counts a row the outer folder already counts.
+#[test]
+fn nested_folders_each_own_their_rows_once() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    let outer = temp.path().join("photos");
+    let inner = outer.join("2024");
+    for root in [&outer, &inner] {
+        std::fs::create_dir_all(root).expect("create the source folder");
+        store
+            .add_folder(&SourceFolder {
+                path: root.display().to_string(),
+                recursive: true,
+                album_mapping: false,
+                album_scope: AlbumScope::Leaf,
+                album_title: None,
+            })
+            .expect("add the source folder");
+    }
+    for (file, state) in [
+        (inner.join("a.jpg"), ItemState::Uploaded),
+        (inner.join("b.jpg"), ItemState::Pending),
+        (inner.join("c.jpg"), ItemState::FailedPermanent),
+        (inner.join("d.jpg"), ItemState::Missing),
+        (outer.join("e.jpg"), ItemState::Duplicate),
+        (outer.join("f.jpg"), ItemState::RetryWait),
+        // A sibling that shares the outer folder's name prefix but is not
+        // inside it: no folder owns it, and no card counts it.
+        (
+            temp.path().join("photos-extra").join("g.jpg"),
+            ItemState::Uploaded,
+        ),
+    ] {
+        store
+            .record(&record(&file.display().to_string(), state))
+            .expect("write the row");
+    }
+
+    // The stored order is the path order, so the outer folder comes first and
+    // owns every row under it, the nested folder's included.
+    let folders = store.folders().expect("read the folders");
+    assert_eq!(folders.len(), 2, "both source folders are stored");
+    let counts = store
+        .folder_counts_by_owner(&folders)
+        .expect("read the counts");
+    assert_eq!(
+        counts[0],
+        counts_of(1, 2, 2, 1),
+        "the outer folder owns the rows under the nested folder too"
+    );
+    assert_eq!(
+        counts[1],
+        FolderCounts::default(),
+        "#52: a nested folder owns nothing the earlier folder already contains"
+    );
+    let mut total = FolderCounts::default();
+    for count in &counts {
+        total.pending += count.pending;
+        total.uploaded += count.uploaded;
+        total.failed += count.failed;
+        total.review += count.review;
+    }
+    assert_eq!(
+        total,
+        counts_of(1, 2, 2, 1),
+        "the cards sum to the rows that belong to a folder, each counted once"
+    );
+
+    // A caller that passes another order owns by that order: the first entry
+    // in the list owns, whatever the paths say.
+    let reversed: Vec<SourceFolder> = folders.iter().rev().cloned().collect();
+    let counts = store
+        .folder_counts_by_owner(&reversed)
+        .expect("read the counts");
+    assert_eq!(
+        counts[0],
+        counts_of(1, 1, 1, 1),
+        "the nested folder owns its own rows when it comes first"
+    );
+    assert_eq!(
+        counts[1],
+        counts_of(0, 1, 1, 0),
+        "the outer folder keeps only the rows the nested one does not own"
     );
 }
 

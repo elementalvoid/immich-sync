@@ -22,6 +22,13 @@ pub fn now_ns() -> i64 {
     }
 }
 
+/// The label of the reconciliation scan line, in the folder detail and on the
+/// global card (#43, #56).
+///
+/// GLOSSARY names the pass; one constant keeps the two surfaces from drifting
+/// into "rescan" or "poll".
+const SCAN_LABEL: &str = "Last reconciliation scan";
+
 /// One detail line: the label, then the relative and exact time, or
 /// [`NOT_YET`].
 ///
@@ -33,6 +40,16 @@ pub fn moment_line(label: &str, at_ns: Option<i64>, now_ns: i64) -> String {
         Some(at_ns) => format!("{label}: {}", moment(at_ns, now_ns)),
         None => format!("{label}: {NOT_YET}"),
     }
+}
+
+/// The reconciliation scan line: [`SCAN_LABEL`] and its moment, or [`NOT_YET`]
+/// (#56).
+///
+/// The folder detail and the global card show the same sentence, so the label
+/// lives with the formatting rather than in two view files.
+#[must_use]
+pub fn scan_line(at_ns: Option<i64>, now_ns: i64) -> String {
+    moment_line(SCAN_LABEL, at_ns, now_ns)
 }
 
 /// One moment, relative and exact: `3 minutes ago · 2026-02-05T14:03:07+01:00`.
