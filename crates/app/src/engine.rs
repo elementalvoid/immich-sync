@@ -126,7 +126,8 @@ enum AlbumChange {
 /// is harmless: it re-notifies the scan loop, which walks the folders again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyncNowOutcome {
-    /// The scan was asked for.
+    /// The start request reached the scan loop. The walk may not have begun
+    /// yet; `Status::scanning` reports the walk itself (#56).
     Requested,
     /// No source folder is recorded, so a scan would walk nothing (R2.1).
     NoFolder,
@@ -134,7 +135,8 @@ pub enum SyncNowOutcome {
     NotConnected,
     /// A state rebuild holds the store (R10.4).
     Rebuilding,
-    /// The store is still opening, so the folders cannot be read yet (R9.2).
+    /// The store is not usable yet: the first open is still running, or it
+    /// failed, so the folder list says nothing (R9.2).
     NotReady,
 }
 
