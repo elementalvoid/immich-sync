@@ -1474,8 +1474,11 @@ async fn a_click_on_a_running_engine_starts_a_scan(cx: &mut TestAppContext) {
     let photos = temp.path().join("photos");
     std::fs::create_dir_all(&photos).expect("create the source folder");
     // Big enough that hashing it outlasts the model's status poll in a debug
-    // build; small enough that the upload the pass queues stays cheap.
-    const SIZE: usize = 32 * 1024 * 1024;
+    // build; small enough that the upload the pass queues stays cheap. The
+    // flag reaches the model only on that 250 ms poll, which costs this test's
+    // loop ~100-130 ms of real time to reach: hashing 64 MiB measures ~570 ms
+    // here (~5 poll cycles), where 32 MiB measured ~285 ms (~2-3).
+    const SIZE: usize = 64 * 1024 * 1024;
     std::fs::write(photos.join("candidate.jpg"), vec![0_u8; SIZE])
         .expect("write the same-size candidate");
     {
