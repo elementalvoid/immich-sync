@@ -1929,6 +1929,9 @@ impl StateStore {
     /// card. The counts come back in the order the caller passed, and a row no
     /// folder contains belongs to none, so the cards sum to what they own.
     ///
+    /// The read runs on a fresh read-only connection (ADR 0005), so a card's
+    /// read never queues behind the engine's writer.
+    ///
     /// # Errors
     ///
     /// Returns [`StoreError`] when the query fails or a row cannot be read.
@@ -1936,6 +1939,9 @@ impl StateStore {
         &self,
         folders: &[SourceFolder],
     ) -> Result<Vec<FolderCounts>, StoreError> {
+        if folders.is_empty() {
+            return Ok(Vec::new());
+        }
         // One pass over the rows. The folder keys are normalized once, and the
         // comparison is the paths module's own rule (R2.4), so the cards cannot
         // disagree with the meters about who owns a path.
@@ -1944,8 +1950,8 @@ impl StateStore {
             .map(|folder| path_key(Path::new(&folder.path)))
             .collect();
         let mut counts = vec![FolderCounts::default(); folders.len()];
-        let writer = self.writer()?;
-        let mut statement = writer
+        let reader = self.reader()?;
+        let mut statement = reader
             .prepare("SELECT path_key, state FROM sync_item")
             .map_err(|source| self.query_error(source))?;
         let rows = statement
@@ -1955,13 +1961,10 @@ impl StateStore {
             .map_err(|source| self.query_error(source))?;
         for row in rows {
             let (key, state) = row.map_err(|source| self.query_error(source))?;
-            let Some(counts) = roots
-                .iter()
-                .position(|root| key_is_within(root, &key))
-                .and_then(|owner| counts.get_mut(owner))
-            else {
+            let Some(owner) = roots.iter().position(|root| key_is_within(root, &key)) else {
                 continue;
             };
+            let counts = &mut counts[owner];
             match ItemState::parse(&state) {
                 Some(ItemState::Uploaded | ItemState::Duplicate | ItemState::ReviewKeep) => {
                     counts.uploaded += 1;
