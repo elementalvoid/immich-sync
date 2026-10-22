@@ -348,6 +348,20 @@ async fn every_long_surface_reaches_its_last_element_at_a_short_height(cx: &mut 
                     window.find(target.clone()).visible(),
                     "{mode:?}: {target:?} is not visible at the short window without scrolling"
                 );
+                if mode == ViewMode::Logs {
+                    // `visible()` is only a non-empty clipped intersection. At
+                    // the tail's end the newest row must lie wholly inside the
+                    // tail box, or a sliver above its top edge would pass (#54).
+                    let tail = window.find(container.clone()).bounds();
+                    let newest = window.find(target.clone()).bounds();
+                    assert!(
+                        newest.origin.y >= tail.origin.y - px(1.)
+                            && newest.origin.y + newest.size.height
+                                <= tail.origin.y + tail.size.height + px(1.),
+                        "{mode:?}: {target:?} at {newest:?} is not wholly inside the tail box \
+                         {tail:?}"
+                    );
+                }
             }
             scroll_until_visible(window, cx, &container, &target, -4.);
         })
