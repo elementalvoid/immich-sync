@@ -206,9 +206,10 @@ fn open_shell(
 /// The probe is the bottom-most element the view registers, so it only becomes
 /// visible when the scroll actually reaches the content's end. Upload is short
 /// enough to fit at the test height, so its probe must be visible without
-/// scrolling; that still catches a clipped control. The Logs tail is also on
-/// screen without a page scroll (#54): its own box takes the height the cards
-/// above it leave, and it opens at its newest line.
+/// scrolling; that still catches a clipped control. The Logs tail is on screen
+/// without a page scroll (#54): its own box takes the height the cards above it
+/// leave, so its newest line must be visible without scrolling either, and the
+/// tail's own scroll is covered by `the_log_tail_scrolls_inside_its_own_container`.
 fn surface_probe(mode: ViewMode) -> (ElementId, ElementId, bool) {
     match mode {
         ViewMode::Dashboard => (
@@ -341,6 +342,11 @@ async fn every_long_surface_reaches_its_last_element_at_a_short_height(cx: &mut 
                     !window.find(target.clone()).visible(),
                     "{mode:?}: {target:?} already fits in the short window, so this surface does \
                      not prove scrolling"
+                );
+            } else {
+                assert!(
+                    window.find(target.clone()).visible(),
+                    "{mode:?}: {target:?} is not visible at the short window without scrolling"
                 );
             }
             scroll_until_visible(window, cx, &container, &target, -4.);

@@ -13,7 +13,7 @@ use gpui_kit::base::{Disableable as _, SelectableText, TextSelection};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::Button;
 use gpui_kit::component::radio::Radio;
-use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_kit::*;
 
 use crate::dashboard::CardPalette;
@@ -51,6 +51,10 @@ pub struct LogsView {
     /// Where the tail is scrolled to. Following is this handle's distance from
     /// the bottom, never a line count.
     scroll: ScrollHandle,
+    /// Where the cards above the tail are scrolled to. The strip only scrolls
+    /// when the window is too short for them, and this is what its scrollbar
+    /// draws while it does (#54).
+    cards_scroll: ScrollHandle,
     /// Whether the user scrolled away from the newest lines, which pauses
     /// following. A poll sets it from the scroll handle, and a poll reads that
     /// handle after the frame that moved it, so a scroll this view asked for can
@@ -110,6 +114,7 @@ impl LogsView {
             _subscriptions: vec![subscription],
             lines_focus: cx.focus_handle(),
             scroll: ScrollHandle::new(),
+            cards_scroll: ScrollHandle::new(),
             paused: false,
             new_lines: 0,
             live: None,
@@ -574,7 +579,18 @@ impl LogsView {
                             .children(lines)
                             .into_any_element(),
                     )
-                    .vertical_scrollbar(&self.scroll)
+                    .child(
+                        div().absolute().inset_0().child(
+                            // Always: the bar shows while the lines overflow
+                            // and hides only because they fit, not two seconds
+                            // after the last wheel (#54). It reads the view's
+                            // own handle, so the drag and the wheel write the
+                            // same offset that following measures.
+                            Scrollbar::vertical(&self.scroll)
+                                .mode(ScrollbarMode::Always)
+                                .viewport_from_layout(),
+                        ),
+                    )
                     .into_any_element(),
             );
         }
@@ -615,6 +631,9 @@ impl LogsView {
             "Recent lines",
             "The newest file's last lines. They follow the file while this surface is open.",
             body,
+            // The paused row sits below the tail, so the card needs a taller
+            // floor while it is there (#54).
+            if self.paused { 20. } else { 16. },
             cx,
         )
     }
@@ -680,10 +699,20 @@ impl Render for LogsView {
                             .flex_1()
                             .min_h_0()
                             .gap_2()
+                            .track_scroll(&self.cards_scroll)
                             .overflow_y_scroll()
                             .child(Self::header(cx))
                             .child(location)
                             .child(level),
+                    )
+                    .child(
+                        div().absolute().inset_0().child(
+                            // The strip is the fallback scroll at a short
+                            // window, so it needs the affordance too (#54).
+                            Scrollbar::vertical(&self.cards_scroll)
+                                .mode(ScrollbarMode::Always)
+                                .viewport_from_layout(),
+                        ),
                     ),
             )
             .child(lines)

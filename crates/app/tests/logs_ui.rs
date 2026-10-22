@@ -470,11 +470,16 @@ async fn ten_refreshes_keep_every_row_at_full_height(cx: &mut TestAppContext) {
                 }
             }
             // The tail no longer has a fixed cap (#54): it takes the height
-            // the cards above it leave, and never more than the page itself.
-            let page = f32::from(window.find("logs-view").bounds().size.height);
+            // the Recent lines card has left below its rows, so it ends at
+            // that card's inner bottom rather than at 24rem.
+            let card = window.find("logs-lines-section").bounds();
+            let tail = window.find("logs-lines").bounds();
+            let card_inner_bottom =
+                f32::from(card.origin.y + card.size.height) - CARD_PADDING - 1.;
             assert!(
-                f32::from(window.find("logs-lines").bounds().size.height) <= page + 0.5,
-                "round {round}: the tail stays within the page"
+                (f32::from(tail.origin.y + tail.size.height) - card_inner_bottom).abs() <= 2.,
+                "round {round}: the tail ends at {}, the inner bottom of the card, not {card_inner_bottom}",
+                f32::from(tail.origin.y + tail.size.height)
             );
         })
         .expect("update the shell window");
@@ -1498,21 +1503,21 @@ async fn the_tail_pane_fills_the_height_left_below_the_level_control(cx: &mut Te
     .expect("update the shell window");
 }
 
-/// The tail's scrollbar thumb, as the frame painted it.
+/// The scrollbar thumb a scroll box painted, as the frame painted it.
 ///
 /// The bar is an overlay the harness cannot find by id, so this reads the quads
 /// the frame painted: the thumb is the only filled strip narrower than the
-/// 16px track at the tail box's right edge. A hidden bar is painted off the
-/// edge, and a bar with nothing to scroll is not painted at all.
-fn tail_thumb(window: &Window, tail: (f32, f32, f32, f32)) -> Option<(f32, f32, f32, f32)> {
+/// 16px track at the box's right edge. A hidden bar is painted off the edge,
+/// and a bar with nothing to scroll is not painted at all.
+fn scrollbar_thumb(window: &Window, area: (f32, f32, f32, f32)) -> Option<(f32, f32, f32, f32)> {
     // The painted frame is in device pixels and the layout bounds are logical
     // ones, so the strip is measured in device pixels and reported in logical.
     let scale = window.scale_factor();
     let (left, top, width, height) = (
-        tail.0 * scale,
-        tail.1 * scale,
-        tail.2 * scale,
-        tail.3 * scale,
+        area.0 * scale,
+        area.1 * scale,
+        area.2 * scale,
+        area.3 * scale,
     );
     let (right, bottom) = (left + width, top + height);
     let track = 16. * scale;
@@ -1523,8 +1528,8 @@ fn tail_thumb(window: &Window, tail: (f32, f32, f32, f32)) -> Option<(f32, f32, 
             quad.bounds.size.height.as_f32(),
         );
         let in_track = w <= track / 2. && x >= right - track && x + w <= right + 0.5;
-        let in_tail = y >= top - 1. && y + h <= bottom + 1.;
-        (in_track && in_tail && h > 0.).then_some((x / scale, y / scale, w / scale, h / scale))
+        let in_area = y >= top - 1. && y + h <= bottom + 1.;
+        (in_track && in_area && h > 0.).then_some((x / scale, y / scale, w / scale, h / scale))
     })
 }
 
@@ -1604,6 +1609,99 @@ async fn a_short_window_keeps_the_tail_on_screen_and_scrolls_the_cards_above_it(
                 .bounds(),
             newest.bounds(),
             "and leaves the newest line on screen"
+        );
+    })
+    .expect("update the shell window");
+}
+
+/// At 900x600 the paused row appears below the tail, and its jump control must
+/// stay fully inside the window: the Recent lines card keeps a floor tall
+/// enough for the paused row plus the tail's own minimum (#54).
+#[gpui_kit::test]
+async fn a_paused_tail_keeps_the_jump_control_inside_a_short_window(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    write_lines(&paths, &long_tail(200));
+    let store = SettingsStore::open(paths.config_file.clone());
+    let (window, _shell) = open_shell_at(cx, store, paths, (900., 600.));
+    show_logs(cx, window);
+
+    // A wheel up in the tail pauses the live tail on the next poll tick, which
+    // adds the paused row and its jump control below the lines.
+    cx.update_window(window, |_, window, cx| {
+        window.scroll(
+            "logs-lines",
+            ScrollDelta::Pixels(point(px(0.), px(400.))),
+            cx,
+        );
+    })
+    .expect("update the shell window");
+    tick_live(cx, window);
+
+    cx.update_window(window, |_, window, _| {
+        assert!(
+            window.find("logs-paused").visible(),
+            "the paused tail draws its paused row"
+        );
+        let jump = window.find("logs-jump-latest").bounds();
+        let viewport = window.viewport_size();
+        let (jump_right, jump_bottom) = (
+            f32::from(jump.origin.x + jump.size.width),
+            f32::from(jump.origin.y + jump.size.height),
+        );
+        assert!(
+            jump_bottom <= f32::from(viewport.height) && jump_right <= f32::from(viewport.width),
+            "the jump control at {jump:?} is fully inside the {viewport:?} viewport, not clipped \
+             by the page"
+        );
+    })
+    .expect("update the shell window");
+}
+
+/// The strip above the tail is the page's fallback scroll when the window is
+/// too short for the cards, so it draws a bar of its own while it overflows and
+/// none when everything fits (#54).
+#[gpui_kit::test]
+async fn the_cards_strip_draws_its_own_scrollbar_while_it_overflows(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let store = SettingsStore::open(paths.config_file.clone());
+    let (window, _shell) = open_shell_at(cx, store, paths, (900., 600.));
+    show_logs(cx, window);
+    cx.update_window(window, |_, window, cx| {
+        let cards = window_rect(window, "logs-cards");
+        let thumb = scrollbar_thumb(window, cards)
+            .expect("the cards strip draws a scrollbar while its controls overflow");
+        assert!(
+            thumb.1 - cards.1 <= 6.,
+            "the strip opens at its top, so the thumb starts at the track's start: {thumb:?} in \
+             {cards:?}"
+        );
+        window.scroll(
+            "logs-cards",
+            ScrollDelta::Pixels(point(px(0.), px(-400.))),
+            cx,
+        );
+        let moved =
+            scrollbar_thumb(window, cards).expect("the scrollbar is still drawn at the end");
+        assert!(
+            moved.1 > thumb.1 + 4.,
+            "a wheel down the strip moves the thumb with the offset: {thumb:?} -> {moved:?}"
+        );
+    })
+    .expect("update the shell window");
+
+    // Everything fits in a tall window, so the strip draws no bar.
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let store = SettingsStore::open(paths.config_file.clone());
+    let (window, _shell) = open_shell_at(cx, store, paths, (1200., 1400.));
+    show_logs(cx, window);
+    cx.update_window(window, |_, window, _| {
+        let cards = window_rect(window, "logs-cards");
+        assert!(
+            scrollbar_thumb(window, cards).is_none(),
+            "a cards strip whose controls fit draws no scrollbar"
         );
     })
     .expect("update the shell window");
@@ -1693,7 +1791,7 @@ async fn a_wheel_over_the_tail_moves_the_tail_and_a_wheel_over_the_cards_moves_t
     .expect("update the shell window");
 }
 /// The tail draws its own scrollbar from the view's own scroll handle: it
-/// appears while the lines overflow, follows the offset a wheel or the jump
+/// shows while the lines overflow, follows the offset a wheel or the jump
 /// control sets, drags to any offset, and is not drawn at all when the lines
 /// fit (#54).
 #[gpui_kit::test]
@@ -1707,11 +1805,17 @@ async fn the_tail_scrollbar_follows_the_scroll_handle_it_was_given(cx: &mut Test
     // motion is off and every frame is a settled one.
     cx.update(|cx| cx.set_reduce_motion(true));
     show_logs(cx, window);
+    // The bar is on screen while the lines overflow, not for two seconds after
+    // the last wheel: past the idle a Scrolling-mode bar hides on, an
+    // overflowing tail still paints it (#54). The bar's idle reads the real
+    // clock, which `advance_clock` does not move, so the test waits it out.
+    std::thread::sleep(Duration::from_millis(2500));
+    settle(cx, window);
 
     let at_end = cx
         .update_window(window, |_, window, cx| {
             let tail = window_rect(window, "logs-lines");
-            let thumb = tail_thumb(window, tail)
+            let thumb = scrollbar_thumb(window, tail)
                 .expect("the tail draws a scrollbar while its lines overflow");
             assert!(
                 tail.1 + tail.3 - (thumb.1 + thumb.3) <= 6.,
@@ -1725,7 +1829,7 @@ async fn the_tail_scrollbar_follows_the_scroll_handle_it_was_given(cx: &mut Test
                 ScrollDelta::Pixels(point(px(0.), px(4000.))),
                 cx,
             );
-            let top = tail_thumb(window, tail).expect("the scrollbar is still drawn at the top");
+            let top = scrollbar_thumb(window, tail).expect("the scrollbar is still drawn at the top");
             assert!(
                 top.1 - tail.1 <= 6.,
                 "a wheel to the tail's start moves the thumb to the track's start: {top:?} in {tail:?}"
@@ -1736,7 +1840,7 @@ async fn the_tail_scrollbar_follows_the_scroll_handle_it_was_given(cx: &mut Test
                 cx,
             );
             let moved =
-                tail_thumb(window, tail).expect("the scrollbar is still drawn mid-way down");
+                scrollbar_thumb(window, tail).expect("the scrollbar is still drawn mid-way down");
             assert!(
                 moved.1 > top.1 + 4.,
                 "a wheel down moves the thumb with the offset: {top:?} -> {moved:?}"
@@ -1754,7 +1858,7 @@ async fn the_tail_scrollbar_follows_the_scroll_handle_it_was_given(cx: &mut Test
     cx.update_window(window, |_, window, cx| {
         let (tail, _) = at_end;
         let jumped =
-            tail_thumb(window, tail).expect("the scrollbar is still drawn after the jump");
+            scrollbar_thumb(window, tail).expect("the scrollbar is still drawn after the jump");
         assert!(
             tail.1 + tail.3 - (jumped.1 + jumped.3) <= 6.,
             "the jump control reaches the tail's end and the thumb follows it: {jumped:?} in {tail:?}"
@@ -1772,7 +1876,7 @@ async fn the_tail_scrollbar_follows_the_scroll_handle_it_was_given(cx: &mut Test
             window.find("logs-line-0").visible(),
             "dragging the thumb to the track's start reaches the oldest line"
         );
-        let dragged = tail_thumb(window, tail).expect("the scrollbar is still drawn");
+        let dragged = scrollbar_thumb(window, tail).expect("the scrollbar is still drawn");
         window.drag(
             point(px(column), px(dragged.1 + dragged.3 / 2.)),
             point(px(column), px(tail.1 + tail.3 - 6.)),
@@ -1799,7 +1903,7 @@ async fn the_tail_scrollbar_follows_the_scroll_handle_it_was_given(cx: &mut Test
     cx.update_window(window, |_, window, cx| {
         let tail = window_rect(window, "logs-lines");
         assert!(
-            tail_thumb(window, tail).is_none(),
+            scrollbar_thumb(window, tail).is_none(),
             "a tail whose lines fit draws no scrollbar"
         );
         let rows = shown_rows(window, 3);

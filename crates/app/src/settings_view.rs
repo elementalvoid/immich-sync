@@ -1444,22 +1444,22 @@ pub(crate) fn section(
 /// One card of related settings that takes the page height the cards above it
 /// leave, for a card whose body is the page's scroll area (the Logs tail, #54).
 ///
-/// The explicit floor is what a window too short for the card keeps: it is at
-/// least as tall as the card's own rows plus the body's minimum, and nothing
-/// squeezes the body to nothing.
+/// The explicit floor is what a window too short for the card keeps. An explicit
+/// floor replaces the card's automatic minimum, which is its body's whole
+/// content height, so `floor_rem` must leave the body its own minimum on top of
+/// the rows the card always shows. It is a parameter because the rows change
+/// with the view's state: the Logs tail adds a paused row below the lines.
 pub(crate) fn filling_section(
     id: &'static str,
     title: &'static str,
     description: &'static str,
     rows: Vec<AnyElement>,
+    floor_rem: f32,
     cx: &App,
 ) -> AnyElement {
     card(id, title, description, rows, cx)
         .flex_1()
-        // An explicit floor replaces the card's automatic minimum, which is its
-        // body's whole content height: 16rem leaves the Logs tail its own
-        // 8rem below the card's header and rows.
-        .min_h(rems(16.))
+        .min_h(rems(floor_rem))
         .into_any_element()
 }
 
