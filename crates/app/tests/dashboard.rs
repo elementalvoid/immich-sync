@@ -865,7 +865,7 @@ fn engine_status_maps_to_the_global_card_and_one_card_per_folder() {
 }
 
 #[gpui_kit::test]
-async fn folder_add_and_remove_controls_reach_the_store(cx: &mut TestAppContext) {
+async fn the_add_control_and_the_detail_remove_reach_the_store(cx: &mut TestAppContext) {
     cx.executor().allow_parking();
     let temp = tempfile::tempdir().expect("create a temp dir");
     let photos = temp.path().join("photos");
@@ -925,14 +925,22 @@ async fn folder_add_and_remove_controls_reach_the_store(cx: &mut TestAppContext)
         window.render_frame(cx);
         let card = window.find(("status-folder", 0_usize));
         assert!(card.visible(), "the new folder has a card");
-        assert_eq!(
-            window.find(("folder-remove", 0_usize)).label(),
-            Some("Remove photos"),
-            "the remove control is named for assistive technology"
+        assert!(
+            window.try_find(("folder-remove", 0_usize)).is_none(),
+            "#53: a source folder card has no Remove control"
         );
-        window.click(("folder-remove", 0_usize), cx);
+        assert!(
+            window.try_find(("folder-details", 0_usize)).is_some(),
+            "#53: the card's footer keeps Details"
+        );
+        // #53: the detail's confirmed Remove is the only removal path.
+        window.click(("folder-details", 0_usize), cx);
+        window.render_frame(cx);
+        window.click("folder-detail-remove", cx);
+        window.render_frame(cx);
+        window.click("folder-detail-remove-confirm", cx);
     })
-    .expect("remove the folder through the dashboard");
+    .expect("remove the folder through its detail");
 
     let mut removed = false;
     for _ in 0..600 {
@@ -945,7 +953,10 @@ async fn folder_add_and_remove_controls_reach_the_store(cx: &mut TestAppContext)
             .await;
         cx.run_until_parked();
     }
-    assert!(removed, "R2.1: the remove control deleted the folder");
+    assert!(
+        removed,
+        "R2.1: the detail's confirmed Remove deleted the folder"
+    );
 }
 
 /// Adds one source folder through the dashboard controls and waits until the

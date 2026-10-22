@@ -211,7 +211,7 @@ fn surface_probe(mode: ViewMode) -> (ElementId, ElementId, bool) {
     match mode {
         ViewMode::Dashboard => (
             "dashboard-scroll".into(),
-            ("folder-remove", SEEDED_FOLDERS - 1).into(),
+            ("folder-details", SEEDED_FOLDERS - 1).into(),
             true,
         ),
         ViewMode::Settings => (
