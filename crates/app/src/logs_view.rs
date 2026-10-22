@@ -499,7 +499,12 @@ impl LogsView {
                     // on a long path. Clamped to the two lines the floor's 4rem
                     // covers; the accessible label keeps the whole text (#54).
                     .line_clamp(2)
-                    .child(notice("logs-problem", problem.clone(), theme.danger, &palette))
+                    .child(notice(
+                        "logs-problem",
+                        problem.clone(),
+                        theme.danger,
+                        &palette,
+                    ))
                     .into_any_element(),
             );
         }
