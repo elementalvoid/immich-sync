@@ -42,7 +42,7 @@ use crate::hash::{Sha1, sha1_file};
 use crate::meter::UploadMeter;
 use crate::missing::{Fate, Host, SizeIndex, fate, is_gone, rename_target};
 use crate::pairing::FolderIndex;
-use crate::paths::{PathCase, is_within, path_key};
+use crate::paths::{PathCase, is_within, key_is_within, path_key};
 use crate::scan::{ScanError, scan_folder};
 use crate::skip::{has_symlink_ancestor, skip_reason_below};
 use crate::status::{AlbumRename, ConnectionHealth, FolderStatus, Status, StatusInputs};
@@ -316,12 +316,17 @@ impl Engine {
         // One limit for the whole client (R7.1), viewed once per folder so a
         // card can read its own share of the bytes it meters (R8.1).
         let bandwidth = BandwidthLimit::new(config.bandwidth_bytes_per_second);
-        let mut entries = Vec::new();
-        for folder in store.folders()? {
-            let counts = store.folder_counts(&folder.path).unwrap_or_else(|error| {
-                tracing::warn!(folder = %folder.path, error = %error, "the folder counts could not be read");
-                FolderCounts::default()
+        // #52: the counts are seeded with the ownership rule, over the one
+        // ordered folder list, so a nested folder's card matches its meter.
+        let stored_folders = store.folders()?;
+        let counts = store
+            .folder_counts_by_owner(&stored_folders)
+            .unwrap_or_else(|error| {
+                tracing::warn!(error = %error, "the folder counts could not be read");
+                vec![FolderCounts::default(); stored_folders.len()]
             });
+        let mut entries = Vec::new();
+        for (folder, counts) in stored_folders.into_iter().zip(counts) {
             // #43: the folder detail keeps its timestamps across a restart.
             let times = store.folder_times(&folder.path).unwrap_or_else(|error| {
                 tracing::warn!(folder = %folder.path, error = %error, "the folder times could not be read");
@@ -964,49 +969,80 @@ impl Observer for EngineObserver {
             return;
         };
         let available = Path::new(&stored.path).is_dir();
-        match folders
-            .iter_mut()
-            .find(|entry| path_key(Path::new(&entry.folder.path)) == key)
-        {
-            Some(entry) => {
-                // The whole row is taken, so the spelling the store wrote is
-                // the one the live entry holds, and no field is left stale.
-                entry.folder = stored.clone();
-                entry.available = available;
-                entry.album = album_of_store(&inner.store, &stored);
-            }
-            None => {
-                // R8.1: a folder new to this engine starts from what the store
-                // already holds for it; a zeroed card would never fill, because
-                // the rows are settled and `prepare` does not count them again.
-                let counts = inner
-                    .store
-                    .folder_counts(&stored.path)
-                    .unwrap_or_else(|error| {
+        let existing = folders
+            .iter()
+            .position(|entry| path_key(Path::new(&entry.folder.path)) == key);
+        // #52: the store upserts the raw `path` and orders by that column, so a
+        // re-add that spells the path differently can move the folder in the
+        // list. For the order and the counts that is an insert.
+        let respelled = existing.is_some_and(|index| folders[index].folder.path != stored.path);
+        if let Some(index) = existing {
+            // The whole row is taken, so the spelling the store wrote is
+            // the one the live entry holds, and no field is left stale.
+            let entry = &mut folders[index];
+            entry.folder = stored.clone();
+            entry.available = available;
+            entry.album = album_of_store(&inner.store, &stored);
+        } else {
+            // R8.1: a folder new to this engine starts from what the store
+            // already holds for it; a zeroed card would never fill, because
+            // the rows are settled and `prepare` does not count them again.
+            // #43: a folder new to this engine starts from the times
+            // the store already holds for it.
+            let times = inner.store.folder_times(&stored.path).unwrap_or_default();
+            folders.push(FolderEntry {
+                available,
+                folder: stored.clone(),
+                counts: FolderCounts::default(),
+                last_error: None,
+                last_scan_ns: times.last_scan_ns,
+                last_upload_ns: times.last_upload_ns,
+                // R8.1: every upload under this folder meters into this
+                // one, under the folder's view of the client limit (R7.1).
+                meter: Arc::new(UploadMeter::new(&inner.bandwidth)),
+                // #47: a folder new to this engine starts from the title
+                // the store already holds for it.
+                album: album_of_store(&inner.store, &stored),
+            });
+        }
+        if existing.is_none() || respelled {
+            // N1: `store.folders()` orders by path, and the first-owner rule
+            // follows that order, so the live list keeps it: a nested folder
+            // added after the folder that contains it owns the same rows a
+            // restart gives it.
+            folders.sort_by(|left, right| left.folder.path.cmp(&right.folder.path));
+        }
+        // #52: a row moves cards only between a folder and one that contains
+        // it or lies inside it. A re-spell with no such neighbour keeps every
+        // live counter it has: the read would replace them with a store
+        // snapshot that lags an upload already in flight.
+        let moves_rows = respelled
+            && folders.iter().any(|entry| {
+                let other = path_key(Path::new(&entry.folder.path));
+                other != key && (key_is_within(&other, &key) || key_is_within(&key, &other))
+            });
+        if existing.is_none() || moves_rows {
+            // #52: the seed is the ownership read over this list. It scans the
+            // table, so it runs with the folder lock released: a status poll
+            // never queues behind it (N2).
+            let ordered: Vec<SourceFolder> =
+                folders.iter().map(|entry| entry.folder.clone()).collect();
+            drop(folders);
+            let counts = inner.store.folder_counts_by_owner(&ordered);
+            folders = inner.folders.lock().expect("the folder lock");
+            // The list the read counted: a later add or remove replaced it and
+            // has a read of its own, whose answer is the newer one.
+            if same_paths(&folders, &ordered) {
+                match counts {
+                    Ok(counts) => apply_owned_counts(&mut folders, &key, counts),
+                    Err(error) => {
                         tracing::warn!(
                             folder = %stored.path,
                             error = %error,
                             "the folder counts could not be read"
                         );
-                        FolderCounts::default()
-                    });
-                // #43: a folder new to this engine starts from the times
-                // the store already holds for it.
-                let times = inner.store.folder_times(&stored.path).unwrap_or_default();
-                folders.push(FolderEntry {
-                    available,
-                    folder: stored.clone(),
-                    counts,
-                    last_error: None,
-                    last_scan_ns: times.last_scan_ns,
-                    last_upload_ns: times.last_upload_ns,
-                    // R8.1: every upload under this folder meters into this
-                    // one, under the folder's view of the client limit (R7.1).
-                    meter: Arc::new(UploadMeter::new(&inner.bandwidth)),
-                    // #47: a folder new to this engine starts from the title
-                    // the store already holds for it.
-                    album: album_of_store(&inner.store, &stored),
-                });
+                    }
+                }
             }
         }
         drop(folders);
@@ -1095,6 +1131,37 @@ impl Observer for EngineObserver {
             return;
         }
         folders.retain(|entry| path_key(Path::new(&entry.folder.path)) != key);
+        // #52: the removed folder's rows move to another card only when a
+        // remaining folder contains it or lies inside it. Otherwise every live
+        // counter stays as it is: a read taken while an upload is in flight
+        // would replace it with an older row.
+        let related = folders.iter().any(|entry| {
+            let other = path_key(Path::new(&entry.folder.path));
+            key_is_within(&other, &key) || key_is_within(&key, &other)
+        });
+        if related {
+            let ordered: Vec<SourceFolder> =
+                folders.iter().map(|entry| entry.folder.clone()).collect();
+            // The read scans the table, so it runs with the folder lock
+            // released: a status poll never queues behind it (N2).
+            drop(folders);
+            let counts = inner.store.folder_counts_by_owner(&ordered);
+            folders = inner.folders.lock().expect("the folder lock");
+            // The list the read counted: a later add or remove replaced it and
+            // has a read of its own, whose answer is the newer one.
+            if same_paths(&folders, &ordered) {
+                match counts {
+                    Ok(counts) => apply_owned_counts(&mut folders, &key, counts),
+                    Err(error) => {
+                        tracing::warn!(
+                            folder = %path,
+                            error = %error,
+                            "the folder counts could not be read"
+                        );
+                    }
+                }
+            }
+        }
         drop(folders);
         let mut watcher = inner.watcher.lock().expect("the watcher lock");
         if let Some(watcher) = watcher.as_mut() {
@@ -1188,9 +1255,9 @@ impl EngineInner {
     /// The owning folder is the first entry that contains the path, as
     /// [`folder_index_in`] decides, so the path is metered once.
     ///
-    /// Note for #44: the pending count seeds from a pure prefix query, so a
-    /// file under a folder and one of its subfolders is counted on both cards
-    /// while its bytes land once.
+    /// #52: the counts seed by the same rule
+    /// ([`crate::store::StateStore::folder_counts_by_owner`]), so a nested
+    /// source folder's card and its meter name one owner.
     ///
     /// A path no folder owns — its folder was removed while the item was
     /// queued — is metered on no card, but its bytes still count in the
@@ -2593,6 +2660,37 @@ fn folder_entry_mut<'a>(folders: &'a mut [FolderEntry], path: &str) -> Option<&'
         .find(|entry| path_key(Path::new(&entry.folder.path)) == key)
 }
 
+/// Whether the live list still holds the paths the ownership read counted.
+///
+/// Only the ordered raw paths decide a row's owner, so an edit to a folder's
+/// other fields inside the read window keeps the answer (#52).
+fn same_paths(folders: &[FolderEntry], ordered: &[SourceFolder]) -> bool {
+    folders
+        .iter()
+        .map(|entry| entry.folder.path.as_str())
+        .eq(ordered.iter().map(|folder| folder.path.as_str()))
+}
+
+/// Applies an ownership read to the live entries a folder edit can move rows
+/// between (#52): `key`'s entry and every entry that contains it or lies inside
+/// it.
+///
+/// A row changes cards only when two folders contain one another, so every
+/// other card keeps its live count: replacing it with the store's snapshot
+/// could lose an increment that landed after the read.
+///
+/// shortcut: a row written just before the read and counted on its card just
+/// after it lands twice until the next start; upgrade if a live card must never
+/// be off by the items in flight.
+fn apply_owned_counts(folders: &mut [FolderEntry], key: &str, counts: Vec<FolderCounts>) {
+    for (entry, counts) in folders.iter_mut().zip(counts) {
+        let other = path_key(Path::new(&entry.folder.path));
+        if other == key || key_is_within(&other, key) || key_is_within(key, &other) {
+            entry.counts = counts;
+        }
+    }
+}
+
 /// Writes one folder timestamp to the store and returns when it happened
 /// (#43).
 ///
@@ -3048,6 +3146,426 @@ mod tests {
             (queued, queued),
             "R8.1: the owner counted every file handed to it"
         );
+    }
+
+    /// #52: removing an outer source folder hands its rows to the next folder
+    /// that contains them, so the card the user keeps counts them at once
+    /// instead of showing nothing until the next start.
+    #[test]
+    fn removing_an_outer_folder_hands_its_rows_to_the_next_owner() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let store =
+            Arc::new(StateStore::open(temp.path().join("state.db")).expect("open the state store"));
+        let outer = temp.path().join("photos");
+        let inner = outer.join("2024");
+        for root in [&outer, &inner] {
+            std::fs::create_dir_all(root).expect("create the folder");
+            store
+                .add_folder(&SourceFolder {
+                    path: root.display().to_string(),
+                    recursive: true,
+                    album_mapping: false,
+                    album_scope: AlbumScope::default(),
+                    album_title: None,
+                })
+                .expect("add the folder");
+        }
+        store
+            .record(&ItemRecord {
+                path: inner.join("photo.jpg").display().to_string(),
+                size: 1,
+                mtime_ns: 0,
+                sha1: Sha1::from_slice(&[0; 20]).expect("a full digest"),
+                asset_id: Some("asset-1".to_string()),
+                state: ItemState::Uploaded,
+                error_class: None,
+                error_message: None,
+                attempts: 0,
+                sidecar: None,
+            })
+            .expect("write the uploaded row");
+        // The session is never used: this test sends no request.
+        let session = crate::connection::Connection::new(
+            "http://127.0.0.1:1",
+            Arc::new(crate::credential::MemoryCredentialStore::new()),
+        )
+        .expect("a valid URL")
+        .shared();
+        let engine = Engine::new(
+            Arc::new(Tracking::new(store)),
+            session,
+            EngineConfig::default(),
+        )
+        .expect("build the engine");
+        assert_eq!(
+            engine.status().folders[0].counts.uploaded,
+            1,
+            "the outer folder is first in path order and owns the row"
+        );
+        assert_eq!(
+            engine.status().folders[1].counts,
+            FolderCounts::default(),
+            "the nested folder owns nothing while the outer folder is there"
+        );
+        // #52: the file's bytes and its row land on one card, so the meter
+        // `meter_for` hands out is the card's own.
+        let owner_meter = {
+            let folders = engine.inner.folders.lock().expect("the folder lock");
+            Arc::clone(&folders[0].meter)
+        };
+        assert!(
+            Arc::ptr_eq(
+                &engine.inner.meter_for(&inner.join("photo.jpg")),
+                &owner_meter
+            ),
+            "#52: the meter and the counts must name the same owner"
+        );
+
+        engine
+            .remove_folder(&outer.display().to_string())
+            .expect("remove the outer folder");
+
+        let folders = engine.status().folders;
+        assert_eq!(folders.len(), 1, "only the nested folder is left");
+        assert_eq!(
+            folders[0].counts.uploaded, 1,
+            "#52: the nested folder owns the row the removed folder held"
+        );
+        assert_eq!(engine.status().counts.uploaded, 1, "the total is unchanged");
+        engine.stop();
+    }
+
+    /// #52: a removal re-reads only the cards a row can move to, so a counter
+    /// the store has not confirmed yet is not replaced by an older snapshot.
+    ///
+    /// The store row of an upload is written before the live counter moves.
+    /// Re-seeding every remaining card from a snapshot taken in that window
+    /// leaves the item counted twice (snapshot plus the later increment) on a
+    /// card the removal never touches. `a` and `b` are siblings, so removing
+    /// `a` moves no row and `b` keeps its live count.
+    #[test]
+    fn removing_an_unrelated_folder_keeps_the_live_counts() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let store =
+            Arc::new(StateStore::open(temp.path().join("state.db")).expect("open the state store"));
+        let first = temp.path().join("a");
+        let second = temp.path().join("b");
+        for root in [&first, &second] {
+            std::fs::create_dir_all(root).expect("create the folder");
+            store
+                .add_folder(&SourceFolder {
+                    path: root.display().to_string(),
+                    recursive: true,
+                    album_mapping: false,
+                    album_scope: AlbumScope::default(),
+                    album_title: None,
+                })
+                .expect("add the folder");
+        }
+        store
+            .record(&ItemRecord {
+                path: second.join("queued.jpg").display().to_string(),
+                size: 1,
+                mtime_ns: 0,
+                sha1: Sha1::from_slice(&[0; 20]).expect("a full digest"),
+                asset_id: None,
+                state: ItemState::Pending,
+                error_class: None,
+                error_message: None,
+                attempts: 0,
+                sidecar: None,
+            })
+            .expect("write the pending row");
+        // The session is never used: this test sends no request.
+        let session = crate::connection::Connection::new(
+            "http://127.0.0.1:1",
+            Arc::new(crate::credential::MemoryCredentialStore::new()),
+        )
+        .expect("a valid URL")
+        .shared();
+        let engine = Engine::new(
+            Arc::new(Tracking::new(store)),
+            session,
+            EngineConfig::default(),
+        )
+        .expect("build the engine");
+        assert_eq!(
+            engine.status().folders[1].counts.pending,
+            1,
+            "the stored row seeds the card"
+        );
+        // In flight: the store already holds the row and the live counter has
+        // moved past it.
+        engine.inner.note_pending(&second.join("queued.jpg"), None);
+        assert_eq!(engine.status().folders[1].counts.pending, 2);
+
+        engine
+            .remove_folder(&first.display().to_string())
+            .expect("remove the unrelated folder");
+
+        let folders = engine.status().folders;
+        assert_eq!(folders.len(), 1, "only the second folder is left");
+        assert_eq!(
+            folders[0].counts.pending, 2,
+            "#52: the removal replaced a live count with an older store snapshot"
+        );
+        engine.stop();
+    }
+
+    /// #52: the live list keeps the store's path order, so a nested folder
+    /// added after the folder inside it owns the same rows the next start does.
+    ///
+    /// `store.folders()` orders by path while the live list used to append, so
+    /// with the inner folder listed first every row stayed on the inner card
+    /// until a restart moved it to the outer one.
+    #[test]
+    fn adding_an_outer_folder_keeps_the_live_counts_in_store_order() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let store =
+            Arc::new(StateStore::open(temp.path().join("state.db")).expect("open the state store"));
+        let outer = temp.path().join("photos");
+        let inner = outer.join("2024");
+        std::fs::create_dir_all(&inner).expect("create the folder");
+        store
+            .add_folder(&SourceFolder {
+                path: inner.display().to_string(),
+                recursive: true,
+                album_mapping: false,
+                album_scope: AlbumScope::default(),
+                album_title: None,
+            })
+            .expect("add the inner folder first");
+        store
+            .record(&ItemRecord {
+                path: inner.join("photo.jpg").display().to_string(),
+                size: 1,
+                mtime_ns: 0,
+                sha1: Sha1::from_slice(&[0; 20]).expect("a full digest"),
+                asset_id: Some("asset-1".to_string()),
+                state: ItemState::Uploaded,
+                error_class: None,
+                error_message: None,
+                attempts: 0,
+                sidecar: None,
+            })
+            .expect("write the uploaded row");
+        // The session is never used: this test sends no request.
+        let session = crate::connection::Connection::new(
+            "http://127.0.0.1:1",
+            Arc::new(crate::credential::MemoryCredentialStore::new()),
+        )
+        .expect("a valid URL")
+        .shared();
+        let engine = Engine::new(
+            Arc::new(Tracking::new(Arc::clone(&store))),
+            session,
+            EngineConfig::default(),
+        )
+        .expect("build the engine");
+        assert_eq!(
+            engine.status().folders[0].counts.uploaded,
+            1,
+            "the only folder owns the row"
+        );
+
+        engine
+            .add_folder(&outer.display().to_string(), true)
+            .expect("add the outer folder mid-session");
+
+        let status = engine.status();
+        let stored = store.folders().expect("read the stored folders");
+        let counts = store
+            .folder_counts_by_owner(&stored)
+            .expect("read the stored counts");
+        assert_eq!(
+            status
+                .folders
+                .iter()
+                .map(|folder| (folder.path.clone(), folder.counts))
+                .collect::<Vec<_>>(),
+            stored
+                .iter()
+                .zip(counts)
+                .map(|(folder, counts)| (folder.path.clone(), counts))
+                .collect::<Vec<_>>(),
+            "#52: the live cards must own what the stored ones own, in the same order"
+        );
+        engine.stop();
+    }
+
+    /// #52: a re-add that spells the path differently rewrites the stored
+    /// `path`, and the store orders by that raw column. The live list must
+    /// re-sort and re-read with it, or its cards and meters name another owner
+    /// than the next start does.
+    ///
+    /// The re-spelled path sorts after the nested one, so the nested folder
+    /// becomes the owner. Windows folds case (R2.4); on Linux a trailing
+    /// separator is dropped from the key and sorts after the nested path's
+    /// separator.
+    #[test]
+    fn a_respelled_re_add_keeps_the_live_counts_in_store_order() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let store =
+            Arc::new(StateStore::open(temp.path().join("state.db")).expect("open the state store"));
+        let outer = temp.path().join("photos");
+        let inner = outer.join("2024");
+        std::fs::create_dir_all(&inner).expect("create the folder");
+        // The raw spellings the store keys as one folder: `before` is stored,
+        // `after` is the re-add, and both sort after the nested path.
+        let (before, inner_path, after) = if cfg!(windows) {
+            let before = outer.with_file_name("PHOTOS").display().to_string();
+            let inner_path = format!("{before}\\2024");
+            (before, inner_path, outer.display().to_string())
+        } else {
+            let before = outer.display().to_string();
+            let inner_path = format!("{before}/2024");
+            let after = format!("{before}\\");
+            (before, inner_path, after)
+        };
+        for path in [&before, &inner_path] {
+            store
+                .add_folder(&SourceFolder {
+                    path: path.clone(),
+                    recursive: true,
+                    album_mapping: false,
+                    album_scope: AlbumScope::default(),
+                    album_title: None,
+                })
+                .expect("add the folder");
+        }
+        store
+            .record(&ItemRecord {
+                path: format!("{inner_path}/photo.jpg"),
+                size: 1,
+                mtime_ns: 0,
+                sha1: Sha1::from_slice(&[0; 20]).expect("a full digest"),
+                asset_id: Some("asset-1".to_string()),
+                state: ItemState::Uploaded,
+                error_class: None,
+                error_message: None,
+                attempts: 0,
+                sidecar: None,
+            })
+            .expect("write the uploaded row");
+        // The session is never used: this test sends no request.
+        let session = crate::connection::Connection::new(
+            "http://127.0.0.1:1",
+            Arc::new(crate::credential::MemoryCredentialStore::new()),
+        )
+        .expect("a valid URL")
+        .shared();
+        let engine = Engine::new(
+            Arc::new(Tracking::new(Arc::clone(&store))),
+            session,
+            EngineConfig::default(),
+        )
+        .expect("build the engine");
+        assert_eq!(
+            engine.status().folders[0].counts.uploaded,
+            1,
+            "the outer folder is first in the stored order and owns the row"
+        );
+
+        engine
+            .add_folder(&after, true)
+            .expect("re-add the outer folder with another spelling");
+
+        let status = engine.status();
+        let stored = store.folders().expect("read the stored folders");
+        let counts = store
+            .folder_counts_by_owner(&stored)
+            .expect("read the stored counts");
+        assert_eq!(
+            status.folders[0].path, inner_path,
+            "the re-spelled outer path sorts after the nested one"
+        );
+        assert_eq!(
+            status
+                .folders
+                .iter()
+                .map(|folder| (folder.path.clone(), folder.counts))
+                .collect::<Vec<_>>(),
+            stored
+                .iter()
+                .zip(counts)
+                .map(|(folder, counts)| (folder.path.clone(), counts))
+                .collect::<Vec<_>>(),
+            "#52: the live cards must own what the stored ones own, in the same order"
+        );
+        engine.stop();
+    }
+
+    /// #52: a re-spelled re-add of a folder that contains no other and lies
+    /// inside none moves no row, so the live counters stay. The ownership read
+    /// would replace them with a store snapshot that lags an upload already in
+    /// flight, and the folder has no neighbour to take a row from anyway.
+    #[test]
+    fn a_respelled_re_add_that_cannot_move_rows_keeps_the_live_counts() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let store =
+            Arc::new(StateStore::open(temp.path().join("state.db")).expect("open the state store"));
+        let photos = temp.path().join("photos");
+        std::fs::create_dir_all(&photos).expect("create the folder");
+        store
+            .add_folder(&SourceFolder {
+                path: photos.display().to_string(),
+                recursive: true,
+                album_mapping: false,
+                album_scope: AlbumScope::default(),
+                album_title: None,
+            })
+            .expect("add the folder");
+        store
+            .record(&ItemRecord {
+                path: photos.join("queued.jpg").display().to_string(),
+                size: 1,
+                mtime_ns: 0,
+                sha1: Sha1::from_slice(&[0; 20]).expect("a full digest"),
+                asset_id: None,
+                state: ItemState::Pending,
+                error_class: None,
+                error_message: None,
+                attempts: 0,
+                sidecar: None,
+            })
+            .expect("write the pending row");
+        // The session is never used: this test sends no request.
+        let session = crate::connection::Connection::new(
+            "http://127.0.0.1:1",
+            Arc::new(crate::credential::MemoryCredentialStore::new()),
+        )
+        .expect("a valid URL")
+        .shared();
+        let engine = Engine::new(
+            Arc::new(Tracking::new(store)),
+            session,
+            EngineConfig::default(),
+        )
+        .expect("build the engine");
+        assert_eq!(engine.status().folders[0].counts.pending, 1);
+        // In flight: the store already holds the row and the live counter has
+        // moved past it.
+        engine.inner.note_pending(&photos.join("queued.jpg"), None);
+        assert_eq!(engine.status().folders[0].counts.pending, 2);
+
+        // The trailing separator is the same path under R2.4 and sorts after
+        // it; the folder is the only entry, so no row can change cards.
+        engine
+            .add_folder(&format!("{}/", photos.display()), true)
+            .expect("re-add the folder with another spelling");
+
+        let folders = engine.status().folders;
+        assert_eq!(folders.len(), 1, "the re-add is the same folder");
+        assert_eq!(
+            folders[0].path,
+            format!("{}/", photos.display()),
+            "the live entry took the spelling the store wrote"
+        );
+        assert_eq!(
+            folders[0].counts.pending, 2,
+            "#52: a re-spell that moves no row replaced a live count with an older snapshot"
+        );
+        engine.stop();
     }
 
     #[test]

@@ -69,16 +69,22 @@ pub fn equal(left: &Path, right: &Path, case: PathCase) -> bool {
 /// Whether `path` is `root` itself or lies below it under `case`.
 #[must_use]
 pub fn is_within(root: &Path, path: &Path, case: PathCase) -> bool {
-    let root = key(root, case);
+    key_is_within(&key(root, case), &key(path, case))
+}
+
+/// Whether the normalized key `path` is `root` itself or lies below it.
+///
+/// Both arguments are [`key`] output, so a caller holding rows that are already
+/// keyed (the state store) applies the same rule without re-normalizing either
+/// side.
+pub(crate) fn key_is_within(root: &str, path: &str) -> bool {
     if root.is_empty() {
         return false;
     }
-    let path = key(path, case);
-    if path == root {
-        return true;
-    }
-    path.strip_prefix(&root)
-        .is_some_and(|rest| rest.starts_with('/'))
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 #[cfg(test)]

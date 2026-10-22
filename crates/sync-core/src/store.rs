@@ -23,7 +23,7 @@ use rusqlite_migration::{M, Migrations};
 
 use crate::failure::FailureClass;
 use crate::hash::Sha1;
-use crate::paths::{PathCase, key, path_key};
+use crate::paths::{PathCase, key, key_is_within, path_key};
 
 /// The first schema (SPEC §5 and issue #5): one row per sync item.
 ///
@@ -1920,48 +1920,66 @@ impl StateStore {
         Ok(changed > 0)
     }
 
-    /// The item counts under one source folder, for its dashboard card
-    /// (R8.1).
+    /// The item counts per source folder, with every row owned by exactly one
+    /// folder, for the dashboard cards (R8.1, #52).
+    ///
+    /// The owner of a row is the first entry in `folders` that contains the
+    /// row's path, the rule the engine meters an upload by, so a file under a
+    /// nested source folder counts on one card and its bytes land on that same
+    /// card. The counts come back in the order the caller passed, and a row no
+    /// folder contains belongs to none, so the cards sum to what they own.
+    ///
+    /// The read runs on a fresh read-only connection (ADR 0005), so a card's
+    /// read never queues behind the engine's writer.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError`] when the query fails.
-    pub fn folder_counts(&self, folder: &str) -> Result<FolderCounts, StoreError> {
-        let prefix = format!("{}/", path_key(Path::new(folder)));
-        let writer = self.writer()?;
-        let mut statement = writer
-            .prepare(
-                "SELECT state, COUNT(*) FROM sync_item
-                 WHERE substr(path_key, 1, length(?1)) = ?1
-                 GROUP BY state",
-            )
+    /// Returns [`StoreError`] when the query fails or a row cannot be read.
+    pub fn folder_counts_by_owner(
+        &self,
+        folders: &[SourceFolder],
+    ) -> Result<Vec<FolderCounts>, StoreError> {
+        if folders.is_empty() {
+            return Ok(Vec::new());
+        }
+        // One pass over the rows. The folder keys are normalized once, and the
+        // comparison is the paths module's own rule (R2.4), so the cards cannot
+        // disagree with the meters about who owns a path.
+        let roots: Vec<String> = folders
+            .iter()
+            .map(|folder| path_key(Path::new(&folder.path)))
+            .collect();
+        let mut counts = vec![FolderCounts::default(); folders.len()];
+        let reader = self.reader()?;
+        let mut statement = reader
+            .prepare("SELECT path_key, state FROM sync_item")
             .map_err(|source| self.query_error(source))?;
         let rows = statement
-            .query_map([&prefix], |row| {
-                let state: String = row.get(0)?;
-                let count: i64 = row.get(1)?;
-                Ok((state, count))
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
             .map_err(|source| self.query_error(source))?;
-        let mut counts = FolderCounts::default();
         for row in rows {
-            let (state, count) = row.map_err(|source| self.query_error(source))?;
-            let count = u32::try_from(count).unwrap_or(u32::MAX);
+            let (key, state) = row.map_err(|source| self.query_error(source))?;
+            let Some(owner) = roots.iter().position(|root| key_is_within(root, &key)) else {
+                continue;
+            };
+            let counts = &mut counts[owner];
             match ItemState::parse(&state) {
                 Some(ItemState::Uploaded | ItemState::Duplicate | ItemState::ReviewKeep) => {
-                    counts.uploaded += count;
+                    counts.uploaded += 1;
                 }
                 Some(ItemState::FailedPermanent | ItemState::RetryWait | ItemState::DeadLetter) => {
-                    counts.failed += count;
+                    counts.failed += 1;
                 }
-                Some(ItemState::Missing) => counts.review += count,
+                Some(ItemState::Missing) => counts.review += 1,
                 // A trashed item is a finished decision: the server copy is in
                 // the trash and the local file is gone, so it is neither work
                 // in flight nor a failure (R5.3).
                 Some(ItemState::ReviewTrash) => {}
                 // A state a newer build wrote still counts as work in flight,
                 // and an unknown state is not silently dropped.
-                _ => counts.pending += count,
+                _ => counts.pending += 1,
             }
         }
         Ok(counts)
