@@ -176,8 +176,9 @@ a key from Immich's account settings.
    this folder**), and **Album title** (blank means the album takes the
    folder's name).
 3. **Add** records the path and all four choices in one write, and the folder's
-   status card appears on the **Dashboard**; **Cancel** writes nothing. Clicking
-   the new card, or its **Details** control, opens **Folder detail**.
+   status card appears on the **Dashboard**; **Cancel** writes nothing. The card
+   summarizes the folder's settings; click the card, or its **Details** control,
+   to change them in **Folder detail**.
 4. **Remove**, in **Folder detail**, stops syncing that folder; the detail asks
    for confirmation first. Nothing is deleted from the server: the folder's
    uploaded assets stay there.
@@ -195,7 +196,9 @@ its card instead of producing one error per file.
 - **Window.** Closing the window hides it; the client keeps running in the tray.
   **Quit** exits the client. Starting the app again focuses the running
   instance instead of starting a second one.
-- **Views.** *Dashboard* (status and folders), *Upload* (send one file now to
+- **Views.** *Dashboard* (status and folders; a folder's card summarizes its
+  recursion, album mapping, and scope, and its detail is where those settings
+  change), *Upload* (send one file now to
   test the pipeline; type the path or click **Browse…**), *Failed items* (files
   the client gave up on, with **Retry**), *Review* (see below), *Settings*,
   *Logs*, *Diagnostics*. **Failed items** and **Review** each have a folder

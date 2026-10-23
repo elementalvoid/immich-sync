@@ -28,7 +28,7 @@ sudo apt-get install -y \
 For the headless window tests and screenshots, add:
 
 ```sh
-sudo apt-get install -y xvfb xauth dbus-daemon imagemagick x11-utils
+sudo apt-get install -y xvfb xauth dbus-daemon imagemagick x11-utils xdotool
 ```
 
 On Windows, use the MSVC Rust toolchain with the Visual Studio C++ build tools.
@@ -122,7 +122,7 @@ dbus-run-session -- xvfb-run -a -s "-screen 0 1440x1000x24" bash -c '
   # screen; at the origin the whole frame is captured.
   xdotool windowmove "$WIN" 0 0
   sleep 3
-  import -window "$WIN" ../docs/screenshot.png
+  import -window "$WIN" docs/screenshot.png
   kill $APP
 '
 ```

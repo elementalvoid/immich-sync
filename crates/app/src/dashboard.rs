@@ -10,7 +10,6 @@ use std::sync::Arc;
 
 use crate::asset_link::{self, LinkOpener};
 use crate::engine::{EngineModel, SyncNowOutcome};
-use crate::folder_controls::{SettingsControls, SettingsIds, SettingsValues};
 use crate::folder_panel::{FolderOpener, FolderPanel, FolderPanelEvent};
 use crate::path_picker::{self, Picked};
 use crate::shell::ViewMode;
@@ -25,7 +24,6 @@ use gpui_kit::component::progress::Progress;
 use gpui_kit::component::tag::Tag;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use sync_core::store::AlbumScope;
 
 /// What the dashboard asks the shell to do (#43).
 ///
@@ -421,30 +419,6 @@ impl Dashboard {
         }
     }
 
-    /// Turns recursive discovery on or off for one source folder (R2.1).
-    ///
-    /// The engine model treats this as the folder's own edit, updates the
-    /// existing folder, and re-watches and rescans it.
-    fn set_folder_recursive(&mut self, path: String, recursive: bool, cx: &mut Context<Self>) {
-        if let Some(engine) = &self.engine {
-            engine.update(cx, |model, cx| model.add_folder(path, recursive, cx));
-        }
-    }
-
-    /// Turns album mapping on or off for one source folder (R3.4).
-    fn set_album_mapping(&mut self, path: String, enabled: bool, cx: &mut Context<Self>) {
-        if let Some(engine) = &self.engine {
-            engine.update(cx, |model, cx| model.set_album_mapping(path, enabled, cx));
-        }
-    }
-
-    /// Sets the album scope for one source folder (R3.4).
-    fn set_album_scope(&mut self, path: String, scope: AlbumScope, cx: &mut Context<Self>) {
-        if let Some(engine) = &self.engine {
-            engine.update(cx, |model, cx| model.set_album_scope(path, scope, cx));
-        }
-    }
-
     /// Shows the connection state on the global card (SPEC R8.1).
     pub fn set_connection(&mut self, state: Option<String>, cx: &mut Context<Self>) {
         if self.model.global.connection != state {
@@ -531,50 +505,6 @@ impl Dashboard {
                     &palette,
                 ))
             })
-    }
-
-    /// The recursion switch, the album mapping switch, and the album scope
-    /// choice for one folder card (R2.1, R3.4), through the shared controls
-    /// the folder detail uses too (#43).
-    ///
-    /// Each control stops the click from reaching the card, which opens the
-    /// folder's detail (#43).
-    fn folder_controls(
-        &self,
-        index: usize,
-        card: &StatusCard,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
-        let path = card.path.clone().unwrap_or_default();
-        let recursive_path = path.clone();
-        let mapping_path = path.clone();
-        SettingsControls::new(
-            SettingsIds {
-                recursive: ("folder-recursive", index).into(),
-                album_mapping: ("folder-album", index).into(),
-                album_leaf: ("folder-album-leaf", index).into(),
-                album_whole: ("folder-album-whole", index).into(),
-            },
-            card.title.clone(),
-            SettingsValues {
-                recursive: card.recursive,
-                album_mapping: card.album_mapping,
-                album_scope: card.album_scope,
-            },
-            cx.listener(move |this, recursive: &bool, _, cx| {
-                this.set_folder_recursive(recursive_path.clone(), *recursive, cx);
-                cx.stop_propagation();
-            }),
-            cx.listener(move |this, enabled: &bool, _, cx| {
-                this.set_album_mapping(mapping_path.clone(), *enabled, cx);
-                cx.stop_propagation();
-            }),
-            cx.listener(move |this, scope: &AlbumScope, _, cx| {
-                this.set_album_scope(path.clone(), *scope, cx);
-                cx.stop_propagation();
-            }),
-        )
-        .render(cx.theme().muted_foreground)
     }
 
     fn header(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -702,7 +632,6 @@ impl Render for Dashboard {
                 Some("status-connection-global".into()),
                 &self.model.global,
                 None,
-                None,
                 cx,
             ))
             .child(folder_bar)
@@ -719,9 +648,6 @@ impl Render for Dashboard {
                         .map(|(index, folder)| {
                             let path = folder.path.clone().unwrap_or_default();
                             let title = folder.title.clone();
-                            let album = live.then(|| {
-                                self.folder_controls(index, folder, cx).into_any_element()
-                            });
                             let details_focus = self.details_focus(&path, cx);
                             // #53: removal is the detail's confirmed action.
                             let footer = live.then(|| {
@@ -761,8 +687,10 @@ impl Render for Dashboard {
                                 .test_support()
                                 .w(rems(17.5))
                                 .flex()
-                                // #43: the card opens the folder's detail; its
-                                // controls stop the click at themselves.
+                                // #43: the card opens the folder's detail. #57:
+                                // the card has no control of its own, so
+                                // nothing needs to stop a click. Its settings
+                                // are read straight into the card's text.
                                 .when(live, |this| {
                                     let path = path.clone();
                                     this.on_click(cx.listener(move |this, _, window, cx| {
@@ -774,7 +702,6 @@ impl Render for Dashboard {
                                     ("status-state-folder", index).into(),
                                     None,
                                     folder,
-                                    album,
                                     footer,
                                     cx,
                                 ))
@@ -841,14 +768,12 @@ pub fn state_border(state: ActivityState, theme: &Theme) -> Hsla {
 
 /// One status card. The text comes from [`StatusCard::content`], so the view
 /// does no formatting. `footer` is the card's control row — its Details control
-/// on a folder card, when the dashboard is attached to an engine (#43, R2.1) —
-/// and `album` the per-folder settings controls (R3.4).
+/// on a folder card, when the dashboard is attached to an engine (#43, R2.1).
 fn status_card(
     id: ElementId,
     state_id: ElementId,
     connection_id: Option<ElementId>,
     card: &StatusCard,
-    album: Option<AnyElement>,
     footer: Option<AnyElement>,
     cx: &App,
 ) -> impl IntoElement {
@@ -961,8 +886,19 @@ fn status_card(
                     .child(scan),
             )
         })
-        .when_some(content.album.clone(), |this, album| {
-            this.child(div().text_sm().text_color(palette.meta).child(album))
+        .when_some(content.settings.clone(), |this, settings| {
+            // #57: the folder's stored settings as text, once each, on the
+            // card that has a folder. A label, not a control: the folder
+            // detail is where they change.
+            this.child(
+                div()
+                    .id((id.clone(), "settings"))
+                    .test_support()
+                    .aria_label(settings.clone())
+                    .text_sm()
+                    .text_color(palette.meta)
+                    .child(settings),
+            )
         });
 
     if let Some(connection) = content.connection.clone()
@@ -987,9 +923,6 @@ fn status_card(
             theme.danger,
             &palette,
         ));
-    }
-    if let Some(album) = album {
-        root = root.child(album);
     }
     if let Some(footer) = footer {
         root = root.child(footer);
