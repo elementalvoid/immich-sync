@@ -5,8 +5,11 @@
 //! the whole dashboard. The rendered-view test opens a real headless window and
 //! reads native accessibility properties and layout bounds.
 
+mod common;
+
 use std::collections::BTreeSet;
 
+use common::scroll_dashboard_into_view;
 use gpui_kit::component::Theme;
 use gpui_kit::component::ThemeMode;
 use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
@@ -252,9 +255,13 @@ fn the_card_states_the_folder_settings_once() {
         .find(|folder| folder.album_mapping && folder.album_scope == AlbumScope::WholeFolder)
         .expect("the sample data has a mapped folder");
     assert_eq!(
-        mapped.content().settings.as_deref(),
-        Some("Recursive: on · Album mapping: on · Album scope: One album for this folder"),
-        "#57: the card states recursion, mapping, and scope once each"
+        mapped.content().settings,
+        Some(vec![
+            "Recursive: on".to_string(),
+            "Album mapping: on".to_string(),
+            "Album scope: One album for this folder".to_string(),
+        ]),
+        "#57: the card states recursion, mapping, and scope once each, one per line"
     );
 
     let off = model
@@ -263,8 +270,11 @@ fn the_card_states_the_folder_settings_once() {
         .find(|folder| !folder.album_mapping)
         .expect("the sample data has an unmapped folder");
     assert_eq!(
-        off.content().settings.as_deref(),
-        Some("Recursive: on · Album mapping: off"),
+        off.content().settings,
+        Some(vec![
+            "Recursive: on".to_string(),
+            "Album mapping: off".to_string(),
+        ]),
         "#57: the scope is left out while the mapping is not in force"
     );
 
@@ -465,6 +475,10 @@ fn dashboard_shows_named_controls_and_one_card_per_folder(cx: &mut TestAppContex
 
         let model = sample();
         for (index, folder) in model.folders.iter().enumerate() {
+            // #57: one setting per line makes the cards taller, so a card that
+            // wrapped to a second row sits below the fold on a short window;
+            // the dashboard scrolls (R8.1).
+            scroll_dashboard_into_view(window, cx, ("status-folder", index));
             let card = window.find(("status-folder", index));
             assert!(card.visible(), "folder card {index} is visible");
             assert!(

@@ -887,17 +887,19 @@ fn status_card(
             )
         })
         .when_some(content.settings.clone(), |this, settings| {
-            // #57: the folder's stored settings as text, once each, on the
-            // card that has a folder. A label, not a control: the folder
-            // detail is where they change.
+            // #57: one setting per line, so the narrow card cannot split a key
+            // from its value. A label, not a control: the folder detail is
+            // where they change.
             this.child(
                 div()
                     .id((id.clone(), "settings"))
                     .test_support()
-                    .aria_label(settings.clone())
+                    .aria_label(settings.join(" · "))
+                    .flex()
+                    .flex_col()
                     .text_sm()
                     .text_color(palette.meta)
-                    .child(settings),
+                    .children(settings),
             )
         });
 

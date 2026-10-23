@@ -102,10 +102,11 @@ pub struct CardContent {
     pub progress_percent: String,
     pub counts: String,
     pub review: Option<String>,
-    /// The folder's stored settings in one line: recursion, album mapping,
-    /// and, only while the mapping is on, the scope (#57). `None` on the card
-    /// that has no folder of its own.
-    pub settings: Option<String>,
+    /// The folder's stored settings, one line each: recursion, album mapping,
+    /// and, only while the mapping is on, the scope (#57). One setting per
+    /// line, so the narrow card cannot split a key from its value. `None` on
+    /// the card that has no folder of its own.
+    pub settings: Option<Vec<String>>,
     /// Whether the folder is readable; the counts line says so when it is not.
     pub available: bool,
     /// The upload line, on the global card (R8.1): the rate and the uploads on
@@ -149,15 +150,17 @@ impl StatusCard {
             // scope is left out while the mapping is off, because it is not in
             // force yet (R3.4).
             settings: self.path.as_ref().map(|_| {
-                let mut line = format!(
-                    "Recursive: {} · Album mapping: {}",
-                    if self.recursive { "on" } else { "off" },
-                    if self.album_mapping { "on" } else { "off" }
-                );
+                let mut lines = vec![
+                    format!("Recursive: {}", if self.recursive { "on" } else { "off" }),
+                    format!(
+                        "Album mapping: {}",
+                        if self.album_mapping { "on" } else { "off" }
+                    ),
+                ];
                 if self.album_mapping {
-                    line.push_str(&format!(" · Album scope: {}", self.album_scope.label()));
+                    lines.push(format!("Album scope: {}", self.album_scope.label()));
                 }
-                line
+                lines
             }),
             available: self.available,
             // R8.1: the line sums the folders, so it belongs to the card that
