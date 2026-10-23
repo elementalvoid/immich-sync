@@ -92,7 +92,7 @@ fn seed_capture_state() {
                 path: folder.display().to_string(),
                 recursive: true,
                 // R3.4: the capture shows one mapped and one unmapped folder, so
-                // the album scope controls are visible in both states.
+                // the card states the album scope and the mapping-off form.
                 album_mapping,
                 album_scope: if album_mapping {
                     AlbumScope::WholeFolder
