@@ -1,7 +1,17 @@
 name: ci
 
+# `push` is limited to the branches this repository pushes on its own: main,
+# and `integration/v1`, which the implement loop pushes for verification and
+# where no pull request exists (implement-orchestrator-rules.md, decision 1
+# and step 6). A bare `push:` also fired for every pull request branch, and a
+# pull request reports the merge ref rather than the branch tip, so the two
+# runs have different refs and different concurrency groups: every check ran
+# twice, and neither run replaced the other.
 on:
   push:
+    branches:
+      - main
+      - integration/**
   pull_request:
 
 env:
