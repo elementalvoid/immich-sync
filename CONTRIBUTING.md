@@ -134,6 +134,8 @@ A blank or crashed window is a single `#000000` histogram bin; `identify
 
 - Use a conventional subject with a scope, as the history does:
   `feat(app): ...`, `fix(client): ...`, `test(app): ...`, `docs(spec): ...`.
+  These subjects are what release-please turns into the changelog, so the type
+  and scope are read by more than humans.
 - One logical change per commit; explain the *why* in the body when it is not
   obvious.
 - Add a failing test first for behaviour changes. UI changes need headless GPUI
@@ -145,10 +147,28 @@ A blank or crashed window is a single `#000000` histogram bin; `identify
 
 For maintainers.
 
-- **Trigger.** Pushing a tag `v<version>` builds and publishes a GitHub release.
-  The version must equal `version` in `crates/app/Cargo.toml`; the workflow
-  fails before building when it does not. **Run workflow** (manual dispatch)
-  builds the same packages without publishing a release.
+- **Trigger.** [release-please](https://github.com/googleapis/release-please)
+  keeps one release pull request open on `main`. Merging it writes the version
+  into the crate manifests and `Cargo.lock`, prepends the `CHANGELOG.md` entry,
+  tags `v<version>` and creates the GitHub release **as a draft**. It then calls
+  `release.yml` as a reusable workflow to build the packages into that draft and
+  publish it, so a broken build leaves nothing public. A tag pushed by hand
+  triggers `release.yml` directly and builds and publishes the same way.
+- **Version.** The workspace root is a package too
+  (`immich-sync-workspace`), holding no code: release-please's `rust` strategy
+  refuses a virtual manifest, and versioning every member in lockstep is what
+  keeps `Cargo.lock` in step with the released version. Only `crates/app`
+  ships, and every crate is `publish = false`. The tag must equal `version` in
+  `crates/app/Cargo.toml`; the workflow fails before building when it does not.
+  **Run workflow** (manual dispatch, no tag) builds the packages without
+  publishing a release.
+- **Bootstrap.** `.release-please-manifest.json` holds the last released
+  version and is written by release-please, never by hand. It started at
+  `0.0.0`, so the first release came out as the `0.1.0` the app already
+  reported rather than a bump past it.
+- **Checks on a release pull request.** A pull request the Actions token opens
+  starts no `ci.yml`. Read the diff: only the generated version files, the
+  manifest and the changelog change.
 - **What is built.** [`cargo-packager`](https://github.com/crabnebula-dev/cargo-packager)
   (version pinned in the workflow) builds the NSIS installer on `windows-latest`
   and the deb and AppImage on `ubuntu-24.04`. The packager configuration lives

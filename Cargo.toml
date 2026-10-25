@@ -1,6 +1,27 @@
+# The root is a package as well as the workspace, with no code of its own
+# (`src/lib.rs` is a doc comment). release-please's `rust` strategy refuses a
+# virtual manifest, and versioning every member in lockstep is what keeps
+# `Cargo.lock` in step with the released version.
+[package]
+name = "immich-sync-workspace"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
 [workspace]
 resolver = "3"
 members = [
+    "crates/app",
+    "crates/immich-client",
+    "crates/mock-immich",
+    "crates/sync-core",
+]
+# The root package above has no code. Without this, a bare `cargo build`
+# builds only it, and `cargo build --bin immich-sync` no longer finds the bin.
+# `--workspace` still covers every member.
+default-members = [
     "crates/app",
     "crates/immich-client",
     "crates/mock-immich",
