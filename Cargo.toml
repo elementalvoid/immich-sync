@@ -18,6 +18,15 @@ members = [
     "crates/mock-immich",
     "crates/sync-core",
 ]
+# The root package above has no code. Without this, a bare `cargo build`
+# builds only it, and `cargo build --bin immich-sync` no longer finds the bin.
+# `--workspace` still covers every member.
+default-members = [
+    "crates/app",
+    "crates/immich-client",
+    "crates/mock-immich",
+    "crates/sync-core",
+]
 
 [workspace.package]
 edition = "2024"
