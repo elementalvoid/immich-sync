@@ -39,18 +39,15 @@ server copy.
 v1 targets Windows 10/11 (x64) and Linux desktops and is developed against
 Immich v3.3.x. macOS is not part of v1.
 
-> **No packaged release is published yet.** The first release will appear on the
-> [releases page](https://github.com/elementalvoid/immich-sync/releases). Until
-> then, build from source — see
-> [Building from source](CONTRIBUTING.md#building-from-source). Windows builds
-> are unsigned for now, so SmartScreen warns on first launch.
+> **Packages are unsigned.** Windows builds are unsigned for now, so SmartScreen
+> warns on first launch.
 
 ## Install
 
 Requirements: Windows 10/11 (x64), or a Linux desktop with a Vulkan-capable
 driver, and an Immich server reachable over HTTPS.
 
-When a release is published, download the packages from the
+Download the packages from the
 [releases page](https://github.com/elementalvoid/immich-sync/releases). Each
 release carries, for version `<version>`:
 

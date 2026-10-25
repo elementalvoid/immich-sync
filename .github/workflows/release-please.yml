@@ -1,0 +1,44 @@
+name: release-please
+
+# Keeps one release pull request open against main. When it is merged this
+# creates the tag and a draft GitHub release, then calls release.yml to build
+# the packages into that draft. The release only goes public once its
+# installers are attached, so a failed build publishes nothing.
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-24.04
+    # Two merges in quick succession would otherwise race on the same release
+    # pull request and the same manifest. Never cancel one halfway through an
+    # update.
+    concurrency:
+      group: release-please
+      cancel-in-progress: false
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      # release-please-action v5.0.0, pinned by SHA like ci.yml.
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # yamllint disable-line rule:line-length
+        id: release
+
+  packages:
+    name: Build and publish the packages
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    # The called workflow's jobs can use no permission this job does not hold.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.release-please.outputs.tag_name }}

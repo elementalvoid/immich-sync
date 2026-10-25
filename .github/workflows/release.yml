@@ -1,13 +1,28 @@
+# yamllint disable rule:line-length
+# Pinned action SHAs cannot be wrapped without breaking the reference, and the
+# packager and gh invocations read worse split than long.
 name: release
 
-# Releases are built from a version tag. `workflow_dispatch` builds the same
-# packages without publishing, which is how an unsigned candidate is checked
-# before a tag exists; the tag run is the one that creates the GitHub release.
+# Releases are built from a version tag. A tag pushed by hand triggers this
+# workflow; release-please cannot, because a tag pushed with the Actions token
+# starts no workflow, so `release-please.yml` calls this as a reusable workflow
+# instead. `workflow_dispatch` builds the same packages without publishing,
+# which is how an unsigned candidate is checked before a tag exists.
 on:
   push:
     tags:
       - "v*"
+  workflow_call:
+    inputs:
+      tag:
+        description: "Tag to build and publish"
+        required: true
+        type: string
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build and publish (empty: build only)"
+        required: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -23,23 +38,29 @@ permissions:
 
 jobs:
   # Fails a tag that does not name the version in the manifest, before two
-  # release builds are paid for. A dispatch has no tag, so the step is skipped
+  # release builds are paid for. A dispatch without a tag input skips the step
   # while the job still succeeds (a skipped job would skip its dependents too).
   version:
     name: Version matches the tag
     runs-on: ubuntu-24.04
+    env:
+      # `github.ref_name` on a tag push, the input when called or dispatched.
+      # `github.ref_type` is 'branch' in the other two cases, so the steps
+      # below test this instead of it.
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.tag || github.ref }}
           # Nothing here pushes over git; the token must not land in .git.
           persist-credentials: false
       - name: Compare the tag with the package version
-        if: github.ref_type == 'tag'
+        if: inputs.tag != '' || github.ref_type == 'tag'
         run: |
           set -euo pipefail
           version=$(python3 -c "import tomllib; print(tomllib.load(open('crates/app/Cargo.toml','rb'))['package']['version'])")
-          echo "manifest version: $version, tag: $GITHUB_REF_NAME"
-          test "v$version" = "$GITHUB_REF_NAME"
+          echo "manifest version: $version, tag: $RELEASE_TAG"
+          test "v$version" = "$RELEASE_TAG"
 
   linux:
     name: Linux packages (deb, AppImage)
@@ -54,6 +75,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.tag || github.ref }}
           persist-credentials: false
       - name: Install Rust 1.99.0
         run: |
@@ -115,6 +137,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.tag || github.ref }}
           persist-credentials: false
       - name: Install Rust 1.99.0
         run: |
@@ -148,9 +171,11 @@ jobs:
       - windows
     runs-on: ubuntu-24.04
     permissions:
-      # `gh release create` needs it on a tag run; the dispatch run only
-      # uploads the workflow artifacts.
+      # Publishing the release needs it; a dispatch without a tag only uploads
+      # the workflow artifacts.
       contents: write
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -162,9 +187,12 @@ jobs:
           cd dist
           # Both platforms and every format R11.1 names must be present before
           # the release is hashed or published.
-          test "$(ls ./*.deb 2>/dev/null | wc -l)" -eq 1
-          test "$(ls ./*.AppImage 2>/dev/null | wc -l)" -eq 1
-          test "$(ls ./*-setup.exe 2>/dev/null | wc -l)" -eq 1
+          test "$(find . -maxdepth 1 -type f -name '*.deb' | wc -l)" -eq 1
+          test "$(find . -maxdepth 1 -type f -name '*.AppImage' | wc -l)" -eq 1
+          test "$(find . -maxdepth 1 -type f -name '*-setup.exe' | wc -l)" -eq 1
+          # SHA256SUMS is excluded by name on the next line, which is the hazard
+          # SC2094 describes.
+          # shellcheck disable=SC2094
           find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%P\0' \
             | sort -z | xargs -0 -r sha256sum > SHA256SUMS
           cat SHA256SUMS
@@ -174,15 +202,24 @@ jobs:
           path: dist/SHA256SUMS
           if-no-files-found: error
       - name: Publish the GitHub release
-        if: github.ref_type == 'tag'
+        if: inputs.tag != '' || github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # A re-run of a failed tag build finds the release already there.
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          # release-please creates the release as a draft, so the packages can
+          # be attached before anyone sees it. A tag pushed by hand has no
+          # release yet and is created published, with the packages in place.
+          if draft=$(gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null); then
+            gh release upload "$RELEASE_TAG" dist/* \
+              --clobber --repo "$GITHUB_REPOSITORY"
+            if [ "$draft" = true ]; then
+              gh release edit "$RELEASE_TAG" \
+                --draft=false --repo "$GITHUB_REPOSITORY"
+            fi
           else
-            gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
-              --title "Immich Sync $GITHUB_REF_NAME" --generate-notes
+            gh release create "$RELEASE_TAG" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Immich Sync $RELEASE_TAG" --generate-notes
           fi
