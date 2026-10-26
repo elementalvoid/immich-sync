@@ -775,6 +775,71 @@ async fn a_folder_that_disappears_is_a_folder_status_not_per_file_errors() {
 }
 
 #[tokio::test]
+async fn a_refused_folder_reports_the_files_and_folders_message() {
+    // #65 (R2.5): macOS blocks the first read of a protected folder until the
+    // user allows the app. The folder must read as unavailable with the switch
+    // to change, never as an empty folder and never as a raw I/O error.
+    //
+    // Running as root can list a mode-000 directory, so the test skips itself
+    // then and prints a `SKIP` line.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let photos = temp.path().join("photos");
+        write_file(&photos, "photo.jpg", b"photo");
+        let store = store_in(&temp);
+        add_folder(&store, &photos, true);
+        std::fs::set_permissions(&photos, std::fs::Permissions::from_mode(0o000))
+            .expect("lock the folder");
+        let refused = std::fs::read_dir(&photos).is_err();
+        if !refused {
+            std::fs::set_permissions(&photos, std::fs::Permissions::from_mode(0o755))
+                .expect("unlock the folder");
+            eprintln!(
+                "SKIP a_refused_folder_reports_the_files_and_folders_message: \
+                 this process lists a mode-000 directory, so it is root"
+            );
+            return;
+        }
+
+        let server = MockImmich::start().await;
+        let config = EngineConfig {
+            watch: false,
+            ..EngineConfig::default()
+        };
+        let engine = start_engine(&server, &store, config).await;
+        engine.sync_now();
+        let reported = wait_until(
+            || {
+                let status = engine.status();
+                status.folders.first().is_some_and(|folder| {
+                    !folder.available
+                        && folder.last_error.as_deref() == Some(sync_core::scan::PERMISSION_DENIED)
+                })
+            },
+            Duration::from_secs(15),
+        )
+        .await;
+        let status = engine.status();
+        engine.stop();
+        std::fs::set_permissions(&photos, std::fs::Permissions::from_mode(0o755))
+            .expect("unlock the folder");
+
+        assert!(reported, "the denial was not reported: {status:?}");
+        let folder = status.folders.first().expect("the folder status");
+        assert!(!folder.available, "R2.5: a refused folder is not available");
+        assert_eq!(
+            folder.last_error.as_deref(),
+            Some(sync_core::scan::PERMISSION_DENIED),
+            "the status carries the message that names the setting"
+        );
+        assert_eq!(status.counts.failed, 0, "no per-file errors are raised");
+    }
+}
+
+#[tokio::test]
 async fn a_restart_requeues_a_pending_row_whose_file_is_unchanged() {
     let server = MockImmich::start().await;
     let temp = tempfile::tempdir().expect("create a temp dir");

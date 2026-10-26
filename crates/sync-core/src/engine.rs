@@ -2409,6 +2409,18 @@ async fn scan_once(inner: &Arc<EngineInner>) {
                 set_folder_available(inner, &path, false);
                 tracing::info!(folder = %path, "the source folder is not available");
             }
+            Ok(Err(ScanError::Denied(path))) => {
+                // #65 (R2.5): a folder the operating system refuses says so and
+                // carries the setting that lifts it. It is not an empty folder,
+                // and nothing retries it: the denial lasts until the user
+                // changes System Settings.
+                set_folder_available(inner, &path, false);
+                set_folder_error(inner, &path, crate::scan::PERMISSION_DENIED);
+                tracing::info!(
+                    folder = %path,
+                    "the source folder needs the Files & Folders permission"
+                );
+            }
             Ok(Err(ScanError::Walk(error))) => {
                 set_folder_error(inner, &folder.path, error);
             }

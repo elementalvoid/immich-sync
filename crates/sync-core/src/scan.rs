@@ -4,6 +4,12 @@
 //! folder with `ignore` and applies the same skip predicate as the watcher
 //! (R2.2), so both discovery paths agree on what a file is. A folder that has
 //! disappeared is reported as such, never as a per-file error (R2.5).
+//!
+//! A folder the operating system refuses to read is reported as refused too: on
+//! macOS the first read of Desktop, Documents, Downloads, and the volume roots
+//! waits for the Files & Folders permission, and a denial lasts until the user
+//! changes System Settings. Rendering it as an empty folder would hide the one
+//! thing the user has to do (#65).
 
 use std::path::PathBuf;
 
@@ -28,8 +34,30 @@ pub struct ScanReport {
 pub enum ScanError {
     /// The source folder is not an accessible directory (R2.5).
     Missing(String),
+    /// The operating system refused this process the folder (R2.5): the macOS
+    /// Files & Folders permission, or a mode bit. It is not an empty folder.
+    Denied(String),
     /// The walk itself failed.
     Walk(String),
+}
+
+/// The sentence a source folder the operating system refuses shows (R2.5).
+///
+/// macOS blocks the first read of a protected folder and keeps blocking it
+/// until the user allows the app, so the message names the switch that lifts
+/// the denial. The map from a refusal to it is platform-neutral; the wording is
+/// the macOS one because that is where the denial is permanent and invisible.
+pub const PERMISSION_DENIED: &str = "macOS is blocking access to this folder. Open System \
+     Settings › Privacy & Security › Files & Folders and allow Immich Sync.";
+
+/// The folder error a failed `read_dir` is, when the operating system refused
+/// this process the folder (#65).
+///
+/// Any other failure is left to the missing-folder check, which has always
+/// answered it.
+fn read_denial(path: &str, error: &std::io::Error) -> Option<ScanError> {
+    (error.kind() == std::io::ErrorKind::PermissionDenied)
+        .then(|| ScanError::Denied(path.to_string()))
 }
 
 /// Walks one source folder and returns the files the sync should consider.
@@ -40,10 +68,20 @@ pub enum ScanError {
 ///
 /// # Errors
 ///
-/// Returns [`ScanError::Missing`] when the folder cannot be read as a
+/// Returns [`ScanError::Denied`] when the operating system refuses this process
+/// the folder, [`ScanError::Missing`] when the folder cannot be read as a
 /// directory, and [`ScanError::Walk`] when the walker itself fails.
 pub fn scan_folder(folder: &SourceFolder) -> Result<ScanReport, ScanError> {
     let root = std::path::Path::new(&folder.path);
+    // #65: asked before the walk, because the walker reports a folder it may
+    // not list as a folder with no files, and the dashboard would show an
+    // empty one. Nothing retries a denial: it lasts until the user allows the
+    // app in System Settings.
+    if let Err(error) = std::fs::read_dir(root)
+        && let Some(denied) = read_denial(&folder.path, &error)
+    {
+        return Err(denied);
+    }
     if !root.is_dir() {
         return Err(ScanError::Missing(folder.path.clone()));
     }
@@ -218,5 +256,69 @@ mod tests {
         let error = scan_folder(&folder(&missing, true)).expect_err("the folder is gone");
 
         assert_eq!(error, ScanError::Missing(missing.display().to_string()));
+    }
+
+    /// #65: a folder that is genuinely empty is an empty scan, never a denial.
+    #[test]
+    fn an_empty_folder_scans_as_empty_and_is_not_a_denial() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+
+        let report = scan_folder(&folder(temp.path(), true)).expect("an empty folder scans");
+
+        assert!(report.files.is_empty(), "an empty folder holds no files");
+    }
+
+    /// #65: the refusal is its own folder error, and the message it renders
+    /// names the setting that lifts it. Both halves are decided here, so a
+    /// Linux test covers what a macOS denial maps to.
+    #[test]
+    fn a_refused_folder_read_maps_to_a_denial_with_the_setting_to_change() {
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+
+        assert_eq!(
+            read_denial("/photos", &denied),
+            Some(ScanError::Denied("/photos".to_string()))
+        );
+        assert_eq!(
+            read_denial("/photos", &missing),
+            None,
+            "only a refusal is a denial; a missing folder keeps its own error"
+        );
+        assert!(
+            PERMISSION_DENIED.contains("System Settings › Privacy & Security › Files & Folders"),
+            "the message names the setting: {PERMISSION_DENIED}"
+        );
+        assert!(
+            PERMISSION_DENIED.contains("Immich Sync"),
+            "the message names the app to allow: {PERMISSION_DENIED}"
+        );
+    }
+
+    /// The same rule against a directory this process really may not list.
+    /// Running as root can list a mode-000 directory, so the test skips itself
+    /// then and prints a `SKIP` line.
+    #[cfg(unix)]
+    #[test]
+    fn a_mode_zero_folder_is_refused_as_a_denial_unless_run_as_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let locked = temp.path().join("locked");
+        std::fs::create_dir(&locked).expect("create the folder");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+            .expect("lock the folder");
+        let scanned = scan_folder(&folder(&locked, true));
+        // Restored before the tempdir drops, so its cleanup can empty it.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))
+            .expect("unlock the folder");
+
+        match scanned {
+            Ok(_) => eprintln!(
+                "SKIP a_mode_zero_folder_is_refused_as_a_denial_unless_run_as_root: \
+                 this process lists a mode-000 directory, so it is root"
+            ),
+            Err(error) => assert_eq!(error, ScanError::Denied(locked.display().to_string())),
+        }
     }
 }
