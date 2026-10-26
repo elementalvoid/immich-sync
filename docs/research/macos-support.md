@@ -230,7 +230,9 @@ command surface. That is a product decision for a later release, not a v1 requir
   event as `EventKind::Other` with `Flag::Rescan`, carrying the folder FSEvents named.
   inotify reports an arriving tree the same way, so the rule and its test run on Linux.
   One hint it does not cover: an inotify queue overflow is the same `Other`/`Rescan`
-  event with no path at all, so it still waits for the periodic scan.
+  event with no path at all, so it still waits for the periodic scan. The hint is inferred
+  from the named path's metadata rather than from `Flag::Rescan`, so a rescan hint for a
+  path that no longer exists is lost to the periodic scan too.
 - **Unpaired renames.** FSEvents cannot pair the two sides of a rename; notify says so
   in `fsevent.rs`. The engine already detects renames by content hash (R5.2), so this
   is handled, but a rename that also changes content will look like delete + create.
