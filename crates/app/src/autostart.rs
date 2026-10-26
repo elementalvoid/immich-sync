@@ -12,10 +12,7 @@ use std::rc::Rc;
 use anyhow::Context as _;
 
 #[cfg(target_os = "macos")]
-use objc2_service_management::{
-    SMAppService, SMAppServiceStatus, kSMErrorAlreadyRegistered, kSMErrorInvalidSignature,
-    kSMErrorJobNotFound,
-};
+use smappservice_rs::{AppService, ServiceManagementError, ServiceStatus, ServiceType};
 
 use crate::paths::AppPaths;
 
@@ -42,21 +39,17 @@ pub trait Autostart {
     /// The text to show when the OS holds the login item but waits for the user
     /// to allow it, or `None` when no approval is pending.
     ///
-    /// macOS registers an item and then leaves it to the user; the setting reads
-    /// as off until they approve it, so the row has to say where.
+    /// macOS registers an item and then leaves the last step to the user, so
+    /// the setting stays on and the row says where to finish it.
     fn approval_needed(&self) -> Option<&'static str> {
         None
     }
 
     /// Opens the OS page where the user approves the login item.
     ///
-    /// # Errors
-    ///
-    /// Returns an error when the platform has no approval step or the page
-    /// cannot be opened.
-    fn open_approval_settings(&self) -> anyhow::Result<()> {
-        anyhow::bail!("this platform has no login-item approval step")
-    }
+    /// The OS reports no result for the open, so a platform with no approval
+    /// step simply does nothing.
+    fn open_approval_settings(&self) {}
 }
 
 /// The autostart backend for this platform.
@@ -228,41 +221,28 @@ impl Autostart for RunKeyAutostart {
     }
 }
 
-/// The bundle identifier from the packager metadata, and so the label of the
-/// login item and of the LaunchAgent file the fallback writes. One label per
-/// app, whichever mechanism carries it.
-#[cfg(target_os = "macos")]
+/// The bundle identifier from the packager metadata (`crates/app/Cargo.toml`),
+/// and so the label of the LaunchAgent file the fallback writes. The login item
+/// itself is addressed by bundle identity and takes no label.
+#[cfg(any(target_os = "macos", test))]
 const MACOS_BUNDLE_ID: &str = "com.elementalvoid.immich-sync";
 
 /// Shown while macOS holds the login item until the user approves it.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const APPROVAL_HINT: &str = "macOS needs your approval in System Settings › General › Login Items.";
 
-/// `kSMErrorInvalidSignature`: the bundle is not signed, so macOS refuses the
-/// login item and ADR 0008 falls back to a LaunchAgent.
-#[cfg(any(target_os = "macos", test))]
-const SM_ERROR_INVALID_SIGNATURE: isize = 3;
-/// `kSMErrorJobNotFound`: nothing is registered, so disabling is already done.
-#[cfg(any(target_os = "macos", test))]
-const SM_ERROR_JOB_NOT_FOUND: isize = 6;
-/// `kSMErrorAlreadyRegistered`: something is registered, so enabling is already
-/// done.
-#[cfg(any(target_os = "macos", test))]
-const SM_ERROR_ALREADY_REGISTERED: isize = 12;
-
-/// The pinned crate's constants these copy, checked when the probe type-checks
-/// the macOS arm, so a pin that moves the numbers fails there.
+/// Shown when the user denied the login item in a system prompt.
 #[cfg(target_os = "macos")]
-const _: () = {
-    assert!(SM_ERROR_INVALID_SIGNATURE == kSMErrorInvalidSignature as isize);
-    assert!(SM_ERROR_JOB_NOT_FOUND == kSMErrorJobNotFound as isize);
-    assert!(SM_ERROR_ALREADY_REGISTERED == kSMErrorAlreadyRegistered as isize);
-};
+const LAUNCH_DENIED_HINT: &str = "macOS is blocking the login item. Open System Settings › General › Login Items and allow Immich Sync.";
+
+/// Shown when macOS refuses the login item for the bundle's signature.
+#[cfg(target_os = "macos")]
+const INVALID_SIGNATURE_HINT: &str = "macOS refused the login item because the app is not code signed. The LaunchAgent fallback starts the app at login instead.";
 
 /// What macOS reports for the app's login item, as a plain value.
 ///
-/// The unsafe `status()` call is mapped to this beside the call, so the rule
-/// the switch follows is a value the Linux tests can check.
+/// The crate's `status()` is mapped to this beside the call, so the rule the
+/// switch follows is a value the Linux tests can check.
 #[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LoginItemStatus {
@@ -274,10 +254,11 @@ enum LoginItemStatus {
 
 #[cfg(any(target_os = "macos", test))]
 impl LoginItemStatus {
-    /// Whether the client starts at login. `RequiresApproval` reads as off: the
-    /// item exists, but the user has not allowed it.
+    /// Whether the client starts at login. `RequiresApproval` reads as on: the
+    /// item is registered, the user has one step left, and the switch must not
+    /// flip itself off while macOS holds the registration.
     const fn is_enabled(self) -> bool {
-        matches!(self, Self::Enabled)
+        matches!(self, Self::Enabled | Self::RequiresApproval)
     }
 
     /// Whether macOS holds the item but waits for the user to allow it.
@@ -286,32 +267,17 @@ impl LoginItemStatus {
     }
 }
 
-/// The result of a register call, once the item's new status is known.
+/// The message for a register or unregister refusal.
 ///
-/// A registration that waits for the user is not success: the setting stays
-/// off and the row says where to approve it.
-#[cfg(any(target_os = "macos", test))]
-fn registration_result(status: LoginItemStatus) -> anyhow::Result<()> {
-    if status.requires_approval() {
-        anyhow::bail!("{APPROVAL_HINT}");
+/// The two refusals the user can act on name the fix; anything else keeps the
+/// crate's own text, which is the only place macOS says why.
+#[cfg(target_os = "macos")]
+fn refusal(error: &ServiceManagementError) -> anyhow::Error {
+    match error {
+        ServiceManagementError::LaunchDeniedByUser => anyhow::anyhow!("{LAUNCH_DENIED_HINT}"),
+        ServiceManagementError::InvalidSignature => anyhow::anyhow!("{INVALID_SIGNATURE_HINT}"),
+        other => anyhow::anyhow!("{other}"),
     }
-    Ok(())
-}
-
-/// Whether an SMError means the requested state already holds.
-#[cfg(any(target_os = "macos", test))]
-fn is_benign(error_code: isize) -> bool {
-    matches!(
-        error_code,
-        SM_ERROR_ALREADY_REGISTERED | SM_ERROR_JOB_NOT_FOUND
-    )
-}
-
-/// The error shown for an SMAppService refusal, with the OS message and code.
-/// The message is never dropped: it is the only place macOS says why.
-#[cfg(any(target_os = "macos", test))]
-fn os_error(action: &str, error_code: isize, message: &str) -> anyhow::Error {
-    anyhow::anyhow!("{action}: {message} (SMError {error_code})")
 }
 
 /// The LaunchAgent plist that starts `executable` at login (ADR 0008).
@@ -352,15 +318,14 @@ fn xml_escape(text: &str) -> String {
 
 /// The macOS login item (SMAppService, macOS 13+).
 ///
-/// An unsigned bundle is refused with `kSMErrorInvalidSignature`; ADR 0008 then
-/// writes a LaunchAgent plist instead, so the setting still works.
+/// An unsigned bundle is refused with `InvalidSignature`; ADR 0008 then writes a
+/// LaunchAgent plist instead, so the setting still works.
 #[cfg(target_os = "macos")]
 #[derive(Clone, Debug)]
 pub struct MacAutostart {
     executable: PathBuf,
-    /// `None` when the platform exposes no home directory; the login item still
-    /// works, only the fallback cannot be written.
-    launch_agents: Option<PathBuf>,
+    /// The directory the unsigned-bundle fallback writes its plist to.
+    launch_agents: PathBuf,
 }
 
 #[cfg(target_os = "macos")]
@@ -369,93 +334,72 @@ impl MacAutostart {
     ///
     /// # Errors
     ///
-    /// Returns an error when the running executable cannot be found.
+    /// Returns an error when the running executable or the home directory
+    /// cannot be found.
     pub fn new() -> anyhow::Result<Self> {
         Ok(Self {
             executable: std::env::current_exe().context("find the running executable")?,
             launch_agents: directories::BaseDirs::new()
-                .map(|base| base.home_dir().join("Library/LaunchAgents")),
+                .context("find the home directory for a login item file")?
+                .home_dir()
+                .join("Library/LaunchAgents"),
         })
     }
 
     /// The LaunchAgent file the unsigned-bundle fallback writes.
-    fn plist_path(&self) -> Option<PathBuf> {
-        self.launch_agents
-            .as_ref()
-            .map(|directory| directory.join(format!("{MACOS_BUNDLE_ID}.plist")))
+    fn plist_path(&self) -> PathBuf {
+        self.launch_agents.join(format!("{MACOS_BUNDLE_ID}.plist"))
     }
 
     /// Whether the fallback, rather than the login item, starts the app.
-    fn launch_agent_installed(&self) -> bool {
-        self.plist_path().is_some_and(|path| path.is_file())
+    ///
+    /// The file counts only when it starts the executable the app runs from:
+    /// launchd keeps the absolute path, so a moved or rebuilt app would leave a
+    /// file that starts nothing while the switch claimed on.
+    fn launch_agent_current(&self) -> bool {
+        std::fs::read_to_string(self.plist_path())
+            .is_ok_and(|plist| plist == launch_agent_plist(MACOS_BUNDLE_ID, &self.executable))
     }
 
     /// Registers the login item, or writes the LaunchAgent when the bundle is
     /// unsigned.
     fn enable(&self) -> anyhow::Result<()> {
-        if self.launch_agent_installed() {
+        if self.launch_agent_current() {
             return Ok(());
         }
-        // SAFETY: `mainAppService` takes no arguments and has no precondition;
-        // SMAppService is not main-thread-only, so any thread may call it.
-        let service = unsafe { SMAppService::mainAppService() };
-        // SAFETY: registration only asks the OS to add the app's login item.
-        match unsafe { service.registerAndReturnError() } {
-            Ok(()) => registration_result(login_item_status()),
-            Err(error) => {
-                let code = error.code();
-                if code == SM_ERROR_INVALID_SIGNATURE {
-                    self.write_launch_agent()
-                } else if is_benign(code) {
-                    // Already registered: succeed, unless the user still has to
-                    // approve the item.
-                    registration_result(login_item_status())
-                } else {
-                    Err(os_error(
-                        "start the app at login",
-                        code,
-                        &error.localizedDescription().to_string(),
-                    ))
-                }
-            }
+        match AppService::new(ServiceType::MainApp).register() {
+            Ok(()) | Err(ServiceManagementError::AlreadyRegistered) => Ok(()),
+            Err(ServiceManagementError::InvalidSignature) => self.write_launch_agent(),
+            Err(error) => Err(refusal(&error).context("start the app at login")),
         }
     }
 
     /// Removes whichever mechanism starts the app at login.
     fn disable(&self) -> anyhow::Result<()> {
-        if let Some(path) = self.plist_path().filter(|path| path.is_file()) {
+        let path = self.plist_path();
+        if path.is_file() {
             std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
         }
-        // SAFETY: `mainAppService` takes no arguments and has no precondition.
-        let service = unsafe { SMAppService::mainAppService() };
-        // SAFETY: unregistration only asks the OS to remove the login item.
-        match unsafe { service.unregisterAndReturnError() } {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                let code = error.code();
-                if is_benign(code) {
-                    Ok(())
-                } else {
-                    Err(os_error(
-                        "stop the app starting at login",
-                        code,
-                        &error.localizedDescription().to_string(),
-                    ))
-                }
-            }
+        match AppService::new(ServiceType::MainApp).unregister() {
+            Ok(()) | Err(ServiceManagementError::JobNotFound) => Ok(()),
+            Err(error) => Err(refusal(&error).context("stop the app starting at login")),
         }
     }
 
-    /// Writes the LaunchAgent that starts the same executable at login.
+    /// Writes the LaunchAgent that starts the current executable at login.
+    ///
+    /// This is the ADR 0008 fallback, so it is recorded: the app then starts at
+    /// login through a second mechanism that no login-item status shows.
     fn write_launch_agent(&self) -> anyhow::Result<()> {
-        let Some(directory) = &self.launch_agents else {
-            anyhow::bail!("no home directory for a login item file");
-        };
-        let path = directory.join(format!("{MACOS_BUNDLE_ID}.plist"));
-        std::fs::create_dir_all(directory)
-            .with_context(|| format!("create {}", directory.display()))?;
+        let path = self.plist_path();
+        std::fs::create_dir_all(&self.launch_agents)
+            .with_context(|| format!("create {}", self.launch_agents.display()))?;
         std::fs::write(&path, launch_agent_plist(MACOS_BUNDLE_ID, &self.executable))
             .with_context(|| format!("write {}", path.display()))?;
+        tracing::warn!(
+            path = %path.display(),
+            "macOS refused the login item for the app's signature; a LaunchAgent now starts it at login"
+        );
         Ok(())
     }
 }
@@ -463,21 +407,18 @@ impl MacAutostart {
 /// Reads the login item state the settings switch shows.
 #[cfg(target_os = "macos")]
 fn login_item_status() -> LoginItemStatus {
-    // SAFETY: `mainAppService` takes no arguments and has no precondition.
-    let service = unsafe { SMAppService::mainAppService() };
-    // SAFETY: `status` only reads the current registration.
-    match unsafe { service.status() } {
-        SMAppServiceStatus::Enabled => LoginItemStatus::Enabled,
-        SMAppServiceStatus::RequiresApproval => LoginItemStatus::RequiresApproval,
-        SMAppServiceStatus::NotRegistered => LoginItemStatus::NotRegistered,
-        _ => LoginItemStatus::NotFound,
+    match AppService::new(ServiceType::MainApp).status() {
+        ServiceStatus::Enabled => LoginItemStatus::Enabled,
+        ServiceStatus::RequiresApproval => LoginItemStatus::RequiresApproval,
+        ServiceStatus::NotRegistered => LoginItemStatus::NotRegistered,
+        ServiceStatus::NotFound => LoginItemStatus::NotFound,
     }
 }
 
 #[cfg(target_os = "macos")]
 impl Autostart for MacAutostart {
     fn is_enabled(&self) -> anyhow::Result<bool> {
-        if self.launch_agent_installed() {
+        if self.launch_agent_current() {
             return Ok(true);
         }
         Ok(login_item_status().is_enabled())
@@ -492,15 +433,14 @@ impl Autostart for MacAutostart {
     }
 
     fn approval_needed(&self) -> Option<&'static str> {
-        login_item_status()
-            .requires_approval()
+        // The fallback already starts the app, so a leftover registration must
+        // not ask for an approval that changes nothing.
+        (!self.launch_agent_current() && login_item_status().requires_approval())
             .then_some(APPROVAL_HINT)
     }
 
-    fn open_approval_settings(&self) -> anyhow::Result<()> {
-        // SAFETY: opens the Login Items pane; no inputs and no precondition.
-        unsafe { SMAppService::openSystemSettingsLoginItems() };
-        Ok(())
+    fn open_approval_settings(&self) {
+        AppService::open_system_settings_login_items();
     }
 }
 
@@ -532,15 +472,15 @@ impl Autostart for UnavailableAutostart {
 mod tests {
     use std::path::Path;
 
-    use super::{
-        LoginItemStatus, SM_ERROR_ALREADY_REGISTERED, SM_ERROR_INVALID_SIGNATURE,
-        SM_ERROR_JOB_NOT_FOUND, is_benign, launch_agent_plist, os_error, registration_result,
-    };
+    use super::{LoginItemStatus, MACOS_BUNDLE_ID, launch_agent_plist};
 
     #[test]
-    fn only_an_enabled_login_item_reads_as_on() {
+    fn a_registered_login_item_reads_as_on() {
         assert!(LoginItemStatus::Enabled.is_enabled());
-        assert!(!LoginItemStatus::RequiresApproval.is_enabled());
+        assert!(
+            LoginItemStatus::RequiresApproval.is_enabled(),
+            "the registration exists, so the switch must not flip itself off"
+        );
         assert!(!LoginItemStatus::NotRegistered.is_enabled());
         assert!(!LoginItemStatus::NotFound.is_enabled());
     }
@@ -558,34 +498,11 @@ mod tests {
     }
 
     #[test]
-    fn a_registration_that_waits_for_approval_is_not_success() {
-        assert!(registration_result(LoginItemStatus::Enabled).is_ok());
-        let error = registration_result(LoginItemStatus::RequiresApproval)
-            .expect_err("a pending approval must not claim success");
+    fn the_launch_agent_label_is_the_packager_identifier() {
         assert!(
-            format!("{error:#}").contains("System Settings"),
-            "the failure says where to approve it"
+            include_str!("../Cargo.toml").contains(&format!("identifier = \"{MACOS_BUNDLE_ID}\"")),
+            "the LaunchAgent label must stay the bundle identifier the package is built with"
         );
-    }
-
-    #[test]
-    fn the_benign_sm_errors_mean_the_state_already_holds() {
-        assert!(is_benign(SM_ERROR_ALREADY_REGISTERED));
-        assert!(is_benign(SM_ERROR_JOB_NOT_FOUND));
-        assert!(!is_benign(SM_ERROR_INVALID_SIGNATURE));
-        assert!(!is_benign(11), "kSMErrorLaunchDeniedByUser is a refusal");
-        assert!(!is_benign(0));
-    }
-
-    #[test]
-    fn an_os_refusal_keeps_the_os_message_and_code() {
-        let message = format!(
-            "{:#}",
-            os_error("start the app at login", 11, "The operation was denied.")
-        );
-        assert!(message.contains("start the app at login"), "{message}");
-        assert!(message.contains("The operation was denied."), "{message}");
-        assert!(message.contains("11"), "{message}");
     }
 
     #[test]
@@ -609,5 +526,37 @@ mod tests {
             "{plist}"
         );
         assert!(plist.contains("<key>RunAtLoad</key>\n\t<true/>"), "{plist}");
+    }
+}
+
+/// The message mapping needs the macOS-only crate, so macOS CI runs these; the
+/// probe type-checks them, and the Linux tests above keep the decisions they do
+/// not reach.
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+    use super::{INVALID_SIGNATURE_HINT, LAUNCH_DENIED_HINT, refusal};
+    use smappservice_rs::ServiceManagementError;
+
+    #[test]
+    fn a_refusal_the_user_can_act_on_names_the_fix() {
+        assert_eq!(
+            format!("{:#}", refusal(&ServiceManagementError::LaunchDeniedByUser)),
+            LAUNCH_DENIED_HINT
+        );
+        assert_eq!(
+            format!("{:#}", refusal(&ServiceManagementError::InvalidSignature)),
+            INVALID_SIGNATURE_HINT
+        );
+    }
+
+    #[test]
+    fn any_other_refusal_keeps_the_os_text() {
+        let known = format!(
+            "{:#}",
+            refusal(&ServiceManagementError::AuthorizationFailure)
+        );
+        assert!(known.contains("authorization"), "{known}");
+        let unknown = format!("{:#}", refusal(&ServiceManagementError::Unknown(99)));
+        assert!(unknown.contains("99"), "{unknown}");
     }
 }

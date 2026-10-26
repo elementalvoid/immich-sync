@@ -102,10 +102,11 @@ impl FakeAutostart {
     }
 
     /// A backend whose entry is registered but waits for the user, as macOS
-    /// does after `SMAppService.register()`.
+    /// does after `SMAppService.register()`. The registration exists, so the
+    /// entry reads as enabled.
     fn awaiting_approval() -> Rc<Self> {
         Rc::new(Self {
-            enabled: Cell::new(false),
+            enabled: Cell::new(true),
             refuse: false,
             unreadable: false,
             approval: Some("macOS needs your approval in System Settings › General › Login Items."),
@@ -134,9 +135,8 @@ impl Autostart for FakeAutostart {
         self.approval
     }
 
-    fn open_approval_settings(&self) -> anyhow::Result<()> {
+    fn open_approval_settings(&self) {
         self.approval_opened.set(true);
-        Ok(())
     }
 }
 
@@ -921,8 +921,8 @@ fn an_unapproved_login_item_shows_where_to_approve_it(cx: &mut TestAppContext) {
         );
         assert_eq!(
             window.find("settings-autostart").checked(),
-            Some(false),
-            "an item waiting for approval reads as off"
+            Some(true),
+            "an item waiting for approval is registered, so it reads as on"
         );
         assert_eq!(
             window.find("settings-autostart-approve").label(),
@@ -936,10 +936,6 @@ fn an_unapproved_login_item_shows_where_to_approve_it(cx: &mut TestAppContext) {
     assert!(
         backend.approval_opened.get(),
         "the control opens the approval settings page"
-    );
-    assert!(
-        !SettingsStore::open(paths.config_file).settings().autostart,
-        "a pending approval is not recorded as on"
     );
 
     // A platform with no approval step shows no row and no control.
