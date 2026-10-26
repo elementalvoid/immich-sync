@@ -32,6 +32,18 @@ use immich_sync::upload_view::UploadView;
 use immich_sync::{status, theme};
 use sync_core::credential::{MemoryCredentialStore, SharedCredentialStore};
 
+/// The copy chord the Root binds on this platform.
+///
+/// gpui-base binds `cmd-c` on macOS and `ctrl-c` elsewhere (`root.rs`), so a
+/// test that hardcodes `ctrl-c` copies nothing on macOS.
+fn copy_chord() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "cmd-c"
+    } else {
+        "ctrl-c"
+    }
+}
+
 fn temporary_paths(dir: &Path) -> AppPaths {
     AppPaths {
         config_file: dir.join("config").join("settings.toml"),
@@ -657,7 +669,7 @@ async fn a_drag_across_lines_and_ctrl_c_copies_the_selection(cx: &mut TestAppCon
             Some(true),
             "the dragged tail holds keyboard focus, so Ctrl+C can reach it"
         );
-        window.press("ctrl-c", cx);
+        window.press(copy_chord(), cx);
     })
     .expect("update the shell window");
 
@@ -732,7 +744,7 @@ async fn a_refresh_clears_the_old_selection_and_the_new_tail_still_copies(cx: &m
         window.blur(cx);
         window.render_frame(cx);
         drag_across(window, cx, 0, 3);
-        window.press("ctrl-c", cx);
+        window.press(copy_chord(), cx);
     })
     .expect("update the shell window");
 
@@ -1038,7 +1050,7 @@ async fn scrolling_up_pauses_the_tail_and_counts_the_lines_it_misses(cx: &mut Te
         window.blur(cx);
         window.render_frame(cx);
         drag_across(window, cx, first, second);
-        window.press("ctrl-c", cx);
+        window.press(copy_chord(), cx);
     })
     .expect("update the shell window");
     let copied = cx
@@ -1221,7 +1233,7 @@ async fn jump_to_latest_loads_the_current_tail_and_follows_again(cx: &mut TestAp
         window.blur(cx);
         window.render_frame(cx);
         drag_across(window, cx, first, last);
-        window.press("ctrl-c", cx);
+        window.press(copy_chord(), cx);
     })
     .expect("update the shell window");
     let copied = cx
