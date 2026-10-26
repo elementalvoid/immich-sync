@@ -263,23 +263,97 @@ impl LoginItemStatus {
     }
 }
 
+/// Why macOS refused a login-item call, as a plain value.
+///
+/// It names only the differences the switch acts on: every other documented
+/// error keeps the crate's own text and stays an error.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Refusal {
+    /// The bundle's signature does not meet ServiceManagement's requirements.
+    InvalidSignature,
+    /// ServiceManagement failed internally.
+    InternalFailure,
+    /// The user denied the login item in a system prompt.
+    LaunchDeniedByUser,
+    /// Any other documented ServiceManagement error.
+    Documented,
+    /// A code the crate does not recognize; Apple's public constants start at 2.
+    Unknown(u32),
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl Refusal {
+    /// The refusal macOS reported.
+    #[cfg(target_os = "macos")]
+    fn of(error: &ServiceManagementError) -> Self {
+        match error {
+            ServiceManagementError::InvalidSignature => Self::InvalidSignature,
+            ServiceManagementError::InternalFailure => Self::InternalFailure,
+            ServiceManagementError::LaunchDeniedByUser => Self::LaunchDeniedByUser,
+            ServiceManagementError::Unknown(code) => Self::Unknown(*code),
+            _ => Self::Documented,
+        }
+    }
+
+    /// Whether the refusal means this bundle cannot be a login item, so the
+    /// LaunchAgent starts the app instead (ADR 0008).
+    ///
+    /// `InternalFailure` and `Unknown` are included on hardware evidence: an
+    /// unsigned x86 bundle makes `register()` return code 1, which is neither
+    /// the documented `InvalidSignature` (3) nor a public constant. The plist is
+    /// the ADR's escape hatch, the same switch removes it, and writing it is
+    /// logged, so a false positive costs a warning rather than a stuck setting.
+    const fn is_bundle_refusal(self) -> bool {
+        matches!(
+            self,
+            Self::InvalidSignature | Self::InternalFailure | Self::Unknown(_)
+        )
+    }
+}
+
+/// What `enable` does about a refused register call.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Action {
+    /// Write the LaunchAgent and let it start the app at login.
+    LaunchAgent,
+    /// Report the refusal; no file is written.
+    Report,
+}
+
+/// The choice `enable` makes, as a value the Linux tests can check.
+#[cfg(any(target_os = "macos", test))]
+const fn after_register(refusal: Refusal) -> Action {
+    if refusal.is_bundle_refusal() {
+        Action::LaunchAgent
+    } else {
+        Action::Report
+    }
+}
+
 /// The message for a register or unregister refusal.
 ///
-/// The two refusals the user can act on name the fix; anything else keeps the
-/// crate's own text, which is the only place macOS says why.
+/// This is the single place refusal messages are built. The refusals the user
+/// can act on name the fix, an unknown code keeps its number so a report is
+/// actionable, and the documented errors keep the crate's own text, which is the
+/// only place macOS says why.
 #[cfg(target_os = "macos")]
 fn refusal(error: &ServiceManagementError) -> anyhow::Error {
-    match error {
-        ServiceManagementError::LaunchDeniedByUser => anyhow::anyhow!("{LAUNCH_DENIED_HINT}"),
-        ServiceManagementError::InvalidSignature => anyhow::anyhow!("{INVALID_SIGNATURE_HINT}"),
-        other => anyhow::anyhow!("{other}"),
+    match Refusal::of(error) {
+        Refusal::LaunchDeniedByUser => anyhow::anyhow!("{LAUNCH_DENIED_HINT}"),
+        Refusal::InvalidSignature => anyhow::anyhow!("{INVALID_SIGNATURE_HINT}"),
+        Refusal::Unknown(code) => anyhow::anyhow!(
+            "macOS refused the login item and reported an unrecognized error code {code}"
+        ),
+        Refusal::InternalFailure | Refusal::Documented => anyhow::anyhow!("{error}"),
     }
 }
 
 /// The LaunchAgent plist that starts `executable` at login (ADR 0008).
 ///
 /// It is plain text so the Linux tests can check it. Only the macOS fallback
-/// writes it, and only after macOS refuses the login item for its signature.
+/// writes it, and only after macOS refuses the login item (ADR 0008).
 #[cfg(any(target_os = "macos", test))]
 fn launch_agent_plist(label: &str, executable: &std::path::Path) -> String {
     let label = xml_escape(label);
@@ -314,8 +388,9 @@ fn xml_escape(text: &str) -> String {
 
 /// The macOS login item (SMAppService, macOS 13+).
 ///
-/// An unsigned bundle is refused with `InvalidSignature`; ADR 0008 then writes a
-/// LaunchAgent plist instead, so the setting still works.
+/// An unsigned bundle is refused (code 1 on x86_64, `InvalidSignature` on a
+/// signed host); ADR 0008 then writes a LaunchAgent plist instead, so the setting
+/// still works.
 #[cfg(target_os = "macos")]
 #[derive(Clone, Debug)]
 pub struct MacAutostart {
@@ -357,16 +432,18 @@ impl MacAutostart {
             .is_ok_and(|plist| plist == launch_agent_plist(BUNDLE_ID, &self.executable))
     }
 
-    /// Registers the login item, or writes the LaunchAgent when the bundle is
-    /// unsigned.
+    /// Registers the login item, or writes the LaunchAgent when macOS refuses
+    /// the bundle.
     fn enable(&self) -> anyhow::Result<()> {
         if self.launch_agent_current() {
             return Ok(());
         }
         match AppService::new(ServiceType::MainApp).register() {
             Ok(()) | Err(ServiceManagementError::AlreadyRegistered) => Ok(()),
-            Err(ServiceManagementError::InvalidSignature) => self.write_launch_agent(),
-            Err(error) => Err(refusal(&error).context("start the app at login")),
+            Err(error) => match after_register(Refusal::of(&error)) {
+                Action::LaunchAgent => self.write_launch_agent(),
+                Action::Report => Err(refusal(&error).context("start the app at login")),
+            },
         }
     }
 
@@ -470,7 +547,7 @@ mod tests {
 
     use crate::BUNDLE_ID;
 
-    use super::{LoginItemStatus, launch_agent_plist};
+    use super::{Action, LoginItemStatus, Refusal, after_register, launch_agent_plist};
 
     #[test]
     fn a_registered_login_item_reads_as_on() {
@@ -493,6 +570,37 @@ mod tests {
         ] {
             assert!(!status.requires_approval(), "{status:?}");
         }
+    }
+
+    #[test]
+    fn a_refused_bundle_takes_the_launch_agent_fallback() {
+        // 3 is the documented InvalidSignature, 2 the documented InternalFailure,
+        // 1 is what an unsigned x86 bundle actually reports, and 4242 stands in
+        // for any other undocumented code.
+        for refusal in [
+            Refusal::InvalidSignature,
+            Refusal::InternalFailure,
+            Refusal::Unknown(1),
+            Refusal::Unknown(4242),
+        ] {
+            assert!(refusal.is_bundle_refusal(), "{refusal:?}");
+            assert_eq!(after_register(refusal), Action::LaunchAgent, "{refusal:?}");
+        }
+    }
+
+    #[test]
+    fn a_user_denied_login_item_writes_no_launch_agent() {
+        assert_eq!(
+            after_register(Refusal::LaunchDeniedByUser),
+            Action::Report,
+            "a plist behind the user's denial would start the app anyway"
+        );
+    }
+
+    #[test]
+    fn the_other_documented_refusals_stay_errors() {
+        assert!(!Refusal::Documented.is_bundle_refusal());
+        assert_eq!(after_register(Refusal::Documented), Action::Report);
     }
 
     #[test]
@@ -532,7 +640,9 @@ mod tests {
 /// not reach.
 #[cfg(all(test, target_os = "macos"))]
 mod macos_tests {
-    use super::{INVALID_SIGNATURE_HINT, LAUNCH_DENIED_HINT, refusal};
+    use super::{
+        Action, INVALID_SIGNATURE_HINT, LAUNCH_DENIED_HINT, Refusal, after_register, refusal,
+    };
     use smappservice_rs::ServiceManagementError;
 
     #[test]
@@ -554,7 +664,43 @@ mod macos_tests {
             refusal(&ServiceManagementError::AuthorizationFailure)
         );
         assert!(known.contains("authorization"), "{known}");
+    }
+
+    #[test]
+    fn an_unknown_refusal_names_the_login_item_and_keeps_the_code() {
         let unknown = format!("{:#}", refusal(&ServiceManagementError::Unknown(99)));
+        assert!(unknown.contains("refused the login item"), "{unknown}");
         assert!(unknown.contains("99"), "{unknown}");
+    }
+
+    #[test]
+    fn only_the_bundle_refusals_take_the_launch_agent_fallback() {
+        for error in [
+            ServiceManagementError::InvalidSignature,
+            ServiceManagementError::InternalFailure,
+            ServiceManagementError::Unknown(1),
+            ServiceManagementError::Unknown(4242),
+        ] {
+            assert_eq!(
+                after_register(Refusal::of(&error)),
+                Action::LaunchAgent,
+                "{error:?}"
+            );
+        }
+        for error in [
+            ServiceManagementError::LaunchDeniedByUser,
+            ServiceManagementError::AuthorizationFailure,
+            ServiceManagementError::ToolNotValid,
+            ServiceManagementError::ServiceUnavailable,
+            ServiceManagementError::JobPlistNotFound,
+            ServiceManagementError::JobMustBeEnabled,
+            ServiceManagementError::InvalidPlist,
+        ] {
+            assert_eq!(
+                after_register(Refusal::of(&error)),
+                Action::Report,
+                "{error:?}"
+            );
+        }
     }
 }
