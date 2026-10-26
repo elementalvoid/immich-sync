@@ -37,7 +37,7 @@ permissions:
   contents: read
 
 jobs:
-  # Fails a tag that does not name the version in the manifest, before two
+  # Fails a tag that does not name the version in the manifest, before three
   # release builds are paid for. A dispatch without a tag input skips the step
   # while the job still succeeds (a skipped job would skip its dependents too).
   version:
@@ -162,13 +162,101 @@ jobs:
           path: dist/*-setup.exe
           if-no-files-found: error
 
-  # Collects both platforms' packages from the real build jobs, hashes what
+  # Builds both architectures on the one arm64 runner: x86_64 is
+  # cross-compiled, which the macOS SDK and clang support for everything this
+  # build compiles (the bundled SQLite included). That avoids paying for an
+  # Intel runner, which GitHub retires in Fall 2027. If a cross-compiled
+  # dependency ever fails here, the fallback shape is a second job on
+  # `macos-26-intel` that builds `x86_64-apple-darwin` natively.
+  macos:
+    name: macOS DMGs (arm64, x64)
+    needs: version
+    runs-on: macos-26
+    permissions:
+      contents: read
+      # See the Linux job: used only by the gated attestation step.
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
+      - name: Install Rust 1.99.0
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal
+          rustup default 1.99.0
+          # The Intel DMG is cross-compiled on this arm64 runner.
+          rustup target add x86_64-apple-darwin
+      # gpui-pre compiles its Metal shaders at build time with `xcrun metal`.
+      # Xcode 26 ships the Metal toolchain as a separate downloadable component,
+      # so a fresh runner fails with `unable to find utility "metal"`.
+      - name: Ensure the Metal toolchain
+        run: |
+          xcrun metal --version \
+            || (xcodebuild -runFirstLaunch && xcodebuild -downloadComponent MetalToolchain)
+          xcrun metal --version
+      - name: Install cargo-packager
+        run: cargo install --locked cargo-packager --version 0.11.8
+      - name: Build the client for both architectures (release)
+        run: |
+          cargo build --release --locked -p immich-sync --target aarch64-apple-darwin
+          cargo build --release --locked -p immich-sync --target x86_64-apple-darwin
+      # cargo-packager resolves `binaries_dir`, `icons`, `licenseFile`, and
+      # `infoPlistPath` against the working directory, so it must run from this
+      # crate. The packager does not build: it packages the binary already at
+      # `target/<triple>/release`, and names the DMG after the architecture
+      # (`_aarch64.dmg`, and `x64` for x86_64). Each run rebuilds the app bundle
+      # from the binary it was pointed at, then bakes that bundle into its DMG.
+      # MACOSX_DEPLOYMENT_TARGET comes from `.cargo/config.toml`.
+      - name: Package the macOS formats
+        working-directory: crates/app
+        run: |
+          cargo packager --release --target aarch64-apple-darwin \
+            --formats app,dmg --out-dir ../../dist
+          cargo packager --release --target x86_64-apple-darwin \
+            --formats app,dmg --out-dir ../../dist
+      # ADR 0008 ships unsigned: no APPLE_* secret and no `signingIdentity`,
+      # so the packager never invokes codesign and there is no signature or
+      # notarization ticket to assert. The file and its per-architecture name
+      # are the whole contract, and `checksums` hashes exactly what appears.
+      - name: Assert both DMGs are present and named per architecture
+        run: |
+          set -euo pipefail
+          count=$(find dist -maxdepth 1 -type f -name '*.dmg' | wc -l | tr -d ' ')
+          if [ "$count" -ne 2 ]; then
+            echo "expected 2 .dmg files, found $count:" >&2
+            find dist -maxdepth 1 -type f -name '*.dmg' -print >&2
+            exit 1
+          fi
+          for arch in aarch64 x64; do
+            n=$(find dist -maxdepth 1 -type f -name "*_${arch}.dmg" | wc -l | tr -d ' ')
+            if [ "$n" -ne 1 ]; then
+              echo "expected one *_${arch}.dmg, found $n" >&2
+              exit 1
+            fi
+          done
+          ls -l dist/*.dmg
+      - name: Attest the macOS DMGs
+        # See the Linux job.
+        if: ${{ vars.RELEASE_ATTEST == 'true' }}
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.dmg
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos-dmgs
+          path: dist/*.dmg
+          if-no-files-found: error
+
+  # Collects every platform's packages from the real build jobs, hashes what
   # they produced, and publishes. No hash is ever written by hand.
   checksums:
     name: SHA256SUMS and release
     needs:
       - linux
       - windows
+      - macos
     runs-on: ubuntu-24.04
     permissions:
       # Publishing the release needs it; a dispatch without a tag only uploads
@@ -185,11 +273,13 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          # Both platforms and every format R11.1 names must be present before
-          # the release is hashed or published.
+          # Every platform and format R11.1 names must be present before the
+          # release is hashed or published.
           test "$(find . -maxdepth 1 -type f -name '*.deb' | wc -l)" -eq 1
           test "$(find . -maxdepth 1 -type f -name '*.AppImage' | wc -l)" -eq 1
           test "$(find . -maxdepth 1 -type f -name '*-setup.exe' | wc -l)" -eq 1
+          # One DMG per macOS architecture: arm64 and Intel.
+          test "$(find . -maxdepth 1 -type f -name '*.dmg' | wc -l)" -eq 2
           # SHA256SUMS is excluded by name on the next line, which is the hazard
           # SC2094 describes.
           # shellcheck disable=SC2094
