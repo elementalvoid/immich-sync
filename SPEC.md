@@ -6,7 +6,7 @@ Companion documents: [PLAN.md](PLAN.md), [GLOSSARY.md](GLOSSARY.md), [docs/adr/]
 
 ## 1. Purpose
 
-Define the v1 requirements for Immich Sync: a Windows tray application that uploads files from user-selected local folders to one Immich server.
+Define the v1 requirements for Immich Sync: a desktop tray application that uploads files from user-selected local folders to one Immich server.
 
 ## 2. Scope
 
@@ -25,7 +25,6 @@ Define the v1 requirements for Immich Sync: a Windows tray application that uplo
 - Download or two-way sync.
 - Multiple servers, accounts, or users per install.
 - OAuth login.
-- macOS releases. The code stays portable. Revisit after v1 ships.
 - Per-folder overrides of the default skip rules.
 - Copying faces, descriptions, or custom metadata to a new version.
 
@@ -49,7 +48,7 @@ Acceptance: password login works. API-key login works on a server with password 
 - R2.1 The user adds and removes source folders, typing the path or choosing it in the OS folder picker. A new folder's settings (recursive, album mapping, and album scope) are confirmed in a setup dialog before the client records it or starts its scan; Add records them together and Cancel writes nothing. Each folder has a recursive toggle.
 - R2.2 The client skips hidden files and folders, symlinks and junctions, temporary and partial files, and system files by default.
 - R2.3 The watcher reports changes while the client runs. A reconciliation scan runs at startup and every 30 minutes by default.
-- R2.4 The client compares paths case-insensitively on Windows. It supports long paths.
+- R2.4 The client compares paths case-insensitively on Windows and on macOS, where APFS and HFSX are case-insensitive by default. A case-sensitive volume can hold two files that differ only in case; they share one path key, so one of them may not sync. It supports long paths.
 - R2.5 A source folder that disappears (for example, an unplugged drive) shows a folder status, not an error per file.
 
 Acceptance: a file added while the client is stopped is found at startup. A file added while the client runs is found within 10 seconds. A file skipped by the watcher is found by the next scan. Hidden and temporary files never upload.
@@ -115,7 +114,7 @@ Acceptance: a sync at a 1 MB/s limit produces near-limit observed throughput. Ra
 - R8.2 The tray icon shows the activity state (idle, syncing, paused, needs attention), the review count, upload progress, and the last error in its tooltip.
 - R8.3 The tray menu offers Show, Pause, Resume, Sync now, and Quit.
 - R8.4 Closing the window hides it. Quit exits the client. A second launch focuses the first instance.
-- R8.5 Autostart at login is a setting. The default is off.
+- R8.5 Autostart at login is a setting. The default is off. Windows uses its Run key, Linux an XDG autostart entry, and macOS a Login Item (`SMAppService`), with a `~/Library/LaunchAgents` fallback when an unsigned bundle is refused.
 - R8.6 The theme follows the system theme.
 - R8.7 Pause stops new uploads. In-flight uploads finish or stop at a safe point.
 
@@ -125,7 +124,7 @@ Acceptance: every tray action works from a cold start. A second launch does not 
 
 - R9.1 Settings live in a TOML file in the OS config directory.
 - R9.2 The state database lives in the local data directory. It never lives on a network share or a cloud-sync folder.
-- R9.3 All paths come from a platform-directory abstraction. No hardcoded Windows path. Linux uses XDG paths.
+- R9.3 All paths come from a platform-directory abstraction. No hardcoded Windows path. Linux uses XDG paths, and macOS resolves the config, the state database, and the logs under `~/Library/Application Support/immich-sync/`.
 
 Acceptance: on Windows, config resolves under `%APPDATA%` and state under `%LOCALAPPDATA%`. A test build resolves XDG paths on Linux. A repository check finds no hardcoded `C:\` paths.
 
@@ -140,16 +139,16 @@ Acceptance: a permanent error raises one notification. Grep of the log finds no 
 
 ### R11 — Packaging and distribution
 
-- R11.1 `cargo-packager` produces an NSIS installer for Windows and deb and AppImage packages for Linux. The Windows installer offers an install-mode choice and defaults to a system-wide install under `C:\Program Files`, with a current-user install as the alternative; either mode ships the app icon on the installed executable.
-- R11.2 Windows binaries ship unsigned in v1. The installer warns under SmartScreen. Code signing belongs to the public-release ticket.
-- R11.3 CI builds both platforms, publishes a SHA256SUMS file, and contains provenance attestation steps guarded by a repository variable. The steps stay skipped while the repository is private. `gh attestation verify` succeeds when they are enabled.
-- R11.4 The README documents install and verification steps for both platforms.
+- R11.1 `cargo-packager` produces an NSIS installer for Windows, deb and AppImage packages for Linux, and one DMG per architecture for macOS: `Immich Sync_<version>_aarch64.dmg` and `Immich Sync_<version>_x64.dmg`. The Windows installer offers an install-mode choice and defaults to a system-wide install under `C:\Program Files`, with a current-user install as the alternative; either mode ships the app icon on the installed executable.
+- R11.2 Binaries ship unsigned in v1 on every platform. The Windows installer warns under SmartScreen. macOS blocks the first launch until the user allows it in **System Settings › Privacy & Security › Open Anyway**, because there is no Apple Developer Program account, no Developer ID certificate, and no notarization ([ADR 0008](docs/adr/0008-macos-unsigned-distribution.md)). Windows code signing belongs to the public-release ticket.
+- R11.3 CI builds every platform, publishes a SHA256SUMS file, and contains provenance attestation steps guarded by a repository variable. The steps stay skipped while the repository is private. `gh attestation verify` succeeds when they are enabled.
+- R11.4 The README documents install and verification steps for every platform.
 
-Acceptance: a clean Windows machine installs from the NSIS installer. A clean Linux desktop installs from the deb or the AppImage. The provenance attestation verifies for both artifacts once the repository is public.
+Acceptance: a clean Windows machine installs from the NSIS installer. A clean Linux desktop installs from the deb or the AppImage. A clean Mac drags the DMG's app to Applications and launches it through Open Anyway. The provenance attestation verifies for every artifact once the repository is public.
 
 ## 4. Non-functional requirements
 
-- N1 Platform: Windows 10 and 11 (x64, arm64 if the toolchain permits) and Linux (deb and AppImage) ship in v1. macOS stays portable but deferred.
+- N1 Platform: Windows 10 and 11 (x64, arm64 if the toolchain permits), Linux (deb and AppImage), and macOS 13 (Ventura) or later on arm64 and x86_64. The macOS packages are unsigned and unnotarized (R11.2).
 - N2 Responsiveness: database reads never block the UI. The common views load in under 16 ms at 300k items. Measure this in M2.
 - N3 Security: TLS verification stays on. Credentials live in the OS credential store only. Logs are redacted.
 - N4 Data safety: WAL with `synchronous=FULL`, `PRAGMA quick_check` at startup, and a rebuild path. Server state changes only from user actions or the version flow in R4.
@@ -183,4 +182,5 @@ Item states: discovered, hashing, checking, pending, uploading, uploaded, duplic
 - [ADR 0004](docs/adr/0004-file-changes-create-a-new-version.md) — versioned changes.
 - [ADR 0005](docs/adr/0005-sqlite-via-rusqlite-for-state.md) — state store.
 - [ADR 0006](docs/adr/0006-hand-written-client-and-engine.md) — hand-written client and engine.
+- [ADR 0008](docs/adr/0008-macos-unsigned-distribution.md) — macOS ships unsigned, without an Apple Developer Program account.
 - [API research](docs/research/immich-sync-client-research.md), [embedded store research](docs/research/embedded-store-options.md), [Rust engine crates](docs/research/rust-sync-engine-crates.md).

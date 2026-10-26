@@ -137,7 +137,8 @@ A long-lived Immich credential with a fixed permission list.
 _Avoid_: token, secret
 
 **Credential store**:
-The operating-system secret store. On Windows this is the Credential Manager.
+The operating-system secret store. On Windows this is the Credential Manager, on
+macOS the login Keychain, and on Linux the Secret Service.
 _Avoid_: vault, password file
 
 ### Shell
