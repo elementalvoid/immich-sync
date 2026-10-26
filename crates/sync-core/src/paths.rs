@@ -1,11 +1,10 @@
 //! Path comparison (SPEC R2.4).
 //!
-//! The client compares paths case-insensitively on Windows, so one folder
-//! spelled with different case cannot become two sync items. The comparison
-//! lives behind
-//! [`PathCase`], a seam that takes the platform behaviour as a value. Tests run
-//! both behaviours on any platform, and the store keys rows with
-//! [`path_key`], which uses the platform default.
+//! The client compares paths case-insensitively on Windows and macOS, so one
+//! folder spelled with different case cannot become two sync items. The
+//! comparison lives behind [`PathCase`], a seam that takes the platform
+//! behaviour as a value. Tests run both behaviours on any platform, and the
+//! store keys rows with [`path_key`], which uses the platform default.
 //!
 //! shortcut: a Windows verbatim (extended-length) path prefix is compared as
 //! written, so it is not normalized. Long-path handling belongs to packaging
@@ -18,15 +17,22 @@ use std::path::Path;
 pub enum PathCase {
     /// Byte-for-byte, as on Linux.
     Sensitive,
-    /// Folded to lower case, as on Windows.
+    /// Folded to lower case, as on Windows and macOS.
     Insensitive,
 }
 
 impl PathCase {
-    /// The behaviour the current platform uses (R2.4).
+    /// The behaviour the current platform uses (R2.4): Windows and macOS both
+    /// fold case, because their default filesystems do.
+    ///
+    /// shortcut: a case-sensitive APFS or HFSX volume (developer setups, some
+    /// external disks) can hold two files whose names differ only in case.
+    /// They collapse into one key, so only one of the two ever syncs. Upgrade
+    /// when the case behaviour is probed per folder at folder-add and stored
+    /// with the folder row.
     #[must_use]
     pub const fn for_platform() -> Self {
-        if cfg!(windows) {
+        if cfg!(windows) || cfg!(target_os = "macos") {
             Self::Insensitive
         } else {
             Self::Sensitive
@@ -173,10 +179,10 @@ mod tests {
     }
 
     #[test]
-    fn the_platform_default_is_windows_insensitive_and_linux_sensitive() {
+    fn the_platform_default_is_insensitive_on_windows_and_macos() {
         assert_eq!(
             PathCase::for_platform(),
-            if cfg!(windows) {
+            if cfg!(windows) || cfg!(target_os = "macos") {
                 PathCase::Insensitive
             } else {
                 PathCase::Sensitive

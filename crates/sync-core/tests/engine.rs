@@ -885,6 +885,94 @@ async fn a_folder_that_disappears_is_a_folder_status_not_per_file_errors() {
 }
 
 #[tokio::test]
+async fn a_refused_folder_reports_the_files_and_folders_message() {
+    // #65 (R2.5): macOS blocks the first read of a protected folder until the
+    // user allows the app. The folder must read as unavailable with the switch
+    // to change, never as an empty folder and never as a raw I/O error.
+    //
+    // Running as root can list a mode-000 directory, so the test skips itself
+    // then and prints a `SKIP` line.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let photos = temp.path().join("photos");
+        write_file(&photos, "photo.jpg", b"photo");
+        let store = store_in(&temp);
+        add_folder(&store, &photos, true);
+        std::fs::set_permissions(&photos, std::fs::Permissions::from_mode(0o000))
+            .expect("lock the folder");
+        let refused = std::fs::read_dir(&photos).is_err();
+        if !refused {
+            std::fs::set_permissions(&photos, std::fs::Permissions::from_mode(0o755))
+                .expect("unlock the folder");
+            eprintln!(
+                "SKIP a_refused_folder_reports_the_files_and_folders_message: \
+                 this process lists a mode-000 directory, so it is root"
+            );
+            return;
+        }
+
+        let server = MockImmich::start().await;
+        let config = EngineConfig {
+            watch: false,
+            ..EngineConfig::default()
+        };
+        let engine = start_engine(&server, &store, config).await;
+        engine.sync_now();
+        let reported = wait_until(
+            || {
+                let status = engine.status();
+                status.folders.first().is_some_and(|folder| {
+                    !folder.available
+                        && folder.last_error.as_deref()
+                            == Some(sync_core::scan::permission_denied())
+                })
+            },
+            Duration::from_secs(15),
+        )
+        .await;
+        let status = engine.status();
+        std::fs::set_permissions(&photos, std::fs::Permissions::from_mode(0o755))
+            .expect("unlock the folder");
+
+        assert!(reported, "the denial was not reported: {status:?}");
+        let folder = status.folders.first().expect("the folder status");
+        assert!(!folder.available, "R2.5: a refused folder is not available");
+        assert_eq!(
+            folder.last_error.as_deref(),
+            Some(sync_core::scan::permission_denied()),
+            "the status carries the message that names the setting"
+        );
+        assert_eq!(status.counts.failed, 0, "no per-file errors are raised");
+
+        // #65: the folder is then unmounted, renamed, or deleted. It stays
+        // unavailable, but the message about System Settings must not outlive
+        // the folder it named.
+        std::fs::remove_dir_all(&photos).expect("remove the fixture folder");
+        engine.sync_now();
+        let cleared = wait_until(
+            || {
+                let status = engine.status();
+                status
+                    .folders
+                    .first()
+                    .is_some_and(|folder| !folder.available && folder.last_error.is_none())
+            },
+            Duration::from_secs(15),
+        )
+        .await;
+        let status = engine.status();
+        engine.stop();
+        assert!(
+            cleared,
+            "the denial message outlived the folder it named: {status:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_restart_requeues_a_pending_row_whose_file_is_unchanged() {
     let server = MockImmich::start().await;
     let temp = tempfile::tempdir().expect("create a temp dir");
@@ -4645,6 +4733,53 @@ async fn a_rename_keeps_the_mapping_and_raises_no_review_item() {
         store.review_count().expect("count the review"),
         0,
         "a later scan must not turn the rename into a missing file"
+    );
+    engine.stop();
+}
+
+/// #65: on a default (case-insensitive) APFS volume a case-only rename is the
+/// same row with the same asset, not a review item plus a second asset. The
+/// mechanism is the folded `path_key` plus `is_gone`, which resolves the old
+/// spelling through the volume; neither can be proved on a case-sensitive
+/// volume, so this test runs on the macOS CI job.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_case_only_rename_is_one_row_and_no_review_item() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let before = write_file(&photos, "IMG_0001.JPG", b"case-only rename bytes");
+    add_folder(&store, &photos, true);
+    let engine = start_engine(
+        &server,
+        &store,
+        review_config(Duration::from_secs(1), false),
+    )
+    .await;
+    let asset_id = sync_one(&store, &before).await;
+
+    let after = photos.join("img_0001.jpg");
+    std::fs::rename(&before, &after).expect("rename the fixture, case only");
+    engine.sync_now();
+    // Later scans walk the same rename; none may raise a review item or write a
+    // second row.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+
+    assert_eq!(
+        engine.status().counts.review,
+        0,
+        "R5.4: a case-only rename is not a missing file"
+    );
+    assert_eq!(store.review_count().expect("count the review"), 0);
+    let row = store
+        .item(&after.display().to_string())
+        .expect("read the renamed path")
+        .expect("the row answers for the renamed spelling");
+    assert_eq!(
+        row.asset_id.as_deref(),
+        Some(asset_id.as_str()),
+        "R5.2: the item keeps its asset mapping"
     );
     engine.stop();
 }
