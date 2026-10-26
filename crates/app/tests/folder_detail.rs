@@ -1852,7 +1852,7 @@ fn album_title_input(window: &Window) -> Option<String> {
 
 /// Replaces the focused field's text with `value` (#47).
 fn retype(window: &mut Window, value: &str, cx: &mut App) {
-    window.press("ctrl-a", cx);
+    window.press(crate::common::select_all_chord(), cx);
     window.input(value, cx);
 }
 
@@ -1908,7 +1908,7 @@ async fn the_detail_shows_the_album_title_and_saves_a_new_one(cx: &mut TestAppCo
     // name.
     act(cx, window, |window, cx| {
         tab_to(window, "folder-panel-title", cx);
-        window.press("ctrl-a", cx);
+        window.press(crate::common::select_all_chord(), cx);
         window.press("backspace", cx);
         window.render_frame(cx);
         window.press("enter", cx);
