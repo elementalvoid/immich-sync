@@ -4054,6 +4054,11 @@ mod tests {
             "a deleted file is adopted through its root, which still resolves"
         );
         assert_eq!(
+            match_canonical(&roots, &resolved.join("Holiday"), PathCase::Sensitive),
+            Some((alias.clone(), alias.join("Holiday"))),
+            "a directory is adopted too, so a resolved directory event still buys a pass (#66)"
+        );
+        assert_eq!(
             match_canonical(
                 &roots,
                 &temp.path().join("elsewhere.jpg"),
