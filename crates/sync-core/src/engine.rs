@@ -1228,8 +1228,9 @@ impl EngineInner {
 
     /// Queues the settled paths the watcher reported, after the shared skip
     /// rules (R2.2). A path that disappeared is recorded and reconciled by the
-    /// scan loop (R5.1). A path that is a directory inside a source folder is
-    /// a rescan hint, not an item, and asks the scan loop for a pass (#66).
+    /// scan loop (R5.1). A directory inside a source folder is not an item: it
+    /// is a rescan hint, and asks the scan loop for a pass when no file in the
+    /// same batch lies under it (#66).
     fn enqueue_watch_batch(&self, paths: Vec<PathBuf>) {
         // A change in a folder makes its cached listing stale, whether or not
         // the changed path itself is queued (a sidecar is not an item, but it
@@ -1238,6 +1239,13 @@ impl EngineInner {
             .lock()
             .expect("the index cache lock")
             .invalidate(&paths);
+        // The hint is decided per batch, so the batch is collected first and
+        // acted on below.
+        enum Watched {
+            Directory(PathBuf),
+            File(PathBuf),
+        }
+        let mut watched = Vec::with_capacity(paths.len());
         for path in paths {
             let Ok(metadata) = std::fs::symlink_metadata(&path) else {
                 // The path is gone. Whether that is a missing file, a rename,
@@ -1277,20 +1285,40 @@ impl EngineInner {
                 continue;
             }
             if metadata.is_dir() {
-                // #66: a directory is a rescan hint, not an item. FSEvents
-                // drops and coalesces events and expects the folder it names
-                // to be walked again (MustScanSubDirs); inotify reports an
-                // arriving tree the same way, so this rule is the same on
-                // every backend. The pass stays the scan loop's, so no second
-                // scheduler appears (R2.3).
-                //
-                // The hint is one global flag, so a directory event in one
-                // folder rescans every folder. That is bounded: at most one
-                // hint per 2 s debounce (R2.3), one serialized scan loop, and
-                // a hint that arrives during a pass is not queued again.
-                self.rescan_hint.store(true, Ordering::SeqCst);
-                self.reconcile.notify_one();
+                watched.push(Watched::Directory(path));
             } else if metadata.is_file() {
+                watched.push(Watched::File(path));
+            }
+        }
+        // #66: a directory is a rescan hint only when no file in the same
+        // batch lies under it. On macOS creating a file also reports its
+        // containing directory in the same batch, so a hint for every
+        // directory would walk every source folder on every new photo, and
+        // those file events are the change the walk would find. A batch with
+        // the directory alone still buys one pass: that is a MustScanSubDirs
+        // rescan, an arriving tree on inotify, or a new empty directory. A
+        // file elsewhere in the batch leaves the directory's dropped events
+        // uncovered, so the hint stays. The pass is the scan loop's, so no
+        // second scheduler appears (R2.3).
+        //
+        // The hint is one global flag, so a directory event in one folder
+        // rescans every folder. That is bounded: at most one hint per 2 s
+        // debounce (R2.3), one serialized scan loop, and a hint that arrives
+        // during a pass is not queued again.
+        let case = PathCase::for_platform();
+        let hint = watched.iter().any(|entry| match entry {
+            Watched::Directory(dir) => !watched.iter().any(|other| match other {
+                Watched::File(file) => is_within(dir, file, case),
+                Watched::Directory(_) => false,
+            }),
+            Watched::File(_) => false,
+        });
+        if hint {
+            self.rescan_hint.store(true, Ordering::SeqCst);
+            self.reconcile.notify_one();
+        }
+        for entry in watched {
+            if let Watched::File(path) = entry {
                 let _ = self.queue.send(path);
             }
         }
@@ -3942,20 +3970,14 @@ mod tests {
         engine.stop();
     }
 
-    /// A directory event asks for a scan pass only inside a source folder
-    /// (#66, R2.3).
-    ///
-    /// This is the seam the real watcher reports at: FSEvents hands over the
-    /// folder it could not describe as a path, and inotify reports an arriving
-    /// directory the same way, so both reach `enqueue_watch_batch` as a path
-    /// whose metadata is a directory.
-    #[test]
-    fn a_directory_event_asks_for_a_scan_only_inside_a_source_folder() {
-        let temp = tempfile::tempdir().expect("create a temp dir");
+    /// An engine over the one source folder `folder`, with its queue receiver
+    /// taken, so a test can hand `enqueue_watch_batch` a batch and read what it
+    /// queued (#66).
+    fn watched_engine(folder: &Path) -> (Arc<EngineInner>, mpsc::UnboundedReceiver<PathBuf>) {
+        std::fs::create_dir_all(folder).expect("create the folder");
+        let root = folder.parent().expect("the folder has a parent");
         let store =
-            Arc::new(StateStore::open(temp.path().join("state.db")).expect("open the state store"));
-        let folder = temp.path().join("photos");
-        std::fs::create_dir_all(&folder).expect("create the folder");
+            Arc::new(StateStore::open(root.join("state.db")).expect("open the state store"));
         store
             .add_folder(&SourceFolder {
                 path: folder.display().to_string(),
@@ -3965,7 +3987,7 @@ mod tests {
                 album_title: None,
             })
             .expect("add the folder");
-        // The session is never used: this test sends no request.
+        // The session is never used: these tests send no request.
         let session = crate::connection::Connection::new(
             "http://127.0.0.1:1",
             Arc::new(crate::credential::MemoryCredentialStore::new()),
@@ -3978,13 +4000,27 @@ mod tests {
             EngineConfig::default(),
         )
         .expect("build the engine");
-        let inner = Arc::clone(&engine.inner);
-        let mut queue = engine
+        let queue = engine
             .queue_rx
             .lock()
             .expect("the queue lock")
             .take()
             .expect("the queue receiver");
+        (Arc::clone(&engine.inner), queue)
+    }
+
+    /// A directory event asks for a scan pass only inside a source folder
+    /// (#66, R2.3).
+    ///
+    /// This is the seam the real watcher reports at: FSEvents hands over the
+    /// folder it could not describe as a path, and inotify reports an arriving
+    /// directory the same way, so both reach `enqueue_watch_batch` as a path
+    /// whose metadata is a directory.
+    #[test]
+    fn a_directory_event_asks_for_a_scan_only_inside_a_source_folder() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let folder = temp.path().join("photos");
+        let (inner, mut queue) = watched_engine(&folder);
 
         // An ordinary file is queued and buys no pass.
         let file = folder.join("late.jpg");
@@ -4000,10 +4036,11 @@ mod tests {
             "#66: an ordinary file event must not buy a reconciliation pass"
         );
 
-        // A directory a source folder owns is a rescan hint.
+        // A directory a source folder owns, alone in its batch, is a rescan
+        // hint.
         let nested = folder.join("Holiday");
         std::fs::create_dir_all(&nested).expect("create the nested folder");
-        for hint in [folder.clone(), nested] {
+        for hint in [folder.clone(), nested.clone()] {
             inner.enqueue_watch_batch(vec![hint.clone()]);
             assert!(
                 inner.take_rescan_hint(),
@@ -4022,6 +4059,59 @@ mod tests {
             "#66: a directory outside every source folder is ignored"
         );
         assert!(queue.try_recv().is_err(), "nothing is queued for it");
+    }
+
+    /// A file in the same batch covers its directory (#66).
+    ///
+    /// This is the macOS shape: FSEvents reports the containing directory
+    /// together with the file it created, so treating the directory as a hint
+    /// would walk every source folder on every new photo.
+    #[test]
+    fn a_file_under_the_named_directory_covers_it_in_the_batch() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let folder = temp.path().join("photos");
+        let (inner, mut queue) = watched_engine(&folder);
+        let nested = folder.join("Holiday");
+        std::fs::create_dir(&nested).expect("create the nested folder");
+        let file = nested.join("beach.jpg");
+        std::fs::write(&file, b"bytes").expect("write the file");
+
+        inner.enqueue_watch_batch(vec![nested, file.clone()]);
+        assert_eq!(
+            queue.try_recv().ok(),
+            Some(file),
+            "#66: the file event still queues the file"
+        );
+        assert!(queue.try_recv().is_err(), "the directory is not an item");
+        assert!(
+            !inner.take_rescan_hint(),
+            "#66: a file under the named directory is the change, so the batch buys no pass"
+        );
+    }
+
+    /// A file outside the named directory leaves its dropped events uncovered,
+    /// so the hint stays (#66).
+    #[test]
+    fn a_file_outside_the_named_directory_leaves_the_hint() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let folder = temp.path().join("photos");
+        let (inner, mut queue) = watched_engine(&folder);
+        let nested = folder.join("Holiday");
+        std::fs::create_dir(&nested).expect("create the nested folder");
+        let file = folder.join("lake.jpg");
+        std::fs::write(&file, b"bytes").expect("write the file");
+
+        inner.enqueue_watch_batch(vec![nested, file.clone()]);
+        assert_eq!(
+            queue.try_recv().ok(),
+            Some(file),
+            "#66: the file event still queues the file"
+        );
+        assert!(queue.try_recv().is_err(), "the directory is not an item");
+        assert!(
+            inner.take_rescan_hint(),
+            "#66: a file elsewhere in the batch does not cover the directory"
+        );
     }
 
     /// A folder the user picked through a symlinked ancestor still owns the

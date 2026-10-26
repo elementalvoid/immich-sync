@@ -223,7 +223,10 @@ command surface. That is a product decision for a later release, not a v1 requir
 - **Dropped/coalesced events.** FSEvents can deliver `MustScanSubDirs` and expects the
   client to rescan the subtree ([Apple](https://developer.apple.com/documentation/coreservices/kfseventstreameventflagmustscansubdirs)).
   Resolved in #66: a directory path inside a source folder now asks the scan loop for a
-  reconciliation pass instead of being dropped. The path is the whole signal, because
+  reconciliation pass instead of being dropped. Refined after the macOS CI run: the
+  directory is a hint only when no file under it is in the same batch, because FSEvents
+  reports the parent directory together with the file it created, while a
+  `MustScanSubDirs` batch carries the folder alone. The path is the whole signal, because
   the debouncer hands over the folder rather than the file events it stands in for: the
   FSEvents backend hardcodes precise mode (`translate_flags(flag, true)`, so it never
   emits `EventKind::Any`), and `notify-debouncer-full` delivers the `MustScanSubDirs`
