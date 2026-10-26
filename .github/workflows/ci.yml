@@ -1,3 +1,5 @@
+# yamllint disable rule:line-length
+# Pinned action SHAs cannot be wrapped without breaking the reference.
 name: ci
 
 # `push` is limited to the branches this repository pushes on its own: main,
@@ -87,6 +89,38 @@ jobs:
           cache-on-failure: "true"
       # fmt is platform-independent and already checked on Linux; running it
       # here only paid for a toolchain component and a fresh checkout.
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
+
+  # The only place the macOS platform arms are compiled and exercised: the
+  # maintainer's Linux host cannot build them (aws-lc-sys needs a macOS C
+  # toolchain and gpui-pre-apple runs `xcrun metal`), and ADR 0008 ships
+  # unsigned packages from this runner. arm64 only: the code is
+  # platform-neutral and the Intel runner is on a clock (macOS support
+  # research §3.3).
+  macos:
+    name: macOS
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust 1.99.0
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal --component rustfmt --component clippy
+          rustup default 1.99.0
+      # gpui-pre compiles its Metal shaders at build time with `xcrun metal`.
+      # Xcode 26 ships the Metal toolchain as a separate downloadable component,
+      # so a fresh runner fails with `unable to find utility "metal"`.
+      - name: Ensure the Metal toolchain
+        run: |
+          xcrun metal --version \
+            || (xcodebuild -runFirstLaunch && xcodebuild -downloadComponent MetalToolchain)
+          xcrun metal --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: macos
+          prefix-key: v0-rust-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'Cargo.toml', 'crates/*/Cargo.toml') }}
+          add-rust-environment-hash-key: "false"
+          cache-on-failure: "true"
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo test --locked --workspace
 
