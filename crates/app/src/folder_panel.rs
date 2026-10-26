@@ -52,6 +52,23 @@ const ASSET_PAGE: usize = 50;
 /// the path can be asserted without launching anything.
 pub type FolderOpener = Arc<dyn Fn(&str) -> std::io::Result<()>>;
 
+/// The program "Open folder" launches for this platform (R8.1 folder detail,
+/// #43).
+///
+/// The one place the platform picks it: Windows has no `open`, and macOS has no
+/// `xdg-open`. `cfg!` keeps every name in the same function, so the test can
+/// read the table on any host.
+#[must_use]
+pub(crate) fn file_manager_command() -> &'static str {
+    if cfg!(windows) {
+        "explorer"
+    } else if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    }
+}
+
 /// Opens `path` in the platform's file manager (R8.1 folder detail, #43).
 ///
 /// The child is reaped on a thread of its own: the dialog must not wait for a
@@ -62,11 +79,9 @@ pub type FolderOpener = Arc<dyn Fn(&str) -> std::io::Result<()>>;
 ///
 /// Returns the platform's error when the file manager cannot be started.
 pub fn open_in_file_manager(path: &str) -> std::io::Result<()> {
-    #[cfg(target_os = "windows")]
-    let mut command = std::process::Command::new("explorer");
-    #[cfg(not(target_os = "windows"))]
-    let mut command = std::process::Command::new("xdg-open");
-    let mut child = command.arg(path).spawn()?;
+    let mut child = std::process::Command::new(file_manager_command())
+        .arg(path)
+        .spawn()?;
     std::thread::spawn(move || {
         let _ = child.wait();
     });
@@ -1526,6 +1541,21 @@ mod tests {
             album_scope: AlbumScope::Leaf,
             album_title: None,
         }
+    }
+
+    /// #65: "Open folder" launches this platform's own file manager. The
+    /// macOS arm is the one only the macOS CI job can run.
+    #[test]
+    fn open_folder_launches_the_platforms_own_file_manager() {
+        let expected = if cfg!(windows) {
+            "explorer"
+        } else if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
+
+        assert_eq!(super::file_manager_command(), expected);
     }
 
     #[test]
