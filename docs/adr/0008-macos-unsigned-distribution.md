@@ -99,6 +99,11 @@ verifies the app again from the mounted image. The DMG is not signed; only the
 bundle is. There is still no signing identity, no notarization, and no Apple
 account.
 
+Hardware confirmed on an Intel Mac: with the bundle ad-hoc signed,
+`SMAppService.mainApp.register()` is accepted and the app appears under Login
+Items, so the `~/Library/LaunchAgents` fallback is the escape hatch for an
+unsigned local build rather than the shipped path.
+
 Not fixed: there is still **no stable code identity**, so the login-Keychain item
 and the Files & Folders grant can still ask again after an update; and the
 Gatekeeper warning and the **Open Anyway** step remain exactly as documented.
