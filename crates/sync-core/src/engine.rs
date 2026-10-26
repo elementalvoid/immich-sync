@@ -1180,6 +1180,29 @@ impl Observer for EngineObserver {
     }
 }
 
+/// The folder that owns `path` once its stored root is resolved, and `path`
+/// rewritten under that root's stored spelling.
+///
+/// Only the root is resolved, never the reported path: the path may name a
+/// file that has just been deleted, which cannot be canonicalised, and the
+/// watcher reports under the resolved root anyway. The caller tries the raw
+/// spelling first; this is the retry. See [`EngineInner::folder_root_for`].
+fn match_canonical(roots: &[&str], path: &Path, case: PathCase) -> Option<(PathBuf, PathBuf)> {
+    for root in roots {
+        let Ok(canonical) = std::fs::canonicalize(root) else {
+            continue;
+        };
+        if !is_within(&canonical, path, case) {
+            continue;
+        }
+        let Ok(relative) = path.strip_prefix(&canonical) else {
+            continue;
+        };
+        return Some((PathBuf::from(*root), Path::new(root).join(relative)));
+    }
+    None
+}
+
 impl EngineInner {
     /// The upload pool in force right now (R7.2).
     ///
@@ -1216,6 +1239,12 @@ impl EngineInner {
                 // place, by the reconciliation scan; the watcher only asks for
                 // one. The store is not read here: this callback runs on the
                 // debouncer's thread and must not block (R5.1, R5.2).
+                //
+                // The absence must still be spelled the way the store spells
+                // it, or the row lookup below the scan finds nothing and the
+                // scan is skipped: a resolved path is adopted through its
+                // folder root, which still exists even when the file does not.
+                let path = self.folder_root_for(&path).map_or(path, |(_, owned)| owned);
                 self.absences.lock().expect("the absence list").push(path);
                 self.reconcile.notify_one();
                 continue;
@@ -1223,9 +1252,19 @@ impl EngineInner {
             if !metadata.is_file() {
                 continue;
             }
-            let Some(root) = self.folder_root_for(&path) else {
+            let reported = path;
+            let Some((root, path)) = self.folder_root_for(&reported) else {
                 continue;
             };
+            // The batch above was invalidated under the reported spelling; a
+            // path the watcher reported resolved is keyed by the folder's own
+            // spelling instead, so its cached listing has to go too (R3.3).
+            if path != reported {
+                self.index_cache
+                    .lock()
+                    .expect("the index cache lock")
+                    .invalidate(std::slice::from_ref(&path));
+            }
             // R2.2: the scan prunes symlinked directories, but the watcher
             // reports a file under one as an ordinary file, so refuse it too.
             if has_symlink_ancestor(&root, &path)
@@ -1237,15 +1276,32 @@ impl EngineInner {
         }
     }
 
-    /// The root of the folder that contains `path`, if any.
-    fn folder_root_for(&self, path: &Path) -> Option<PathBuf> {
+    /// The root of the folder that contains `path`, and `path` in that folder's
+    /// own spelling.
+    ///
+    /// The raw spelling is tried first: it is the common case and costs no
+    /// syscall. A miss is retried against resolved paths, because the watcher
+    /// can report the resolved spelling. On macOS `notify` canonicalises the
+    /// path it hands to FSEvents (`notify-8.2.0/src/fsevent.rs:391-397`), so a
+    /// folder picked through a symlinked ancestor (`/var` -> `/private/var`)
+    /// arrives as `/private/var/...` while the row still says `/var/...`.
+    /// Without the retry every event for such a folder is dropped until the
+    /// next reconciliation scan, and if it were queued as reported, the scan
+    /// would store the same file under a second spelling.
+    fn folder_root_for(&self, path: &Path) -> Option<(PathBuf, PathBuf)> {
         let case = PathCase::for_platform();
-        self.folders
-            .lock()
-            .expect("the folder lock")
+        let folders = self.folders.lock().expect("the folder lock");
+        if let Some(entry) = folders
             .iter()
             .find(|entry| is_within(Path::new(&entry.folder.path), path, case))
-            .map(|entry| PathBuf::from(&entry.folder.path))
+        {
+            return Some((PathBuf::from(&entry.folder.path), path.to_path_buf()));
+        }
+        let roots: Vec<&str> = folders
+            .iter()
+            .map(|entry| entry.folder.path.as_str())
+            .collect();
+        match_canonical(&roots, path, case)
     }
 
     /// The meter of the folder that owns `path` (R8.1).
@@ -3856,5 +3912,45 @@ mod tests {
             "R3.3: one scan pass listed the folder {listings} times"
         );
         engine.stop();
+    }
+
+    /// A folder the user picked through a symlinked ancestor still owns the
+    /// events the watcher reports under the resolved path (#61).
+    ///
+    /// On macOS the resolver is `/var` -> `/private/var`, so this is the shape
+    /// of every watcher event for a temp folder there; the symlink builds the
+    /// same mismatch on Linux.
+    #[cfg(unix)]
+    #[test]
+    fn a_resolved_event_path_is_adopted_into_the_folders_spelling() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let real = temp.path().join("real");
+        std::fs::create_dir(&real).expect("create the folder");
+        let alias = temp.path().join("alias");
+        symlink(&real, &alias).expect("link the folder");
+        let roots = [alias.to_str().expect("a UTF-8 path")];
+        let resolved = std::fs::canonicalize(&real).expect("resolve the folder");
+
+        assert_eq!(
+            match_canonical(&roots, &resolved.join("a.jpg"), PathCase::Sensitive),
+            Some((alias.clone(), alias.join("a.jpg"))),
+            "the event is adopted into the spelling the folder row uses"
+        );
+        assert_eq!(
+            match_canonical(&roots, &resolved.join("gone.jpg"), PathCase::Sensitive),
+            Some((alias.clone(), alias.join("gone.jpg"))),
+            "a deleted file is adopted through its root, which still resolves"
+        );
+        assert_eq!(
+            match_canonical(
+                &roots,
+                &temp.path().join("elsewhere.jpg"),
+                PathCase::Sensitive
+            ),
+            None,
+            "a path outside every folder stays outside"
+        );
     }
 }

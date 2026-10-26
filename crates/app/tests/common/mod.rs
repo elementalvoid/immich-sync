@@ -48,3 +48,18 @@ pub fn scroll_dashboard_into_view(window: &mut Window, cx: &mut App, id: impl In
     }
     panic!("{id:?} never became visible on the dashboard");
 }
+
+/// The select-all chord the GPUI text input binds on this platform.
+///
+/// `ctrl-a` is select-all on Linux and Windows, but macOS binds `ctrl-a` to
+/// "move to the start of the line" and select-all to `cmd-a` (gpui-base's
+/// `input/base/state.rs`), so a test that hardcodes `ctrl-a` types over the
+/// start of the old value on macOS instead of replacing it.
+#[allow(dead_code)]
+pub fn select_all_chord() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "cmd-a"
+    } else {
+        "ctrl-a"
+    }
+}
