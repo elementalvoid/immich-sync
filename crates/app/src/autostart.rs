@@ -3,9 +3,13 @@
 //! The trait is the seam: the real platform backends write the Windows Run key
 //! and the Linux XDG autostart entry, and tests supply a fake.
 
+// Only the Linux and Windows backends use these; macOS goes through the
+// unsupported-platform arm until its own backend lands (#63).
+#[cfg(any(target_os = "linux", windows))]
 use std::path::PathBuf;
 use std::rc::Rc;
 
+#[cfg(any(target_os = "linux", windows))]
 use anyhow::Context as _;
 
 use crate::paths::AppPaths;
