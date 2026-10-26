@@ -222,18 +222,35 @@ command surface. That is a product decision for a later release, not a v1 requir
 
 - **Dropped/coalesced events.** FSEvents can deliver `MustScanSubDirs` and expects the
   client to rescan the subtree ([Apple](https://developer.apple.com/documentation/coreservices/kfseventstreameventflagmustscansubdirs)).
-  The watcher flattens events to paths, and `enqueue_watch_batch` drops directories
-  (`engine.rs:1223-1225`), so a rescan hint is lost until the 30-minute scan. Treat an
-  `EventKind::Any`/directory path for a source root as "reconcile this folder now".
+  Resolved in #66: a directory path inside a source folder now asks the scan loop for a
+  reconciliation pass instead of being dropped. The path is the whole signal, because
+  the debouncer hands over the folder rather than the file events it stands in for: the
+  FSEvents backend hardcodes precise mode (`translate_flags(flag, true)`, so it never
+  emits `EventKind::Any`), and `notify-debouncer-full` delivers the `MustScanSubDirs`
+  event as `EventKind::Other` with `Flag::Rescan`, carrying the folder FSEvents named.
+  inotify reports an arriving tree the same way, so the rule and its test run on Linux.
+  One hint it does not cover: an inotify queue overflow is the same `Other`/`Rescan`
+  event with no path at all, so it still waits for the periodic scan. The hint is inferred
+  from the named path's metadata rather than from `Flag::Rescan`, so a rescan hint for a
+  path that no longer exists is lost to the periodic scan too.
+- **A folder that leaves the library.** An event that names a folder which has
+  been moved out, renamed, or unmounted reaches the absence list, but a folder is
+  never a store item, so the scan loop's "does this absence name something we
+  track?" gate buys no pass and the items inside it wait for the next periodic
+  scan. The same is true of any deleted directory with tracked files in it. This
+  is platform-general, pre-dates #66, and the real fix needs a prefix query on
+  the store (only `item(path)` exists today); #66's directory rule covers the
+  hint FSEvents actually sends for a folder it still owns. Recorded as a
+  known limitation, not fixed.
 - **Unpaired renames.** FSEvents cannot pair the two sides of a rename; notify says so
   in `fsevent.rs`. The engine already detects renames by content hash (R5.2), so this
   is handled, but a rename that also changes content will look like delete + create.
 - **Network volumes.** notify documents that network filesystems may emit no events at
-  all ([docs.rs](https://docs.rs/notify/8.2.0/notify/)). The 30-minute reconciliation
-  scan is the safety net; "new file within 10 seconds" (R2.3) does not hold on an SMB
-  share. Either document that, or add a polling fallback for network mounts (a
-  `PollWatcher` or a shorter scan interval per folder). This is the one watcher item
-  that can grow; keep it out of v1 unless SMB is a target.
+  all ([docs.rs](https://docs.rs/notify/8.2.0/notify/)). Decided in #66: this is a
+  documented limitation, not a polling fallback. "New file within 10 seconds" (R2.3)
+  does not hold on an SMB or NFS share; the 30-minute reconciliation scan is the safety
+  net, and a `PollWatcher` or a shorter per-folder interval is out of scope until SMB is
+  a target. The README carries the user-facing wording (owned by #68).
 
 ### 2.7 TCC and first-run UX
 

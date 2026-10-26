@@ -385,6 +385,116 @@ async fn a_file_added_while_the_engine_runs_uploads_within_ten_seconds() {
     engine.stop();
 }
 
+/// A directory event is a rescan hint, not noise (#66, R2.3).
+///
+/// FSEvents drops and coalesces events and expects the client to walk the
+/// folder it names again; the debouncer hands over the folder, not the files
+/// inside it. inotify reports the same shape when a tree arrives, so the hint
+/// is tested with the real watcher: the file inside the folder is never
+/// reported on its own, and an hour between scans leaves reconciliation as the
+/// only way the engine can find it — which the pass count asserts, so the test
+/// cannot pass by the watcher naming the inner file after all.
+#[tokio::test]
+async fn a_directory_event_for_a_source_folder_reconciles_it() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the folder");
+    add_folder(&store, &photos, true);
+    // The tree is built outside the watch and moved in whole, which is what a
+    // dropped FSEvents batch looks like: one event for the folder, and none
+    // for the file that was already inside it.
+    let staged = write_file(
+        &temp.path().join("staging"),
+        "Holiday/beach.jpg",
+        b"nested bytes",
+    );
+    let arrived = photos.join("Holiday").join("beach.jpg");
+    let engine = start_engine(
+        &server,
+        &store,
+        review_config(Duration::from_secs(60 * 60), true),
+    )
+    .await;
+    assert!(
+        wait_until(
+            || engine.status().folders[0].last_scan_ns.is_some(),
+            Duration::from_secs(10)
+        )
+        .await,
+        "the startup scan never ran"
+    );
+    let baseline = engine.status().folders[0].last_scan_ns;
+
+    std::fs::rename(
+        staged.parent().expect("a staging folder"),
+        photos.join("Holiday"),
+    )
+    .expect("move the staged tree into the source folder");
+
+    assert!(
+        wait_until(
+            || all_terminal(&store, std::slice::from_ref(&arrived)),
+            Duration::from_secs(10)
+        )
+        .await,
+        "#66: a directory event did not reconcile the folder it named"
+    );
+    assert_ne!(
+        engine.status().folders[0].last_scan_ns,
+        baseline,
+        "#66: a scan pass found the file; the watcher never named it"
+    );
+    engine.stop();
+}
+
+/// An ordinary file event queues the file and buys no scan pass (#66, R2.3).
+///
+/// The reconciliation scan walks every source folder, so a watcher that asked
+/// for one per file would walk the library on every photo.
+#[tokio::test]
+async fn an_ordinary_file_event_queues_the_file_without_a_scan() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the folder");
+    add_folder(&store, &photos, true);
+    let engine = start_engine(
+        &server,
+        &store,
+        review_config(Duration::from_secs(60 * 60), true),
+    )
+    .await;
+    assert!(
+        wait_until(
+            || engine.status().folders[0].last_scan_ns.is_some(),
+            Duration::from_secs(10)
+        )
+        .await,
+        "the startup scan never ran"
+    );
+    let baseline = engine.status().folders[0].last_scan_ns;
+
+    let added = write_file(&photos, "arrived.jpg", b"a new photo");
+
+    assert!(
+        wait_until(
+            || all_terminal(&store, std::slice::from_ref(&added)),
+            Duration::from_secs(10)
+        )
+        .await,
+        "the watched file was not queued"
+    );
+    assert_eq!(
+        engine.status().folders[0].last_scan_ns,
+        baseline,
+        "#66: an ordinary file event must not buy a full reconciliation pass"
+    );
+    engine.stop();
+}
+
 #[tokio::test]
 async fn a_file_added_while_the_engine_is_stopped_uploads_after_startup() {
     let server = MockImmich::start().await;
