@@ -118,13 +118,19 @@ embed-resource = "3"
 # in Rust, so the build needs no OpenSSL.
 dbus-secret-service-keyring-store = { version = "=1.0.1", features = ["crypto-rust"] }
 
-[target."cfg(windows)".dependencies]
-windows-native-keyring-store = "=1.1.0"
-windows-registry = "0.6"
-
 [target."cfg(target_os = \"macos\")".dependencies]
+# SMAppService (macOS 13+), the login-item API behind the autostart setting.
+# Pinned exactly, like the other platform stores. This wrapper keeps the raw
+# `objc2-service-management` binding behind safe methods, so the backend writes
+# no `unsafe`.
+smappservice-rs = "=0.1.3"
+
 # The login Keychain store, the macOS sibling of the two above. `keychain` is the
 # file-based login Keychain; `protected` is the data-protection Keychain, which
 # needs a provisioning profile and entitlement this unsigned bundle has none of
 # (ADR 0008).
 apple-native-keyring-store = { version = "=1.0.2", features = ["keychain"] }
+
+[target."cfg(windows)".dependencies]
+windows-native-keyring-store = "=1.1.0"
+windows-registry = "0.6"
