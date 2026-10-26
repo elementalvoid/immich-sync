@@ -222,11 +222,14 @@ jobs:
         working-directory: crates/app
         run: |
           set -euo pipefail
-          app="dist/Immich Sync.app"
-          dmg="dist/Immich Sync_${VERSION}_aarch64.dmg"
+          # The packager resolves --out-dir against this crate's directory,
+          # so the artifact lives two levels up; every path below follows it.
+          app="../../dist/Immich Sync.app"
+          dmg="../../dist/Immich Sync_${VERSION}_aarch64.dmg"
           cargo build --release --locked -p immich-sync --target aarch64-apple-darwin
           cargo packager --release --target aarch64-apple-darwin \
             --formats app --out-dir ../../dist
+          test -d "$app"
           codesign --force --sign - --timestamp=none "$app"
           codesign -dv --verbose=4 "$app"
           codesign --verify --strict --verbose=2 "$app"
@@ -245,11 +248,14 @@ jobs:
         working-directory: crates/app
         run: |
           set -euo pipefail
-          app="dist/Immich Sync.app"
-          dmg="dist/Immich Sync_${VERSION}_x64.dmg"
+          # The packager resolves --out-dir against this crate's directory,
+          # so the artifact lives two levels up; every path below follows it.
+          app="../../dist/Immich Sync.app"
+          dmg="../../dist/Immich Sync_${VERSION}_x64.dmg"
           cargo build --release --locked -p immich-sync --target x86_64-apple-darwin
           cargo packager --release --target x86_64-apple-darwin \
             --formats app --out-dir ../../dist
+          test -d "$app"
           codesign --force --sign - --timestamp=none "$app"
           codesign -dv --verbose=4 "$app"
           codesign --verify --strict --verbose=2 "$app"
