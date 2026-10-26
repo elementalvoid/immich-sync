@@ -139,10 +139,12 @@ settings view must display rather than an error to swallow. If the status is
 `requiresApproval`, call `openSystemSettingsLoginItems()`.
 
 Use `objc2-service-management` 0.3.2 (the objc2 project; the app already uses objc2
-transitively through `gpui-tray`) or the narrower `smappservice-rs` 0.1.3. Do not
-write a `~/Library/LaunchAgents` plist: it still works, but Apple documents it as the
-pre-13 mechanism and it shows the signing organisation rather than the app name in
-Login Items ([Apple](https://developer.apple.com/documentation/servicemanagement/updating-helper-executables-from-earlier-versions-of-macos)).
+transitively through `gpui-tray`) or the narrower `smappservice-rs` 0.1.3. A
+`~/Library/LaunchAgents` plist is the fallback only: [ADR 0008](../adr/0008-macos-unsigned-distribution.md)
+writes it when `register()` returns `InvalidSignature`, because the release ships
+unsigned. It still works, but Apple documents it as the pre-13 mechanism and it shows
+the signing organisation rather than the app name in Login Items
+([Apple](https://developer.apple.com/documentation/servicemanagement/updating-helper-executables-from-earlier-versions-of-macos)).
 The existing `Autostart` trait is the seam; the macOS backend ignores `AppPaths`.
 
 ### 2.3 Open folder
@@ -320,8 +322,8 @@ The metadata this repo would add:
 minimumSystemVersion = "13.0"
 backgroundApp = false
 infoPlistPath = "macos/Info.plist"
-# signingIdentity is injected by the release job; do not commit it here if local
-# unsigned builds must keep working.
+# No signingIdentity: [ADR 0008](../adr/0008-macos-unsigned-distribution.md) ships
+# macOS unsigned, so the release sets no identity and never signs either.
 ```
 
 And the compiler's deployment target, which the packager does not set:

@@ -164,7 +164,7 @@ Each ticket declares its blockers as a native GitHub issue dependency. The front
 | Renames appear as deletions | Review noise | Rename detection by content hash (open question). |
 | Hashing large libraries is slow | First run takes hours | Persist SHA-1. Hash only new or changed files. |
 | Password in the credential store | Credential exposure | OS store only. Never write it to the config file or the logs. |
-| Unsigned macOS bundle is refused by Gatekeeper, the Login Item, or notifications | First launch needs an override; autostart may fall back | Documented **Open Anyway** flow and checksum ([ADR 0008](docs/adr/0008-macos-unsigned-distribution.md)); verified on real hardware. |
+| Unsigned macOS bundle is refused by Gatekeeper, the Login Item, or notifications | First launch needs an override; autostart may fall back | Documented **Open Anyway** flow and checksum ([ADR 0008](docs/adr/0008-macos-unsigned-distribution.md)); to be verified on real hardware before the release (#70). |
 
 ## Open questions
 

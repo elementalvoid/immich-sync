@@ -36,6 +36,13 @@ pub mod upload;
 pub mod upload_view;
 pub mod version;
 
+/// The bundle identifier from the packager metadata (`crates/app/Cargo.toml`).
+///
+/// It is the Windows AppUserModelID the shell sets and the label of the macOS
+/// LaunchAgent the unsigned-bundle fallback writes, so both stay in step with
+/// the identifier the package is built with.
+pub const BUNDLE_ID: &str = "com.elementalvoid.immich-sync";
+
 use anyhow::Context as _;
 use async_channel::Receiver;
 use gpui_kit::{App, QuitMode};

@@ -210,7 +210,20 @@ impl KeyringStore {
 fn failed(action: &'static str, error: keyring_core::Error) -> CredentialError {
     CredentialError::Failed {
         action,
-        reason: error.to_string(),
+        reason: failure_reason(&error.to_string(), cfg!(target_os = "macos")),
+    }
+}
+
+/// The reason a failed keyring operation reports, by platform.
+///
+/// On macOS a denied Keychain ACL prompt arrives here as a platform failure, and
+/// the raw `keyring_core` text names no remedy (#62). Other platforms keep that
+/// text: their store has no prompt to explain.
+fn failure_reason(reason: &str, macos: bool) -> String {
+    if macos {
+        keychain_message(reason)
+    } else {
+        reason.to_string()
     }
 }
 
@@ -324,6 +337,25 @@ mod tests {
         assert!(
             message.contains("the user canceled the operation"),
             "{message}"
+        );
+    }
+
+    #[test]
+    fn a_failed_keychain_operation_names_the_prompt_and_the_remedy_on_macos() {
+        let reason = "the user denied the Keychain prompt";
+
+        assert_eq!(
+            failure_reason(reason, false),
+            reason,
+            "other platforms keep the store's own text"
+        );
+        let message = failure_reason(reason, true);
+        assert!(message.contains("login Keychain"), "{message}");
+        assert!(message.contains("Allow the Keychain prompt"), "{message}");
+        assert!(message.contains("Keychain Access"), "{message}");
+        assert!(
+            message.contains(reason),
+            "the original reason is kept: {message}"
         );
     }
 

@@ -14,6 +14,8 @@ use anyhow::Context as _;
 #[cfg(target_os = "macos")]
 use smappservice_rs::{AppService, ServiceManagementError, ServiceStatus, ServiceType};
 
+#[cfg(target_os = "macos")]
+use crate::BUNDLE_ID;
 use crate::paths::AppPaths;
 
 /// The name the client registers under in the OS autostart mechanism.
@@ -221,12 +223,6 @@ impl Autostart for RunKeyAutostart {
     }
 }
 
-/// The bundle identifier from the packager metadata (`crates/app/Cargo.toml`),
-/// and so the label of the LaunchAgent file the fallback writes. The login item
-/// itself is addressed by bundle identity and takes no label.
-#[cfg(any(target_os = "macos", test))]
-const MACOS_BUNDLE_ID: &str = "com.elementalvoid.immich-sync";
-
 /// Shown while macOS holds the login item until the user approves it.
 #[cfg(target_os = "macos")]
 const APPROVAL_HINT: &str = "macOS needs your approval in System Settings › General › Login Items.";
@@ -348,7 +344,7 @@ impl MacAutostart {
 
     /// The LaunchAgent file the unsigned-bundle fallback writes.
     fn plist_path(&self) -> PathBuf {
-        self.launch_agents.join(format!("{MACOS_BUNDLE_ID}.plist"))
+        self.launch_agents.join(format!("{BUNDLE_ID}.plist"))
     }
 
     /// Whether the fallback, rather than the login item, starts the app.
@@ -358,7 +354,7 @@ impl MacAutostart {
     /// file that starts nothing while the switch claimed on.
     fn launch_agent_current(&self) -> bool {
         std::fs::read_to_string(self.plist_path())
-            .is_ok_and(|plist| plist == launch_agent_plist(MACOS_BUNDLE_ID, &self.executable))
+            .is_ok_and(|plist| plist == launch_agent_plist(BUNDLE_ID, &self.executable))
     }
 
     /// Registers the login item, or writes the LaunchAgent when the bundle is
@@ -394,7 +390,7 @@ impl MacAutostart {
         let path = self.plist_path();
         std::fs::create_dir_all(&self.launch_agents)
             .with_context(|| format!("create {}", self.launch_agents.display()))?;
-        std::fs::write(&path, launch_agent_plist(MACOS_BUNDLE_ID, &self.executable))
+        std::fs::write(&path, launch_agent_plist(BUNDLE_ID, &self.executable))
             .with_context(|| format!("write {}", path.display()))?;
         tracing::warn!(
             path = %path.display(),
@@ -472,7 +468,9 @@ impl Autostart for UnavailableAutostart {
 mod tests {
     use std::path::Path;
 
-    use super::{LoginItemStatus, MACOS_BUNDLE_ID, launch_agent_plist};
+    use crate::BUNDLE_ID;
+
+    use super::{LoginItemStatus, launch_agent_plist};
 
     #[test]
     fn a_registered_login_item_reads_as_on() {
@@ -500,7 +498,7 @@ mod tests {
     #[test]
     fn the_launch_agent_label_is_the_packager_identifier() {
         assert!(
-            include_str!("../Cargo.toml").contains(&format!("identifier = \"{MACOS_BUNDLE_ID}\"")),
+            include_str!("../Cargo.toml").contains(&format!("identifier = \"{BUNDLE_ID}\"")),
             "the LaunchAgent label must stay the bundle identifier the package is built with"
         );
     }

@@ -114,7 +114,10 @@ copy and its shortcuts.
    reason (see [Troubleshooting](#troubleshooting)).
 
 To uninstall, quit the app and move **Immich Sync** from **Applications** to the
-Trash.
+Trash. If macOS refused the unsigned login item, turning **Autostart at login**
+off removes the LaunchAgent at
+`~/Library/LaunchAgents/com.elementalvoid.immich-sync.plist`; deleting that file
+does the same.
 
 ### Linux (deb)
 
@@ -276,7 +279,7 @@ state database, and the logs in one folder under your home directory.
 | --- | --- | --- | --- |
 | Settings (`settings.toml`) | `%APPDATA%\immich-sync\` | `~/.config/immich-sync/` | `~/Library/Application Support/immich-sync/` |
 | State database (`state.db`) and logs | `%LOCALAPPDATA%\immich-sync\` | `~/.local/share/immich-sync/` | `~/Library/Application Support/immich-sync/` |
-| Autostart entry (when enabled) | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` | `~/.config/autostart/immich-sync.desktop` | Login Items (`SMAppService`) |
+| Autostart entry (when enabled) | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` | `~/.config/autostart/immich-sync.desktop` | Login Items (`SMAppService`), or `~/Library/LaunchAgents/com.elementalvoid.immich-sync.plist` when macOS refuses the unsigned login item |
 | Credential | Windows Credential Manager | Secret Service (GNOME Keyring or KWallet) | login Keychain |
 
 The log file is `immich-sync.log.<date>`, one file per day, five kept. The state

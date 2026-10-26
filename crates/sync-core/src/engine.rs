@@ -42,7 +42,7 @@ use crate::hash::{Sha1, sha1_file};
 use crate::meter::UploadMeter;
 use crate::missing::{Fate, Host, SizeIndex, fate, is_gone, rename_target};
 use crate::pairing::FolderIndex;
-use crate::paths::{PathCase, is_within, key_is_within, path_key};
+use crate::paths::{PathCase, is_within, key, key_is_within, path_key};
 use crate::scan::{ScanError, scan_folder};
 use crate::skip::{has_symlink_ancestor, skip_reason_below};
 use crate::status::{AlbumRename, ConnectionHealth, FolderStatus, Status, StatusInputs};
@@ -1242,9 +1242,12 @@ impl EngineInner {
         // The hint is decided per batch, so the batch is collected first and
         // acted on below.
         enum Watched {
-            Directory(PathBuf),
-            File(PathBuf),
+            /// Only its key is used: a directory is a hint, never queued.
+            Directory(String),
+            /// The path is queued; the key is compared against the directories.
+            File { path: PathBuf, key: String },
         }
+        let case = PathCase::for_platform();
         let mut watched = Vec::with_capacity(paths.len());
         for path in paths {
             let Ok(metadata) = std::fs::symlink_metadata(&path) else {
@@ -1285,9 +1288,12 @@ impl EngineInner {
                 continue;
             }
             if metadata.is_dir() {
-                watched.push(Watched::Directory(path));
+                watched.push(Watched::Directory(key(&path, case)));
             } else if metadata.is_file() {
-                watched.push(Watched::File(path));
+                watched.push(Watched::File {
+                    key: key(&path, case),
+                    path,
+                });
             }
         }
         // #66: a directory is a rescan hint only when no file in the same
@@ -1305,20 +1311,19 @@ impl EngineInner {
         // rescans every folder. That is bounded: at most one hint per 2 s
         // debounce (R2.3), one serialized scan loop, and a hint that arrives
         // during a pass is not queued again.
-        let case = PathCase::for_platform();
         let hint = watched.iter().any(|entry| match entry {
-            Watched::Directory(dir) => !watched.iter().any(|other| match other {
-                Watched::File(file) => is_within(dir, file, case),
+            Watched::Directory(dir_key) => !watched.iter().any(|other| match other {
+                Watched::File { key, .. } => key_is_within(dir_key, key),
                 Watched::Directory(_) => false,
             }),
-            Watched::File(_) => false,
+            Watched::File { .. } => false,
         });
         if hint {
             self.rescan_hint.store(true, Ordering::SeqCst);
             self.reconcile.notify_one();
         }
         for entry in watched {
-            if let Watched::File(path) = entry {
+            if let Watched::File { path, .. } = entry {
                 let _ = self.queue.send(path);
             }
         }

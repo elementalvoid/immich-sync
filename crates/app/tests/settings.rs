@@ -6,8 +6,9 @@
 //!
 //! The path tests split in two. Mapping the platform base directories to the
 //! application's paths is our own code and runs on every platform. Resolving
-//! those base directories is the platform's, and only Linux lets a test steer
-//! it, so the end-to-end resolution tests are Linux-only.
+//! those base directories is the platform's: only Linux lets a test steer it,
+//! so the end-to-end Linux tests are steerable and the macOS one pins the fixed
+//! `~/Library/Application Support` shape of the real resolver.
 
 #[cfg(target_os = "linux")]
 use std::ffi::OsString;
@@ -20,7 +21,7 @@ use std::sync::{Mutex, MutexGuard};
 use immich_sync::autostart::{Autostart, XdgAutostart, platform_autostart};
 use immich_sync::logging::LogLevel;
 use immich_sync::paths::AppPaths;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use immich_sync::paths::{APP_DIR, SETTINGS_FILE, STATE_FILE};
 use immich_sync::settings::{Settings, SettingsStore};
 use sync_core::connection::AuthMethod;
@@ -175,6 +176,37 @@ fn linux_paths_fall_back_to_the_home_directories() {
     assert_eq!(
         paths.state_db,
         home.join(".local/share").join(APP_DIR).join(STATE_FILE)
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_paths_resolve_under_application_support() {
+    let home = directories::BaseDirs::new()
+        .expect("the platform provides a home directory")
+        .home_dir()
+        .to_path_buf();
+    let support = home
+        .join("Library")
+        .join("Application Support")
+        .join(APP_DIR);
+
+    let paths = AppPaths::resolve().expect("resolve the macOS paths");
+
+    assert_eq!(
+        paths.config_file,
+        support.join(SETTINGS_FILE),
+        "R9.3: settings live under ~/Library/Application Support/immich-sync/"
+    );
+    assert_eq!(
+        paths.state_db,
+        support.join(STATE_FILE),
+        "R9.3: the state database lives under ~/Library/Application Support/immich-sync/"
+    );
+    assert_eq!(
+        paths.log_directory(),
+        support,
+        "R9.3: the logs sit beside the state database, in the same folder"
     );
 }
 

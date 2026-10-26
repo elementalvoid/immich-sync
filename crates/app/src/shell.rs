@@ -48,7 +48,7 @@ pub fn init(cx: &mut App) {
     // R10.1). It must match the packager identifier: the NSIS installer stamps
     // shortcuts with that identifier, and a pin or toast only resolves to them
     // when the two agree.
-    cx.set_app_identity("com.elementalvoid.immich-sync", "Immich Sync");
+    cx.set_app_identity(crate::BUNDLE_ID, "Immich Sync");
     cx.on_action(show)
         .on_action(hide)
         .on_action(quit)
