@@ -107,7 +107,12 @@ fn run_client() -> anyhow::Result<()> {
     let (requests, incoming) = async_channel::unbounded();
     std::thread::spawn(move || instance::forward(listener, requests));
 
-    gpui_kit::application().run(move |cx| boot(cx, incoming));
+    // A Dock click with no window open reopens the main window. The callback
+    // lives on the `Application`, not on `App`: gpui-pre fires it only from the
+    // macOS delegate, and `show_window` handles both cases (issue #64).
+    let application = gpui_kit::application();
+    application.on_reopen(shell::show_window);
+    application.run(move |cx| boot(cx, incoming));
     Ok(())
 }
 

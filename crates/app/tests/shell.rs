@@ -24,7 +24,9 @@ use immich_sync::failed_view::FailedView;
 use immich_sync::paths::AppPaths;
 use immich_sync::review_view::ReviewView;
 use immich_sync::settings_view::SettingsView;
-use immich_sync::shell::{self, AppShell, Hide, Pause, Resume, Show, SyncNow, ViewMode};
+use immich_sync::shell::{
+    self, About, AppShell, Hide, Minimize, Pause, Quit, Resume, Show, SyncNow, ViewMode,
+};
 use immich_sync::store::StoreModel;
 use immich_sync::upload::UploadModel;
 use immich_sync::upload_view::UploadView;
@@ -444,6 +446,65 @@ async fn the_folder_detail_links_open_a_filtered_view(cx: &mut TestAppContext) {
         );
     })
     .expect("read the review");
+}
+
+/// #64: Cmd+Q and Cmd+W have no `OsAction` in this GPUI, so only a key
+/// binding makes those keys fire, and it must be registered on macOS alone.
+#[gpui_kit::test]
+fn the_menu_shortcuts_are_bound_only_on_macos(cx: &mut TestAppContext) {
+    boot(cx);
+    let (quit, hide) = cx.update(|cx| {
+        let keymap = cx.key_bindings();
+        let keymap = keymap.borrow();
+        (
+            keymap.bindings_for_action(&Quit).count(),
+            keymap.bindings_for_action(&Hide).count(),
+        )
+    });
+
+    #[cfg(target_os = "macos")]
+    assert_eq!((quit, hide), (1, 1), "Cmd+Q quits and Cmd+W closes");
+    #[cfg(not(target_os = "macos"))]
+    assert_eq!(
+        (quit, hide),
+        (0, 0),
+        "the macOS shortcuts stay off every other platform"
+    );
+}
+
+/// #64: About is not a dead item. The Diagnostics surface already holds the
+/// version, the git revision, and the paths, so About opens it rather than a
+/// dialog this app does not have.
+#[gpui_kit::test]
+fn about_opens_the_window_on_the_diagnostics_surface(cx: &mut TestAppContext) {
+    boot(cx);
+    assert_eq!(windows(cx), 0);
+
+    cx.update(|cx| cx.dispatch_action(&About));
+    cx.run_until_parked();
+    assert_eq!(windows(cx), 1, "About opens the window when it is closed");
+
+    let window = cx
+        .read(|cx| cx.windows().first().copied())
+        .expect("the window is open");
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("diagnostics-view").is_some(),
+            "About opens the Diagnostics surface, which holds the version, the \
+             git revision, and the paths"
+        );
+    })
+    .expect("read the About surface");
+
+    // The Window menu's Close is `Hide`, and Minimize with no window open must
+    // not conjure one.
+    cx.update(|cx| cx.dispatch_action(&Hide));
+    cx.run_until_parked();
+    assert_eq!(windows(cx), 0);
+    cx.update(|cx| cx.dispatch_action(&Minimize));
+    cx.run_until_parked();
+    assert_eq!(windows(cx), 0, "Minimize has no window to act on");
 }
 
 #[gpui_kit::test]

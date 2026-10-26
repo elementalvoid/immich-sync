@@ -25,7 +25,10 @@ use sync_core::store::FolderCounts;
 
 use std::sync::Mutex;
 
-actions!(immich_sync, [Show, Hide, Quit, Pause, Resume, SyncNow]);
+actions!(
+    immich_sync,
+    [Show, Hide, Quit, Pause, Resume, SyncNow, About, Minimize]
+);
 
 /// Global holding the tray icon so [`Quit`] can remove it.
 struct TrayHandle(Tray);
@@ -51,9 +54,38 @@ pub fn init(cx: &mut App) {
         .on_action(quit)
         .on_action(pause)
         .on_action(resume)
-        .on_action(sync_now);
+        .on_action(sync_now)
+        // The macOS menu bar's own items; nothing else dispatches them, so
+        // registering the handlers everywhere leaves Linux and Windows alone.
+        .on_action(about)
+        .on_action(minimize);
+    #[cfg(target_os = "macos")]
+    install_macos_menu(cx);
     let connection = install_connection_with(cx, show_connection_on_tray);
     install_models(cx, connection);
+}
+
+/// Installs the macOS menu bar and the shortcuts it advertises (issue #64).
+///
+/// The keys are bound before the bar is built: an item draws its key
+/// equivalent from the keymap, and GPUI has no `OsAction` for Quit or Close.
+#[cfg(target_os = "macos")]
+fn install_macos_menu(cx: &mut App) {
+    cx.bind_keys(app_shortcuts());
+    cx.set_menus(app_menu());
+}
+
+/// The shortcuts the macOS menu bar advertises (issue #64).
+///
+/// GPUI has no `OsAction` for Quit or Close, so the keymap is the only way
+/// `cmd-q` and `cmd-w` fire. They are bound with no context, ahead of the text
+/// inputs' own `cmd-x/c/v/a`.
+#[must_use]
+pub fn app_shortcuts() -> [KeyBinding; 2] {
+    [
+        KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("cmd-w", Hide, None),
+    ]
 }
 
 /// The app-level handle to the one connection model (R1.4).
@@ -212,6 +244,32 @@ fn quit(_: &Quit, cx: &mut App) {
         let _ = tray.close(cx);
     }
     cx.quit();
+}
+
+/// About opens the Diagnostics surface for the same reason it exists: version,
+/// git revision, and paths, without a dialog this app does not have.
+fn about(_: &About, cx: &mut App) {
+    show_window(cx);
+    let Some(window) = cx.windows().first().copied() else {
+        return;
+    };
+    // `gpui_kit::open_window` wraps every window in its `Root`; the shell is
+    // the view inside it.
+    let _ = window.update(cx, |root, _, cx| {
+        let shell = root
+            .downcast::<base::Root>()
+            .ok()
+            .and_then(|root| root.read(cx).view().clone().downcast::<AppShell>().ok());
+        if let Some(shell) = shell {
+            shell.update(cx, |shell, cx| shell.show(ViewMode::Diagnostics, cx));
+        }
+    });
+}
+
+fn minimize(_: &Minimize, cx: &mut App) {
+    if let Some(window) = cx.windows().first().copied() {
+        let _ = window.update(cx, |_, window, _| window.minimize_window());
+    }
 }
 
 /// Brings the main window to the front, opening it if it was closed.
@@ -615,13 +673,16 @@ impl Render for AppShell {
 ///
 /// Returns an error when the platform cannot register the tray icon.
 pub fn install_tray(cx: &mut App) -> gpui_tray::Result<()> {
-    let tray = Tray::builder()
+    let builder = Tray::builder()
         .icon(icon()?)
-        .title("Immich Sync")
         .tooltip("Immich Sync")
         .on_activate(Show)
-        .menu(|_| tray_menu())
-        .build(cx)?;
+        .menu(|_| tray_menu());
+    // The macOS menu bar has no room for a text title beside the icon; Windows
+    // and Linux keep theirs (issue #64).
+    #[cfg(not(target_os = "macos"))]
+    let builder = builder.title("Immich Sync");
+    let tray = builder.build(cx)?;
     cx.set_global(TrayHandle(tray));
     // The models are created before the window, so push the state they already
     // hold instead of waiting for the first transition.
@@ -640,6 +701,36 @@ pub fn tray_menu() -> Vec<MenuItem> {
         MenuItem::action("Sync now", SyncNow),
         MenuItem::separator(),
         MenuItem::action("Quit", Quit),
+    ]
+}
+
+/// The macOS menu bar: the app menu, Edit, and Window (issue #64).
+///
+/// GPUI has no default bar and no prebuilt menus, so every item is spelled out
+/// from the actions [`tray_menu`] already uses. [`init`] installs it on macOS
+/// only.
+#[must_use]
+pub fn app_menu() -> Vec<Menu> {
+    vec![
+        Menu::new("Immich Sync").items([
+            MenuItem::action("About Immich Sync", About),
+            MenuItem::separator(),
+            MenuItem::action("Quit Immich Sync", Quit),
+        ]),
+        // `os_action` gives AppKit the editing selector while the item still
+        // carries the action the text inputs already bind to cmd-x/c/v/a.
+        Menu::new("Edit").items([
+            MenuItem::os_action("Cut", base::input::Cut, OsAction::Cut),
+            MenuItem::os_action("Copy", base::input::Copy, OsAction::Copy),
+            MenuItem::os_action("Paste", base::input::Paste, OsAction::Paste),
+            MenuItem::os_action("Select All", base::input::SelectAll, OsAction::SelectAll),
+        ]),
+        // AppKit gives the menu titled "Window" the window roles and the window
+        // list; Close is this app's Hide, which removes the window as Cmd+W does.
+        Menu::new("Window").items([
+            MenuItem::action("Close", Hide),
+            MenuItem::action("Minimize", Minimize),
+        ]),
     ]
 }
 
@@ -724,28 +815,142 @@ pub fn show_status_on_tray(cx: &mut App) {
 
 /// A solid circular tray icon, drawn in code so the shell needs no asset.
 fn icon() -> gpui_tray::Result<Icon> {
-    const SIZE: u32 = 32;
-    let mut rgba = vec![0u8; (SIZE * SIZE * 4) as usize];
-    for y in 0..SIZE {
-        for x in 0..SIZE {
-            let offset = ((y * SIZE + x) * 4) as usize;
-            let dx = x as i32 - 15;
-            let dy = y as i32 - 15;
-            if dx * dx + dy * dy <= 14 * 14 {
+    let size = tray_icon_spec();
+    Icon::from_rgba(tray_icon_rgba(size), size, size)
+}
+
+/// The status item's pixel size: an 18 pt macOS menu-bar icon, 32 px elsewhere.
+fn tray_icon_spec() -> u32 {
+    if cfg!(target_os = "macos") { 18 } else { 32 }
+}
+
+/// A solid disc centred in a transparent square of `size` pixels.
+///
+/// One colour and no thin strokes is what keeps it legible on a light and a
+/// dark menu bar, because `gpui-tray` 0.1.4 cannot mark the image as a template.
+// shortcut: one coloured 18 px icon, no template or Retina representation in
+// gpui-tray 0.1.4; add a `template` flag upstream and ship 18 + 36 px when it
+// exposes one.
+fn tray_icon_rgba(size: u32) -> Vec<u8> {
+    let mut rgba = vec![0u8; (size * size * 4) as usize];
+    let centre = size as i32 / 2 - 1;
+    let radius = centre - 1;
+    for y in 0..size {
+        for x in 0..size {
+            let offset = ((y * size + x) * 4) as usize;
+            let dx = x as i32 - centre;
+            let dy = y as i32 - centre;
+            if dx * dx + dy * dy <= radius * radius {
                 rgba[offset..offset + 4].copy_from_slice(&[45, 105, 220, 255]);
             }
         }
     }
-    Icon::from_rgba(rgba, SIZE, SIZE)
+    rgba
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{hide_window, install_connection_with, install_models, show_window};
-    use gpui_kit::TestAppContext;
+    use super::{
+        About, Hide, Minimize, Quit, app_menu, app_shortcuts, hide_window, install_connection_with,
+        install_models, show_window, tray_icon_rgba, tray_icon_spec,
+    };
+    use gpui_kit::{Action, MenuItem, OsAction, TestAppContext, base};
     use std::cell::RefCell;
     use std::rc::Rc;
     use sync_core::connection::{Attention, ConnectionState};
+
+    /// The labels and OS actions of a menu's real items, in order.
+    fn menu_items(menu: &gpui_kit::Menu) -> Vec<(&str, Option<OsAction>)> {
+        menu.items
+            .iter()
+            .filter_map(|item| match item {
+                MenuItem::Action {
+                    name, os_action, ..
+                } => Some((name.as_ref(), *os_action)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn carries(item: &MenuItem, expected: &dyn Action) -> bool {
+        matches!(item, MenuItem::Action { action, .. } if action.partial_eq(expected))
+    }
+
+    /// #64: the macOS menu bar is the app menu, the Edit menu, and the Window
+    /// menu, built from the same actions the tray menu uses. AppKit gives the
+    /// items below the first menu no OS role, so About and Quit are plain app
+    /// actions and Close is this app's Hide.
+    #[test]
+    fn the_app_menu_is_the_macos_app_edit_and_window_bar() {
+        let menus = app_menu();
+        let names: Vec<&str> = menus.iter().map(|menu| menu.name.as_ref()).collect();
+        assert_eq!(names, ["Immich Sync", "Edit", "Window"]);
+
+        assert!(
+            menu_items(&menus[0]) == [("About Immich Sync", None), ("Quit Immich Sync", None)],
+            "the app menu holds About and Quit"
+        );
+        assert!(carries(&menus[0].items[0], &About));
+        assert!(carries(&menus[0].items[2], &Quit));
+
+        assert!(
+            menu_items(&menus[1])
+                == [
+                    ("Cut", Some(OsAction::Cut)),
+                    ("Copy", Some(OsAction::Copy)),
+                    ("Paste", Some(OsAction::Paste)),
+                    ("Select All", Some(OsAction::SelectAll)),
+                ],
+            "the Edit menu carries the four AppKit editing roles"
+        );
+        // The same actions the text inputs bind: the item sends the AppKit
+        // selector and dispatches the action the input already handles.
+        assert!(carries(&menus[1].items[0], &base::input::Cut));
+        assert!(carries(&menus[1].items[1], &base::input::Copy));
+        assert!(carries(&menus[1].items[2], &base::input::Paste));
+        assert!(carries(&menus[1].items[3], &base::input::SelectAll));
+
+        assert!(
+            menu_items(&menus[2]) == [("Close", None), ("Minimize", None)],
+            "the Window menu closes and minimizes"
+        );
+        assert!(carries(&menus[2].items[0], &Hide));
+        assert!(carries(&menus[2].items[1], &Minimize));
+    }
+
+    /// #64: Cmd+Q quits and Cmd+W closes, through the actions the menu items
+    /// carry, so the keys and the menu cannot drift.
+    #[test]
+    fn the_app_shortcuts_are_quit_and_close() {
+        let shortcuts = app_shortcuts();
+        assert_eq!(shortcuts.len(), 2);
+        assert!(shortcuts[0].action().partial_eq(&Quit));
+        assert!(shortcuts[1].action().partial_eq(&Hide));
+    }
+
+    /// #64: the status item is 18 pt on macOS and 32 px elsewhere, and the art
+    /// is a solid disc: one colour with no thin strokes, which is what stays
+    /// legible on both menu bar appearances because 0.1.4 cannot mark the
+    /// image as a template.
+    #[test]
+    fn the_tray_icon_is_menu_bar_sized_on_macos() {
+        assert_eq!(
+            tray_icon_spec(),
+            if cfg!(target_os = "macos") { 18 } else { 32 }
+        );
+
+        for size in [18, 32] {
+            let rgba = tray_icon_rgba(size);
+            assert_eq!(rgba.len(), (size * size * 4) as usize);
+            assert_eq!(rgba[0..4], [0, 0, 0, 0], "the corner stays transparent");
+            let centre = ((size / 2 * size + size / 2) * 4) as usize;
+            assert_eq!(
+                rgba[centre..centre + 4],
+                [45, 105, 220, 255],
+                "the disc covers the centre"
+            );
+        }
+    }
 
     #[gpui_kit::test]
     fn the_tray_mapping_follows_a_state_change_with_no_window(cx: &mut TestAppContext) {
