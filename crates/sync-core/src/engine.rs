@@ -1180,21 +1180,22 @@ impl Observer for EngineObserver {
     }
 }
 
-/// The folder that owns `path` once both sides are resolved, and `path`
-/// rewritten under that folder's stored spelling.
+/// The folder that owns `path` once its stored root is resolved, and `path`
+/// rewritten under that root's stored spelling.
 ///
-/// The caller tries the raw spelling first; this is the retry for a path the
-/// watcher reported resolved. See [`EngineInner::folder_root_for`].
+/// Only the root is resolved, never the reported path: the path may name a
+/// file that has just been deleted, which cannot be canonicalised, and the
+/// watcher reports under the resolved root anyway. The caller tries the raw
+/// spelling first; this is the retry. See [`EngineInner::folder_root_for`].
 fn match_canonical(roots: &[&str], path: &Path, case: PathCase) -> Option<(PathBuf, PathBuf)> {
-    let resolved = std::fs::canonicalize(path).ok()?;
     for root in roots {
         let Ok(canonical) = std::fs::canonicalize(root) else {
             continue;
         };
-        if !is_within(&canonical, &resolved, case) {
+        if !is_within(&canonical, path, case) {
             continue;
         }
-        let Ok(relative) = resolved.strip_prefix(&canonical) else {
+        let Ok(relative) = path.strip_prefix(&canonical) else {
             continue;
         };
         return Some((PathBuf::from(*root), Path::new(root).join(relative)));
@@ -1238,6 +1239,12 @@ impl EngineInner {
                 // place, by the reconciliation scan; the watcher only asks for
                 // one. The store is not read here: this callback runs on the
                 // debouncer's thread and must not block (R5.1, R5.2).
+                //
+                // The absence must still be spelled the way the store spells
+                // it, or the row lookup below the scan finds nothing and the
+                // scan is skipped: a resolved path is adopted through its
+                // folder root, which still exists even when the file does not.
+                let path = self.folder_root_for(&path).map_or(path, |(_, owned)| owned);
                 self.absences.lock().expect("the absence list").push(path);
                 self.reconcile.notify_one();
                 continue;
@@ -3937,15 +3944,16 @@ mod tests {
         symlink(&real, &alias).expect("link the folder");
         let roots = [alias.to_str().expect("a UTF-8 path")];
         let resolved = std::fs::canonicalize(&real).expect("resolve the folder");
-        // The engine only asks about paths whose metadata it just read, so the
-        // event file exists by the time the lookup runs.
-        std::fs::write(resolved.join("a.jpg"), b"the file the watcher saw")
-            .expect("write the file");
 
         assert_eq!(
             match_canonical(&roots, &resolved.join("a.jpg"), PathCase::Sensitive),
             Some((alias.clone(), alias.join("a.jpg"))),
             "the event is adopted into the spelling the folder row uses"
+        );
+        assert_eq!(
+            match_canonical(&roots, &resolved.join("gone.jpg"), PathCase::Sensitive),
+            Some((alias.clone(), alias.join("gone.jpg"))),
+            "a deleted file is adopted through its root, which still resolves"
         );
         assert_eq!(
             match_canonical(
