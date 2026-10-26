@@ -392,7 +392,8 @@ async fn a_file_added_while_the_engine_runs_uploads_within_ten_seconds() {
 /// inside it. inotify reports the same shape when a tree arrives, so the hint
 /// is tested with the real watcher: the file inside the folder is never
 /// reported on its own, and an hour between scans leaves reconciliation as the
-/// only way the engine can find it.
+/// only way the engine can find it — which the pass count asserts, so the test
+/// cannot pass by the watcher naming the inner file after all.
 #[tokio::test]
 async fn a_directory_event_for_a_source_folder_reconciles_it() {
     let server = MockImmich::start().await;
@@ -424,6 +425,7 @@ async fn a_directory_event_for_a_source_folder_reconciles_it() {
         .await,
         "the startup scan never ran"
     );
+    let baseline = engine.status().folders[0].last_scan_ns;
 
     std::fs::rename(
         staged.parent().expect("a staging folder"),
@@ -438,6 +440,11 @@ async fn a_directory_event_for_a_source_folder_reconciles_it() {
         )
         .await,
         "#66: a directory event did not reconcile the folder it named"
+    );
+    assert_ne!(
+        engine.status().folders[0].last_scan_ns,
+        baseline,
+        "#66: a scan pass found the file; the watcher never named it"
     );
     engine.stop();
 }
