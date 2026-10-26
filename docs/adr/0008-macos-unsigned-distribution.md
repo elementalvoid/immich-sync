@@ -84,11 +84,11 @@ not taking, is in
 
 Hardware evidence from the first arm64 DMG this workflow produced: launching the
 app gave **"Immich Sync.app is damaged and can't be opened. You should move it to
-the Trash."**, with no route to **Open Anyway**. `codesign -dv` reported the
-bundle as not signed at all. The arm64 linker's ad-hoc signature covers the
-executable only, and Gatekeeper judges the bundle. A probe app whose bundle was
-signed with `codesign --force --sign -` showed the normal first-launch dialog and
-launched after **System Settings › Privacy & Security › Open Anyway**.
+the Trash."**, a dialog that offers no **Open Anyway**. The bundle carried no
+bundle signature: the arm64 linker's ad-hoc signature covers the executable
+only, and Gatekeeper judges the bundle. A probe app whose bundle was signed with
+`codesign --force --sign -` showed the normal first-launch dialog and launched
+after **System Settings › Privacy & Security › Open Anyway**.
 
 Decision: the macOS release job signs the bundle ad-hoc, then builds the DMG.
 `cargo-packager` produces only the `.app` (`--formats app`); the job runs
