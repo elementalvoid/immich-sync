@@ -117,8 +117,9 @@ pub fn credential_manager_message(reason: &str) -> String {
 #[must_use]
 pub fn keychain_message(reason: &str) -> String {
     format!(
-        "The login Keychain could not be opened, so the password cannot be stored. Unlock the \
-         login Keychain in Keychain Access, then sign in again. ({reason})"
+        "The login Keychain could not be opened, so the password cannot be stored. Allow the \
+         Keychain prompt (or unlock the login Keychain in Keychain Access), then sign in again. \
+         ({reason})"
     )
 }
 
@@ -319,6 +320,7 @@ mod tests {
         assert!(message.contains("login Keychain"), "{message}");
         assert!(message.contains("cannot be stored"), "{message}");
         assert!(message.contains("Keychain Access"), "{message}");
+        assert!(message.contains("Allow the Keychain prompt"), "{message}");
         assert!(
             message.contains("the user canceled the operation"),
             "{message}"
