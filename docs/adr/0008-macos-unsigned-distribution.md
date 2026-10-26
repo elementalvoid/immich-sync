@@ -70,6 +70,4 @@ not taking, is in
 - If an Apple Developer account ever appears, the change is additive: add the
   identity and secrets, and `cargo-packager` signs with hardened runtime and
   notarizes. No application code changes.
-- This ADR adds macOS to the supported platforms. `SPEC.md` §2 and N1 no longer
-  defer it; `SPEC.md`, `PLAN.md`, `README.md`, and `CONTRIBUTING.md` carry the
-  platform matrix, the install flow, and the unsigned status.
+- This ADR adds macOS to the supported platforms.

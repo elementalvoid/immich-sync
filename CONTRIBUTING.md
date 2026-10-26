@@ -59,7 +59,8 @@ cargo run -p immich-sync
 
 ## Gates
 
-CI runs these on every push, on Linux, Windows, and macOS (arm64):
+CI runs on every push, on Linux, Windows, and macOS (arm64). The Linux job runs
+all three; the Windows and macOS jobs run clippy and the tests:
 
 ```sh
 cargo fmt --all -- --check

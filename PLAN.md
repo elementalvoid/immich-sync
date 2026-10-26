@@ -37,7 +37,7 @@ A background sync client for Immich on Windows, Linux, and macOS. The user selec
 | Carried state | Tags move to the new version. Faces, descriptions, and custom metadata stay on the old version. | this plan |
 | Settings store | TOML in the OS config directory. XDG-ready, no hardcoded Windows paths. | this plan |
 | Path layout | Config in the OS config directory. State in the local data directory. | this plan |
-| Platforms (v1) | Windows and Linux ship together. macOS 13+ (arm64 and x86_64) follows as M5. | this plan |
+| Platforms (v1) | Windows and Linux ship together. macOS 13+ (arm64 and x86_64) lands as M4, before the M5 release. | this plan |
 | Release signing (v1) | Unsigned on every platform, macOS unnotarized. Windows signing moves to the public-release ticket; macOS needs no Apple account. | [ADR 0008](docs/adr/0008-macos-unsigned-distribution.md) |
 | Release provenance | Guarded CI steps, enabled when the repository goes public. | this plan |
 | Sync-state store | SQLite via `rusqlite` (bundled), WAL, `synchronous=FULL`. | [ADR 0005](docs/adr/0005-sqlite-via-rusqlite-for-state.md) |
@@ -113,7 +113,8 @@ Store settings: bundled SQLite, WAL, `synchronous=FULL`, one writer connection w
 
 ### Build prerequisites (macOS)
 
-macOS 13 or later, with Xcode and the Command Line Tools. GPUI compiles its Metal shaders at build time, so `xcrun metal --version` must succeed. On macOS 26 the Metal toolchain is a separate download: run `xcodebuild -downloadComponent MetalToolchain` when `xcrun metal --version` fails. Rendering is Metal-only with no software fallback, so a GPU-less VM cannot run the app. The release builds `aarch64-apple-darwin` natively and cross-compiles `x86_64-apple-darwin`; the packager sets no `signingIdentity` and no `APPLE_*` secret, so it signs and notarizes nothing.
+macOS 13 or later needs Xcode and the Command Line Tools, including the Metal
+toolchain; see [CONTRIBUTING.md](CONTRIBUTING.md#building-from-source).
 
 ## Milestones
 
@@ -123,8 +124,8 @@ macOS 13 or later, with Xcode and the Command Line Tools. GPUI compiles its Meta
 | M1 Engine | Headless `sync-core` with tests against a mock server | A 10k-file tree syncs. Restart resumes. The dead letter works. Missing files appear as events. |
 | M2 Integration | Config, keyring, deletion review, tray status | A user configures and syncs without a terminal. |
 | M3 Reliability | Failure visibility, diagnostics, autostart | The user sees and retries a permanent failure. |
-| M4 Release | Signed NSIS installer and docs | A stranger installs the app and syncs a folder. |
-| M5 macOS | macOS 13+ on arm64 and x86_64: unsigned DMGs, Login Item, Keychain, Files & Folders | A Mac installs from the DMG through Open Anyway and syncs a folder. |
+| M4 macOS | macOS 13+ on arm64 and x86_64: unsigned DMGs, Login Item, Keychain, Files & Folders | A Mac installs from the DMG through Open Anyway and syncs a folder. |
+| M5 Release | Unsigned NSIS installer, deb, AppImage, and docs | A stranger installs the app and syncs a folder. |
 
 The tray and GPUI integration is the main technical risk. M0 tests it first, by design.
 
