@@ -44,11 +44,24 @@ pub enum ScanError {
 /// The sentence a source folder the operating system refuses shows (R2.5).
 ///
 /// macOS blocks the first read of a protected folder and keeps blocking it
-/// until the user allows the app, so the message names the switch that lifts
-/// the denial. The map from a refusal to it is platform-neutral; the wording is
-/// the macOS one because that is where the denial is permanent and invisible.
-pub const PERMISSION_DENIED: &str = "macOS is blocking access to this folder. Open System \
-     Settings › Privacy & Security › Files & Folders and allow Immich Sync.";
+/// until the user allows the app, so there the message names the switch that
+/// lifts the denial. Anywhere else the refusal is a mode bit or a mount
+/// setting, so the message asks for permissions without naming a macOS pane:
+/// the same sentence on every platform would send a Linux user to System
+/// Settings.
+pub const fn permission_denied() -> &'static str {
+    permission_denied_on(cfg!(target_os = "macos"))
+}
+
+/// The sentence for `macos`, split out so both arms are testable on any host.
+const fn permission_denied_on(macos: bool) -> &'static str {
+    if macos {
+        "macOS is blocking access to this folder. Open System \
+         Settings › Privacy & Security › Files & Folders and allow Immich Sync."
+    } else {
+        "This folder cannot be read. Check its permissions."
+    }
+}
 
 /// The folder error a failed `read_dir` is, when the operating system refused
 /// this process the folder (#65).
@@ -268,9 +281,10 @@ mod tests {
         assert!(report.files.is_empty(), "an empty folder holds no files");
     }
 
-    /// #65: the refusal is its own folder error, and the message it renders
-    /// names the setting that lifts it. Both halves are decided here, so a
-    /// Linux test covers what a macOS denial maps to.
+    /// #65: the refusal is its own folder error, and the message it renders is
+    /// the platform's: the Files & Folders instruction on macOS, a plain
+    /// permission sentence elsewhere. Both arms are decided here, so a Linux
+    /// test covers what a macOS denial maps to.
     #[test]
     fn a_refused_folder_read_maps_to_a_denial_with_the_setting_to_change() {
         let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
@@ -285,19 +299,32 @@ mod tests {
             None,
             "only a refusal is a denial; a missing folder keeps its own error"
         );
+
+        let macos = permission_denied_on(true);
         assert!(
-            PERMISSION_DENIED.contains("System Settings › Privacy & Security › Files & Folders"),
-            "the message names the setting: {PERMISSION_DENIED}"
+            macos.contains("System Settings › Privacy & Security › Files & Folders"),
+            "the macOS message names the setting: {macos}"
         );
         assert!(
-            PERMISSION_DENIED.contains("Immich Sync"),
-            "the message names the app to allow: {PERMISSION_DENIED}"
+            macos.contains("Immich Sync"),
+            "the macOS message names the app to allow: {macos}"
+        );
+        assert_eq!(
+            permission_denied_on(false),
+            "This folder cannot be read. Check its permissions.",
+            "no other platform is told about a macOS setting"
+        );
+        assert_eq!(
+            permission_denied(),
+            permission_denied_on(cfg!(target_os = "macos")),
+            "the platform picks its own sentence"
         );
     }
 
     /// The same rule against a directory this process really may not list.
     /// Running as root can list a mode-000 directory, so the test skips itself
-    /// then and prints a `SKIP` line.
+    /// then and prints a `SKIP` line. The probe decides that, not the scan: a
+    /// scan that succeeds is the regression this test exists for.
     #[cfg(unix)]
     #[test]
     fn a_mode_zero_folder_is_refused_as_a_denial_unless_run_as_root() {
@@ -308,17 +335,24 @@ mod tests {
         std::fs::create_dir(&locked).expect("create the folder");
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
             .expect("lock the folder");
+        if !std::fs::read_dir(&locked).is_err() {
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))
+                .expect("unlock the folder");
+            eprintln!(
+                "SKIP a_mode_zero_folder_is_refused_as_a_denial_unless_run_as_root: \
+                 this process lists a mode-000 directory, so it is root"
+            );
+            return;
+        }
         let scanned = scan_folder(&folder(&locked, true));
         // Restored before the tempdir drops, so its cleanup can empty it.
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))
             .expect("unlock the folder");
 
-        match scanned {
-            Ok(_) => eprintln!(
-                "SKIP a_mode_zero_folder_is_refused_as_a_denial_unless_run_as_root: \
-                 this process lists a mode-000 directory, so it is root"
-            ),
-            Err(error) => assert_eq!(error, ScanError::Denied(locked.display().to_string())),
-        }
+        assert_eq!(
+            scanned,
+            Err(ScanError::Denied(locked.display().to_string())),
+            "a folder this process may not list is a denial, not an empty folder"
+        );
     }
 }

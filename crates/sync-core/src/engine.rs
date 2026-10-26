@@ -2471,7 +2471,7 @@ async fn scan_once(inner: &Arc<EngineInner>) {
                 // and nothing retries it: the denial lasts until the user
                 // changes System Settings.
                 set_folder_available(inner, &path, false);
-                set_folder_error(inner, &path, crate::scan::PERMISSION_DENIED);
+                set_folder_error(inner, &path, crate::scan::permission_denied());
                 tracing::info!(
                     folder = %path,
                     "the source folder needs the Files & Folders permission"
