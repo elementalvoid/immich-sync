@@ -109,6 +109,37 @@ depends = [
 # the host, and cargo resolves that table against the host too, so the crate
 # would be missing when a Linux host cross-compiles to Windows. `build.rs`
 # gates on `CARGO_CFG_TARGET_OS` instead and stays inert on other targets.
+# The macOS bundle (#67, ADR 0008). Run the packager from this directory here
+# too: `macos/Info.plist` is read relative to the working directory, so it means
+# `crates/app/macos/Info.plist` only when the release workflow has changed into
+# this crate.
+#
+# Deliberately absent: `signingIdentity`, `entitlements`, `providerShortName`,
+# and the notarization credentials. ADR 0008 ships macOS unsigned and
+# unnotarized, and cargo-packager skips signing and notarization silently when
+# there is no identity, so their absence is the decision, not an omission. Adding
+# an identity later is a config change, not a code change.
+#
+# `MacOsConfig` denies unknown fields, so a misspelled key fails the package
+# build rather than being ignored — and that build only runs on a macOS host,
+# hence the exact three keys and `tests/packaging.rs`.
+[package.metadata.packager.macos]
+# The ADR 0008 support floor, written into the bundle as LSMinimumSystemVersion.
+# It sets nothing for the compiler: rustc keeps its own default (11.0 on arm64)
+# unless MACOSX_DEPLOYMENT_TARGET is exported, which `.cargo/config.toml` does.
+minimumSystemVersion = "13.0"
+# false keeps the Regular activation policy: Dock icon, app menu, and a window.
+# `true` would add LSUIElement and make the app a menu-bar-only extra, which is
+# not what the tray and the settings window are for.
+backgroundApp = false
+# Merged over the plist the packager generates, last writer wins, which is why
+# the file carries the five NS*UsageDescription strings and nothing else: any
+# other key here would silently override the manifest's own value.
+infoPlistPath = "macos/Info.plist"
+# `icons` above needs no macOS entry: the 512 px `icon.png` maps to ICNS
+# RGBA32_512x512 and the `.ico`'s largest frame to RGBA32_256x256, both accepted.
+# A 1024 px addition must be named `icon@2x.png`; as `icon.png` it fails.
+
 [build-dependencies]
 embed-resource = "3"
 

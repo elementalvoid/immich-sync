@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Merged over the Info.plist cargo-packager generates, with a last-writer-wins
+  insert per key, so it carries only the file-access usage strings macOS shows in
+  its privacy prompt. Every other key — CFBundleIdentifier, the version keys,
+  LSMinimumSystemVersion, NSHighResolutionCapable, LSUIElement — comes from
+  crates/app/Cargo.toml and the packager's own generator. Repeating one here
+  would silently override the manifest instead of being ignored.
+-->
+<plist version="1.0">
+<dict>
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>Immich Sync uploads photos and videos from the source folders you add, including folders on your Desktop.</string>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>Immich Sync uploads photos and videos from the source folders you add, including folders in your Documents folder.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>Immich Sync uploads photos and videos from the source folders you add, including folders in your Downloads folder.</string>
+	<key>NSNetworkVolumesUsageDescription</key>
+	<string>Immich Sync uploads photos and videos from the source folders you add on mounted network volumes.</string>
+	<key>NSRemovableVolumesUsageDescription</key>
+	<string>Immich Sync uploads photos and videos from the source folders you add on removable volumes such as SD cards and USB drives.</string>
+</dict>
+</plist>
