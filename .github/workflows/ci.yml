@@ -122,7 +122,10 @@ jobs:
           add-rust-environment-hash-key: "false"
           cache-on-failure: "true"
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
-      - run: cargo test --locked --workspace
+      # --no-fail-fast: one macOS-only failure must not hide the next test
+      # binary's. This job is the only place those tests run and each cold run
+      # costs minutes.
+      - run: cargo test --locked --workspace --no-fail-fast
 
   windows-gui-subsystem:
     name: Windows GUI subsystem (release PE)
