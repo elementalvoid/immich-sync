@@ -2692,6 +2692,10 @@ fn note_folder_scanned(inner: &EngineInner, path: &str) {
 }
 
 /// Marks one folder available or missing (R2.5).
+///
+/// Either way the entry drops its older message: a folder that just answered
+/// and a folder that just went missing both make it stale, and a denial that
+/// outlives its folder would keep naming System Settings (#65).
 fn set_folder_available(inner: &EngineInner, path: &str, available: bool) {
     let key = path_key(Path::new(path));
     let mut folders = inner.folders.lock().expect("the folder lock");
@@ -2700,9 +2704,7 @@ fn set_folder_available(inner: &EngineInner, path: &str, available: bool) {
         .find(|entry| path_key(Path::new(&entry.folder.path)) == key)
     {
         entry.available = available;
-        if available {
-            entry.last_error = None;
-        }
+        entry.last_error = None;
     }
     if available {
         clear_global_error_if_recovered(inner, &folders);
