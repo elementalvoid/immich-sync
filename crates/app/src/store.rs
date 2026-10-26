@@ -574,7 +574,10 @@ mod tests {
 
     /// The WAL sidecars follow the path's own bytes, not a lossy display of
     /// them, so a non-UTF-8 database name removes the right files (Unix).
-    #[cfg(unix)]
+    ///
+    /// Not on macOS: APFS stores names as normalised UTF-8 and rejects this
+    /// name with EILSEQ, so the case cannot be constructed there.
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn sidecars_of_a_non_utf8_database_are_removed() {
         use std::ffi::OsStr;
