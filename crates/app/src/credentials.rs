@@ -113,13 +113,16 @@ pub fn credential_manager_message(reason: &str) -> String {
     )
 }
 
-/// The message for a macOS login Keychain that could not be opened.
+/// The message for a macOS login Keychain that could not be used.
+///
+/// It covers the open and every later operation, so it must not promise a
+/// direction: a denied ACL breaks the read as readily as the write.
 #[must_use]
 pub fn keychain_message(reason: &str) -> String {
     format!(
-        "The login Keychain could not be opened, so the password cannot be stored. Allow the \
-         Keychain prompt (or unlock the login Keychain in Keychain Access), then sign in again. \
-         ({reason})"
+        "The login Keychain could not be used, so the password cannot be read or saved. Allow \
+         the Keychain prompt (or unlock the login Keychain in Keychain Access), then sign in \
+         again. ({reason})"
     )
 }
 
@@ -331,7 +334,7 @@ mod tests {
         let message = keychain_message("the user canceled the operation");
 
         assert!(message.contains("login Keychain"), "{message}");
-        assert!(message.contains("cannot be stored"), "{message}");
+        assert!(message.contains("cannot be read or saved"), "{message}");
         assert!(message.contains("Keychain Access"), "{message}");
         assert!(message.contains("Allow the Keychain prompt"), "{message}");
         assert!(

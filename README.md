@@ -113,11 +113,11 @@ copy and its shortcuts.
    folders. Allow it; without the grant the folder shows as unreadable, with the
    reason (see [Troubleshooting](#troubleshooting)).
 
-To uninstall, quit the app and move **Immich Sync** from **Applications** to the
-Trash. If macOS refused the unsigned login item, turning **Autostart at login**
-off removes the LaunchAgent at
-`~/Library/LaunchAgents/com.elementalvoid.immich-sync.plist`; deleting that file
-does the same.
+To uninstall, first turn **Autostart at login** off if macOS refused the
+unsigned login item: that removes the LaunchAgent at
+`~/Library/LaunchAgents/com.elementalvoid.immich-sync.plist`, or delete that file
+afterwards. Then quit the app and move **Immich Sync** from **Applications** to
+the Trash.
 
 ### Linux (deb)
 
