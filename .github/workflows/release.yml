@@ -198,24 +198,31 @@ jobs:
           xcrun metal --version
       - name: Install cargo-packager
         run: cargo install --locked cargo-packager --version 0.11.8
-      - name: Build the client for both architectures (release)
-        run: |
-          cargo build --release --locked -p immich-sync --target aarch64-apple-darwin
-          cargo build --release --locked -p immich-sync --target x86_64-apple-darwin
       # cargo-packager resolves `binaries_dir`, `icons`, `licenseFile`, and
       # `infoPlistPath` against the working directory, so it must run from this
       # crate. The packager does not build: it packages the binary already at
       # `target/<triple>/release`, and names the DMG after the architecture
-      # (`_aarch64.dmg`, and `x64` for x86_64). Each run rebuilds the app bundle
-      # from the binary it was pointed at, then bakes that bundle into its DMG.
+      # (`_aarch64.dmg`, and `x64` for x86_64). `--formats dmg` builds the app
+      # bundle itself, so no stray `.app` is left behind.
+      #
+      # The two architectures are built and packaged one at a time: two release
+      # trees (aws-lc-sys, bundled SQLite, GPUI) do not fit comfortably beside
+      # each other on the runner. The arm64 DMG is already in `dist` when its
+      # tree is removed, so the x64 build gets the space.
       # MACOSX_DEPLOYMENT_TARGET comes from `.cargo/config.toml`.
-      - name: Package the macOS formats
+      - name: Build and package the arm64 DMG
         working-directory: crates/app
         run: |
+          cargo build --release --locked -p immich-sync --target aarch64-apple-darwin
           cargo packager --release --target aarch64-apple-darwin \
-            --formats app,dmg --out-dir ../../dist
+            --formats dmg --out-dir ../../dist
+          rm -rf ../../target/aarch64-apple-darwin
+      - name: Build and package the x64 DMG
+        working-directory: crates/app
+        run: |
+          cargo build --release --locked -p immich-sync --target x86_64-apple-darwin
           cargo packager --release --target x86_64-apple-darwin \
-            --formats app,dmg --out-dir ../../dist
+            --formats dmg --out-dir ../../dist
       # ADR 0008 ships unsigned: no APPLE_* secret and no `signingIdentity`,
       # so the packager never invokes codesign and there is no signature or
       # notarization ticket to assert. The file and its per-architecture name
