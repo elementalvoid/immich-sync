@@ -30,22 +30,28 @@ server copy.
   bundle** archive that gathers the logs, versions, database health,
   configuration, and sizing into a single `.zip`.
 - **Private by design.** Credentials live in the operating system's credential
-  store (Windows Credential Manager, Secret Service on Linux), never in the
-  settings file or the log. There is no telemetry: the client talks only to the
-  Immich server you enter.
+  store (Windows Credential Manager, the login Keychain on macOS, Secret Service
+  on Linux), never in the settings file or the log. There is no telemetry: the
+  client talks only to the Immich server you enter.
 
 ## Status
 
-v1 targets Windows 10/11 (x64) and Linux desktops and is developed against
-Immich v3.3.x. macOS is not part of v1.
+v1 targets Windows 10/11 (x64), Linux desktops, and macOS 13 or later on Apple
+Silicon (arm64) and Intel (x86_64), and is developed against Immich v3.3.x.
 
-> **Packages are unsigned.** Windows builds are unsigned for now, so SmartScreen
-> warns on first launch.
+> **Packages are unsigned.** Windows builds are unsigned, so SmartScreen warns on
+> first launch, and macOS builds are unsigned and unnotarized, so Gatekeeper
+> blocks the first launch until you allow it in System Settings. Neither warning
+> means the download was altered; `SHA256SUMS` is the integrity check. The macOS
+> decision is recorded in
+> [ADR 0008](docs/adr/0008-macos-unsigned-distribution.md).
 
 ## Install
 
-Requirements: Windows 10/11 (x64), or a Linux desktop with a Vulkan-capable
-driver, and an Immich server reachable over HTTPS.
+Requirements: Windows 10/11 (x64), a Linux desktop with a Vulkan-capable driver,
+or macOS 13 (Ventura) or later on Apple Silicon (arm64) or Intel (x86_64), and
+an Immich server reachable over HTTPS. Rendering on macOS is Metal-only, so the
+app does not run on a Mac without a Metal device.
 
 Download the packages from the
 [releases page](https://github.com/elementalvoid/immich-sync/releases). Each
@@ -54,9 +60,11 @@ release carries, for version `<version>`:
 | File | Platform |
 | --- | --- |
 | `immich-sync_<version>_x64-setup.exe` | Windows 10/11 (x64) installer |
+| `Immich Sync_<version>_aarch64.dmg` | macOS 13+ on Apple Silicon (arm64) |
+| `Immich Sync_<version>_x64.dmg` | macOS 13+ on Intel (x86_64) |
 | `immich-sync_<version>_amd64.deb` | Debian/Ubuntu-family Linux |
 | `immich-sync_<version>_x86_64.AppImage` | Any Linux desktop |
-| `SHA256SUMS` | Checksums for all three packages |
+| `SHA256SUMS` | Checksums for every package |
 
 ### Windows 10/11
 
@@ -85,6 +93,29 @@ Uninstall from **Settings → Apps → Immich Sync**. That removes the installed
 copy and its shortcuts. Settings, state, and logs (see
 [Where everything lives](#where-everything-lives)) are kept; delete those
 folders yourself for a complete reset.
+
+### macOS (DMG)
+
+1. Open `Immich Sync_<version>_aarch64.dmg` on an Apple Silicon Mac, or
+   `Immich Sync_<version>_x64.dmg` on an Intel Mac, and drag **Immich Sync** to
+   **Applications**.
+2. The first launch is blocked. macOS says it "cannot verify that this app is
+   free of malware", because the app is not notarized by Apple. Click **Done**,
+   not **Move to Trash**. Open **System Settings › Privacy & Security**, scroll
+   down to **Security**, and click **Open Anyway** beside the message about
+   Immich Sync. Authenticate, then confirm **Open**. The app opens normally from
+   then on; the warning is expected and is not a sign the download was altered.
+   [Verify the download](#verify-the-download) before you allow it.
+3. The first sync of a folder under Desktop, Documents, Downloads, or iCloud
+   Drive, or on a removable or network volume, asks for access to files and
+   folders. Allow it; without the grant the folder shows as unreadable, with the
+   reason (see [Troubleshooting](#troubleshooting)).
+
+Settings, state, and logs are per user, and the install directory holds only the
+program. To uninstall, quit the app and move **Immich Sync** from
+**Applications** to the Trash. Settings, state, and logs (see
+[Where everything lives](#where-everything-lives)) are kept; delete that folder
+yourself for a complete reset.
 
 ### Linux (deb)
 
@@ -126,6 +157,12 @@ Linux:
 sha256sum -c SHA256SUMS
 ```
 
+macOS:
+
+```sh
+shasum -a 256 -c SHA256SUMS
+```
+
 Windows PowerShell:
 
 ```powershell
@@ -153,8 +190,9 @@ On first launch the window opens on the **Dashboard**.
 3. Click **Sign in**.
 
 The credential is stored in the operating system's credential store — Windows
-Credential Manager, or the Secret Service (GNOME Keyring or KWallet) on Linux.
-It is never written to the settings file or to the log. Later launches sign in
+Credential Manager, the login Keychain on macOS, or the Secret Service (GNOME
+Keyring or KWallet) on Linux. It is never written to the settings file or to the
+log. Later launches sign in
 again from that stored credential, without asking. A wrong password shows an
 error in the window and does not crash the client; the connection shows as
 "Needs attention" in the window and the tray tooltip.
@@ -229,13 +267,15 @@ its card instead of producing one error per file.
 
 All paths are per user. `%APPDATA%` and `%LOCALAPPDATA%` are the usual Windows
 roaming and local application-data directories; the Linux paths follow the XDG
-base directories (`~/.config`, `~/.local/share`).
+base directories (`~/.config`, `~/.local/share`); macOS keeps the settings, the
+state database, and the logs in one folder under your home directory.
 
-| What | Windows | Linux |
-| --- | --- | --- |
-| Settings (`settings.toml`) | `%APPDATA%\immich-sync\` | `~/.config/immich-sync/` |
-| State database (`state.db`) and logs | `%LOCALAPPDATA%\immich-sync\` | `~/.local/share/immich-sync/` |
-| Autostart entry (when enabled) | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` | `~/.config/autostart/immich-sync.desktop` |
+| What | Windows | Linux | macOS |
+| --- | --- | --- | --- |
+| Settings (`settings.toml`) | `%APPDATA%\immich-sync\` | `~/.config/immich-sync/` | `~/Library/Application Support/immich-sync/` |
+| State database (`state.db`) and logs | `%LOCALAPPDATA%\immich-sync\` | `~/.local/share/immich-sync/` | `~/Library/Application Support/immich-sync/` |
+| Autostart entry (when enabled) | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` | `~/.config/autostart/immich-sync.desktop` | Login Items (`SMAppService`) |
+| Credential | Windows Credential Manager | Secret Service (GNOME Keyring or KWallet) | login Keychain |
 
 The log file is `immich-sync.log.<date>`, one file per day, five kept. The state
 database stays on this machine by design: never put it on a network share or in
@@ -263,11 +303,20 @@ Expected: v1 Windows binaries are unsigned. Click **More info → Run anyway**.
 Verify the download with `SHA256SUMS` first if the warning worries you. Signing
 arrives with the public release.
 
+### "macOS cannot verify that this app is free of malware" (Gatekeeper)
+
+Expected: the macOS packages are unsigned and unnotarized. Click **Done**, not
+**Move to Trash**, then open **System Settings › Privacy & Security**, scroll
+down to **Security**, and click **Open Anyway** beside the message about Immich
+Sync. Authenticate and confirm **Open**; macOS remembers the exception. The
+checksum is how you know the download was not altered; see
+[Verify the download](#verify-the-download).
+
 ### The app seems to do nothing after launch
 
-It starts in the tray. Double-click the tray icon, or start the app again to
-bring the window to the front. If there is no tray icon, see the Linux note
-below; the window is still running.
+It starts in the tray; on macOS that is the menu bar icon. Open it, or start the
+app again to bring the window to the front. If there is no tray icon, see the
+Linux note below; the window is still running.
 
 ### No tray icon on Linux (GNOME)
 
@@ -288,6 +337,28 @@ sign-in.
 Install FUSE 2 (`libfuse2t64` on Ubuntu 24.04) or run the file with
 `--appimage-extract-and-run`.
 
+### macOS is blocking access to a folder (Files & Folders)
+
+macOS asks before an app reads Desktop, Documents, Downloads, iCloud Drive, and
+removable and network volumes. Allow it when it asks; a source folder in one of
+those places stays unreadable until you do, and its card says so instead of
+showing an empty folder. If you refused, open **System Settings › Privacy &
+Security › Files & Folders**, switch Immich Sync on, then click **Sync now** in
+the tray. Full Disk Access is not needed for a folder you picked yourself.
+
+### No notifications on macOS
+
+Notifications need the app bundle, so run **Immich Sync** from **Applications**,
+not the executable inside it and not a build under `target/`. If they still do
+not appear, check **System Settings › Notifications › Immich Sync** and allow
+them; without the permission the client posts nothing and keeps running.
+
+### macOS asks for the Keychain password again after an update
+
+Expected: the packages are unsigned, so the app has no stable code identity.
+After an update, the login-Keychain entry and the **Files & Folders** grant can
+ask again. Allow them again and syncing continues; nothing is lost.
+
 ### Sync does not pick up a new file
 
 Hidden files, symlinks, temporary files, and system files are skipped by
@@ -295,6 +366,19 @@ design, and a file inside a folder that is not added is not tracked. Check the
 folder card and **Diagnostics**; if the watcher missed a change, the next
 reconciliation scan (30 minutes by default) finds it, or click **Sync now** in
 the tray.
+
+### A file on a network volume does not sync right away (macOS)
+
+macOS file watching reports no changes on SMB or NFS shares, so a file added on
+a network volume is found by the reconciliation scan (30 minutes by default), not
+within 10 seconds. Click **Sync now** to scan immediately. Polling is not
+implemented; the periodic scan is the safety net.
+
+### Two files that differ only in case (macOS)
+
+One of the two may not sync. The client compares paths case-insensitively, which
+matches the default APFS and HFSX settings, so on a case-sensitive volume
+`IMG_0001.JPG` and `img_0001.jpg` collapse into one path key. Rename one of them.
 
 ### A file keeps failing
 
