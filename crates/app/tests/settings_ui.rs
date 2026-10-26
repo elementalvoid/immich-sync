@@ -226,7 +226,7 @@ fn open_settings_over_connection(
 
 /// Replaces the text in the focused field with `value`.
 fn retype(window: &mut Window, value: &str, cx: &mut App) {
-    window.press("ctrl-a", cx);
+    window.press(crate::common::select_all_chord(), cx);
     window.input(value, cx);
 }
 
