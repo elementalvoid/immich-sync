@@ -114,7 +114,7 @@ Acceptance: a sync at a 1 MB/s limit produces near-limit observed throughput. Ra
 - R8.2 The tray icon shows the activity state (idle, syncing, paused, needs attention), the review count, upload progress, and the last error in its tooltip.
 - R8.3 The tray menu offers Show, Pause, Resume, Sync now, and Quit.
 - R8.4 Closing the window hides it. Quit exits the client. A second launch focuses the first instance.
-- R8.5 Autostart at login is a setting. The default is off. Windows uses its Run key, Linux an XDG autostart entry, and macOS a Login Item (`SMAppService`), with a `~/Library/LaunchAgents` fallback when an unsigned bundle is refused.
+- R8.5 Autostart at login is a setting. The default is off. Windows uses its Run key, Linux an XDG autostart entry, and macOS a Login Item (`SMAppService.mainApp`), falling back to a LaunchAgent plist when an unsigned bundle is refused.
 - R8.6 The theme follows the system theme.
 - R8.7 Pause stops new uploads. In-flight uploads finish or stop at a safe point.
 
@@ -126,7 +126,7 @@ Acceptance: every tray action works from a cold start. A second launch does not 
 - R9.2 The state database lives in the local data directory. It never lives on a network share or a cloud-sync folder.
 - R9.3 All paths come from a platform-directory abstraction. No hardcoded Windows path. Linux uses XDG paths, and macOS resolves the config, the state database, and the logs under `~/Library/Application Support/immich-sync/`.
 
-Acceptance: on Windows, config resolves under `%APPDATA%` and state under `%LOCALAPPDATA%`. A test build resolves XDG paths on Linux. A repository check finds no hardcoded `C:\` paths.
+Acceptance: on Windows, config resolves under `%APPDATA%` and state under `%LOCALAPPDATA%`. A test build resolves XDG paths on Linux. On macOS, the settings file, the state database, and the logs resolve under `~/Library/Application Support/immich-sync/`. A repository check finds no hardcoded `C:\` paths.
 
 ### R10 — Diagnostics and notifications
 

@@ -66,6 +66,11 @@ release carries, for version `<version>`:
 | `immich-sync_<version>_x86_64.AppImage` | Any Linux desktop |
 | `SHA256SUMS` | Checksums for every package |
 
+The install directory holds only the program. Settings, state, logs, and the
+autostart entry are always per user, and uninstalling keeps them: delete them
+yourself for a complete reset (see
+[Where everything lives](#where-everything-lives)).
+
 ### Windows 10/11
 
 1. Run `immich-sync_<version>_x64-setup.exe`.
@@ -86,22 +91,19 @@ release carries, for version `<version>`:
    install. Declining the prompt cancels the install. It can start the app when
    it finishes.
 
-Settings, state, logs, and the autostart entry are always per user, whichever
-mode you pick; the install directory holds only the program.
-
 Uninstall from **Settings → Apps → Immich Sync**. That removes the installed
-copy and its shortcuts. Settings, state, and logs (see
-[Where everything lives](#where-everything-lives)) are kept; delete those
-folders yourself for a complete reset.
+copy and its shortcuts.
 
 ### macOS (DMG)
 
 1. Open `Immich Sync_<version>_aarch64.dmg` on an Apple Silicon Mac, or
    `Immich Sync_<version>_x64.dmg` on an Intel Mac, and drag **Immich Sync** to
    **Applications**.
-2. The first launch is blocked. macOS says it "cannot verify that this app is
-   free of malware", because the app is not notarized by Apple. Click **Done**,
-   not **Move to Trash**. Open **System Settings › Privacy & Security**, scroll
+2. The first launch is blocked, because the app is not notarized by Apple. macOS
+   15 and later say it "cannot verify that this app is free of malware", with
+   **Done** as the dismiss button; macOS 13 and 14 say "Apple cannot check it
+   for malicious software", with **Cancel**. Click **Done** or **Cancel**, not
+   **Move to Trash**. Open **System Settings › Privacy & Security**, scroll
    down to **Security**, and click **Open Anyway** beside the message about
    Immich Sync. Authenticate, then confirm **Open**. The app opens normally from
    then on; the warning is expected and is not a sign the download was altered.
@@ -111,11 +113,8 @@ folders yourself for a complete reset.
    folders. Allow it; without the grant the folder shows as unreadable, with the
    reason (see [Troubleshooting](#troubleshooting)).
 
-Settings, state, and logs are per user, and the install directory holds only the
-program. To uninstall, quit the app and move **Immich Sync** from
-**Applications** to the Trash. Settings, state, and logs (see
-[Where everything lives](#where-everything-lives)) are kept; delete that folder
-yourself for a complete reset.
+To uninstall, quit the app and move **Immich Sync** from **Applications** to the
+Trash.
 
 ### Linux (deb)
 
@@ -154,13 +153,15 @@ same directory as the downloaded packages.
 Linux:
 
 ```sh
-sha256sum -c SHA256SUMS
+sha256sum immich-sync_<version>_amd64.deb          # deb
+sha256sum immich-sync_<version>_x86_64.AppImage    # AppImage
 ```
 
 macOS:
 
 ```sh
-shasum -a 256 -c SHA256SUMS
+shasum -a 256 "Immich Sync_<version>_aarch64.dmg"  # Apple Silicon
+shasum -a 256 "Immich Sync_<version>_x64.dmg"      # Intel
 ```
 
 Windows PowerShell:
@@ -169,7 +170,9 @@ Windows PowerShell:
 Get-FileHash .\immich-sync_<version>_x64-setup.exe -Algorithm SHA256
 ```
 
-Compare the printed hash with the line for that file in `SHA256SUMS`.
+Compare the printed hash with the line for that file in `SHA256SUMS`. If you
+downloaded every package, `-c` checks them all at once: `sha256sum -c SHA256SUMS`
+on Linux, `shasum -a 256 -c SHA256SUMS` on macOS.
 
 Release packages are built by this repository's release workflow, which also
 publishes a build provenance attestation once enabled. The process, and the
@@ -192,10 +195,9 @@ On first launch the window opens on the **Dashboard**.
 The credential is stored in the operating system's credential store — Windows
 Credential Manager, the login Keychain on macOS, or the Secret Service (GNOME
 Keyring or KWallet) on Linux. It is never written to the settings file or to the
-log. Later launches sign in
-again from that stored credential, without asking. A wrong password shows an
-error in the window and does not crash the client; the connection shows as
-"Needs attention" in the window and the tray tooltip.
+log. Later launches sign in again from that stored credential, without asking. A
+wrong password shows an error in the window and does not crash the client; the
+connection shows as "Needs attention" in the window and the tray tooltip.
 
 If the server has password login disabled, choose **API key** instead and paste
 a key from Immich's account settings.
@@ -305,12 +307,10 @@ arrives with the public release.
 
 ### "macOS cannot verify that this app is free of malware" (Gatekeeper)
 
-Expected: the macOS packages are unsigned and unnotarized. Click **Done**, not
-**Move to Trash**, then open **System Settings › Privacy & Security**, scroll
-down to **Security**, and click **Open Anyway** beside the message about Immich
-Sync. Authenticate and confirm **Open**; macOS remembers the exception. The
-checksum is how you know the download was not altered; see
-[Verify the download](#verify-the-download).
+Expected: the macOS packages are unsigned and unnotarized, and macOS remembers
+the exception once you allow it. The exact clicks are in
+[Install › macOS](#macos-dmg); the checksum is how you know the download was not
+altered ([Verify the download](#verify-the-download)).
 
 ### The app seems to do nothing after launch
 
@@ -348,10 +348,10 @@ the tray. Full Disk Access is not needed for a folder you picked yourself.
 
 ### No notifications on macOS
 
-Notifications need the app bundle, so run **Immich Sync** from **Applications**,
-not the executable inside it and not a build under `target/`. If they still do
-not appear, check **System Settings › Notifications › Immich Sync** and allow
-them; without the permission the client posts nothing and keeps running.
+Notifications need the app bundle's identifier, so run **Immich Sync** from
+**Applications**, not a build under `target/`. If they still do not appear,
+check **System Settings › Notifications › Immich Sync** and allow them; without
+the permission the client posts nothing and keeps running.
 
 ### macOS asks for the Keychain password again after an update
 
