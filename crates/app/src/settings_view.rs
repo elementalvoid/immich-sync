@@ -211,6 +211,8 @@ const SAVE_PROBLEM: &str = "Could not save the settings";
 const AUTOSTART_PROBLEM: &str = "Could not update the autostart setting";
 /// The notice prefix for an autostart state that could not be read.
 const AUTOSTART_READ_PROBLEM: &str = "Could not read the autostart setting";
+/// The notice prefix for a login-items settings page that could not be opened.
+const AUTOSTART_APPROVAL_PROBLEM: &str = "Could not open the login items settings";
 
 /// One numeric row: its key and the input state that edits it.
 struct Field {
@@ -744,6 +746,18 @@ impl SettingsView {
         );
     }
 
+    /// Opens the OS page where the user approves the login item.
+    ///
+    /// The row that shows the approval hint is the only caller, so a platform
+    /// with no approval step never reaches this.
+    fn open_approval_settings(&mut self, cx: &mut Context<Self>) {
+        self.record(
+            AUTOSTART_APPROVAL_PROBLEM,
+            self.autostart.open_approval_settings(),
+            cx,
+        );
+    }
+
     /// Shows a failure, or clears the previous one after a success.
     fn record(&mut self, prefix: &'static str, result: anyhow::Result<()>, cx: &mut Context<Self>) {
         self.action_error = result.err().map(|error| format!("{prefix}: {error:#}"));
@@ -1020,13 +1034,38 @@ impl SettingsView {
         // The switch shows the user's newest intent, so a queued or in-flight
         // write is reflected before it lands (N2).
         let enabled = self.intended_settings().autostart;
-        section(
-            "settings-general",
-            "General",
-            "How the client starts.",
-            vec![
+        let mut rows = vec![
+            div()
+                .id("settings-autostart-row")
+                .test_support()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap_6()
+                .min_h(rems(2.25))
+                .child(field_text(
+                    "Autostart at login",
+                    "Start Immich Sync when you log in. Off by default.",
+                    &palette,
+                ))
+                .child(
+                    Switch::new("settings-autostart")
+                        .checked(enabled)
+                        .accessibility_label("Start Immich Sync at login")
+                        .on_change(cx.listener(|this, enabled, _, cx| {
+                            this.toggle_autostart(*enabled, cx);
+                        })),
+                )
+                .into_any_element(),
+        ];
+        // macOS registers the item and leaves the last step to the user; the
+        // setting reads as off until they allow it. The backend supplies the
+        // text, so no platform detail lives here.
+        if let Some(hint) = self.autostart.approval_needed() {
+            rows.push(
                 div()
-                    .id("settings-autostart-row")
+                    .id("settings-autostart-approval")
                     .test_support()
                     .flex()
                     .flex_row()
@@ -1034,21 +1073,23 @@ impl SettingsView {
                     .justify_between()
                     .gap_6()
                     .min_h(rems(2.25))
-                    .child(field_text(
-                        "Autostart at login",
-                        "Start Immich Sync when you log in. Off by default.",
-                        &palette,
-                    ))
+                    .child(field_text("Approval needed", hint, &palette))
                     .child(
-                        Switch::new("settings-autostart")
-                            .checked(enabled)
-                            .accessibility_label("Start Immich Sync at login")
-                            .on_change(cx.listener(|this, enabled, _, cx| {
-                                this.toggle_autostart(*enabled, cx);
+                        Button::new("settings-autostart-approve")
+                            .label("Open Login Items")
+                            .accessibility_label("Open Login Items settings")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.open_approval_settings(cx);
                             })),
                     )
                     .into_any_element(),
-            ],
+            );
+        }
+        section(
+            "settings-general",
+            "General",
+            "How the client starts.",
+            rows,
             cx,
         )
     }

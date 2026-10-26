@@ -118,6 +118,12 @@ embed-resource = "3"
 # in Rust, so the build needs no OpenSSL.
 dbus-secret-service-keyring-store = { version = "=1.0.1", features = ["crypto-rust"] }
 
+[target."cfg(target_os = \"macos\")".dependencies]
+# SMAppService (macOS 13+), the login-item API behind the autostart setting.
+# Pinned exactly, like the other platform stores. The default features carry the
+# `SMAppService` and `SMErrors` modules this backend calls.
+objc2-service-management = "=0.3.2"
+
 [target."cfg(windows)".dependencies]
 windows-native-keyring-store = "=1.1.0"
 windows-registry = "0.6"
