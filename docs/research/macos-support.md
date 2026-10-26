@@ -233,6 +233,15 @@ command surface. That is a product decision for a later release, not a v1 requir
   event with no path at all, so it still waits for the periodic scan. The hint is inferred
   from the named path's metadata rather than from `Flag::Rescan`, so a rescan hint for a
   path that no longer exists is lost to the periodic scan too.
+- **A folder that leaves the library.** An event that names a folder which has
+  been moved out, renamed, or unmounted reaches the absence list, but a folder is
+  never a store item, so the scan loop's "does this absence name something we
+  track?" gate buys no pass and the items inside it wait for the next periodic
+  scan. The same is true of any deleted directory with tracked files in it. This
+  is platform-general, pre-dates #66, and the real fix needs a prefix query on
+  the store (only `item(path)` exists today); #66's directory rule covers the
+  hint FSEvents actually sends for a folder it still owns. Recorded as a
+  known limitation, not fixed.
 - **Unpaired renames.** FSEvents cannot pair the two sides of a rename; notify says so
   in `fsevent.rs`. The engine already detects renames by content hash (R5.2), so this
   is handled, but a rename that also changes content will look like delete + create.

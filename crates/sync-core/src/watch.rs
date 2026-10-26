@@ -49,7 +49,10 @@ impl FolderWatcher {
                             // A read changes nothing, and the scan's own walk of a
                             // folder opens it, so an `Access` event would make
                             // the engine read a directory change into its own
-                            // scan and reconcile forever (#66).
+                            // scan and reconcile forever (#66). This also drops
+                            // `Access(Close(Write))`, which inotify reports after
+                            // a write; the write itself still arrives as
+                            // `Modify(Data)`, so nothing is lost.
                             .filter(|event| !matches!(event.event.kind, EventKind::Access(_)))
                             .flat_map(|event| event.event.paths)
                             .collect(),

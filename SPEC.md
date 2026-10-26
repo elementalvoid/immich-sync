@@ -51,7 +51,7 @@ Acceptance: password login works. API-key login works on a server with password 
 - R2.4 The client compares paths case-insensitively on Windows and on macOS, where APFS and HFSX are case-insensitive by default. A case-sensitive volume can hold two files that differ only in case; they share one path key, so one of them may not sync. It supports long paths.
 - R2.5 A source folder that disappears (for example, an unplugged drive) shows a folder status, not an error per file.
 
-Acceptance: a file added while the client is stopped is found at startup. A file added while the client runs is found within 10 seconds. A file skipped by the watcher is found by the next scan. Hidden and temporary files never upload.
+Acceptance: a file added while the client is stopped is found at startup. A file added while the client runs is found within 10 seconds on a local disk. A file skipped by the watcher is found by the next scan. Hidden and temporary files never upload.
 
 ### R3 — Upload pipeline
 
