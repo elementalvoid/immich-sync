@@ -323,7 +323,8 @@ minimumSystemVersion = "13.0"
 backgroundApp = false
 infoPlistPath = "macos/Info.plist"
 # No signingIdentity: [ADR 0008](../adr/0008-macos-unsigned-distribution.md) ships
-# macOS unsigned, so the release sets no identity and never signs either.
+# macOS without an identity, so the packager signs nothing; the release job
+# ad-hoc signs the bundle afterwards.
 ```
 
 And the compiler's deployment target, which the packager does not set:
@@ -333,6 +334,19 @@ And the compiler's deployment target, which the packager does not set:
 [env]
 MACOSX_DEPLOYMENT_TARGET = "13.0"
 ```
+
+What the release job does instead: `cargo packager --formats app` builds only the
+`.app`, the job ad-hoc signs the **bundle** with
+`codesign --force --sign - --timestamp=none`, and the DMG is made with `hdiutil`
+from a staging directory holding the signed bundle and an `Applications` link
+([ADR 0008](../adr/0008-macos-unsigned-distribution.md), amendment of 2026-10-26).
+This is not decoration. The first arm64 DMG shipped without a bundle-level
+signature launched as *"Immich Sync.app is damaged and can't be opened"*, with no
+**Open Anyway** route at all: the linker's ad-hoc signature covers only the
+executable, and Gatekeeper judges the bundle. The same bundle signed with
+`codesign --force --sign -` reached the normal first-launch dialog and launched
+via **Open Anyway**. The DMG itself stays unsigned, because Gatekeeper checks the
+app inside it.
 
 What it runs on a macOS host **when a signing identity is configured**, from the
 0.11.8 source

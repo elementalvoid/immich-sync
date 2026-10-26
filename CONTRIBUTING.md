@@ -182,10 +182,30 @@ For maintainers.
   manifest and the changelog change.
 - **What is built.** [`cargo-packager`](https://github.com/crabnebula-dev/cargo-packager)
   (version pinned in the workflow) builds the NSIS installer on `windows-latest`,
-  the deb and AppImage on `ubuntu-24.04`, and the two DMGs on `macos-26` (arm64,
-  with `x86_64-apple-darwin` cross-compiled): `Immich Sync_<version>_aarch64.dmg`
-  and `Immich Sync_<version>_x64.dmg`. The packager configuration lives in
-  `crates/app/Cargo.toml` under `[package.metadata.packager]`.
+  the deb and AppImage on `ubuntu-24.04`, and the two macOS app bundles on
+  `macos-26` (arm64, with `x86_64-apple-darwin` cross-compiled). The macOS job
+  signs each bundle ad-hoc and then builds the DMG itself, so the artifacts stay
+  `Immich Sync_<version>_aarch64.dmg` and `Immich Sync_<version>_x64.dmg`. The
+  packager configuration lives in `crates/app/Cargo.toml` under
+  `[package.metadata.packager]`.
+- **Local macOS package.** The same order as the job: app bundle, ad-hoc
+  signature, then the DMG.
+
+  ```sh
+  cd crates/app
+  cargo packager --release --target aarch64-apple-darwin --formats app --out-dir ../../dist
+  codesign --force --sign - --timestamp=none "dist/Immich Sync.app"
+  codesign --verify --strict --verbose=2 "dist/Immich Sync.app"
+  staging=$(mktemp -d)
+  ditto "dist/Immich Sync.app" "$staging/Immich Sync.app"
+  ln -s /Applications "$staging/Applications"
+  hdiutil create -volname "Immich Sync" -srcfolder "$staging" -ov -format UDZO \
+    "dist/Immich Sync_<version>_aarch64.dmg"
+  ```
+
+  The image still carries the app next to the `Applications` link, so the
+  install flow for users is unchanged; the job additionally verifies the app
+  from the mounted image.
 - **Checksums.** A final job downloads every platform's packages and generates
   `SHA256SUMS` from the real files; nothing is hand-written.
 - **Provenance.** The workflow attests each platform's packages with
@@ -205,8 +225,10 @@ For maintainers.
   public-release step that removes the Windows warning. macOS has no Apple
   Developer Program account, so there is no Developer ID certificate and no
   notarization: the packager is configured with no `signingIdentity`, the job
-  sets no `APPLE_*` secret, and it asserts that both DMGs exist and are
-  checksummed instead. The decision is
+  sets no `APPLE_*` secret, and it ad-hoc signs only the app bundle
+  (`codesign --sign -`), which is what lets arm64 macOS launch it at all. It
+  asserts that both DMGs exist and are checksummed instead of asserting a
+  notarization ticket. The decision is
   [ADR 0008](docs/adr/0008-macos-unsigned-distribution.md).
 
 ## License

@@ -201,32 +201,73 @@ jobs:
       # cargo-packager resolves `binaries_dir`, `icons`, `licenseFile`, and
       # `infoPlistPath` against the working directory, so it must run from this
       # crate. The packager does not build: it packages the binary already at
-      # `target/<triple>/release`, and names the DMG after the architecture
-      # (`_aarch64.dmg`, and `x64` for x86_64). `--formats dmg` builds the app
-      # bundle itself, so no stray `.app` is left behind.
+      # `target/<triple>/release`. It builds only the `.app`; the DMG is made
+      # below with `hdiutil`, because the bundle has to be signed first (#67).
       #
-      # The two architectures are built and packaged one at a time: two release
-      # trees (aws-lc-sys, bundled SQLite, GPUI) do not fit comfortably beside
-      # each other on the runner. The arm64 DMG is already in `dist` when its
-      # tree is removed, so the x64 build gets the space.
+      # The two architectures are built one at a time: two release trees
+      # (aws-lc-sys, bundled SQLite, GPUI) do not fit comfortably beside each
+      # other on the runner. The arm64 DMG is already in `dist` when its tree
+      # and bundle are removed, so the x64 build gets the space.
       # MACOSX_DEPLOYMENT_TARGET comes from `.cargo/config.toml`.
-      - name: Build and package the arm64 DMG
+      - name: Read the version for the DMG names
+        run: |
+          set -euo pipefail
+          version=$(python3 -c "import tomllib; print(tomllib.load(open('crates/app/Cargo.toml','rb'))['package']['version'])")
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      # Ad-hoc signed: `--sign -` with no identity and `--timestamp=none`, so no
+      # Apple account and no notarization (ADR 0008). The bundle signature is
+      # what lets arm64 Gatekeeper offer **Open Anyway** instead of reporting
+      # the app as damaged (ADR 0008 amendment).
+      - name: Build and sign the arm64 bundle, then make the DMG
         working-directory: crates/app
         run: |
+          set -euo pipefail
+          app="dist/Immich Sync.app"
+          dmg="dist/Immich Sync_${VERSION}_aarch64.dmg"
           cargo build --release --locked -p immich-sync --target aarch64-apple-darwin
           cargo packager --release --target aarch64-apple-darwin \
-            --formats dmg --out-dir ../../dist
-          rm -rf ../../target/aarch64-apple-darwin
-      - name: Build and package the x64 DMG
+            --formats app --out-dir ../../dist
+          codesign --force --sign - --timestamp=none "$app"
+          codesign -dv --verbose=4 "$app"
+          codesign --verify --strict --verbose=2 "$app"
+          staging=$(mktemp -d)
+          trap 'hdiutil detach "/Volumes/Immich Sync" || true; rm -rf "$staging"' EXIT
+          ditto "$app" "$staging/Immich Sync.app"
+          ln -s /Applications "$staging/Applications"
+          hdiutil create -volname "Immich Sync" -srcfolder "$staging" -ov \
+            -format UDZO "$dmg"
+          # What the user gets: the signed bundle, read back off the image.
+          hdiutil attach -readonly -nobrowse "$dmg"
+          test -d "/Volumes/Immich Sync/Immich Sync.app"
+          codesign --verify --strict --verbose=2 "/Volumes/Immich Sync/Immich Sync.app"
+          rm -rf "$app" ../../target/aarch64-apple-darwin
+      - name: Build and sign the x64 bundle, then make the DMG
         working-directory: crates/app
         run: |
+          set -euo pipefail
+          app="dist/Immich Sync.app"
+          dmg="dist/Immich Sync_${VERSION}_x64.dmg"
           cargo build --release --locked -p immich-sync --target x86_64-apple-darwin
           cargo packager --release --target x86_64-apple-darwin \
-            --formats dmg --out-dir ../../dist
-      # ADR 0008 ships unsigned: no APPLE_* secret and no `signingIdentity`,
-      # so the packager never invokes codesign and there is no signature or
-      # notarization ticket to assert. The file and its per-architecture name
-      # are the whole contract, and `checksums` hashes exactly what appears.
+            --formats app --out-dir ../../dist
+          codesign --force --sign - --timestamp=none "$app"
+          codesign -dv --verbose=4 "$app"
+          codesign --verify --strict --verbose=2 "$app"
+          staging=$(mktemp -d)
+          trap 'hdiutil detach "/Volumes/Immich Sync" || true; rm -rf "$staging"' EXIT
+          ditto "$app" "$staging/Immich Sync.app"
+          ln -s /Applications "$staging/Applications"
+          hdiutil create -volname "Immich Sync" -srcfolder "$staging" -ov \
+            -format UDZO "$dmg"
+          hdiutil attach -readonly -nobrowse "$dmg"
+          test -d "/Volumes/Immich Sync/Immich Sync.app"
+          codesign --verify --strict --verbose=2 "/Volumes/Immich Sync/Immich Sync.app"
+          rm -rf "$app"
+      # ADR 0008 ships without an Apple identity: no APPLE_* secret and no
+      # `signingIdentity`, so there is no notarization ticket to assert and the
+      # only signature is the ad-hoc bundle one the steps above verify. The
+      # file, its per-architecture name, and its count are the contract, and
+      # `checksums` hashes exactly what appears.
       - name: Assert both DMGs are present and named per architecture
         run: |
           set -euo pipefail

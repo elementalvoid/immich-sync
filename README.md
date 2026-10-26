@@ -40,10 +40,11 @@ v1 targets Windows 10/11 (x64), Linux desktops, and macOS 13 or later on Apple
 Silicon (arm64) and Intel (x86_64), and is developed against Immich v3.3.x.
 
 > **Packages are unsigned.** Windows builds are unsigned, so SmartScreen warns on
-> first launch, and macOS builds are unsigned and unnotarized, so Gatekeeper
-> blocks the first launch until you allow it in System Settings. Neither warning
-> means the download was altered; `SHA256SUMS` is the integrity check. The macOS
-> decision is recorded in
+> first launch, and macOS builds carry no Developer ID and are not notarized, so
+> Gatekeeper blocks the first launch until you allow it in System Settings. The
+> macOS app bundle is ad-hoc signed, which is what lets arm64 macOS launch it at
+> all. Neither warning means the download was altered; `SHA256SUMS` is the
+> integrity check. The macOS decision is recorded in
 > [ADR 0008](docs/adr/0008-macos-unsigned-distribution.md).
 
 ## Install
@@ -310,10 +311,10 @@ arrives with the public release.
 
 ### "macOS cannot verify that this app is free of malware" (Gatekeeper)
 
-Expected: the macOS packages are unsigned and unnotarized, and macOS remembers
-the exception once you allow it. The exact clicks are in
-[Install › macOS](#macos-dmg); the checksum is how you know the download was not
-altered ([Verify the download](#verify-the-download)).
+Expected: the macOS packages are not notarized and carry only an ad-hoc
+signature, and macOS remembers the exception once you allow it. The exact clicks
+are in [Install › macOS](#macos-dmg); the checksum is how you know the download
+was not altered ([Verify the download](#verify-the-download)).
 
 ### The app seems to do nothing after launch
 
@@ -358,7 +359,8 @@ the permission the client posts nothing and keeps running.
 
 ### macOS asks for the Keychain password again after an update
 
-Expected: the packages are unsigned, so the app has no stable code identity.
+Expected: the packages carry no Developer ID, so the app has no stable code
+identity.
 After an update, the login-Keychain entry and the **Files & Folders** grant can
 ask again. Allow them again and syncing continues; nothing is lost.
 
