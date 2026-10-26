@@ -20,6 +20,13 @@
 //! ```sh
 //! cargo test -p immich-sync --test keyring -- --ignored --nocapture
 //! ```
+//!
+//! macOS, against the login Keychain (it prompts for the test entry once per
+//! ad-hoc rebuild, which is the unsigned-build cost in ADR 0008):
+//!
+//! ```sh
+//! cargo test -p immich-sync --test keyring -- --ignored --nocapture
+//! ```
 
 use immich_sync::credentials::{keyring_store, platform_credential_store};
 use sync_core::credential::Secret;
