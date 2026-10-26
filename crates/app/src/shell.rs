@@ -59,33 +59,21 @@ pub fn init(cx: &mut App) {
         // registering the handlers everywhere leaves Linux and Windows alone.
         .on_action(about)
         .on_action(minimize);
+    // The macOS menu bar and the shortcuts it advertises (issue #64). The keys
+    // are bound before the bar is built: an item draws its key equivalent from
+    // the keymap, and GPUI has no `OsAction` for Quit or Close. With no context
+    // they apply everywhere; the Edit items carry the inputs' own actions, so
+    // `cmd-x/c/v/a` still dispatch to the focused field's handlers.
     #[cfg(target_os = "macos")]
-    install_macos_menu(cx);
+    {
+        cx.bind_keys([
+            KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("cmd-w", Hide, None),
+        ]);
+        cx.set_menus(app_menu());
+    }
     let connection = install_connection_with(cx, show_connection_on_tray);
     install_models(cx, connection);
-}
-
-/// Installs the macOS menu bar and the shortcuts it advertises (issue #64).
-///
-/// The keys are bound before the bar is built: an item draws its key
-/// equivalent from the keymap, and GPUI has no `OsAction` for Quit or Close.
-#[cfg(target_os = "macos")]
-fn install_macos_menu(cx: &mut App) {
-    cx.bind_keys(app_shortcuts());
-    cx.set_menus(app_menu());
-}
-
-/// The shortcuts the macOS menu bar advertises (issue #64).
-///
-/// GPUI has no `OsAction` for Quit or Close, so the keymap is the only way
-/// `cmd-q` and `cmd-w` fire. They are bound with no context, ahead of the text
-/// inputs' own `cmd-x/c/v/a`.
-#[must_use]
-pub fn app_shortcuts() -> [KeyBinding; 2] {
-    [
-        KeyBinding::new("cmd-q", Quit, None),
-        KeyBinding::new("cmd-w", Hide, None),
-    ]
 }
 
 /// The app-level handle to the one connection model (R1.4).
@@ -266,6 +254,11 @@ fn about(_: &About, cx: &mut App) {
     });
 }
 
+/// Window > Minimize. [`show_window`] does not undo it: `minimize_window` is
+/// `miniaturize:`, and `activate_window()` is only `makeKeyAndOrderFront:`,
+/// which does not deminiaturize. gpui exposes no deminiaturize, so after this
+/// item, the tray's Show and a Dock click leave the window minimized; only the
+/// Dock tile or the Window menu's list restores it (known limit, #64).
 fn minimize(_: &Minimize, cx: &mut App) {
     if let Some(window) = cx.windows().first().copied() {
         let _ = window.update(cx, |_, window, _| window.minimize_window());
@@ -709,8 +702,11 @@ pub fn tray_menu() -> Vec<MenuItem> {
 /// GPUI has no default bar and no prebuilt menus, so every item is spelled out
 /// from the actions [`tray_menu`] already uses. [`init`] installs it on macOS
 /// only.
+///
+/// Built on macOS and under test only; elsewhere it would be a dead menu.
+#[cfg(any(test, target_os = "macos"))]
 #[must_use]
-pub fn app_menu() -> Vec<Menu> {
+fn app_menu() -> Vec<Menu> {
     vec![
         Menu::new("Immich Sync").items([
             MenuItem::action("About Immich Sync", About),
@@ -815,12 +811,12 @@ pub fn show_status_on_tray(cx: &mut App) {
 
 /// A solid circular tray icon, drawn in code so the shell needs no asset.
 fn icon() -> gpui_tray::Result<Icon> {
-    let size = tray_icon_spec();
+    let size = tray_icon_size();
     Icon::from_rgba(tray_icon_rgba(size), size, size)
 }
 
 /// The status item's pixel size: an 18 pt macOS menu-bar icon, 32 px elsewhere.
-fn tray_icon_spec() -> u32 {
+fn tray_icon_size() -> u32 {
     if cfg!(target_os = "macos") { 18 } else { 32 }
 }
 
@@ -828,9 +824,11 @@ fn tray_icon_spec() -> u32 {
 ///
 /// One colour and no thin strokes is what keeps it legible on a light and a
 /// dark menu bar, because `gpui-tray` 0.1.4 cannot mark the image as a template.
-// shortcut: one coloured 18 px icon, no template or Retina representation in
-// gpui-tray 0.1.4; add a `template` flag upstream and ship 18 + 36 px when it
-// exposes one.
+// shortcut: one coloured 18 px icon. gpui-tray 0.1.4 has no `setTemplate` and
+// no Retina representation, so a monochrome icon could not invert and a second
+// image would have nowhere to go; #64 records the gap and the upstream request
+// (a template flag plus a 2x image, then ship an 18 + 36 px template) is still
+// manual.
 fn tray_icon_rgba(size: u32) -> Vec<u8> {
     let mut rgba = vec![0u8; (size * size * 4) as usize];
     let centre = size as i32 / 2 - 1;
@@ -851,8 +849,8 @@ fn tray_icon_rgba(size: u32) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        About, Hide, Minimize, Quit, app_menu, app_shortcuts, hide_window, install_connection_with,
-        install_models, show_window, tray_icon_rgba, tray_icon_spec,
+        About, Hide, Minimize, Quit, app_menu, hide_window, install_connection_with,
+        install_models, show_window, tray_icon_rgba, tray_icon_size,
     };
     use gpui_kit::{Action, MenuItem, OsAction, TestAppContext, base};
     use std::cell::RefCell;
@@ -918,26 +916,16 @@ mod tests {
         assert!(carries(&menus[2].items[1], &Minimize));
     }
 
-    /// #64: Cmd+Q quits and Cmd+W closes, through the actions the menu items
-    /// carry, so the keys and the menu cannot drift.
-    #[test]
-    fn the_app_shortcuts_are_quit_and_close() {
-        let shortcuts = app_shortcuts();
-        assert_eq!(shortcuts.len(), 2);
-        assert!(shortcuts[0].action().partial_eq(&Quit));
-        assert!(shortcuts[1].action().partial_eq(&Hide));
-    }
-
     /// #64: the status item is 18 pt on macOS and 32 px elsewhere, and the art
     /// is a solid disc: one colour with no thin strokes, which is what stays
     /// legible on both menu bar appearances because 0.1.4 cannot mark the
     /// image as a template.
     #[test]
     fn the_tray_icon_is_menu_bar_sized_on_macos() {
-        assert_eq!(
-            tray_icon_spec(),
-            if cfg!(target_os = "macos") { 18 } else { 32 }
-        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(tray_icon_size(), 18, "an 18 pt menu-bar icon");
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(tray_icon_size(), 32, "a 32 px status icon");
 
         for size in [18, 32] {
             let rgba = tray_icon_rgba(size);

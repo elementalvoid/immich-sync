@@ -450,25 +450,55 @@ async fn the_folder_detail_links_open_a_filtered_view(cx: &mut TestAppContext) {
 
 /// #64: Cmd+Q and Cmd+W have no `OsAction` in this GPUI, so only a key
 /// binding makes those keys fire, and it must be registered on macOS alone.
+/// The keys actually firing is manual; this reads the chord strings, so a typo
+/// (`cmd-q` to `cmd-p`) fails here rather than shipping.
 #[gpui_kit::test]
 fn the_menu_shortcuts_are_bound_only_on_macos(cx: &mut TestAppContext) {
     boot(cx);
     let (quit, hide) = cx.update(|cx| {
         let keymap = cx.key_bindings();
         let keymap = keymap.borrow();
-        (
-            keymap.bindings_for_action(&Quit).count(),
-            keymap.bindings_for_action(&Hide).count(),
-        )
+        let chords = |action: &dyn Action| -> Vec<String> {
+            keymap
+                .bindings_for_action(action)
+                .map(|binding| binding.keystrokes()[0].inner().unparse())
+                .collect()
+        };
+        (chords(&Quit), chords(&Hide))
     });
 
     #[cfg(target_os = "macos")]
-    assert_eq!((quit, hide), (1, 1), "Cmd+Q quits and Cmd+W closes");
+    assert_eq!(quit, ["cmd-q"], "Cmd+Q quits");
+    #[cfg(target_os = "macos")]
+    assert_eq!(hide, ["cmd-w"], "Cmd+W closes the window");
     #[cfg(not(target_os = "macos"))]
-    assert_eq!(
-        (quit, hide),
-        (0, 0),
+    assert!(
+        quit.is_empty() && hide.is_empty(),
         "the macOS shortcuts stay off every other platform"
+    );
+}
+
+/// #64: `shell::init` installs the menu bar, not just the function that builds
+/// it: deleting the `set_menus` call must fail here. The harness records what
+/// the app set (`gpui_kit::test`'s platform keeps it), so this reads the real
+/// installed bar.
+#[gpui_kit::test]
+fn the_menu_bar_is_installed_by_init(cx: &mut TestAppContext) {
+    boot(cx);
+    let names: Vec<String> = cx.update(|cx| {
+        cx.get_menus()
+            .expect("the test platform records the menu bar")
+            .iter()
+            .map(|menu| menu.name.to_string())
+            .collect()
+    });
+
+    #[cfg(target_os = "macos")]
+    assert_eq!(names, ["Immich Sync", "Edit", "Window"]);
+    #[cfg(not(target_os = "macos"))]
+    assert!(
+        names.is_empty(),
+        "the menu bar stays off every other platform"
     );
 }
 
@@ -496,15 +526,22 @@ fn about_opens_the_window_on_the_diagnostics_surface(cx: &mut TestAppContext) {
         );
     })
     .expect("read the About surface");
+}
 
-    // The Window menu's Close is `Hide`, and Minimize with no window open must
-    // not conjure one.
-    cx.update(|cx| cx.dispatch_action(&Hide));
-    cx.run_until_parked();
+/// #64: the Window menu's Close is `Hide`, and neither it nor Minimize may
+/// conjure a window when none is open.
+#[gpui_kit::test]
+fn window_menu_actions_need_an_open_window(cx: &mut TestAppContext) {
+    boot(cx);
     assert_eq!(windows(cx), 0);
+
     cx.update(|cx| cx.dispatch_action(&Minimize));
     cx.run_until_parked();
     assert_eq!(windows(cx), 0, "Minimize has no window to act on");
+
+    cx.update(|cx| cx.dispatch_action(&Hide));
+    cx.run_until_parked();
+    assert_eq!(windows(cx), 0, "Close has no window to act on");
 }
 
 #[gpui_kit::test]
