@@ -3925,7 +3925,7 @@ checksum = "6e44b0a4eaa4c82f441d50a963f2d5f05a787240aeee097597033e72accfd22f"
 
 [[package]]
 name = "immich-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "hex",
@@ -3944,7 +3944,7 @@ dependencies = [
 
 [[package]]
 name = "immich-sync"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
@@ -3975,7 +3975,7 @@ dependencies = [
 
 [[package]]
 name = "immich-sync-workspace"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "indexmap"
@@ -4712,7 +4712,7 @@ dependencies = [
 
 [[package]]
 name = "mock-immich"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -7589,7 +7589,7 @@ dependencies = [
 
 [[package]]
 name = "sync-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "fastrand",

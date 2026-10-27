@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/elementalvoid/immich-sync/compare/v0.1.0...v0.2.0) (2026-10-27)
+
+
+### Features
+
+* **macos:** macOS 13+ (arm64 and x86_64) ([#71](https://github.com/elementalvoid/immich-sync/issues/71)) ([d332eac](https://github.com/elementalvoid/immich-sync/commit/d332eace3b7eb6e27671fb18176a725ca777cb72))
+
 ## 0.1.0 (2026-10-25)
 
 First release: a tray client that keeps a set of local folders in an Immich
