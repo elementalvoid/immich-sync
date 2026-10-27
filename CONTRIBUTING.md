@@ -32,7 +32,17 @@ sudo apt-get install -y xvfb xauth dbus-daemon imagemagick x11-utils xdotool
 ```
 
 On Windows, use the MSVC Rust toolchain with the Visual Studio C++ build tools.
-macOS is not part of v1.
+
+On macOS 13 or later, install Xcode and the Command Line Tools. GPUI compiles
+its Metal shaders at build time, so `xcrun metal --version` must succeed. On
+macOS 26 the Metal toolchain is a separate download; install it with
+
+```sh
+xcodebuild -downloadComponent MetalToolchain
+```
+
+when `xcrun metal --version` fails, as the macOS CI job does. Rendering is
+Metal-only with no software fallback, so the app does not run in a GPU-less VM.
 
 ```sh
 cargo run -p immich-sync
@@ -49,7 +59,8 @@ cargo run -p immich-sync
 
 ## Gates
 
-CI runs these on every push, on Linux and Windows:
+CI runs on every push, on Linux, Windows, and macOS (arm64). The Linux job runs
+all three; the Windows and macOS jobs run clippy and the tests:
 
 ```sh
 cargo fmt --all -- --check
@@ -170,10 +181,32 @@ For maintainers.
   starts no `ci.yml`. Read the diff: only the generated version files, the
   manifest and the changelog change.
 - **What is built.** [`cargo-packager`](https://github.com/crabnebula-dev/cargo-packager)
-  (version pinned in the workflow) builds the NSIS installer on `windows-latest`
-  and the deb and AppImage on `ubuntu-24.04`. The packager configuration lives
-  in `crates/app/Cargo.toml` under `[package.metadata.packager]`.
-- **Checksums.** A final job downloads both platforms' packages and generates
+  (version pinned in the workflow) builds the NSIS installer on `windows-latest`,
+  the deb and AppImage on `ubuntu-24.04`, and the two macOS app bundles on
+  `macos-26` (arm64, with `x86_64-apple-darwin` cross-compiled). The macOS job
+  signs each bundle ad-hoc and then builds the DMG itself, so the artifacts stay
+  `Immich Sync_<version>_aarch64.dmg` and `Immich Sync_<version>_x64.dmg`. The
+  packager configuration lives in `crates/app/Cargo.toml` under
+  `[package.metadata.packager]`.
+- **Local macOS package.** The same order as the job: app bundle, ad-hoc
+  signature, then the DMG.
+
+  ```sh
+  cd crates/app
+  cargo packager --release --target aarch64-apple-darwin --formats app --out-dir ../../dist
+  codesign --force --sign - --timestamp=none "dist/Immich Sync.app"
+  codesign --verify --strict --verbose=2 "dist/Immich Sync.app"
+  staging=$(mktemp -d)
+  ditto "dist/Immich Sync.app" "$staging/Immich Sync.app"
+  ln -s /Applications "$staging/Applications"
+  hdiutil create -volname "Immich Sync" -srcfolder "$staging" -ov -format UDZO \
+    "dist/Immich Sync_<version>_aarch64.dmg"
+  ```
+
+  The image still carries the app next to the `Applications` link, so the
+  install flow for users is unchanged; the job additionally verifies the app
+  from the mounted image.
+- **Checksums.** A final job downloads every platform's packages and generates
   `SHA256SUMS` from the real files; nothing is hand-written.
 - **Provenance.** The workflow attests each platform's packages with
   `actions/attest-build-provenance`, gated on the repository variable
@@ -186,8 +219,17 @@ For maintainers.
   gh attestation verify immich-sync_<version>_amd64.deb --repo elementalvoid/immich-sync
   ```
 
-- **Signing.** v1 is unsigned, so Windows shows a SmartScreen warning. Windows
-  code signing is the public-release step that removes it.
+- **Signing.** v1 is unsigned on every platform, so Windows shows a SmartScreen
+  warning and macOS blocks the first launch until the user allows it in **System
+  Settings › Privacy & Security › Open Anyway**. Windows code signing is the
+  public-release step that removes the Windows warning. macOS has no Apple
+  Developer Program account, so there is no Developer ID certificate and no
+  notarization: the packager is configured with no `signingIdentity`, the job
+  sets no `APPLE_*` secret, and it ad-hoc signs only the app bundle
+  (`codesign --sign -`), which is what lets arm64 macOS launch it at all. It
+  asserts that both DMGs exist and are checksummed instead of asserting a
+  notarization ticket. The decision is
+  [ADR 0008](docs/adr/0008-macos-unsigned-distribution.md).
 
 ## License
 

@@ -8,7 +8,7 @@ Tickets: [GitHub](https://github.com/elementalvoid/immich-sync/issues)
 
 ## Goal
 
-A background sync client for Immich on Windows. The user selects local folders in a config window. The client uploads new and changed files to one Immich server. It shows a tray icon and runs at login. The user can set bandwidth and concurrency limits. The client retries retriable errors and marks permanent errors for the user.
+A background sync client for Immich on Windows, Linux, and macOS. The user selects local folders in a config window. The client uploads new and changed files to one Immich server. It shows a tray icon and runs at login. The user can set bandwidth and concurrency limits. The client retries retriable errors and marks permanent errors for the user.
 
 ## Non-goals for v1
 
@@ -16,7 +16,6 @@ A background sync client for Immich on Windows. The user selects local folders i
 - Automatic server-side deletion
 - Multiple Immich servers or accounts
 - OAuth login
-- macOS releases. The code stays portable. Revisit after v1 ships.
 
 ## Decisions
 
@@ -38,8 +37,8 @@ A background sync client for Immich on Windows. The user selects local folders i
 | Carried state | Tags move to the new version. Faces, descriptions, and custom metadata stay on the old version. | this plan |
 | Settings store | TOML in the OS config directory. XDG-ready, no hardcoded Windows paths. | this plan |
 | Path layout | Config in the OS config directory. State in the local data directory. | this plan |
-| Platforms (v1) | Windows and Linux ship together. macOS is deferred. | this plan |
-| Release signing (v1) | Unsigned. Signing moves to the public-release ticket. | this plan |
+| Platforms (v1) | Windows and Linux ship together. macOS 13+ (arm64 and x86_64) lands as M4, before the M5 release. | this plan |
+| Release signing (v1) | Unsigned on every platform, macOS unnotarized. Windows signing moves to the public-release ticket; macOS needs no Apple account. | [ADR 0008](docs/adr/0008-macos-unsigned-distribution.md) |
 | Release provenance | Guarded CI steps, enabled when the repository goes public. | this plan |
 | Sync-state store | SQLite via `rusqlite` (bundled), WAL, `synchronous=FULL`. | [ADR 0005](docs/adr/0005-sqlite-via-rusqlite-for-state.md) |
 | Album scope | User choice per mapped folder: leaf folders or the whole source folder. | this plan |
@@ -69,7 +68,7 @@ Engine components are hand-written on adopted crates: `notify` + `notify-debounc
 
 ### Paths
 
-All paths come from a platform-directory crate (for example `directories`). The config lives in the OS config directory. The state database lives in the local data directory. Windows is the first target. Linux and macOS use the XDG and platform paths from the same crate.
+All paths come from a platform-directory crate (for example `directories`). The config lives in the OS config directory. The state database lives in the local data directory. Windows is the first target. Linux uses the XDG paths and macOS `~/Library/Application Support/immich-sync/` from the same crate. The macOS package is unsigned; see [ADR 0008](docs/adr/0008-macos-unsigned-distribution.md).
 
 ### Sync pipeline
 
@@ -112,6 +111,11 @@ Store settings: bundled SQLite, WAL, `synchronous=FULL`, one writer connection w
 - Bandwidth: a token bucket over the request body.
 - Both limits are live-adjustable and persisted.
 
+### Build prerequisites (macOS)
+
+macOS 13 or later needs Xcode and the Command Line Tools, including the Metal
+toolchain; see [CONTRIBUTING.md](CONTRIBUTING.md#building-from-source).
+
 ## Milestones
 
 | Milestone | Result | Exit test |
@@ -120,7 +124,8 @@ Store settings: bundled SQLite, WAL, `synchronous=FULL`, one writer connection w
 | M1 Engine | Headless `sync-core` with tests against a mock server | A 10k-file tree syncs. Restart resumes. The dead letter works. Missing files appear as events. |
 | M2 Integration | Config, keyring, deletion review, tray status | A user configures and syncs without a terminal. |
 | M3 Reliability | Failure visibility, diagnostics, autostart | The user sees and retries a permanent failure. |
-| M4 Release | Signed NSIS installer and docs | A stranger installs the app and syncs a folder. |
+| M4 macOS | macOS 13+ on arm64 and x86_64: unsigned DMGs, Login Item, Keychain, Files & Folders | A Mac installs from the DMG through Open Anyway and syncs a folder. |
+| M5 Release | Unsigned NSIS installer, deb, AppImage, and docs | A stranger installs the app and syncs a folder. |
 
 The tray and GPUI integration is the main technical risk. M0 tests it first, by design.
 
@@ -159,6 +164,7 @@ Each ticket declares its blockers as a native GitHub issue dependency. The front
 | Renames appear as deletions | Review noise | Rename detection by content hash (open question). |
 | Hashing large libraries is slow | First run takes hours | Persist SHA-1. Hash only new or changed files. |
 | Password in the credential store | Credential exposure | OS store only. Never write it to the config file or the logs. |
+| Unsigned macOS bundle is refused by Gatekeeper, the Login Item, or notifications | First launch needs an override; autostart may fall back | Documented **Open Anyway** flow and checksum ([ADR 0008](docs/adr/0008-macos-unsigned-distribution.md)); to be verified on real hardware before the release (#70). |
 
 ## Open questions
 

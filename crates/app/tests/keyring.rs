@@ -15,7 +15,9 @@
 //! '
 //! ```
 //!
-//! Windows, against the Credential Manager:
+//! Windows, against the Credential Manager, and macOS, against the login
+//! Keychain (which prompts for the test entry once per ad-hoc rebuild, the
+//! unsigned-build cost in ADR 0008):
 //!
 //! ```sh
 //! cargo test -p immich-sync --test keyring -- --ignored --nocapture

@@ -42,7 +42,7 @@ use crate::hash::{Sha1, sha1_file};
 use crate::meter::UploadMeter;
 use crate::missing::{Fate, Host, SizeIndex, fate, is_gone, rename_target};
 use crate::pairing::FolderIndex;
-use crate::paths::{PathCase, is_within, key_is_within, path_key};
+use crate::paths::{PathCase, is_within, key, key_is_within, path_key};
 use crate::scan::{ScanError, scan_folder};
 use crate::skip::{has_symlink_ancestor, skip_reason_below};
 use crate::status::{AlbumRename, ConnectionHealth, FolderStatus, Status, StatusInputs};
@@ -277,6 +277,10 @@ struct EngineInner {
     index_cache: Mutex<FolderIndex>,
     /// Wakes the scan loop when an absence needs reconciling.
     reconcile: Notify,
+    /// Whether the watcher reported a directory inside a source folder since
+    /// the last pass (#66). The scan loop reads it, so a rescan hint buys a
+    /// pass while an ordinary file event does not.
+    rescan_hint: AtomicBool,
     /// Wakes the album retry, which sends the titles the user changed (#47).
     album_wake: Notify,
 }
@@ -409,6 +413,7 @@ impl Engine {
             uploads: Mutex::new(JoinSet::new()),
             absences: Mutex::new(Vec::new()),
             reconcile: Notify::new(),
+            rescan_hint: AtomicBool::new(false),
             index_cache: Mutex::new(FolderIndex::default()),
         });
         let observer: Arc<dyn Observer> = Arc::new(EngineObserver {
@@ -1180,6 +1185,29 @@ impl Observer for EngineObserver {
     }
 }
 
+/// The folder that owns `path` once its stored root is resolved, and `path`
+/// rewritten under that root's stored spelling.
+///
+/// Only the root is resolved, never the reported path: the path may name a
+/// file that has just been deleted, which cannot be canonicalised, and the
+/// watcher reports under the resolved root anyway. The caller tries the raw
+/// spelling first; this is the retry. See [`EngineInner::folder_root_for`].
+fn match_canonical(roots: &[&str], path: &Path, case: PathCase) -> Option<(PathBuf, PathBuf)> {
+    for root in roots {
+        let Ok(canonical) = std::fs::canonicalize(root) else {
+            continue;
+        };
+        if !is_within(&canonical, path, case) {
+            continue;
+        }
+        let Ok(relative) = path.strip_prefix(&canonical) else {
+            continue;
+        };
+        return Some((PathBuf::from(*root), Path::new(root).join(relative)));
+    }
+    None
+}
+
 impl EngineInner {
     /// The upload pool in force right now (R7.2).
     ///
@@ -1200,7 +1228,9 @@ impl EngineInner {
 
     /// Queues the settled paths the watcher reported, after the shared skip
     /// rules (R2.2). A path that disappeared is recorded and reconciled by the
-    /// scan loop (R5.1).
+    /// scan loop (R5.1). A directory inside a source folder is not an item: it
+    /// is a rescan hint, and asks the scan loop for a pass when no file in the
+    /// same batch lies under it (#66).
     fn enqueue_watch_batch(&self, paths: Vec<PathBuf>) {
         // A change in a folder makes its cached listing stale, whether or not
         // the changed path itself is queued (a sidecar is not an item, but it
@@ -1209,6 +1239,16 @@ impl EngineInner {
             .lock()
             .expect("the index cache lock")
             .invalidate(&paths);
+        // The hint is decided per batch, so the batch is collected first and
+        // acted on below.
+        enum Watched {
+            /// Only its key is used: a directory is a hint, never queued.
+            Directory(String),
+            /// The path is queued; the key is compared against the directories.
+            File { path: PathBuf, key: String },
+        }
+        let case = PathCase::for_platform();
+        let mut watched = Vec::with_capacity(paths.len());
         for path in paths {
             let Ok(metadata) = std::fs::symlink_metadata(&path) else {
                 // The path is gone. Whether that is a missing file, a rename,
@@ -1216,36 +1256,105 @@ impl EngineInner {
                 // place, by the reconciliation scan; the watcher only asks for
                 // one. The store is not read here: this callback runs on the
                 // debouncer's thread and must not block (R5.1, R5.2).
+                //
+                // The absence must still be spelled the way the store spells
+                // it, or the row lookup below the scan finds nothing and the
+                // scan is skipped: a resolved path is adopted through its
+                // folder root, which still exists even when the file does not.
+                let path = self.folder_root_for(&path).map_or(path, |(_, owned)| owned);
                 self.absences.lock().expect("the absence list").push(path);
                 self.reconcile.notify_one();
                 continue;
             };
-            if !metadata.is_file() {
-                continue;
-            }
-            let Some(root) = self.folder_root_for(&path) else {
+            let reported = path;
+            let Some((root, path)) = self.folder_root_for(&reported) else {
                 continue;
             };
-            // R2.2: the scan prunes symlinked directories, but the watcher
-            // reports a file under one as an ordinary file, so refuse it too.
+            // The batch above was invalidated under the reported spelling; a
+            // path the watcher reported resolved is keyed by the folder's own
+            // spelling instead, so its cached listing has to go too (R3.3).
+            if path != reported {
+                self.index_cache
+                    .lock()
+                    .expect("the index cache lock")
+                    .invalidate(std::slice::from_ref(&path));
+            }
+            // R2.2: the scan prunes symlinked directories and refuses a path
+            // the skip rules name, but the watcher reports both anyway, so it
+            // applies the same predicate.
             if has_symlink_ancestor(&root, &path)
                 || skip_reason_below(&root, &path, Some(&metadata)).is_some()
             {
                 continue;
             }
-            let _ = self.queue.send(path);
+            if metadata.is_dir() {
+                watched.push(Watched::Directory(key(&path, case)));
+            } else if metadata.is_file() {
+                watched.push(Watched::File {
+                    key: key(&path, case),
+                    path,
+                });
+            }
+        }
+        // #66: a directory is a rescan hint only when no file in the same
+        // batch lies under it. On macOS creating a file also reports its
+        // containing directory in the same batch, so a hint for every
+        // directory would walk every source folder on every new photo, and
+        // those file events are the change the walk would find. A batch with
+        // the directory alone still buys one pass: that is a MustScanSubDirs
+        // rescan, an arriving tree on inotify, or a new empty directory. A
+        // file elsewhere in the batch leaves the directory's dropped events
+        // uncovered, so the hint stays. The pass is the scan loop's, so no
+        // second scheduler appears (R2.3).
+        //
+        // The hint is one global flag, so a directory event in one folder
+        // rescans every folder. That is bounded: at most one hint per 2 s
+        // debounce (R2.3), one serialized scan loop, and a hint that arrives
+        // during a pass is not queued again.
+        let hint = watched.iter().any(|entry| match entry {
+            Watched::Directory(dir_key) => !watched.iter().any(|other| match other {
+                Watched::File { key, .. } => key_is_within(dir_key, key),
+                Watched::Directory(_) => false,
+            }),
+            Watched::File { .. } => false,
+        });
+        if hint {
+            self.rescan_hint.store(true, Ordering::SeqCst);
+            self.reconcile.notify_one();
+        }
+        for entry in watched {
+            if let Watched::File { path, .. } = entry {
+                let _ = self.queue.send(path);
+            }
         }
     }
 
-    /// The root of the folder that contains `path`, if any.
-    fn folder_root_for(&self, path: &Path) -> Option<PathBuf> {
+    /// The root of the folder that contains `path`, and `path` in that folder's
+    /// own spelling.
+    ///
+    /// The raw spelling is tried first: it is the common case and costs no
+    /// syscall. A miss is retried against resolved paths, because the watcher
+    /// can report the resolved spelling. On macOS `notify` canonicalises the
+    /// path it hands to FSEvents (`notify-8.2.0/src/fsevent.rs:391-397`), so a
+    /// folder picked through a symlinked ancestor (`/var` -> `/private/var`)
+    /// arrives as `/private/var/...` while the row still says `/var/...`.
+    /// Without the retry every event for such a folder is dropped until the
+    /// next reconciliation scan, and if it were queued as reported, the scan
+    /// would store the same file under a second spelling.
+    fn folder_root_for(&self, path: &Path) -> Option<(PathBuf, PathBuf)> {
         let case = PathCase::for_platform();
-        self.folders
-            .lock()
-            .expect("the folder lock")
+        let folders = self.folders.lock().expect("the folder lock");
+        if let Some(entry) = folders
             .iter()
             .find(|entry| is_within(Path::new(&entry.folder.path), path, case))
-            .map(|entry| PathBuf::from(&entry.folder.path))
+        {
+            return Some((PathBuf::from(&entry.folder.path), path.to_path_buf()));
+        }
+        let roots: Vec<&str> = folders
+            .iter()
+            .map(|entry| entry.folder.path.as_str())
+            .collect();
+        match_canonical(&roots, path, case)
     }
 
     /// The meter of the folder that owns `path` (R8.1).
@@ -1330,6 +1439,11 @@ impl EngineInner {
     /// the store whether any of them is tracked (R5.1).
     fn drain_absences(&self) -> Vec<PathBuf> {
         std::mem::take(&mut *self.absences.lock().expect("the absence list"))
+    }
+
+    /// Takes the rescan hint the watcher set since the last pass (#66).
+    fn take_rescan_hint(&self) -> bool {
+        self.rescan_hint.swap(false, Ordering::SeqCst)
     }
 
     /// Records one finished item against its folder and releases its claim.
@@ -2350,7 +2464,10 @@ async fn scan_loop(inner: Arc<EngineInner>) {
         }
         // A scan is expensive, so the watcher's absences buy one only when
         // they name something the client tracks; a temporary file that came
-        // and went does not walk every source folder.
+        // and went does not walk every source folder. A rescan hint is the
+        // watcher saying it lost track of a folder, so it always buys one
+        // (#66).
+        let rescan = inner.take_rescan_hint();
         let absences = inner.drain_absences();
         let tracked = absences.iter().any(|path| {
             inner
@@ -2360,7 +2477,7 @@ async fn scan_loop(inner: Arc<EngineInner>) {
                 .flatten()
                 .is_some()
         });
-        if !absences.is_empty() && !tracked {
+        if !rescan && !absences.is_empty() && !tracked {
             continue;
         }
         scan_once(&inner).await;
@@ -2408,6 +2525,18 @@ async fn scan_once(inner: &Arc<EngineInner>) {
             Ok(Err(ScanError::Missing(path))) => {
                 set_folder_available(inner, &path, false);
                 tracing::info!(folder = %path, "the source folder is not available");
+            }
+            Ok(Err(ScanError::Denied(path))) => {
+                // #65 (R2.5): a folder the operating system refuses says so and
+                // carries the setting that lifts it. It is not an empty folder,
+                // and nothing retries it: the denial lasts until the user
+                // changes System Settings.
+                set_folder_available(inner, &path, false);
+                set_folder_error(inner, &path, crate::scan::permission_denied());
+                tracing::info!(
+                    folder = %path,
+                    "the source folder needs the Files & Folders permission"
+                );
             }
             Ok(Err(ScanError::Walk(error))) => {
                 set_folder_error(inner, &folder.path, error);
@@ -2624,6 +2753,10 @@ fn note_folder_scanned(inner: &EngineInner, path: &str) {
 }
 
 /// Marks one folder available or missing (R2.5).
+///
+/// Either way the entry drops its older message: a folder that just answered
+/// and a folder that just went missing both make it stale, and a denial that
+/// outlives its folder would keep naming System Settings (#65).
 fn set_folder_available(inner: &EngineInner, path: &str, available: bool) {
     let key = path_key(Path::new(path));
     let mut folders = inner.folders.lock().expect("the folder lock");
@@ -2632,9 +2765,7 @@ fn set_folder_available(inner: &EngineInner, path: &str, available: bool) {
         .find(|entry| path_key(Path::new(&entry.folder.path)) == key)
     {
         entry.available = available;
-        if available {
-            entry.last_error = None;
-        }
+        entry.last_error = None;
     }
     if available {
         clear_global_error_if_recovered(inner, &folders);
@@ -3856,5 +3987,194 @@ mod tests {
             "R3.3: one scan pass listed the folder {listings} times"
         );
         engine.stop();
+    }
+
+    /// An engine over the one source folder `folder`, with its queue receiver
+    /// taken, so a test can hand `enqueue_watch_batch` a batch and read what it
+    /// queued (#66).
+    fn watched_engine(folder: &Path) -> (Arc<EngineInner>, mpsc::UnboundedReceiver<PathBuf>) {
+        std::fs::create_dir_all(folder).expect("create the folder");
+        let root = folder.parent().expect("the folder has a parent");
+        let store =
+            Arc::new(StateStore::open(root.join("state.db")).expect("open the state store"));
+        store
+            .add_folder(&SourceFolder {
+                path: folder.display().to_string(),
+                recursive: true,
+                album_mapping: false,
+                album_scope: AlbumScope::default(),
+                album_title: None,
+            })
+            .expect("add the folder");
+        // The session is never used: these tests send no request.
+        let session = crate::connection::Connection::new(
+            "http://127.0.0.1:1",
+            Arc::new(crate::credential::MemoryCredentialStore::new()),
+        )
+        .expect("a valid URL")
+        .shared();
+        let engine = Engine::new(
+            Arc::new(Tracking::new(store)),
+            session,
+            EngineConfig::default(),
+        )
+        .expect("build the engine");
+        let queue = engine
+            .queue_rx
+            .lock()
+            .expect("the queue lock")
+            .take()
+            .expect("the queue receiver");
+        (Arc::clone(&engine.inner), queue)
+    }
+
+    /// A directory event asks for a scan pass only inside a source folder
+    /// (#66, R2.3).
+    ///
+    /// This is the seam the real watcher reports at: FSEvents hands over the
+    /// folder it could not describe as a path, and inotify reports an arriving
+    /// directory the same way, so both reach `enqueue_watch_batch` as a path
+    /// whose metadata is a directory.
+    #[test]
+    fn a_directory_event_asks_for_a_scan_only_inside_a_source_folder() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let folder = temp.path().join("photos");
+        let (inner, mut queue) = watched_engine(&folder);
+
+        // An ordinary file is queued and buys no pass.
+        let file = folder.join("late.jpg");
+        std::fs::write(&file, b"bytes").expect("write the file");
+        inner.enqueue_watch_batch(vec![file.clone()]);
+        assert_eq!(
+            queue.try_recv().ok(),
+            Some(file),
+            "an ordinary file event still queues the file"
+        );
+        assert!(
+            !inner.take_rescan_hint(),
+            "#66: an ordinary file event must not buy a reconciliation pass"
+        );
+
+        // A directory a source folder owns, alone in its batch, is a rescan
+        // hint.
+        let nested = folder.join("Holiday");
+        std::fs::create_dir_all(&nested).expect("create the nested folder");
+        for hint in [folder.clone(), nested.clone()] {
+            inner.enqueue_watch_batch(vec![hint.clone()]);
+            assert!(
+                inner.take_rescan_hint(),
+                "#66: a directory event for {} asks for a pass",
+                hint.display()
+            );
+            assert!(queue.try_recv().is_err(), "a directory is not an item");
+        }
+
+        // A directory outside every source folder is still ignored.
+        let outside = temp.path().join("elsewhere");
+        std::fs::create_dir_all(&outside).expect("create the other folder");
+        inner.enqueue_watch_batch(vec![outside.clone()]);
+        assert!(
+            !inner.take_rescan_hint(),
+            "#66: a directory outside every source folder is ignored"
+        );
+        assert!(queue.try_recv().is_err(), "nothing is queued for it");
+    }
+
+    /// A file in the same batch covers its directory (#66).
+    ///
+    /// This is the macOS shape: FSEvents reports the containing directory
+    /// together with the file it created, so treating the directory as a hint
+    /// would walk every source folder on every new photo.
+    #[test]
+    fn a_file_under_the_named_directory_covers_it_in_the_batch() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let folder = temp.path().join("photos");
+        let (inner, mut queue) = watched_engine(&folder);
+        let nested = folder.join("Holiday");
+        std::fs::create_dir(&nested).expect("create the nested folder");
+        let file = nested.join("beach.jpg");
+        std::fs::write(&file, b"bytes").expect("write the file");
+
+        inner.enqueue_watch_batch(vec![nested, file.clone()]);
+        assert_eq!(
+            queue.try_recv().ok(),
+            Some(file),
+            "#66: the file event still queues the file"
+        );
+        assert!(queue.try_recv().is_err(), "the directory is not an item");
+        assert!(
+            !inner.take_rescan_hint(),
+            "#66: a file under the named directory is the change, so the batch buys no pass"
+        );
+    }
+
+    /// A file outside the named directory leaves its dropped events uncovered,
+    /// so the hint stays (#66).
+    #[test]
+    fn a_file_outside_the_named_directory_leaves_the_hint() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let folder = temp.path().join("photos");
+        let (inner, mut queue) = watched_engine(&folder);
+        let nested = folder.join("Holiday");
+        std::fs::create_dir(&nested).expect("create the nested folder");
+        let file = folder.join("lake.jpg");
+        std::fs::write(&file, b"bytes").expect("write the file");
+
+        inner.enqueue_watch_batch(vec![nested, file.clone()]);
+        assert_eq!(
+            queue.try_recv().ok(),
+            Some(file),
+            "#66: the file event still queues the file"
+        );
+        assert!(queue.try_recv().is_err(), "the directory is not an item");
+        assert!(
+            inner.take_rescan_hint(),
+            "#66: a file elsewhere in the batch does not cover the directory"
+        );
+    }
+
+    /// A folder the user picked through a symlinked ancestor still owns the
+    /// events the watcher reports under the resolved path (#61).
+    ///
+    /// On macOS the resolver is `/var` -> `/private/var`, so this is the shape
+    /// of every watcher event for a temp folder there; the symlink builds the
+    /// same mismatch on Linux.
+    #[cfg(unix)]
+    #[test]
+    fn a_resolved_event_path_is_adopted_into_the_folders_spelling() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let real = temp.path().join("real");
+        std::fs::create_dir(&real).expect("create the folder");
+        let alias = temp.path().join("alias");
+        symlink(&real, &alias).expect("link the folder");
+        let roots = [alias.to_str().expect("a UTF-8 path")];
+        let resolved = std::fs::canonicalize(&real).expect("resolve the folder");
+
+        assert_eq!(
+            match_canonical(&roots, &resolved.join("a.jpg"), PathCase::Sensitive),
+            Some((alias.clone(), alias.join("a.jpg"))),
+            "the event is adopted into the spelling the folder row uses"
+        );
+        assert_eq!(
+            match_canonical(&roots, &resolved.join("gone.jpg"), PathCase::Sensitive),
+            Some((alias.clone(), alias.join("gone.jpg"))),
+            "a deleted file is adopted through its root, which still resolves"
+        );
+        assert_eq!(
+            match_canonical(&roots, &resolved.join("Holiday"), PathCase::Sensitive),
+            Some((alias.clone(), alias.join("Holiday"))),
+            "a directory is adopted too, so a resolved directory event still buys a pass (#66)"
+        );
+        assert_eq!(
+            match_canonical(
+                &roots,
+                &temp.path().join("elsewhere.jpg"),
+                PathCase::Sensitive
+            ),
+            None,
+            "a path outside every folder stays outside"
+        );
     }
 }

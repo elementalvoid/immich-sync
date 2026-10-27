@@ -1,0 +1,10 @@
+# The compiler's macOS deployment target (#67). cargo-packager's
+# `minimumSystemVersion` only writes LSMinimumSystemVersion into the bundle's
+# Info.plist; it passes nothing to rustc, whose own arm64 default is 11.0, so a
+# build without this produces an app whose plist promises 13.0 and whose binary
+# accepts 11.0. A local macOS build needs it as much as the release job, and it
+# is harmless elsewhere: rustc ignores the variable for Linux and Windows
+# targets, because it only feeds the darwin linker's -mmacosx-version-min. A job
+# that exports the variable itself still wins over this value.
+[env]
+MACOSX_DEPLOYMENT_TARGET = "13.0"

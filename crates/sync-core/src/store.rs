@@ -1883,7 +1883,8 @@ impl StateStore {
     /// stack follow the file; only the path, the comparison key, and the size
     /// and modification time the next scan compares against are rewritten. A
     /// move onto a path another row already holds is refused rather than
-    /// merging two items into one.
+    /// merging two items into one; the row being moved is not such a row, so a
+    /// case-only rename under a folding key (macOS, Windows) still applies.
     ///
     /// A missing row that finds its content again is settled: the server
     /// already held those bytes, so the item is a duplicate and leaves the
@@ -1907,7 +1908,9 @@ impl StateStore {
                 "UPDATE sync_item SET path = ?2, path_key = ?3, size = ?4, mtime_ns = ?5,
                      state = CASE WHEN state = 'missing' THEN 'duplicate' ELSE state END
                  WHERE path_key = ?1
-                   AND NOT EXISTS (SELECT 1 FROM sync_item WHERE path_key = ?3)",
+                   AND NOT EXISTS (
+                       SELECT 1 FROM sync_item WHERE path_key = ?3 AND path_key <> ?1
+                   )",
                 params![
                     path_key(Path::new(from)),
                     to,

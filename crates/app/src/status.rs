@@ -573,6 +573,31 @@ mod tests {
         );
     }
 
+    /// #65: a folder the operating system is blocking is not an empty folder.
+    /// The card says so and shows the message the scan produced — the Files &
+    /// Folders instruction on macOS, the plain permission sentence elsewhere —
+    /// so the reason the user reads is the scan's own.
+    #[test]
+    fn a_refused_folder_card_names_the_files_and_folders_setting() {
+        let mut status = status_with_scans(&[None]);
+        let folder = status.folders.first_mut().expect("one folder card");
+        folder.available = false;
+        folder.last_error = Some(sync_core::scan::permission_denied().to_string());
+
+        let model = DashboardModel::from_engine(&status, None);
+        let card = model.folders.first().expect("one folder card");
+        let content = card.content();
+
+        assert_eq!(content.counts, "Folder unavailable", "not an empty folder");
+        assert_eq!(card.activity, super::ActivityState::NeedsAttention);
+        let reason = content.error.expect("the card shows why");
+        assert_eq!(
+            reason,
+            sync_core::scan::permission_denied(),
+            "the card shows the message the scan produced, not a generic one"
+        );
+    }
+
     /// A burst shorter than the poll interval leaves a rate with no upload on
     /// the wire: the window still holds its bytes, so the line must show the
     /// rate rather than claim the client is idle (R8.1).

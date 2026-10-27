@@ -1,13 +1,13 @@
 //! The OS credential store the shell hands to the connection session
 //! (SPEC R1.2, R1.5, N3).
 //!
-//! Windows files the password in the Credential Manager; Linux uses the Secret
-//! Service (GNOME Keyring or KWallet). The credential never enters the settings
-//! file and never enters a log.
+//! Windows files the password in the Credential Manager, Linux uses the Secret
+//! Service (GNOME Keyring or KWallet), and macOS uses the login Keychain. The
+//! credential never enters the settings file and never enters a log.
 //!
-//! A machine with no Secret Service provider must not panic: the platform store
-//! becomes a value whose every operation reports a message that names what to
-//! install and what to do instead, and the connection form shows it.
+//! A machine with no usable store must not panic: the platform store becomes a
+//! value whose every operation reports a message that names what to install or
+//! unlock and what to do instead, and the connection form shows it.
 
 use std::sync::{Arc, OnceLock};
 
@@ -113,6 +113,19 @@ pub fn credential_manager_message(reason: &str) -> String {
     )
 }
 
+/// The message for a macOS login Keychain that could not be used.
+///
+/// It covers the open and every later operation, so it must not promise a
+/// direction: a denied ACL breaks the read as readily as the write.
+#[must_use]
+pub fn keychain_message(reason: &str) -> String {
+    format!(
+        "The login Keychain could not be used, so the password cannot be read or saved. Allow \
+         the Keychain prompt (or unlock the login Keychain in Keychain Access), then sign in \
+         again. ({reason})"
+    )
+}
+
 /// The message for a platform this build has no store for.
 #[must_use]
 pub fn unsupported_platform_message(platform: &str) -> String {
@@ -139,8 +152,17 @@ fn install_platform_store() -> Result<(), String> {
     Ok(())
 }
 
-/// Reports the platform as unsupported. macOS is deferred (SPEC N1).
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+/// Installs the platform store as the keyring default.
+#[cfg(target_os = "macos")]
+fn install_platform_store() -> Result<(), String> {
+    let store = apple_native_keyring_store::keychain::Store::new()
+        .map_err(|error| keychain_message(&error.to_string()))?;
+    keyring_core::set_default_store(store);
+    Ok(())
+}
+
+/// Reports the platform as unsupported.
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 fn install_platform_store() -> Result<(), String> {
     Err(unsupported_platform_message(std::env::consts::OS))
 }
@@ -191,7 +213,20 @@ impl KeyringStore {
 fn failed(action: &'static str, error: keyring_core::Error) -> CredentialError {
     CredentialError::Failed {
         action,
-        reason: error.to_string(),
+        reason: failure_reason(&error.to_string(), cfg!(target_os = "macos")),
+    }
+}
+
+/// The reason a failed keyring operation reports, by platform.
+///
+/// On macOS a denied Keychain ACL prompt arrives here as a platform failure, and
+/// the raw `keyring_core` text names no remedy (#62). Other platforms keep that
+/// text: their store has no prompt to explain.
+fn failure_reason(reason: &str, macos: bool) -> String {
+    if macos {
+        keychain_message(reason)
+    } else {
+        reason.to_string()
     }
 }
 
@@ -292,6 +327,39 @@ mod tests {
 
         assert!(message.contains("Credential Manager"), "{message}");
         assert!(message.contains("access denied"), "{message}");
+    }
+
+    #[test]
+    fn the_keychain_message_names_the_login_keychain_and_the_next_step() {
+        let message = keychain_message("the user canceled the operation");
+
+        assert!(message.contains("login Keychain"), "{message}");
+        assert!(message.contains("cannot be read or saved"), "{message}");
+        assert!(message.contains("Keychain Access"), "{message}");
+        assert!(message.contains("Allow the Keychain prompt"), "{message}");
+        assert!(
+            message.contains("the user canceled the operation"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_failed_keychain_operation_names_the_prompt_and_the_remedy_on_macos() {
+        let reason = "the user denied the Keychain prompt";
+
+        assert_eq!(
+            failure_reason(reason, false),
+            reason,
+            "other platforms keep the store's own text"
+        );
+        let message = failure_reason(reason, true);
+        assert!(message.contains("login Keychain"), "{message}");
+        assert!(message.contains("Allow the Keychain prompt"), "{message}");
+        assert!(message.contains("Keychain Access"), "{message}");
+        assert!(
+            message.contains(reason),
+            "the original reason is kept: {message}"
+        );
     }
 
     #[test]

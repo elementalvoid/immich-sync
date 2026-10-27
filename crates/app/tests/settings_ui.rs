@@ -52,6 +52,10 @@ struct FakeAutostart {
     enabled: Cell<bool>,
     refuse: bool,
     unreadable: bool,
+    /// The hint shown while the OS waits for the user to approve the item.
+    approval: Option<&'static str>,
+    /// Whether the approval settings page was opened.
+    approval_opened: Cell<bool>,
 }
 
 impl FakeAutostart {
@@ -60,6 +64,8 @@ impl FakeAutostart {
             enabled: Cell::new(false),
             refuse: false,
             unreadable: false,
+            approval: None,
+            approval_opened: Cell::new(false),
         })
     }
 
@@ -69,6 +75,8 @@ impl FakeAutostart {
             enabled: Cell::new(enabled),
             refuse: false,
             unreadable: false,
+            approval: None,
+            approval_opened: Cell::new(false),
         })
     }
 
@@ -77,6 +85,8 @@ impl FakeAutostart {
             enabled: Cell::new(false),
             refuse: true,
             unreadable: false,
+            approval: None,
+            approval_opened: Cell::new(false),
         })
     }
 
@@ -86,6 +96,21 @@ impl FakeAutostart {
             enabled: Cell::new(false),
             refuse: false,
             unreadable: true,
+            approval: None,
+            approval_opened: Cell::new(false),
+        })
+    }
+
+    /// A backend whose entry is registered but waits for the user, as macOS
+    /// does after `SMAppService.register()`. The registration exists, so the
+    /// entry reads as enabled.
+    fn awaiting_approval() -> Rc<Self> {
+        Rc::new(Self {
+            enabled: Cell::new(true),
+            refuse: false,
+            unreadable: false,
+            approval: Some("macOS needs your approval in System Settings › General › Login Items."),
+            approval_opened: Cell::new(false),
         })
     }
 }
@@ -104,6 +129,14 @@ impl Autostart for FakeAutostart {
         }
         self.enabled.set(enabled);
         Ok(())
+    }
+
+    fn approval_needed(&self) -> Option<&'static str> {
+        self.approval
+    }
+
+    fn open_approval_settings(&self) {
+        self.approval_opened.set(true);
     }
 }
 
@@ -193,7 +226,7 @@ fn open_settings_over_connection(
 
 /// Replaces the text in the focused field with `value`.
 fn retype(window: &mut Window, value: &str, cx: &mut App) {
-    window.press("ctrl-a", cx);
+    window.press(crate::common::select_all_chord(), cx);
     window.input(value, cx);
 }
 
@@ -869,6 +902,55 @@ async fn a_noop_edit_while_a_write_is_in_flight_still_reports_its_failure(cx: &m
         message.starts_with("Could not save the settings"),
         "a no-op edit must not hide the failing write: {message}"
     );
+}
+
+#[gpui_kit::test]
+fn an_unapproved_login_item_shows_where_to_approve_it(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let store = SettingsStore::open(paths.config_file.clone());
+    let backend = FakeAutostart::awaiting_approval();
+    let autostart: Rc<dyn Autostart> = backend.clone();
+    let window = open_settings(cx, store, paths.clone(), autostart);
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.find("settings-autostart-approval").visible(),
+            "the approval row is shown"
+        );
+        assert_eq!(
+            window.find("settings-autostart").checked(),
+            Some(true),
+            "an item waiting for approval is registered, so it reads as on"
+        );
+        assert_eq!(
+            window.find("settings-autostart-approve").label(),
+            Some("Open Login Items settings"),
+            "the control to approve it is named"
+        );
+        window.click("settings-autostart-approve", cx);
+    })
+    .expect("update the settings window");
+
+    assert!(
+        backend.approval_opened.get(),
+        "the control opens the approval settings page"
+    );
+
+    // A platform with no approval step shows no row and no control.
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let store = SettingsStore::open(paths.config_file.clone());
+    let window = open_settings(cx, store, paths, FakeAutostart::new());
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("settings-autostart-approval").is_none(),
+            "no approval row without a pending approval"
+        );
+    })
+    .expect("update the settings window");
 }
 
 #[gpui_kit::test]

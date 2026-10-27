@@ -266,6 +266,67 @@ fn the_store_compares_paths_with_the_requested_case_rule() {
 }
 
 #[test]
+fn a_case_only_rename_keeps_the_row_and_its_asset_under_the_insensitive_rule() {
+    // #65: a default APFS volume folds case, so the row tracked before the
+    // rename answers for the file's new spelling: one row, one asset, and no
+    // item left to review. This proves the key, not the volume.
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    let before = "/photos/IMG_0001.JPG";
+    let after = "/photos/img_0001.jpg";
+    store
+        .record_with_case(
+            &record(before, ItemState::Uploaded),
+            sync_core::paths::PathCase::Insensitive,
+        )
+        .expect("write the row before the rename");
+
+    let renamed = store
+        .item_with_case(after, sync_core::paths::PathCase::Insensitive)
+        .expect("read at the new spelling")
+        .expect("the row answers for the new spelling");
+    assert_eq!(renamed.path, before, "the same row, not a second item");
+    assert_eq!(
+        renamed.asset_id.as_deref(),
+        Some("asset-1"),
+        "R5.2: the asset mapping stays with the row"
+    );
+}
+
+/// #65: the twin guard must not read the row being moved as its own twin.
+///
+/// With a folding key (macOS, Windows) a case-only rename gives both sides the
+/// row's own key, and the guard refused it — on a case-sensitive APFS volume
+/// that turned the rename into a `Missing` review item. The platform key also
+/// trims trailing separators, so a Linux test reaches the same collision
+/// without a folding filesystem.
+#[test]
+fn a_move_onto_the_rows_own_key_moves_it_instead_of_finding_a_twin() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = StateStore::open(temp.path().join("state.db")).expect("open a fresh store");
+    store
+        .record(&record("photos/IMG_0001.JPG", ItemState::Uploaded))
+        .expect("write the row");
+
+    assert!(
+        store
+            .move_item("photos/IMG_0001.JPG/", "photos/IMG_0001.JPG", 11, 1)
+            .expect("move the row onto its own key"),
+        "the row being moved is not a twin of itself"
+    );
+    assert_eq!(
+        store
+            .item("photos/IMG_0001.JPG")
+            .expect("read the row")
+            .expect("the row is still there")
+            .asset_id
+            .as_deref(),
+        Some("asset-1"),
+        "the row kept its asset"
+    );
+}
+
+#[test]
 fn source_folders_persist_with_their_recursive_flag() {
     use sync_core::store::{AlbumScope, SourceFolder};
 

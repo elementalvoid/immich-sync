@@ -247,6 +247,9 @@ pub struct SettingsView {
     tag: TagStatus,
     /// The last failed save or autostart change, shown with the load problem.
     action_error: Option<String>,
+    /// The approval hint the autostart backend last reported. It is read when the
+    /// OS state changes, not on render: on macOS it is a login-item status call.
+    approval_hint: Option<&'static str>,
     /// A failure before the store opened, such as path resolution. It stays
     /// visible until the process restarts, because a later save cannot fix it.
     environment_problem: Option<String>,
@@ -347,6 +350,7 @@ impl SettingsView {
             engine: None,
             tag: TagStatus::default(),
             action_error: None,
+            approval_hint: None,
             environment_problem: None,
             settings_generation: 0,
             pending_settings: None,
@@ -628,6 +632,9 @@ impl SettingsView {
     /// background writer, like every other settings save (N2), so a slow disk
     /// never blocks the UI thread at startup.
     fn reconcile_autostart(&mut self, cx: &mut Context<Self>) {
+        // The approval hint has its own source, so it is read even when the
+        // settings file has a problem.
+        self.approval_hint = self.autostart.approval_needed();
         // A corrupt file holds defaults, so its flag is not a stored value. A
         // write here would replace the unparsable bytes and clear the load
         // problem, so leave the file and the notice alone until the user acts.
@@ -716,7 +723,10 @@ impl SettingsView {
     /// the OS change back, so the switch never claims a state one store does
     /// not hold.
     fn toggle_autostart(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        if let Err(error) = self.autostart.set_enabled(enabled) {
+        let applied = self.autostart.set_enabled(enabled);
+        // One status read per user action, never per render.
+        self.approval_hint = self.autostart.approval_needed();
+        if let Err(error) = applied {
             let error = error.context("apply the OS autostart change");
             self.record(AUTOSTART_PROBLEM, Err(error), cx);
             return;
@@ -731,7 +741,9 @@ impl SettingsView {
                         // The file still holds the previous value; bring the
                         // OS back to it, so the two stores agree.
                         let stored = view.store.settings().autostart;
-                        match view.autostart.set_enabled(stored) {
+                        let rolled_back = view.autostart.set_enabled(stored);
+                        view.approval_hint = view.autostart.approval_needed();
+                        match rolled_back {
                             Ok(()) => Err(error),
                             Err(rollback) => Err(error.context(format!(
                                 "and rolling the OS autostart change back failed: {rollback:#}"
@@ -1020,13 +1032,38 @@ impl SettingsView {
         // The switch shows the user's newest intent, so a queued or in-flight
         // write is reflected before it lands (N2).
         let enabled = self.intended_settings().autostart;
-        section(
-            "settings-general",
-            "General",
-            "How the client starts.",
-            vec![
+        let mut rows = vec![
+            div()
+                .id("settings-autostart-row")
+                .test_support()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap_6()
+                .min_h(rems(2.25))
+                .child(field_text(
+                    "Autostart at login",
+                    "Start Immich Sync when you log in. Off by default.",
+                    &palette,
+                ))
+                .child(
+                    Switch::new("settings-autostart")
+                        .checked(enabled)
+                        .accessibility_label("Start Immich Sync at login")
+                        .on_change(cx.listener(|this, enabled, _, cx| {
+                            this.toggle_autostart(*enabled, cx);
+                        })),
+                )
+                .into_any_element(),
+        ];
+        // macOS registers the item and leaves the last step to the user; the
+        // setting stays on. The backend supplies the text, and the view caches
+        // it, so no platform detail or OS call lives on the render path.
+        if let Some(hint) = self.approval_hint {
+            rows.push(
                 div()
-                    .id("settings-autostart-row")
+                    .id("settings-autostart-approval")
                     .test_support()
                     .flex()
                     .flex_row()
@@ -1034,21 +1071,23 @@ impl SettingsView {
                     .justify_between()
                     .gap_6()
                     .min_h(rems(2.25))
-                    .child(field_text(
-                        "Autostart at login",
-                        "Start Immich Sync when you log in. Off by default.",
-                        &palette,
-                    ))
+                    .child(field_text("Approval needed", hint, &palette))
                     .child(
-                        Switch::new("settings-autostart")
-                            .checked(enabled)
-                            .accessibility_label("Start Immich Sync at login")
-                            .on_change(cx.listener(|this, enabled, _, cx| {
-                                this.toggle_autostart(*enabled, cx);
+                        Button::new("settings-autostart-approve")
+                            .label("Open Login Items")
+                            .accessibility_label("Open Login Items settings")
+                            .on_click(cx.listener(|this, _, _, _| {
+                                this.autostart.open_approval_settings();
                             })),
                     )
                     .into_any_element(),
-            ],
+            );
+        }
+        section(
+            "settings-general",
+            "General",
+            "How the client starts.",
+            rows,
             cx,
         )
     }
