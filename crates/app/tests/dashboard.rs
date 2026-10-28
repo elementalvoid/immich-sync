@@ -1027,10 +1027,19 @@ async fn the_add_control_and_the_detail_remove_reach_the_store(cx: &mut TestAppC
         window.click(("folder-details", 0_usize), cx);
         window.render_frame(cx);
         window.click("folder-detail-remove", cx);
+        common::settle_alert(window, cx);
         window.render_frame(cx);
         window.click("folder-detail-remove-confirm", cx);
     })
     .expect("remove the folder through its detail");
+
+    // The press has to reach the button, or the store hears nothing (#73). The
+    // layer clears on a frame of its own, so this waits rather than asserting
+    // against the next frame.
+    cx.wait_for(window, std::time::Duration::from_secs(10), |window, _| {
+        window.try_find("folder-detail-confirm").is_none()
+    })
+    .await;
 
     let mut removed = false;
     for _ in 0..600 {

@@ -49,6 +49,22 @@ pub fn scroll_dashboard_into_view(window: &mut Window, cx: &mut App, id: impl In
     panic!("{id:?} never became visible on the dashboard");
 }
 
+/// Waits for an alert dialog's entrance to settle before pressing it.
+///
+/// The surface slides in for 250 ms, and a press is dispatched from the bounds
+/// read a moment earlier: mid-flight the control has moved on, so under load the
+/// press lands beside it and the button looks dead. The entrance runs on the
+/// wall clock, which the test executor's `advance_clock` does not move, hence
+/// the sleep. A person aims at the control they can see, so this is the
+/// harness's problem, not the dialog's (#73).
+#[allow(dead_code)]
+pub fn settle_alert(window: &mut Window, cx: &mut App) {
+    use gpui_kit::test::TestWindowExt as _;
+
+    std::thread::sleep(std::time::Duration::from_millis(350));
+    window.render_frame(cx);
+}
+
 /// The select-all chord the GPUI text input binds on this platform.
 ///
 /// `ctrl-a` is select-all on Linux and Windows, but macOS binds `ctrl-a` to

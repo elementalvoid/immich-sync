@@ -888,7 +888,8 @@ async fn the_remove_confirmation_asks_twice_and_says_what_stays_on_the_server(
 
     open_detail_now(cx, window);
     act(cx, window, |window, cx| {
-        window.click("folder-detail-remove", cx)
+        window.click("folder-detail-remove", cx);
+        common::settle_alert(window, cx);
     });
     read(cx, window, |window, _| {
         assert!(
@@ -954,23 +955,27 @@ async fn the_remove_confirmation_asks_twice_and_says_what_stays_on_the_server(
             detail_open(window),
             "#43: Escape during the confirmation keeps the dialog"
         );
-        assert!(
-            window.try_find("folder-detail-confirm").is_none(),
-            "Escape cancels the confirmation"
-        );
     });
+    // The alert layer clears on a frame of its own, so this waits instead of
+    // reading the frame right after the press (#73).
+    cx.wait_for(window, Duration::from_secs(10), |window, _| {
+        window.try_find("folder-detail-confirm").is_none()
+    })
+    .await;
 
     // Off, and on again: Cancel does the same.
     act(cx, window, |window, cx| {
-        window.click("folder-detail-remove", cx)
+        window.click("folder-detail-remove", cx);
+        common::settle_alert(window, cx);
     });
     act(cx, window, |window, cx| {
         window.click("folder-detail-remove-cancel", cx);
     });
-    read(cx, window, |window, _| {
-        assert!(detail_open(window));
-        assert!(window.try_find("folder-detail-confirm").is_none());
-    });
+    read(cx, window, |window, _| assert!(detail_open(window)));
+    cx.wait_for(window, Duration::from_secs(10), |window, _| {
+        window.try_find("folder-detail-confirm").is_none()
+    })
+    .await;
     assert_eq!(
         cx.read(|cx| store.read(cx).folders().len()),
         1,
@@ -979,11 +984,20 @@ async fn the_remove_confirmation_asks_twice_and_says_what_stays_on_the_server(
 
     // The second Remove is the one that drops it.
     act(cx, window, |window, cx| {
-        window.click("folder-detail-remove", cx)
+        window.click("folder-detail-remove", cx);
+        common::settle_alert(window, cx);
     });
     act(cx, window, |window, cx| {
         window.click("folder-detail-remove-confirm", cx);
     });
+    // The press has to reach the button: the alert closes on it whether the
+    // write succeeds or not, so an alert still up means the click landed
+    // nowhere and nothing was ever asked of the store. The layer clears on a
+    // frame of its own, so this waits rather than reading the next frame.
+    cx.wait_for(window, Duration::from_secs(10), |window, _| {
+        window.try_find("folder-detail-confirm").is_none()
+    })
+    .await;
     for _ in 0..600 {
         if cx.read(|cx| store.read(cx).folders().is_empty()) {
             break;
@@ -1037,7 +1051,8 @@ async fn a_refused_remove_keeps_the_detail_open_with_its_reason(cx: &mut TestApp
 
     act(cx, window, |window, cx| {
         scroll_into_view(window, cx, "folder-detail-remove");
-        window.click("folder-detail-remove", cx)
+        window.click("folder-detail-remove", cx);
+        common::settle_alert(window, cx);
     });
     act(cx, window, |window, cx| {
         window.click("folder-detail-remove-confirm", cx);
@@ -1062,7 +1077,8 @@ async fn a_refused_remove_keeps_the_detail_open_with_its_reason(cx: &mut TestApp
     // ignores the click, so the confirmation appearing is what proves it.
     act(cx, window, |window, cx| {
         scroll_into_view(window, cx, "folder-detail-remove");
-        window.click("folder-detail-remove", cx)
+        window.click("folder-detail-remove", cx);
+        common::settle_alert(window, cx);
     });
     read(cx, window, |window, _| {
         assert!(
@@ -1131,7 +1147,8 @@ async fn a_setting_edit_during_a_pending_remove_still_answers_the_remove(cx: &mu
         .expect("hold the write lock");
 
     act(cx, window, |window, cx| {
-        window.click("folder-detail-remove", cx)
+        window.click("folder-detail-remove", cx);
+        common::settle_alert(window, cx);
     });
     act(cx, window, |window, cx| {
         window.click("folder-detail-remove-confirm", cx);
@@ -1167,7 +1184,8 @@ async fn a_setting_edit_during_a_pending_remove_still_answers_the_remove(cx: &mu
     // A disabled control ignores the click, so the confirmation appearing is
     // what proves the setting edit did not leave `removing` set forever.
     act(cx, window, |window, cx| {
-        window.click("folder-detail-remove", cx)
+        window.click("folder-detail-remove", cx);
+        common::settle_alert(window, cx);
     });
     read(cx, window, |window, _| {
         assert!(
@@ -1257,7 +1275,8 @@ async fn open_folder_passes_the_stored_path_and_is_disabled_when_unavailable(
         window.click("folder-panel-recursive", cx)
     });
     act(cx, window, |window, cx| {
-        window.click("folder-detail-remove", cx)
+        window.click("folder-detail-remove", cx);
+        common::settle_alert(window, cx);
     });
     read(cx, window, |window, _| {
         assert!(
