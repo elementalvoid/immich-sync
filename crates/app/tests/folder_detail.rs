@@ -904,28 +904,46 @@ async fn the_remove_confirmation_asks_twice_and_says_what_stays_on_the_server(
             "Remove photos?",
             "the confirmation names the folder"
         );
-        assert_eq!(
-            window.find("folder-detail-confirm").focused(),
-            Some(true),
-            "#43: the confirmation takes the keyboard"
-        );
-        // #43: the dimming is structural. Only the normal body is dimmed, so
-        // the confirmation the user must read and act on keeps its contrast.
-        // The harness observes structure, not opacity, so the tree is what the
-        // test can pin: the confirmation is not a child of the dimmed element.
+        // #73: the answer is a window-level alert, so it is on screen wherever
+        // the detail's body has scrolled to. It is not a child of the panel, and
+        // no test-side scrolling is needed to reach it.
         assert!(
             window
-                .within("folder-detail-body-dim")
+                .within("folder-panel")
                 .try_find("folder-detail-confirm")
                 .is_none(),
-            "#43: the confirmation is not inside the dimmed body"
+            "the confirmation is its own layer, not panel content"
         );
+        let confirm = window.find("folder-detail-remove-confirm").bounds();
+        let viewport = window.viewport_size();
         assert!(
-            window
-                .within("folder-detail-body")
-                .try_find("folder-detail-confirm")
-                .is_some(),
-            "#43: the confirmation still sits in the dialog body"
+            confirm.top() >= px(0.) && confirm.bottom() <= viewport.height,
+            "the confirmation opens on screen without scrolling: {confirm:?} in {viewport:?}"
+        );
+        // #43 kept the panel readable but subordinate: it stays behind the
+        // alert rather than being replaced by it.
+        assert!(
+            detail_open(window) && window.try_find("folder-detail-body-dim").is_some(),
+            "the panel stays behind the confirmation"
+        );
+        // #73: one pair of answers, not two. The alert builds its own OK and
+        // Cancel row unless a footer is set, and its buttons carry the bare
+        // `ok` and `cancel` ids, so their absence is what pins the single row.
+        assert!(
+            window.try_find("ok").is_none() && window.try_find("cancel").is_none(),
+            "the confirmation renders one pair of buttons"
+        );
+    });
+
+    // The alert owns the keyboard, so Tab reaches the answer instead of the
+    // panel behind it.
+    act(cx, window, |window, cx| window.press("tab", cx));
+    read(cx, window, |window, _| {
+        let on_cancel = window.find("folder-detail-remove-cancel").focused();
+        let on_confirm = window.find("folder-detail-remove-confirm").focused();
+        assert!(
+            on_cancel == Some(true) || on_confirm == Some(true),
+            "the keyboard reaches the confirmation's own controls"
         );
     });
 
@@ -1022,7 +1040,6 @@ async fn a_refused_remove_keeps_the_detail_open_with_its_reason(cx: &mut TestApp
         window.click("folder-detail-remove", cx)
     });
     act(cx, window, |window, cx| {
-        scroll_into_view(window, cx, "folder-detail-remove-confirm");
         window.click("folder-detail-remove-confirm", cx);
     });
 
@@ -1062,7 +1079,6 @@ async fn a_refused_remove_keeps_the_detail_open_with_its_reason(cx: &mut TestApp
             .expect("drop the trigger that refused the delete");
     }
     act(cx, window, |window, cx| {
-        scroll_into_view(window, cx, "folder-detail-remove-confirm");
         window.click("folder-detail-remove-confirm", cx);
     });
     for _ in 0..600 {

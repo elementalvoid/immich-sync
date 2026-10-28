@@ -18,6 +18,7 @@ use crate::status::{ActivityState, DashboardModel, StatusCard};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::Colorize as _;
 use gpui_kit::component::Theme;
+use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::progress::Progress;
@@ -377,6 +378,9 @@ impl Dashboard {
     /// Closes the detail dialog and puts focus back on the folder's card
     /// (#43), or on the folder field when the card is gone.
     fn close_folder_detail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The Remove confirmation is a window-level layer: it must not outlive
+        // the panel that opened it (#73).
+        window.close_dialog(cx);
         self.panel = None;
         self.panel_subscription = None;
         if let Some((path, anchor)) = self.detail_return.take() {

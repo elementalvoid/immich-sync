@@ -21,7 +21,11 @@ use gpui_kit::base::FocusTrapElement as _;
 use gpui_kit::base::SelectableText;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::Theme;
+use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::dialog::{
+    DialogAction, DialogClose, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
+};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::progress::Progress;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -236,7 +240,8 @@ pub struct FolderPanel {
     /// Whether the folder is no longer a source folder while the detail is
     /// open. Its last known settings stay usable.
     gone: bool,
-    /// Whether the inline Remove confirmation is showing (#43).
+    /// Whether the Remove confirmation alert is up, so the body dims behind
+    /// it (#43, #73).
     confirming: bool,
     /// Whether the removal is in flight: the dialog closes when the folder
     /// leaves the status, so a failed write keeps it open.
@@ -268,8 +273,6 @@ pub struct FolderPanel {
     /// read at, so the next status poll that changes either reloads them.
     assets_read_at: Option<(u32, bool)>,
     focus: FocusHandle,
-    /// Where the inline Remove confirmation sends the keyboard.
-    confirm_focus: FocusHandle,
     _subscription: Subscription,
     _title_subscription: Subscription,
 }
@@ -319,7 +322,6 @@ impl FolderPanel {
             assets_loading: false,
             assets_read_at: None,
             focus,
-            confirm_focus: cx.focus_handle(),
             _subscription: subscription,
             _title_subscription: title_subscription,
         }
@@ -340,7 +342,6 @@ impl FolderPanel {
         cx: &mut Context<Self>,
     ) -> Self {
         let focus = cx.focus_handle();
-        let confirm_focus = cx.focus_handle();
         let subscription = cx.observe(&engine, |this, engine, cx| this.engine_changed(&engine, cx));
         let card = folder_card(&engine, &path, cx);
         let server_url = engine.read(cx).server_url(cx);
@@ -378,7 +379,6 @@ impl FolderPanel {
             assets_loading: false,
             assets_read_at: None,
             focus,
-            confirm_focus,
             _subscription: subscription,
             _title_subscription: title_subscription,
         };
@@ -651,12 +651,84 @@ impl FolderPanel {
         self.removing = false;
     }
 
-    /// The first Remove: shows the inline confirmation and gives it the
-    /// keyboard (#43).
+    /// The first Remove: opens the confirmation alert and dims the dialog
+    /// behind it (#43, #73).
+    ///
+    /// The alert is a window-level layer, so the answer is on screen whatever
+    /// the detail's body scrolls to. The layer may rebuild the builder, so it
+    /// captures the name and a handle instead of reading the panel.
     fn ask_remove(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.confirming = true;
-        window.focus(&self.confirm_focus, cx);
         cx.notify();
+        let title = self.folder_name();
+        let panel = cx.entity().downgrade();
+        let cancelled = panel.clone();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            // The layer may rebuild the builder, so each run gets its own
+            // copies of what the callbacks and the content move into place.
+            let title = title.clone();
+            let cancelled = cancelled.clone();
+            let removed = panel.clone();
+            alert
+                // The buttons go in the dialog's own footer: an alert builds
+                // its default OK/Cancel row only when no footer is set, so a
+                // footer supplied through `content` rendered both (#73).
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            DialogClose::new().child(
+                                Button::new("folder-detail-remove-cancel")
+                                    .flex_1()
+                                    .outline()
+                                    .label("Cancel")
+                                    .accessibility_label("Keep the folder"),
+                            ),
+                        )
+                        .child(
+                            DialogAction::new().child(
+                                Button::new("folder-detail-remove-confirm")
+                                    .flex_1()
+                                    .danger()
+                                    .label("Remove folder")
+                                    .accessibility_label(format!("Remove {title} now")),
+                            ),
+                        ),
+                )
+                .content(move |content, _, _| {
+                    content.child(
+                        div()
+                            .id("folder-detail-confirm")
+                            .test_support()
+                            .role(Role::Alert)
+                            .aria_label(format!("Remove {title}?"))
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                DialogHeader::new()
+                                    .child(
+                                        DialogTitle::new()
+                                            .child(format!("Remove “{title}” from Immich Sync?")),
+                                    )
+                                    .child(DialogDescription::new().child(
+                                        "Its uploaded assets stay on the server. The client \
+                                         stops syncing this folder and forgets the items it \
+                                         tracked.",
+                                    )),
+                            ),
+                    )
+                })
+                .on_cancel(move |_, _, cx| {
+                    // The panel can be gone already: closing the detail closes this
+                    // alert with it, so there is nothing left to undim (#73).
+                    let _ = cancelled.update(cx, |panel, cx| panel.confirmation_closed(cx));
+                    true
+                })
+                .on_ok(move |_, _, cx| {
+                    let _ = removed.update(cx, |panel, cx| panel.remove_confirmed(cx));
+                    true
+                })
+        });
     }
 
     /// The second Remove: asks the engine to drop the folder and waits for the
@@ -676,10 +748,12 @@ impl FolderPanel {
         cx.notify();
     }
 
-    /// Escape during the confirmation cancels only the confirmation (#43).
-    fn cancel_confirmation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// The confirmation alert is gone: the body stops dimming (#73).
+    ///
+    /// Focus returns to the panel by itself: the alert layer puts it back on
+    /// the control it took it from.
+    fn confirmation_closed(&mut self, cx: &mut Context<Self>) {
         self.confirming = false;
-        window.focus(&self.focus, cx);
         cx.notify();
     }
 
@@ -692,12 +766,9 @@ impl FolderPanel {
         }
     }
 
-    /// Escape inside the dialog: a confirmation cancels itself first (#43).
-    fn escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.confirming {
-            self.cancel_confirmation(window, cx);
-            return;
-        }
+    /// Escape inside the dialog (#43). While the confirmation alert is up,
+    /// focus is in that layer and its own Escape closes only the alert (#73).
+    fn escape(&mut self, cx: &mut Context<Self>) {
         self.dismiss(cx);
     }
 
@@ -967,11 +1038,12 @@ impl FolderPanel {
         );
         let percent = format!("{}%", (progress.clamp(0.0, 1.0) * 100.0).round() as u32);
 
-        // #43: while the Remove confirmation shows, the normal body dims and
-        // the confirmation owns the keyboard. The opacity sits on this inner
-        // wrapper, never on the whole body: a child inherits its parent's
-        // opacity, so a confirmation appended to a dimmed body is dimmed with
-        // it and hard to read.
+        // #43: while the Remove confirmation shows, the normal body dims. The
+        // opacity sits on this inner wrapper, never on the whole body, so the
+        // answer is never dimmed with the panel (#73 moved the answer into its
+        // own window-level layer). Opacity is not one of the things the test
+        // harness observes, so no test pins this; the flag is pinned by the
+        // alert opening and closing.
         let inner = div()
             .id("folder-detail-body-dim")
             .test_support()
@@ -1177,7 +1249,7 @@ impl FolderPanel {
                     ),
             );
 
-        let mut body = div()
+        div()
             .id("folder-detail-body")
             .test_support()
             .flex()
@@ -1185,9 +1257,9 @@ impl FolderPanel {
             .gap_3()
             .w_full()
             .child(inner)
-            // The problem notice and the confirmation are the dialog's answers,
-            // not body content: they stay outside the dimmed wrapper, so a
-            // refused Remove is readable while its confirmation is up.
+            // The problem notice is the dialog's answer, not body content: it
+            // stays outside the dimmed wrapper, so a refused Remove is readable
+            // while the confirmation is up.
             .when_some(self.problem.clone(), |this, problem| {
                 this.child(notice(
                     "folder-panel-problem",
@@ -1195,12 +1267,8 @@ impl FolderPanel {
                     theme.danger,
                     palette,
                 ))
-            });
-
-        if self.confirming {
-            body = body.child(self.confirmation(&title, palette, theme, cx));
-        }
-        body.into_any_element()
+            })
+            .into_any_element()
     }
 
     /// The folder's uploaded assets: one row per current asset, newest first,
@@ -1344,67 +1412,6 @@ impl FolderPanel {
             .into_any_element()
     }
 
-    /// The inline Remove confirmation: the second action is the one that
-    /// removes, and it says what stays on the server (#43).
-    fn confirmation(
-        &self,
-        title: &str,
-        palette: &CardPalette,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        div()
-            .id("folder-detail-confirm")
-            .test_support()
-            .role(Role::Alert)
-            .aria_label(format!("Remove {title}?"))
-            .track_focus(&self.confirm_focus)
-            .flex()
-            .flex_col()
-            .gap_2()
-            .p_3()
-            .w_full()
-            .rounded(theme.radius_lg)
-            .border_1()
-            .border_color(theme.danger)
-            .bg(palette.surface)
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(palette.text)
-                    .child(format!("Remove “{title}” from Immich Sync?")),
-            )
-            .child(div().text_xs().text_color(palette.meta).child(
-                "Its uploaded assets stay on the server. The client stops syncing this folder \
-                     and forgets the items it tracked.",
-            ))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .justify_end()
-                    .gap_2()
-                    .child(
-                        Button::new("folder-detail-remove-cancel")
-                            .secondary()
-                            .label("Cancel")
-                            .accessibility_label("Keep the folder")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.cancel_confirmation(window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("folder-detail-remove-confirm")
-                            .danger()
-                            .label("Remove folder")
-                            .accessibility_label(format!("Remove {title} now"))
-                            .on_click(cx.listener(|this, _, _, cx| this.remove_confirmed(cx))),
-                    ),
-            )
-            .into_any_element()
-    }
-
     /// The modal host: centered over a backdrop, focus trapped, Escape cancels.
     ///
     /// The backdrop is the host's sibling rather than an ancestor of the card,
@@ -1448,9 +1455,9 @@ impl FolderPanel {
                     // dashboard behind the modal stays inert.
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                         if event.keystroke.key == "escape" {
-                            this.escape(window, cx);
+                            this.escape(cx);
                         }
                     }))
                     .child(backdrop)
