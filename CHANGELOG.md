@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/elementalvoid/immich-sync/compare/v0.2.0...v0.2.1) (2026-10-28)
+
+
+### Bug Fixes
+
+* **app:** open the Remove confirmation as an alert dialog ([#73](https://github.com/elementalvoid/immich-sync/issues/73)) ([bdd1c7f](https://github.com/elementalvoid/immich-sync/commit/bdd1c7fecf118fabf463757c48ce4e6ae87eab53))
+
 ## [0.2.0](https://github.com/elementalvoid/immich-sync/compare/v0.1.0...v0.2.0) (2026-10-27)
 
 
