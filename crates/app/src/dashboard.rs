@@ -488,30 +488,30 @@ impl Dashboard {
                     .when_some(input, |this, input| {
                         let focus = input.read(cx).focus_handle(cx);
                         this.child(
-                            div()
-                                .id("dashboard-folder-path")
-                                .test_support()
-                                .track_focus(&focus)
-                                .aria_label("Source folder path")
-                                // Enter opens the setup dialog. This raw key
-                                // handler is the path that fires: the field
-                                // and this wrapper share one focus handle, so
-                                // the key reaches the wrapper whatever the
-                                // platform does with the input's own context.
-                                // The input's `PressEnter` used to open the
-                                // dialog a second time; a rendered test covers
-                                // the surviving path (#43).
-                                .on_key_down(cx.listener(
-                                    |this, event: &KeyDownEvent, window, cx| {
-                                        if event.keystroke.key == "enter" {
-                                            this.open_setup_from_field(window, cx);
-                                            cx.stop_propagation();
-                                        }
-                                    },
-                                ))
-                                .flex_1()
-                                .min_w_0()
-                                .child(Input::new(&input).aria_label("Source folder path")),
+                            crate::a11y::named(
+                                Role::Group,
+                                "dashboard-folder-path",
+                                "Source folder path",
+                                None,
+                            )
+                            .track_focus(&focus)
+                            // Enter opens the setup dialog. This raw key
+                            // handler is the path that fires: the field
+                            // and this wrapper share one focus handle, so
+                            // the key reaches the wrapper whatever the
+                            // platform does with the input's own context.
+                            // The input's `PressEnter` used to open the
+                            // dialog a second time; a rendered test covers
+                            // the surviving path (#43).
+                            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                                if event.keystroke.key == "enter" {
+                                    this.open_setup_from_field(window, cx);
+                                    cx.stop_propagation();
+                                }
+                            }))
+                            .flex_1()
+                            .min_w_0()
+                            .child(Input::new(&input).aria_label("Source folder path")),
                         )
                         .child(
                             Button::new("dashboard-browse-folder")
@@ -865,10 +865,7 @@ fn status_card(
                         }),
                 )
                 .child(
-                    div()
-                        .id(state_id)
-                        .test_support()
-                        .aria_label(content.state.clone())
+                    crate::a11y::named(Role::Label, state_id, content.state.clone(), None)
                         .child(state_tag(card.activity, content.state, &palette, theme)),
                 ),
         )
@@ -903,10 +900,7 @@ fn status_card(
             // test measures, and a label instead of a control: nothing new to
             // operate or to skip.
             this.child(
-                div()
-                    .id((id.clone(), "uploads"))
-                    .test_support()
-                    .aria_label(uploads.clone())
+                crate::a11y::named(Role::Label, (id.clone(), "uploads"), uploads.clone(), None)
                     .text_sm()
                     .text_color(palette.meta)
                     .child(uploads),
@@ -917,10 +911,7 @@ fn status_card(
             // detail's own words. A label, not a control: nothing new to
             // operate or to skip.
             this.child(
-                div()
-                    .id((id.clone(), "scan"))
-                    .test_support()
-                    .aria_label(scan.clone())
+                crate::a11y::named(Role::Label, (id.clone(), "scan"), scan.clone(), None)
                     .text_sm()
                     .text_color(palette.meta)
                     .child(scan),
@@ -931,15 +922,17 @@ fn status_card(
             // from its value. A label, not a control: the folder detail is
             // where they change.
             this.child(
-                div()
-                    .id((id.clone(), "settings"))
-                    .test_support()
-                    .aria_label(settings.join(" · "))
-                    .flex()
-                    .flex_col()
-                    .text_sm()
-                    .text_color(palette.meta)
-                    .children(settings),
+                crate::a11y::named(
+                    Role::Label,
+                    (id.clone(), "settings"),
+                    settings.join(" · "),
+                    None,
+                )
+                .flex()
+                .flex_col()
+                .text_sm()
+                .text_color(palette.meta)
+                .children(settings),
             )
         });
 
@@ -947,10 +940,7 @@ fn status_card(
         && let Some(id) = connection_id
     {
         root = root.child(
-            div()
-                .id(id)
-                .test_support()
-                .aria_label(connection.clone())
+            crate::a11y::named(Role::Label, id, connection.clone(), None)
                 .text_sm()
                 .text_color(palette.meta)
                 .child(connection),

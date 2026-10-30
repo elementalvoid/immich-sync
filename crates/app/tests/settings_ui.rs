@@ -1190,6 +1190,11 @@ fn long_storage_paths_stay_inside_their_card(cx: &mut TestAppContext) {
                 Some(path.as_str()),
                 "{value_id} is named by the path it shows"
             );
+            assert_eq!(
+                window.find(value_id).role(),
+                Some(Role::Label),
+                "{value_id} is a label node, so its name is read (B1)"
+            );
         }
     })
     .expect("update the settings window");
@@ -2866,6 +2871,14 @@ fn every_settings_row_is_named_and_explained_on_its_own_page(cx: &mut TestAppCon
                         "{} keeps its help sentence",
                         pin.help_id
                     );
+                    // #78 criterion 3: the name and the help sentence are on an
+                    // element with a role, so they reach the tree at all (B1).
+                    assert_eq!(
+                        window.find(pin.help_id).role(),
+                        Some(Role::Group),
+                        "{} names the row as a group",
+                        pin.help_id
+                    );
                 } else {
                     assert!(
                         window.try_find(pin.id).is_none(),
@@ -2895,6 +2908,13 @@ fn the_page_strip_reports_every_page_as_a_tab_and_the_selected_one(cx: &mut Test
         draw(window, cx);
         for shown in 0..PAGE_COUNT {
             open_page(window, shown, cx);
+            // #78: the strip is a tab list, so the seven tabs are one
+            // collection to assistive technology and not loose controls.
+            assert_eq!(
+                window.find("settings-page-tabs").role(),
+                Some(Role::TabList),
+                "the page strip is a tab list"
+            );
             for (page, id) in PAGE_BUTTONS.iter().enumerate() {
                 let tab = window.find(*id);
                 assert_eq!(tab.role(), Some(Role::Tab), "{id} is announced as a tab");

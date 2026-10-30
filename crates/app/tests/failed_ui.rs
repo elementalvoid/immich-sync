@@ -40,6 +40,15 @@ fn announced(window: &Window, text: &str) -> usize {
         .count()
 }
 
+/// How many `Role::Status` nodes carry `text` as their name: the count a
+/// screen reader walks past, so a sentence stated twice fails here (#76, #77).
+fn statuses(window: &Window, text: &str) -> usize {
+    snapshots(window)
+        .into_iter()
+        .filter(|element| element.role() == Some(Role::Status) && element.label() == Some(text))
+        .count()
+}
+
 /// The path layout the other app tests use, so the view gets a temp database.
 fn temporary_paths(dir: &Path) -> AppPaths {
     AppPaths {
@@ -413,9 +422,10 @@ async fn a_retry_click_requeues_the_item_and_clears_its_row(cx: &mut TestAppCont
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
         assert_eq!(
-            window.find("failed-summary").label(),
-            Some("Nothing has failed."),
-            "the empty state is stated"
+            statuses(window, "Nothing has failed"),
+            1,
+            "the empty list states its sentence once: {}",
+            registered(window)
         );
     })
     .expect("read the empty state");
@@ -600,10 +610,18 @@ async fn choosing_a_folder_narrows_the_list_its_summary_and_its_empty_state(
             0,
             "#77: an empty filtered list never claims the whole client is empty"
         );
+        // #77, #76: the sentence is stated once. The summary above the list says
+        // what needs the user; with nothing in the list there is nothing to
+        // count, so the empty state is the only status carrying the words.
         assert_eq!(
-            window.find("failed-summary").label(),
-            Some("No failed items in Videos"),
-            "an empty filtered list is summarised for its folder, not for the whole client"
+            statuses(window, "No failed items in Videos"),
+            1,
+            "an empty filtered list states its sentence once: {}",
+            registered(window)
+        );
+        assert!(
+            window.try_find("failed-summary").is_none(),
+            "with no row to count the summary states nothing"
         );
         assert!(window.try_find("failed-row-0").is_none());
 

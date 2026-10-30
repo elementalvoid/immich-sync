@@ -1,5 +1,6 @@
 //! Immich Sync shell: a GPUI-Kit window, a tray icon, and a single instance.
 
+mod a11y;
 pub mod asset_link;
 pub mod autostart;
 pub mod connection;

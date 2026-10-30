@@ -197,11 +197,8 @@ impl Render for UploadView {
                     .border_1()
                     .border_color(theme.border)
                     .child(
-                        div()
-                            .id("upload-path")
-                            .test_support()
+                        crate::a11y::named(Role::Group, "upload-path", "File path", None)
                             .track_focus(&focus)
-                            .aria_label("File path")
                             .flex()
                             .flex_row()
                             .items_center()

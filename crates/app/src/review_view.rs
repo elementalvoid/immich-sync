@@ -96,12 +96,10 @@ impl Render for ReviewView {
             .read(cx)
             .empty_heading("No missing files", "Every tracked file is present");
         // #41 review: an empty filtered list must not be summarised as if the
-        // whole client were empty, so the summary says what the list says.
-        let summary = if rows.is_empty() && self.filter.read(cx).is_active() {
-            empty.clone()
-        } else {
-            summary(&items)
-        };
+        // whole client were empty, so the summary only states a count. An empty
+        // list is stated once, by the empty state below it (#76's "announced
+        // once" rule, #77).
+        let summary = (!rows.is_empty()).then(|| summary(&items));
 
         div()
             .id("review-view")
@@ -141,16 +139,18 @@ impl Render for ReviewView {
                 window,
                 cx,
             ))
-            .child(
-                div()
-                    .id("review-summary")
-                    .test_support()
-                    .role(Role::Status)
-                    .aria_label(summary.clone())
-                    .text_sm()
-                    .text_color(muted)
-                    .child(summary),
-            )
+            .when_some(summary, |this, summary| {
+                this.child(
+                    div()
+                        .id("review-summary")
+                        .test_support()
+                        .role(Role::Status)
+                        .aria_label(summary.clone())
+                        .text_sm()
+                        .text_color(muted)
+                        .child(summary),
+                )
+            })
             .child(
                 div()
                     .id("review-list")

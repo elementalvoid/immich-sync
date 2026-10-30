@@ -372,10 +372,7 @@ impl LogsView {
                 .child(
                     div().flex_1().min_w_0().text_right().child(
                         // Wrapped, not truncated: the whole path stays visible.
-                        div()
-                            .id(value_id)
-                            .test_support()
-                            .aria_label(value.clone())
+                        crate::a11y::named(Role::Label, value_id, value.clone(), None)
                             .min_w_0()
                             .font_family(theme.mono_font_family.clone())
                             .text_xs()
@@ -554,34 +551,36 @@ impl LogsView {
                 .iter()
                 .enumerate()
                 .map(|(index, line)| {
-                    div()
-                        .id(ElementId::Name(format!("logs-line-{index}").into()))
-                        .test_support()
-                        .aria_label(line.clone())
-                        .min_w_0()
-                        .w_full()
-                        // The tail box caps its height, so a shrinkable row is
-                        // squeezed into the cap and its glyphs are clipped: the
-                        // tail must overflow and scroll instead (#38).
-                        .flex_shrink_0()
-                        .truncate()
-                        .font_family(theme.mono_font_family.clone())
-                        .text_xs()
-                        .text_color(palette.text)
-                        // One handle per line: a shared handle registers once
-                        // and the last line painted would win (probe Q1).
-                        // A blank line selected by a drag is dropped from the
-                        // copied text: the selection layer drops whitespace-only
-                        // participants and the Root trims. That is vendored
-                        // gpui-base behaviour; Copy all keeps blank lines.
-                        .child(
-                            SelectableText::new(
-                                ElementId::Name(format!("logs-text-{index}").into()),
-                                line.clone(),
-                            )
-                            .document_order(index as u64),
+                    crate::a11y::named(
+                        Role::Label,
+                        ElementId::Name(format!("logs-line-{index}").into()),
+                        line.clone(),
+                        None,
+                    )
+                    .min_w_0()
+                    .w_full()
+                    // The tail box caps its height, so a shrinkable row is
+                    // squeezed into the cap and its glyphs are clipped: the
+                    // tail must overflow and scroll instead (#38).
+                    .flex_shrink_0()
+                    .truncate()
+                    .font_family(theme.mono_font_family.clone())
+                    .text_xs()
+                    .text_color(palette.text)
+                    // One handle per line: a shared handle registers once
+                    // and the last line painted would win (probe Q1).
+                    // A blank line selected by a drag is dropped from the
+                    // copied text: the selection layer drops whitespace-only
+                    // participants and the Root trims. That is vendored
+                    // gpui-base behaviour; Copy all keeps blank lines.
+                    .child(
+                        SelectableText::new(
+                            ElementId::Name(format!("logs-text-{index}").into()),
+                            line.clone(),
                         )
-                        .into_any_element()
+                        .document_order(index as u64),
+                    )
+                    .into_any_element()
                 })
                 .collect();
             let focus = self.lines_focus.clone();

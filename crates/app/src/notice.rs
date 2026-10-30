@@ -25,6 +25,13 @@
 //!
 //! A headline is visible emphasis, not content: it stays out of the accessible
 //! name, so it must not carry information the message lacks.
+//!
+//! The sibling lesson, and the reason [`crate::a11y::named`] exists: gpui builds
+//! a node only for an element that declares a role, so an `aria_label` or an
+//! `aria_description` on an element without `.role()` is stored and read by
+//! nobody. The snapshots cannot see the difference — they read the declaration —
+//! so no test catches it; a name or a description is always written with the
+//! role it needs.
 
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::Theme;

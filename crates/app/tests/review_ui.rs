@@ -77,6 +77,15 @@ fn announced(window: &Window, text: &str) -> usize {
         .count()
 }
 
+/// How many `Role::Status` nodes carry `text` as their name: the count a
+/// screen reader walks past, so a sentence stated twice fails here (#76, #77).
+fn statuses(window: &Window, text: &str) -> usize {
+    snapshots(window)
+        .into_iter()
+        .filter(|element| element.role() == Some(Role::Status) && element.label() == Some(text))
+        .count()
+}
+
 /// Seeds one source folder and `names` missing files under it.
 ///
 /// The folder itself exists: the scenario is a file that disappeared, not a
@@ -621,10 +630,17 @@ async fn choosing_a_folder_narrows_the_review_its_summary_and_its_empty_state(
             0,
             "#77: an empty filtered list never claims every tracked file is present"
         );
+        // #77, #76: the sentence is stated once. The summary above the list says
+        // what waits for the user; with nothing in the list there is nothing to
+        // count, so the empty state is the only status carrying the words.
         assert_eq!(
-            window.find("review-summary").label(),
-            Some("No missing files in Videos"),
-            "an empty filtered list is summarised for its folder, not for the whole client"
+            statuses(window, "No missing files in Videos"),
+            1,
+            "an empty filtered list states its sentence once"
+        );
+        assert!(
+            window.try_find("review-summary").is_none(),
+            "with no row to count the summary states nothing"
         );
         assert!(window.try_find("review-row-0").is_none());
 

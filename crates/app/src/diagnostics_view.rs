@@ -285,14 +285,16 @@ impl DiagnosticsView {
         let errors = self.model.read(cx).errors().to_vec();
         let rows: Vec<AnyElement> = if errors.is_empty() {
             vec![
-                div()
-                    .id("diagnostics-errors-empty")
-                    .test_support()
-                    .aria_label("No failure has been recorded.")
-                    .text_xs()
-                    .text_color(palette.meta)
-                    .child("No failure has been recorded.")
-                    .into_any_element(),
+                crate::a11y::named(
+                    Role::Label,
+                    "diagnostics-errors-empty",
+                    "No failure has been recorded.",
+                    None,
+                )
+                .text_xs()
+                .text_color(palette.meta)
+                .child("No failure has been recorded.")
+                .into_any_element(),
             ]
         } else {
             let items = errors
@@ -620,15 +622,17 @@ fn value_item_with_font(
     font: Option<SharedString>,
 ) -> DescriptionItem {
     DescriptionItem::new(
-        div()
-            .id(ElementId::Name(format!("{value_id}-label").into()))
-            .test_support()
-            .role(Role::Term)
-            .min_w_0()
-            .text_sm()
-            .font_weight(FontWeight::MEDIUM)
-            .child(label.to_string())
-            .into_any_element(),
+        crate::a11y::named(
+            Role::Term,
+            ElementId::Name(format!("{value_id}-label").into()),
+            label,
+            None,
+        )
+        .min_w_0()
+        .text_sm()
+        .font_weight(FontWeight::MEDIUM)
+        .child(label.to_string())
+        .into_any_element(),
     )
     .value(
         div()
@@ -637,16 +641,20 @@ fn value_item_with_font(
             .gap_0p5()
             .min_w_0()
             .child(
-                div()
-                    .id(ElementId::Name(value_id.into()))
-                    .test_support()
-                    .aria_label(name.unwrap_or_else(|| value.clone()))
-                    .min_w_0()
-                    .line_clamp(VALUE_LINE_CLAMP)
-                    .text_xs()
-                    .text_color(palette.text)
-                    .when_some(font, |this, font| this.font_family(font))
-                    .child(value),
+                // The description-list value of the term above it, so the two
+                // reach the tree as a pair and not as flat text (#80).
+                crate::a11y::named(
+                    Role::Definition,
+                    ElementId::Name(value_id.into()),
+                    name.unwrap_or_else(|| value.clone()),
+                    None,
+                )
+                .min_w_0()
+                .line_clamp(VALUE_LINE_CLAMP)
+                .text_xs()
+                .text_color(palette.text)
+                .when_some(font, |this, font| this.font_family(font))
+                .child(value),
             )
             .when_some(help, |this, help| {
                 this.child(

@@ -889,17 +889,26 @@ impl SettingsView {
     }
 
     /// The page strip: one tab per page, the shell's own view switch and this
-    /// strip draw the same element (#75, #78).
+    /// strip draw the same element and the same `Role::TabList` root (#75, #78).
     ///
     /// A kit sidebar entry has no focus handle and no key binding, so the strip
-    /// is the only keyboard path between the pages (#78).
+    /// is the only keyboard path between the pages (#78). The root is a plain
+    /// `div` with the list role rather than the kit's `Tabs` only because
+    /// `Tabs` is a `RenderOnce` and so cannot be observed by the snapshots; the
+    /// role and the tab children are the same as the shell's strip.
     fn page_strip(
         &self,
         selected: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
-        let mut strip = div().flex().flex_row().flex_wrap().items_center().gap_1();
+        let mut strip =
+            crate::a11y::named(Role::TabList, "settings-page-tabs", "Settings pages", None)
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .items_center()
+                .gap_1();
         for (ix, page) in PAGES.iter().enumerate() {
             // The handles are claimed in the loop that needs `cx` for its
             // listeners, so each one is read out before that borrow.
@@ -1080,11 +1089,7 @@ impl SettingsView {
         let input = input.clone();
         let focus = input.read(cx).focus_handle(cx);
         Row::stacked(title, help, move |_, _| {
-            div()
-                .id(id)
-                .test_support()
-                .aria_label(title)
-                .aria_description(help)
+            crate::a11y::named(Role::Group, id, title, Some(help.into()))
                 .track_focus(&focus)
                 .min_w_0()
                 .w_full()
@@ -1112,30 +1117,33 @@ impl SettingsView {
             move |_, _| {
                 let password = Rc::clone(&password);
                 let api_key = Rc::clone(&api_key);
-                div()
-                    .id("settings-auth-method")
-                    .test_support()
-                    .aria_label("Credential")
-                    .aria_description("A password for the account, or an API key from Immich.")
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_4()
-                    .child(
-                        Radio::new("settings-auth-password")
-                            .label("Password")
-                            .accessibility_label("Sign in with a password")
-                            .checked(method == AuthMethod::Password)
-                            .on_change(move |checked, window, cx| password(checked, window, cx)),
-                    )
-                    .child(
-                        Radio::new("settings-auth-apikey")
-                            .label("API key")
-                            .accessibility_label("Sign in with an API key")
-                            .checked(method == AuthMethod::ApiKey)
-                            .on_change(move |checked, window, cx| api_key(checked, window, cx)),
-                    )
-                    .into_any_element()
+                // A named group around the two radios: the row's title and help
+                // sentence ride here, beside the controls that name themselves.
+                crate::a11y::named(
+                    Role::Group,
+                    "settings-auth-method",
+                    "Credential",
+                    Some("A password for the account, or an API key from Immich.".into()),
+                )
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_4()
+                .child(
+                    Radio::new("settings-auth-password")
+                        .label("Password")
+                        .accessibility_label("Sign in with a password")
+                        .checked(method == AuthMethod::Password)
+                        .on_change(move |checked, window, cx| password(checked, window, cx)),
+                )
+                .child(
+                    Radio::new("settings-auth-apikey")
+                        .label("API key")
+                        .accessibility_label("Sign in with an API key")
+                        .checked(method == AuthMethod::ApiKey)
+                        .on_change(move |checked, window, cx| api_key(checked, window, cx)),
+                )
+                .into_any_element()
             },
         )
     }
@@ -1265,10 +1273,7 @@ impl SettingsView {
                 "Fixed. The client always uses this name.",
                 "settings-tag-name-row",
                 move |_, _| {
-                    div()
-                        .id("settings-tag-name")
-                        .test_support()
-                        .aria_label(SYNC_TAG)
+                    crate::a11y::named(Role::Label, "settings-tag-name", SYNC_TAG, None)
                         .font_family(mono.clone())
                         .text_sm()
                         .child(SYNC_TAG)
@@ -1318,10 +1323,7 @@ impl SettingsView {
         // lands.
         if let Some(progress) = backfill_text(&self.tag.backfill, enabled) {
             rows.push(note(move |_, _| {
-                div()
-                    .id("settings-tag-backfill")
-                    .test_support()
-                    .aria_label(progress.clone())
+                crate::a11y::named(Role::Label, "settings-tag-backfill", progress.clone(), None)
                     .text_xs()
                     .text_color(muted)
                     .child(progress.clone())
@@ -1392,11 +1394,7 @@ impl SettingsView {
         let muted = cx.theme().muted_foreground;
         let unit = key.unit();
         Some(Row::stacked(key.label(), key.help(), move |_, _| {
-            div()
-                .id(key.id())
-                .test_support()
-                .aria_label(key.label())
-                .aria_description(key.help())
+            crate::a11y::named(Role::Group, key.id(), key.label(), Some(key.help().into()))
                 .track_focus(&focus)
                 .flex()
                 .flex_row()
@@ -1564,10 +1562,7 @@ impl Row {
         control: impl Fn(&mut Window, &mut App) -> AnyElement + 'static,
     ) -> Self {
         Self::setting(title, help, move |window, cx| {
-            div()
-                .id(row_id)
-                .test_support()
-                .aria_description(help)
+            crate::a11y::named(Role::Group, row_id, title, Some(help.into()))
                 .child(control(window, cx))
                 .into_any_element()
         })
@@ -1662,11 +1657,7 @@ fn storage_row(
 ) -> Row {
     const HELP: &str = "Resolved from the platform.";
     Row::stacked(title, HELP, move |_, _| {
-        div()
-            .id(id)
-            .test_support()
-            .aria_label(title)
-            .aria_description(HELP)
+        crate::a11y::named(Role::Group, id, title, Some(HELP.into()))
             .min_w_0()
             .w_full()
             .flex()
@@ -1677,10 +1668,7 @@ fn storage_row(
                 div().flex_1().min_w_0().text_right().child(
                     // The text node itself must shrink, or the path draws past
                     // the row with no ellipsis.
-                    div()
-                        .id(value_id)
-                        .test_support()
-                        .aria_label(path.clone())
+                    crate::a11y::named(Role::Label, value_id, path.clone(), None)
                         .min_w_0()
                         .truncate()
                         .font_family(mono.clone())

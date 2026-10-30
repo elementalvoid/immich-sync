@@ -346,6 +346,11 @@ async fn a_card_click_and_its_details_control_open_the_detail(cx: &mut TestAppCo
             format!("Folder path: {}", folder.path),
             "the detail shows the whole stored path"
         );
+        assert_eq!(
+            window.find("folder-panel-path").role(),
+            Some(gpui_kit::Role::Label),
+            "the path is a label node, so its name is read (B1)"
+        );
     });
 
     // Esc closes it and the card gets the keyboard back (#43).

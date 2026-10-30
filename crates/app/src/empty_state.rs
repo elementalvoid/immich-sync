@@ -20,9 +20,9 @@
 //!   `node_added` carries no `Announcement`). This is the lesson of
 //!   [`crate::notice`]: a bare child string produces no accessibility node at
 //!   all, so the status must carry the text. What surrounds the state is the
-//!   surface's business: the failed list's summary above it states the same
-//!   fact, so that window holds two identical statuses, and only the state can
-//!   announce.
+//!   surface's business: the failed and review lists carry their count above the
+//!   list only while there are rows to count, so an empty list holds one status
+//!   and not two saying the same sentence (#77).
 //! - A filtered list says which folder it is empty for. The title is the
 //!   caller's sentence and already names the folder
 //!   ([`crate::folder_filter::FolderFilter::empty_heading`]), so the component

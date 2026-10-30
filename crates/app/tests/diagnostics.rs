@@ -486,6 +486,11 @@ async fn the_view_shows_the_sqlite_state_the_server_and_the_permissions(cx: &mut
                 Some("No failure has been recorded."),
                 "with no recorded failure the section says so"
             );
+            assert_eq!(
+                window.find("diagnostics-errors-empty").role(),
+                Some(Role::Label),
+                "the empty section is a label node, so its sentence is read (B1)"
+            );
         })
         .expect("update the shell window");
     }
@@ -1592,7 +1597,9 @@ async fn every_value_row_keeps_its_element_id_and_accessible_name(cx: &mut TestA
                     Some(name.as_str()),
                     "{id} keeps its accessible name in {system:?}"
                 );
-                // #80: the term is announced as a term, not as flat text.
+                // #80: the term is announced as a term, and the value as the
+                // description-list value beside it — both named, so both reach
+                // the tree (B1).
                 let term = window
                     .try_find(ElementId::Name(format!("{id}-label").into()))
                     .unwrap_or_else(|| panic!("{id} has no label in {system:?}"));
@@ -1600,6 +1607,12 @@ async fn every_value_row_keeps_its_element_id_and_accessible_name(cx: &mut TestA
                     term.role(),
                     Some(Role::Term),
                     "{id} is announced as its term in {system:?}"
+                );
+                assert!(term.label().is_some(), "{id} names its term in {system:?}");
+                assert_eq!(
+                    window.find(*id).role(),
+                    Some(Role::Definition),
+                    "{id} is announced as its term's value in {system:?}"
                 );
             }
             // The rows whose value the run itself decides: each one still says
@@ -1712,7 +1725,13 @@ async fn a_very_long_value_is_cut_at_the_clamp_and_keeps_its_whole_name(cx: &mut
                 "{system:?}: the 2000-character value takes {lines:.1} lines, the clamp's \
                  {VALUE_LINE_CLAMP}"
             );
-            // The cut is visual: every character is still in the name.
+            // The cut is visual: every character is still in the name, and the
+            // name is on a node with a role, so it reaches the tree (#80, B1).
+            assert_eq!(
+                value.role(),
+                Some(Role::Definition),
+                "{system:?}: the value is the term's value, so its name is read"
+            );
             assert_eq!(
                 value.label(),
                 Some(name.as_str()),

@@ -828,23 +828,25 @@ impl FolderPanel {
         };
         let muted = cx.theme().muted_foreground;
         let selectable = self.mode == FolderPanelMode::Detail;
-        div()
-            .id("folder-panel-path")
-            .test_support()
-            .aria_label(format!("Folder path: {shown}"))
-            .min_w_0()
-            .w_full()
-            .text_sm()
-            .text_color(muted)
-            .when(!selectable, |this| this.truncate())
-            // The detail shows the path whole: a long one wraps instead of
-            // being cut, and it can be selected and copied.
-            .when(selectable, |this| {
-                this.child(
-                    SelectableText::new("folder-panel-path-text", shown.clone()).document_order(0),
-                )
-            })
-            .when(!selectable, |this| this.child(shown))
+        crate::a11y::named(
+            Role::Label,
+            "folder-panel-path",
+            format!("Folder path: {shown}"),
+            None,
+        )
+        .min_w_0()
+        .w_full()
+        .text_sm()
+        .text_color(muted)
+        .when(!selectable, |this| this.truncate())
+        // The detail shows the path whole: a long one wraps instead of
+        // being cut, and it can be selected and copied.
+        .when(selectable, |this| {
+            this.child(
+                SelectableText::new("folder-panel-path-text", shown.clone()).document_order(0),
+            )
+        })
+        .when(!selectable, |this| this.child(shown))
     }
 
     /// The album title field (#47): the user's own name for this folder's
@@ -858,24 +860,29 @@ impl FolderPanel {
         let detail = self.mode == FolderPanelMode::Detail;
         let name = self.folder_name();
         let focus = self.title_input.read(cx).focus_handle(cx);
-        let row = div()
-            .id("folder-panel-title")
-            .test_support()
-            .track_focus(&focus)
-            .aria_label(format!("Album title for {name}"))
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child("Album title"),
-            )
-            .child(div().flex_1().min_w_0().child(
-                Input::new(&self.title_input).aria_label(format!("Album title for {name}")),
-            ));
+        let row = crate::a11y::named(
+            Role::Group,
+            "folder-panel-title",
+            format!("Album title for {name}"),
+            None,
+        )
+        .track_focus(&focus)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .child(
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child("Album title"),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(Input::new(&self.title_input).aria_label(format!("Album title for {name}"))),
+        );
         row.when(detail, |this| {
             this.child(
                 Button::new("folder-panel-title-save")
@@ -1076,13 +1083,15 @@ impl FolderPanel {
                     .justify_between()
                     .gap_3()
                     .child(
-                        div()
-                            .id("folder-detail-title")
-                            .test_support()
-                            .aria_label(title.clone())
-                            .text_lg()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(title.clone()),
+                        crate::a11y::named(
+                            Role::Heading,
+                            "folder-detail-title",
+                            title.clone(),
+                            None,
+                        )
+                        .text_lg()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(title.clone()),
                     )
                     .child(
                         Button::new("folder-detail-close")
@@ -1100,16 +1109,18 @@ impl FolderPanel {
                     .items_center()
                     .gap_3()
                     .child(
-                        div()
-                            .id("folder-detail-state")
-                            .test_support()
-                            .aria_label(activity.label().to_string())
-                            .child(state_tag(
-                                activity,
-                                activity.label().to_string(),
-                                palette,
-                                theme,
-                            )),
+                        crate::a11y::named(
+                            Role::Label,
+                            "folder-detail-state",
+                            activity.label().to_string(),
+                            None,
+                        )
+                        .child(state_tag(
+                            activity,
+                            activity.label().to_string(),
+                            palette,
+                            theme,
+                        )),
                     )
                     .child(
                         Progress::new("folder-detail-progress")
@@ -1118,32 +1129,33 @@ impl FolderPanel {
                             .accessibility_label(format!("{title} progress")),
                     )
                     .child(
-                        div()
-                            .id("folder-detail-percent")
-                            .test_support()
-                            .aria_label(percent.clone())
-                            .text_sm()
-                            .text_color(muted)
-                            .child(percent),
+                        crate::a11y::named(
+                            Role::Label,
+                            "folder-detail-percent",
+                            percent.clone(),
+                            None,
+                        )
+                        .text_sm()
+                        .text_color(muted)
+                        .child(percent),
                     ),
             )
             .child(
-                div()
-                    .id("folder-detail-counts")
-                    .test_support()
-                    .aria_label(counts.clone())
+                crate::a11y::named(Role::Label, "folder-detail-counts", counts.clone(), None)
                     .text_sm()
                     .text_color(muted)
                     .child(counts),
             )
             .child(
-                div()
-                    .id("folder-detail-activity")
-                    .test_support()
-                    .aria_label(activity_line.clone())
-                    .text_sm()
-                    .text_color(muted)
-                    .child(activity_line),
+                crate::a11y::named(
+                    Role::Label,
+                    "folder-detail-activity",
+                    activity_line.clone(),
+                    None,
+                )
+                .text_sm()
+                .text_color(muted)
+                .child(activity_line),
             )
             .when(!available, |this| {
                 this.child(Notice::new(
@@ -1176,19 +1188,18 @@ impl FolderPanel {
                 ))
             })
             .child(
-                div()
-                    .id("folder-detail-upload")
-                    .test_support()
-                    .aria_label(upload_line.clone())
-                    .text_sm()
-                    .text_color(muted)
-                    .child(upload_line),
+                crate::a11y::named(
+                    Role::Label,
+                    "folder-detail-upload",
+                    upload_line.clone(),
+                    None,
+                )
+                .text_sm()
+                .text_color(muted)
+                .child(upload_line),
             )
             .child(
-                div()
-                    .id("folder-detail-scan")
-                    .test_support()
-                    .aria_label(scan_line.clone())
+                crate::a11y::named(Role::Label, "folder-detail-scan", scan_line.clone(), None)
                     .text_sm()
                     .text_color(muted)
                     .child(scan_line),
@@ -1332,10 +1343,7 @@ impl FolderPanel {
                     "No uploaded assets in this folder yet.",
                 )
             };
-            div()
-                .id(id)
-                .test_support()
-                .aria_label(text)
+            crate::a11y::named(Role::Label, id, text, None)
                 .text_xs()
                 .text_color(palette.meta)
                 .child(text)
@@ -1390,10 +1398,7 @@ impl FolderPanel {
         // Two lines: the file's name gets the row's width, and the metadata
         // shares the second line with the link. One line squeezed the name to
         // an ellipsis, which is the one thing the row is for.
-        div()
-            .id(("folder-asset", index))
-            .test_support()
-            .aria_label(described)
+        crate::a11y::named(Role::Group, ("folder-asset", index), described, None)
             .flex()
             .flex_col()
             .gap_1()
