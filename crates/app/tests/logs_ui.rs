@@ -393,7 +393,7 @@ async fn the_logs_entry_shows_the_location_and_the_recent_lines(cx: &mut TestApp
     cx.update_window(window, |_, window, _| {
         assert!(window.find("logs-view").visible(), "the Logs view is shown");
         assert!(
-            window.try_find("settings-general").is_none(),
+            window.try_find("settings-scroll").is_none(),
             "the settings are not rendered"
         );
         assert!(

@@ -32,6 +32,7 @@ pub mod settings_view;
 pub mod shell;
 pub mod status;
 pub mod store;
+mod tab;
 pub mod theme;
 pub mod times;
 pub mod upload;
