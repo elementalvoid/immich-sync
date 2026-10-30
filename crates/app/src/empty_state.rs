@@ -10,12 +10,19 @@
 //!   `Role::Status` whose accessible name is the title and whose description
 //!   follows it, and the visible lines inside it are `Text::new_inaccessible`,
 //!   so the component adds no second node of its own. It is also a polite live
-//!   region, so a list that empties itself says so out loud
-//!   ([`crate::notice::polite_live_region`]). This is the lesson of
+//!   region ([`crate::notice::polite_live_region`]), which decides *when* that
+//!   name is heard: the status carries it on every platform, Windows announces
+//!   it when it appears and when the name changes, AT-SPI announces a changed
+//!   name on a node that stays, and macOS announces only a node carrying a
+//!   value, which a status has none of. So filtering a list to empty and
+//!   re-titling the state that is already on screen is announced on Windows and
+//!   AT-SPI, while a status that mounts is announced on Windows only (AT-SPI's
+//!   `node_added` carries no `Announcement`). This is the lesson of
 //!   [`crate::notice`]: a bare child string produces no accessibility node at
 //!   all, so the status must carry the text. What surrounds the state is the
 //!   surface's business: the failed list's summary above it states the same
-//!   fact, so that window announces both.
+//!   fact, so that window holds two identical statuses, and only the state can
+//!   announce.
 //! - A filtered list says which folder it is empty for. The title is the
 //!   caller's sentence and already names the folder
 //!   ([`crate::folder_filter::FolderFilter::empty_heading`]), so the component

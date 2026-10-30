@@ -11,8 +11,14 @@
 //!   and the only other node inside is the severity caption, which exposes the
 //!   severity word as a `Role::Label`. A [`Notice::quiet`] notice adds no node
 //!   at all, because the container holding it already names the same fact.
-//! - The wrapper is a polite live region ([`polite_live_region`]), so a change
-//!   to what it says reaches assistive technology instead of only the screen.
+//! - The wrapper is a polite live region ([`polite_live_region`]), and the three
+//!   adapters read it differently: Windows announces the node when it appears
+//!   and when its name changes, AT-SPI announces a changed name on a node that
+//!   stays (its `node_added` carries no `Announcement`, so a mount is silent
+//!   there), and macOS announces only a node carrying an accessibility value.
+//!   A plain notice sets no value, so it is silent on macOS; that is what
+//!   [`Notice::announcement`] is for, and it sets the name and the value to the
+//!   same words so a repeat is heard on every platform.
 //!
 //! The severity is also stated in a visible word, so the accent colour is never
 //! the only thing that says how urgent a notice is.
@@ -155,6 +161,11 @@ impl Notice {
 /// from a custom `Element`; the synthetic-children hook hands out
 /// `parent_node()`, the node the element just contributed, which is the
 /// bounded app-side way to set the property.
+///
+/// The hook only runs for an element that contributed a node, which is why a
+/// [`Notice::quiet`] notice never reaches it. Ungated, `parent_node()` would not
+/// panic (it only panics on an empty stack); it would return the ancestor node
+/// still on the stack and make the container politely live.
 pub(crate) fn polite_live_region(node: &mut accesskit::Node) {
     node.set_live(accesskit::Live::Polite);
 }
