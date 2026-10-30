@@ -9,11 +9,20 @@
 //! - The state is one node: one name, one description. The titled box is a
 //!   `Role::Status` whose accessible name is the title and whose description
 //!   follows it, and the visible lines inside it are `Text::new_inaccessible`,
-//!   so the component adds no second node of its own. This is the lesson of
+//!   so the component adds no second node of its own. It is also a polite live
+//!   region ([`crate::notice::polite_live_region`]), which decides *when* that
+//!   name is heard: the status carries it on every platform, Windows announces
+//!   it when it appears and when the name changes, AT-SPI announces a changed
+//!   name on a node that stays, and macOS announces only a node carrying a
+//!   value, which a status has none of. So filtering a list to empty and
+//!   re-titling the state that is already on screen is announced on Windows and
+//!   AT-SPI, while a status that mounts is announced on Windows only (AT-SPI's
+//!   `node_added` carries no `Announcement`). This is the lesson of
 //!   [`crate::notice`]: a bare child string produces no accessibility node at
 //!   all, so the status must carry the text. What surrounds the state is the
 //!   surface's business: the failed list's summary above it states the same
-//!   fact, so that window announces both.
+//!   fact, so that window holds two identical statuses, and only the state can
+//!   announce.
 //! - A filtered list says which folder it is empty for. The title is the
 //!   caller's sentence and already names the folder
 //!   ([`crate::folder_filter::FolderFilter::empty_heading`]), so the component
@@ -22,6 +31,7 @@
 //! The action slot stays empty where the surface has no next step it can carry
 //! out; an empty state never offers a control it cannot honour.
 
+use crate::notice::polite_live_region;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -92,6 +102,9 @@ impl RenderOnce for EmptyState {
                     .role(Role::Status)
                     .aria_label(self.title.clone())
                     .aria_description(self.description.clone())
+                    // The same live-region hook the notice uses: the adapters
+                    // announce nothing whose live is `Off`.
+                    .a11y_synthetic_children(|builder| polite_live_region(builder.parent_node()))
                     .flex()
                     .flex_col()
                     .gap_1()

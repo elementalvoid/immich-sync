@@ -19,7 +19,7 @@ use gpui_kit::*;
 use crate::dashboard::CardPalette;
 use crate::empty_state::EmptyState;
 use crate::logging::{self, LogLevel, TAIL_LINES};
-use crate::notice::{Notice, Severity};
+use crate::notice::{Notice, Severity, copy_confirmation};
 use crate::settings_view::{SettingsView, field_text, filling_section, section};
 
 /// How often the live tail re-reads the newest log file while the Logs surface
@@ -75,6 +75,11 @@ pub struct LogsView {
     /// What the read in flight does when it lands. A read latches this before
     /// its file read starts, and the apply re-reads the viewport for a poll.
     follow: Follow,
+    /// How many times Copy all has been pressed since the displayed tail last
+    /// changed. The confirmation is one node whose announcement names the press,
+    /// and it goes when the rows it copied are no longer the rows on screen
+    /// (#82).
+    copies: u32,
     /// The window the tail is painted in, where a selection is read from before
     /// a live replace would drop the rows under it. Set by every render.
     window: Option<AnyWindowHandle>,
@@ -123,6 +128,7 @@ impl LogsView {
             visible: false,
             read_generation: 0,
             follow: Follow::Always,
+            copies: 0,
             window: None,
         }
     }
@@ -269,6 +275,12 @@ impl LogsView {
             // file's name stays with the rows: it names the file they show.
             self.counted = tail;
         } else {
+            // The confirmation names the rows it copied, so it goes as soon as
+            // they are not the rows on screen. A poll that read the same tail
+            // leaves it alone, so the live tail cannot make it flicker (#82).
+            if self.lines != tail {
+                self.copies = 0;
+            }
             self.current_file = file;
             self.lines = tail.clone();
             self.counted = tail;
@@ -305,12 +317,15 @@ impl LogsView {
     ///
     /// The clipboard is written from the lines the view holds, so nothing that
     /// was not written to the log can reach it. Joining keeps blank lines,
-    /// which the selection layer's copy path drops.
+    /// which the selection layer's copy path drops. The confirmation is the
+    /// copy's own: a refused copy sets nothing and confirms nothing (#82).
     fn copy_all(&mut self, cx: &mut Context<Self>) {
         if self.lines.is_empty() {
             return;
         }
         cx.write_to_clipboard(ClipboardItem::new_string(self.lines.join("\n")));
+        self.copies += 1;
+        cx.notify();
     }
 
     /// The page header.
@@ -480,11 +495,22 @@ impl LogsView {
                     &palette,
                 ))
                 .child(
-                    Button::new("logs-copy-all")
-                        .label("Copy all")
-                        .accessibility_label("Copy every displayed log line")
-                        .disabled(self.lines.is_empty())
-                        .on_click(cx.listener(|this, _, _, cx| this.copy_all(cx))),
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_3()
+                        // #82: the confirmation sits beside the control it
+                        // belongs to, in the row, so it opens no surface and
+                        // adds no row to the card's floor.
+                        .children(copy_confirmation("logs-copy-confirmation", self.copies))
+                        .child(
+                            Button::new("logs-copy-all")
+                                .label("Copy all")
+                                .accessibility_label("Copy every displayed log line")
+                                .disabled(self.lines.is_empty())
+                                .on_click(cx.listener(|this, _, _, cx| this.copy_all(cx))),
+                        ),
                 )
                 .into_any_element(),
         );

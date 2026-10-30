@@ -10,7 +10,7 @@ use gpui_kit::*;
 use crate::dashboard::CardPalette;
 use crate::debug_bundle::{LOG_BYTES, LOG_FILES};
 use crate::diagnostics::{BundleState, DiagnosticsModel, Permissions, format_bytes, format_rate};
-use crate::notice::{Notice, Severity};
+use crate::notice::{Notice, Severity, copy_confirmation};
 use crate::settings_view::{field_text, section};
 use crate::version;
 use sync_core::store::SqliteInfo;
@@ -19,13 +19,36 @@ use sync_core::store::SqliteInfo;
 pub struct DiagnosticsView {
     /// The model owns every read; the view renders what it last produced.
     model: Entity<DiagnosticsModel>,
+    /// The archive path the last copy put on the clipboard, and how many presses
+    /// it has had since. Both are dropped once that path is no longer the last
+    /// archive, so the confirmation never describes a stale copy (#82).
+    copied: Option<(String, u32)>,
 }
 
 impl DiagnosticsView {
     /// A view over the diagnostics model.
     pub fn new(model: Entity<DiagnosticsModel>, cx: &mut Context<Self>) -> Self {
-        cx.observe(&model, |_, _, cx| cx.notify()).detach();
-        Self { model }
+        cx.observe(&model, |this, model, cx| {
+            // The confirmation names the path it copied, so it goes when the last
+            // archive is no longer that path (#82).
+            let current = match model.read(cx).bundle() {
+                BundleState::Ready(report) => Some(report.path.display().to_string()),
+                _ => None,
+            };
+            let still_copied = this
+                .copied
+                .as_ref()
+                .is_some_and(|(copied, _)| current.as_deref() == Some(copied.as_str()));
+            if !still_copied {
+                this.copied = None;
+            }
+            cx.notify();
+        })
+        .detach();
+        Self {
+            model,
+            copied: None,
+        }
     }
 
     /// The page header.
@@ -433,10 +456,39 @@ impl DiagnosticsView {
                             &palette,
                         ))
                         .child(
-                            Button::new("diagnostics-bundle-copy")
-                                .label("Copy path")
-                                .accessibility_label("Copy the debug bundle's path")
-                                .on_click(cx.listener(|this, _, _, cx| this.copy_bundle_path(cx))),
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_3()
+                                // #82: the confirmation sits beside the control
+                                // it belongs to, in the row, so it opens no
+                                // surface and adds no row above the control.
+                                .flex_shrink_0()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .justify_end()
+                                        // #82: its slot is reserved whether or not
+                                        // it is showing, so the confirmation
+                                        // cannot rewrap the help text and slide
+                                        // the button out from under the pointer.
+                                        .w(rems(6.))
+                                        .children(copy_confirmation(
+                                            "diagnostics-copy-confirmation",
+                                            self.presses(),
+                                        )),
+                                )
+                                .child(
+                                    Button::new("diagnostics-bundle-copy")
+                                        .label("Copy path")
+                                        .accessibility_label("Copy the debug bundle's path")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.copy_bundle_path(cx);
+                                        })),
+                                ),
                         )
                         .into_any_element(),
                 );
@@ -473,12 +525,25 @@ impl DiagnosticsView {
     }
 
     /// Puts the last archive's path on the clipboard.
+    ///
+    /// Only a ready archive can be copied: the control renders only for one, and
+    /// a press with nothing behind it confirms nothing (#82).
     fn copy_bundle_path(&mut self, cx: &mut Context<Self>) {
         let path = match self.model.read(cx).bundle() {
             BundleState::Ready(report) => report.path.display().to_string(),
             _ => return,
         };
-        cx.write_to_clipboard(ClipboardItem::new_string(path));
+        cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+        self.copied = Some(match self.copied.take() {
+            Some((copied, presses)) if copied == path => (copied, presses + 1),
+            _ => (path, 1),
+        });
+        cx.notify();
+    }
+
+    /// How many times the archive now on the clipboard has been copied (#82).
+    fn presses(&self) -> u32 {
+        self.copied.as_ref().map_or(0, |(_, presses)| *presses)
     }
 
     /// The upload rate from the engine's meter, and the live progress.
