@@ -445,6 +445,32 @@ impl DiagnosticsView {
                         )
                         .into_any_element(),
                 );
+                rows.push(
+                    div()
+                        .id("diagnostics-bundle-reveal-row")
+                        .test_support()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .gap_6()
+                        .min_h(rems(2.25))
+                        .child(field_text(
+                            "Show in folder",
+                            "Opens the folder that holds the archive in your file manager, with \
+                             the archive selected where the platform allows it.",
+                            &palette,
+                        ))
+                        .child(
+                            Button::new("diagnostics-bundle-reveal")
+                                .label("Show in folder")
+                                .accessibility_label("Show the debug bundle in the file manager")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.reveal_bundle(cx);
+                                })),
+                        )
+                        .into_any_element(),
+                );
                 // A partial archive says what it could not hold, in the same
                 // words its README uses.
                 for (index, note) in report.notes.iter().enumerate() {
@@ -492,6 +518,19 @@ impl DiagnosticsView {
             _ => (path, 1),
         });
         cx.notify();
+    }
+
+    /// Shows the last archive in the file manager (#87). It writes nothing to
+    /// the clipboard and confirms nothing: the file manager opening is the
+    /// feedback, so a failure is only logged.
+    fn reveal_bundle(&mut self, cx: &mut Context<Self>) {
+        let path = match self.model.read(cx).bundle() {
+            BundleState::Ready(report) => report.path.display().to_string(),
+            _ => return,
+        };
+        if let Err(error) = crate::folder_panel::reveal_in_file_manager(&path) {
+            tracing::warn!(%error, "could not show the debug bundle in the file manager");
+        }
     }
 
     /// How many times the archive now on the clipboard has been copied (#82).

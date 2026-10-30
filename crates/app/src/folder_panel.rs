@@ -84,9 +84,41 @@ pub(crate) fn file_manager_command() -> &'static str {
 ///
 /// Returns the platform's error when the file manager cannot be started.
 pub fn open_in_file_manager(path: &str) -> std::io::Result<()> {
-    let mut child = std::process::Command::new(file_manager_command())
-        .arg(path)
-        .spawn()?;
+    spawn_reaped(std::process::Command::new(file_manager_command()).arg(path))
+}
+
+/// The program and arguments that show `path` in the platform's file manager
+/// (#87).
+///
+/// Windows and macOS select the file itself. Linux has no launcher that selects
+/// a file, so it opens the folder that holds it.
+#[must_use]
+pub(crate) fn reveal_command(path: &str) -> (&'static str, Vec<String>) {
+    if cfg!(windows) {
+        ("explorer", vec![format!("/select,{path}")])
+    } else if cfg!(target_os = "macos") {
+        ("open", vec!["-R".to_string(), path.to_string()])
+    } else {
+        let folder = Path::new(path).parent().unwrap_or(Path::new(path));
+        ("xdg-open", vec![folder.display().to_string()])
+    }
+}
+
+/// Shows `path` in the platform's file manager with the file selected where the
+/// platform allows it (#87). Same reaping rule as [`open_in_file_manager`].
+///
+/// # Errors
+///
+/// Returns the platform's error when the file manager cannot be started.
+pub fn reveal_in_file_manager(path: &str) -> std::io::Result<()> {
+    let (program, args) = reveal_command(path);
+    spawn_reaped(std::process::Command::new(program).args(args))
+}
+
+/// Starts `command` and reaps the child on a thread of its own, so the caller
+/// never waits for a file manager the user may keep open.
+fn spawn_reaped(command: &mut std::process::Command) -> std::io::Result<()> {
+    let mut child = command.spawn()?;
     std::thread::spawn(move || {
         let _ = child.wait();
     });
@@ -1521,6 +1553,26 @@ mod tests {
         };
 
         assert_eq!(super::file_manager_command(), expected);
+    }
+
+    /// #87: "Show in folder" selects the archive where the platform can, and
+    /// opens the containing folder where it cannot. The macOS and Windows arms
+    /// are the ones only their CI jobs run.
+    #[test]
+    fn reveal_selects_the_archive_or_opens_its_folder_per_platform() {
+        let archive = "/exports/immich-sync-debug.zip";
+        let (program, args) = super::reveal_command(archive);
+
+        if cfg!(windows) {
+            assert_eq!(program, "explorer");
+            assert_eq!(args, vec![format!("/select,{archive}")]);
+        } else if cfg!(target_os = "macos") {
+            assert_eq!(program, "open");
+            assert_eq!(args, vec!["-R".to_string(), archive.to_string()]);
+        } else {
+            assert_eq!(program, "xdg-open");
+            assert_eq!(args, vec!["/exports".to_string()]);
+        }
     }
 
     #[test]
