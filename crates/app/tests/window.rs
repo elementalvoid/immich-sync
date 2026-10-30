@@ -216,8 +216,11 @@ fn surface_probe(mode: ViewMode) -> (ElementId, ElementId, bool) {
             ("folder-details", SEEDED_FOLDERS - 1).into(),
             true,
         ),
+        // #78: the settings surface is six pages, so its last element is on
+        // the last page. The page body scrolls, not the surface, so the wheel
+        // is aimed at the first row of that page.
         ViewMode::Settings => (
-            "settings-scroll".into(),
+            "settings-path-config".into(),
             "settings-path-state-value".into(),
             true,
         ),
@@ -333,6 +336,15 @@ async fn every_long_surface_reaches_its_last_element_at_a_short_height(cx: &mut 
     ] {
         let (container, target, must_scroll) = surface_probe(mode);
         shell.update(cx, |shell, cx| shell.show(mode, cx));
+        if mode == ViewMode::Settings {
+            // The storage locations are on the settings surface's last page.
+            cx.update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                window.render_frame(cx);
+                window.click("0-5", cx);
+            })
+            .expect("open the settings surface's last page");
+        }
         wait_for_element(cx, window, target.clone()).await;
         cx.update_window(window, |_, window, cx| {
             window.render_frame(cx);

@@ -18,8 +18,8 @@ use std::time::Duration;
 use gpui_kit::test::TestAppContextExt as _;
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, Bounds, ElementId, Entity, Point, Role, TestAppContext,
-    Window, WindowBounds, WindowOptions, px, size,
+    AnyWindowHandle, App, AppContext as _, Bounds, ElementId, Entity, InputEvent as _, Point, Role,
+    ScrollDelta, ScrollEvent, TestAppContext, Window, WindowBounds, WindowOptions, point, px, size,
 };
 use immich_sync::autostart::Autostart;
 use immich_sync::connection::{ConnectionModel, profile_from_settings};
@@ -32,6 +32,7 @@ use immich_sync::settings_view::{FieldKey, SettingsView};
 use immich_sync::shell::AppShell;
 use immich_sync::status;
 use immich_sync::store::StoreModel;
+use immich_sync::theme;
 use immich_sync::upload::UploadModel;
 use immich_sync::upload_view::UploadView;
 use mock_immich::{Fault, Operation};
@@ -490,18 +491,24 @@ fn settings_view_shows_the_stored_values(cx: &mut TestAppContext) {
     let window = open_settings(cx, store, paths, autostart);
 
     cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
+        draw(window, cx);
 
+        // #78: the surface is six pages now, so a stored value is shown on its
+        // own page; `every_settings_row_is_named_and_explained_on_its_own_page`
+        // pins which page each row belongs to.
+        open_page(window, PAGE_GENERAL, cx);
         assert_eq!(
             window.find("settings-autostart").checked(),
             Some(false),
             "autostart defaults to off (R8.5)"
         );
-        assert!(window.find("settings-general").visible());
-        assert!(window.find("settings-limits").visible());
-        assert!(window.find("settings-sync").visible());
-        assert!(window.find("settings-storage").visible());
-        for key in FieldKey::ALL {
+        for (key, page) in [
+            (FieldKey::Bandwidth, PAGE_LIMITS),
+            (FieldKey::Concurrency, PAGE_LIMITS),
+            (FieldKey::ScanInterval, PAGE_SYNC),
+            (FieldKey::AttemptCap, PAGE_SYNC),
+        ] {
+            open_page(window, page, cx);
             let row = window.find(key.id());
             assert!(row.visible(), "the {} row is visible", key.label());
             assert!(
@@ -514,6 +521,7 @@ fn settings_view_shows_the_stored_values(cx: &mut TestAppContext) {
             window.try_find("settings-problem").is_none(),
             "a healthy settings file shows no problem"
         );
+        open_page(window, PAGE_STORAGE, cx);
         assert!(
             window.find("settings-path-config").visible(),
             "the settings file location is shown"
@@ -534,8 +542,14 @@ fn every_numeric_field_has_an_accessible_name(cx: &mut TestAppContext) {
     let window = open_settings(cx, store, paths, FakeAutostart::new());
 
     cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
-        for key in FieldKey::ALL {
+        draw(window, cx);
+        for (key, page) in [
+            (FieldKey::Bandwidth, PAGE_LIMITS),
+            (FieldKey::Concurrency, PAGE_LIMITS),
+            (FieldKey::ScanInterval, PAGE_SYNC),
+            (FieldKey::AttemptCap, PAGE_SYNC),
+        ] {
+            open_page(window, page, cx);
             assert_eq!(
                 window.find(key.id()).label(),
                 Some(key.label()),
@@ -566,7 +580,8 @@ fn opening_the_view_leaves_a_fractional_bandwidth_alone(cx: &mut TestAppContext)
     let window = open_settings(cx, store, paths.clone(), FakeAutostart::new());
 
     cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
+        draw(window, cx);
+        open_page(window, PAGE_LIMITS, cx);
         assert_eq!(
             row_text_input(window, FieldKey::Bandwidth.id(), Role::TextInput).value(),
             Some("1.5"),
@@ -593,7 +608,8 @@ async fn stepping_the_bandwidth_keeps_the_fraction(cx: &mut TestAppContext) {
     let window = open_settings(cx, store, paths.clone(), FakeAutostart::new());
 
     cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
+        draw(window, cx);
+        open_page(window, PAGE_LIMITS, cx);
         tab_to(window, FieldKey::Bandwidth.id(), cx);
         window.press("up", cx);
         assert_eq!(
@@ -622,14 +638,18 @@ async fn keyboard_reaches_every_control_and_steps_the_concurrency(cx: &mut TestA
     let window = open_settings(cx, store, paths.clone(), FakeAutostart::new());
 
     cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
-        for id in [
-            "settings-autostart",
-            FieldKey::Bandwidth.id(),
-            FieldKey::Concurrency.id(),
-            FieldKey::ScanInterval.id(),
-            FieldKey::AttemptCap.id(),
+        draw(window, cx);
+        // #78: each page holds one group of controls, so the keyboard reaches
+        // a page's controls once that page is open. Every control on every
+        // page still takes the keyboard, in the order the page lists it.
+        for (page, id) in [
+            (PAGE_GENERAL, "settings-autostart"),
+            (PAGE_LIMITS, FieldKey::Bandwidth.id()),
+            (PAGE_LIMITS, FieldKey::Concurrency.id()),
+            (PAGE_SYNC, FieldKey::ScanInterval.id()),
+            (PAGE_SYNC, FieldKey::AttemptCap.id()),
         ] {
+            open_page(window, page, cx);
             tab_to(window, id, cx);
             assert_eq!(
                 window.find(id).focused(),
@@ -638,13 +658,14 @@ async fn keyboard_reaches_every_control_and_steps_the_concurrency(cx: &mut TestA
             );
         }
 
-        // The Tab key itself moves focus between controls.
-        tab_to(window, "settings-autostart", cx);
+        // The Tab key itself moves focus between the controls of one page.
+        open_page(window, PAGE_LIMITS, cx);
+        tab_to(window, FieldKey::Bandwidth.id(), cx);
         window.press("tab", cx);
         assert_eq!(
-            window.find(FieldKey::Bandwidth.id()).focused(),
+            window.find(FieldKey::Concurrency.id()).focused(),
             Some(true),
-            "Tab moves focus from the switch to the next field"
+            "Tab moves focus from one field to the next on the page"
         );
 
         // Up and Down step the focused field and save it.
@@ -673,7 +694,8 @@ async fn the_autostart_toggle_applies_to_the_os_and_persists(cx: &mut TestAppCon
     let window = open_settings(cx, store, paths.clone(), autostart);
 
     cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
+        draw(window, cx);
+        open_page(window, PAGE_GENERAL, cx);
         tab_to(window, "settings-autostart", cx);
         window.press("space", cx);
         assert_eq!(
@@ -707,7 +729,8 @@ fn a_failed_path_resolution_is_shown_through_the_problem_notice(cx: &mut TestApp
     );
 
     cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
+        draw(window, cx);
+        open_page(window, PAGE_STORAGE, cx);
         let notice = window.find("settings-problem");
         assert!(notice.visible(), "the resolution failure is shown");
         let message = notice.label().unwrap_or_default();
@@ -736,7 +759,8 @@ async fn the_view_reconciles_the_autostart_setting_with_the_os(cx: &mut TestAppC
     let window = open_settings(cx, store, paths.clone(), FakeAutostart::new());
 
     cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
+        draw(window, cx);
+        open_page(window, PAGE_GENERAL, cx);
         assert_eq!(
             window.find("settings-autostart").checked(),
             Some(false),
@@ -759,7 +783,8 @@ async fn the_view_reconciles_the_autostart_setting_with_the_os(cx: &mut TestAppC
     let window = open_settings(cx, store, paths.clone(), autostart);
 
     cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
+        draw(window, cx);
+        open_page(window, PAGE_GENERAL, cx);
         assert_eq!(
             window.find("settings-autostart").checked(),
             Some(true),
@@ -780,7 +805,8 @@ fn an_unreadable_os_autostart_state_is_reported_as_a_read_failure(cx: &mut TestA
     let window = open_settings(cx, store, paths.clone(), FakeAutostart::unreadable());
 
     cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
+        draw(window, cx);
+        open_page(window, PAGE_GENERAL, cx);
         let notice = window.find("settings-action-error");
         assert!(notice.visible(), "the read failure is visible");
         let message = notice.label().unwrap_or_default();
@@ -807,7 +833,8 @@ async fn a_failed_settings_write_rolls_the_autostart_change_back(cx: &mut TestAp
     let window = open_settings(cx, store, paths.clone(), autostart);
 
     cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
+        draw(window, cx);
+        open_page(window, PAGE_GENERAL, cx);
         tab_to(window, "settings-autostart", cx);
         window.press("space", cx);
 
@@ -860,7 +887,8 @@ async fn a_failed_save_says_the_settings_could_not_be_saved(cx: &mut TestAppCont
     let window = open_settings(cx, store, paths, FakeAutostart::new());
 
     cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
+        draw(window, cx);
+        open_page(window, PAGE_LIMITS, cx);
         tab_to(window, FieldKey::Concurrency.id(), cx);
         window.press("up", cx);
         // N2: the write runs off the UI thread, so its failure is not here
@@ -892,7 +920,8 @@ async fn a_noop_edit_while_a_write_is_in_flight_still_reports_its_failure(cx: &m
     let window = open_settings(cx, store, paths, FakeAutostart::new());
 
     cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
+        draw(window, cx);
+        open_page(window, PAGE_LIMITS, cx);
         tab_to(window, FieldKey::Bandwidth.id(), cx);
         // The first edit starts a write for 2 MB/s that will fail.
         retype(window, "2", cx);
@@ -924,7 +953,8 @@ fn an_unapproved_login_item_shows_where_to_approve_it(cx: &mut TestAppContext) {
     let window = open_settings(cx, store, paths.clone(), autostart);
 
     cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
+        draw(window, cx);
+        open_page(window, PAGE_GENERAL, cx);
         assert!(
             window.find("settings-autostart-approval").visible(),
             "the approval row is shown"
@@ -971,7 +1001,8 @@ fn a_refused_autostart_change_is_reported_and_not_recorded(cx: &mut TestAppConte
     let window = open_settings(cx, store, paths.clone(), FakeAutostart::refusing());
 
     cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
+        draw(window, cx);
+        open_page(window, PAGE_GENERAL, cx);
         tab_to(window, "settings-autostart", cx);
         window.press("space", cx);
 
@@ -1009,7 +1040,8 @@ async fn corrupt_settings_load_defaults_and_show_a_problem_that_clears_after_a_s
     let window = open_settings(cx, store, paths.clone(), FakeAutostart::new());
 
     cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
+        draw(window, cx);
+        open_page(window, PAGE_LIMITS, cx);
         let notice = window.find("settings-problem");
         assert!(notice.visible(), "the corrupt file is reported in the UI");
         let message = notice.label().unwrap_or_default();
@@ -1017,11 +1049,13 @@ async fn corrupt_settings_load_defaults_and_show_a_problem_that_clears_after_a_s
             message.contains("settings.toml"),
             "the notice names the file: {message}"
         );
+        open_page(window, PAGE_GENERAL, cx);
         assert_eq!(
             window.find("settings-autostart").checked(),
             Some(false),
             "the view stays usable on defaults"
         );
+        open_page(window, PAGE_LIMITS, cx);
 
         // Acting on the defaults repairs the file. The input change is
         // delivered as an entity effect, and the save runs on the background
@@ -1065,7 +1099,8 @@ fn corrupt_settings_are_left_alone_when_the_os_autostart_is_enabled(cx: &mut Tes
     let window = open_settings(cx, store, paths.clone(), backend);
 
     cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
+        draw(window, cx);
+        open_page(window, PAGE_GENERAL, cx);
         let notice = window
             .try_find("settings-problem")
             .expect("the corrupt file is still reported");
@@ -1100,34 +1135,31 @@ fn long_storage_paths_stay_inside_their_card(cx: &mut TestAppContext) {
     let window = open_settings(cx, store, paths, FakeAutostart::new());
 
     cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
-        let storage = window.find("settings-storage").bounds();
-        let limits = window.find("settings-limits").bounds();
-        assert_eq!(
-            storage.size.width, limits.size.width,
-            "every section card keeps the same width"
-        );
-
+        draw(window, cx);
+        open_page(window, PAGE_STORAGE, cx);
+        // #78: the house cards are gone, so the row's bound is the surface it
+        // sits in rather than a card of its own.
+        let surface = window.find("settings-scroll").bounds();
         for (id, value_id) in [
             ("settings-path-config", "settings-path-config-value"),
             ("settings-path-state", "settings-path-state-value"),
         ] {
             let row = window.find(id).bounds();
             assert!(
-                row.right() <= storage.right() && row.left() >= storage.left(),
-                "{id} overflows its card: {row:?} vs {storage:?}"
+                row.right() <= surface.right() && row.left() >= surface.left(),
+                "{id} overflows the settings surface: {row:?} vs {surface:?}"
             );
 
             // Only the text node itself proves the path was truncated: an
             // unconstrained text child overflows its row while the row fits.
             let value = window.find(value_id).bounds();
             assert!(
-                value.right() <= storage.right() && value.left() >= storage.left(),
-                "{value_id} overflows its card: {value:?} vs {storage:?}"
+                value.right() <= surface.right() && value.left() >= surface.left(),
+                "{value_id} overflows the settings surface: {value:?} vs {surface:?}"
             );
             assert!(
-                value.size.width < storage.size.width,
-                "{value_id} shrank to fit instead of keeping its full width: {value:?} vs {storage:?}"
+                value.size.width < surface.size.width,
+                "{value_id} shrank to fit instead of keeping its full width: {value:?} vs {surface:?}"
             );
         }
     })
@@ -1148,14 +1180,15 @@ fn the_shell_switch_shows_the_dashboard_and_the_settings(cx: &mut TestAppContext
             "the shell starts on the dashboard"
         );
         assert!(
-            window.try_find("settings-general").is_none(),
+            window.try_find("settings-scroll").is_none(),
             "settings are not rendered while the dashboard is shown"
         );
 
         tab_to(window, "nav-settings", cx);
         window.press("enter", cx);
+        draw(window, cx);
         assert!(
-            window.find("settings-general").visible(),
+            window.find("settings-scroll").visible(),
             "the settings surface is shown"
         );
         assert!(
@@ -1192,11 +1225,11 @@ fn the_connection_form_names_its_controls(cx: &mut TestAppContext) {
     let window = open_settings(cx, store, paths, FakeAutostart::new());
 
     cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
+        draw(window, cx);
 
         assert!(
-            window.find("settings-connection").visible(),
-            "the connection section is on the settings surface"
+            window.find("settings-server-url").visible(),
+            "the connection page is on the settings surface"
         );
         for (id, label) in [
             ("settings-server-url", "Server URL"),
@@ -1259,7 +1292,7 @@ fn the_connection_state_shows_on_the_form_and_the_global_card(cx: &mut TestAppCo
     let attention = ConnectionState::NeedsAttention(Attention::PasswordLoginDisabled);
 
     cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
+        draw(window, cx);
         assert_eq!(
             window.find("status-connection-global").label(),
             Some(ConnectionState::NotConfigured.message().as_str()),
@@ -1348,7 +1381,7 @@ fn reopening_the_window_does_not_restart_the_startup_login(cx: &mut TestAppConte
         "a reopened window keeps the state the app-level model holds"
     );
     cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
+        draw(window, cx);
         assert_eq!(
             window.find("settings-connection-state").label(),
             Some(attention.message().as_str()),
@@ -1389,7 +1422,7 @@ async fn a_first_run_does_not_restart_the_login_on_reopen(cx: &mut TestAppContex
     // The user signs in through the form, and the view persists the connected
     // profile, so the settings file now holds the login a later launch reads.
     cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
+        draw(window, cx);
         tab_to(window, "settings-server-url", cx);
         window.input(&server_url, cx);
         tab_to(window, "settings-email", cx);
@@ -1553,7 +1586,7 @@ fn a_wrong_password_shows_an_error_and_the_form_stays_usable(cx: &mut TestAppCon
                 cx,
             );
         });
-        window.render_frame(cx);
+        draw(window, cx);
 
         let notice = window.find("settings-connection-state");
         let label = notice.label();
@@ -1594,7 +1627,7 @@ fn the_connection_form_reports_empty_fields_without_signing_in(cx: &mut TestAppC
     let window = open_settings(cx, store, paths, FakeAutostart::new());
 
     cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
+        draw(window, cx);
         window.click("settings-sign-in", cx);
 
         let error = window.find("settings-connection-error");
@@ -1621,7 +1654,7 @@ fn switching_the_credential_updates_the_secret_placeholder(cx: &mut TestAppConte
     );
 
     cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
+        draw(window, cx);
         assert_eq!(
             view.read(cx).secret_placeholder(cx),
             "Password",
@@ -1664,7 +1697,7 @@ async fn signing_in_through_the_form_never_writes_the_secret(cx: &mut TestAppCon
     );
 
     cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
+        draw(window, cx);
         tab_to(window, "settings-server-url", cx);
         window.input(&server_url, cx);
         tab_to(window, "settings-email", cx);
@@ -1729,7 +1762,7 @@ async fn signing_in_again_resolves_the_credential_store_again(cx: &mut TestAppCo
 
     // The first sign-in resolves a missing provider and reports it.
     cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
+        draw(window, cx);
         tab_to(window, "settings-server-url", cx);
         window.input(&server_url, cx);
         tab_to(window, "settings-email", cx);
@@ -1809,7 +1842,7 @@ async fn a_failed_sign_in_does_not_replace_the_saved_profile(cx: &mut TestAppCon
     // Change the account and give the wrong credential, so the server rejects
     // the sign-in.
     cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
+        draw(window, cx);
         tab_to(window, "settings-email", cx);
         retype(window, "someone-else@example.com", cx);
         tab_to(window, "settings-secret", cx);
@@ -1914,7 +1947,8 @@ async fn a_limits_change_reaches_the_running_engine(cx: &mut TestAppContext) {
     cx.update(|cx| view.update(cx, |view, cx| view.set_engine(engine_model.clone(), cx)));
 
     cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
+        draw(window, cx);
+        open_page(window, PAGE_LIMITS, cx);
         tab_to(window, FieldKey::Bandwidth.id(), cx);
         retype(window, "1", cx);
         tab_to(window, FieldKey::Concurrency.id(), cx);
@@ -1973,7 +2007,8 @@ fn the_tagging_section_shows_the_fixed_tag_and_opens_its_immich_page(cx: &mut Te
     let window = open_settings(cx, store, paths.clone(), FakeAutostart::new());
 
     cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
+        draw(window, cx);
+        open_page(window, PAGE_TAGGING, cx);
         assert_eq!(
             window.find("settings-tag-name").label(),
             Some("immich-sync"),
@@ -1988,6 +2023,14 @@ fn the_tagging_section_shows_the_fixed_tag_and_opens_its_immich_page(cx: &mut Te
             Some(true),
             "R3.7: a fresh install shows the switch on"
         );
+        // #78: the link is one of the rows the kit has no field type for, so it
+        // is a custom item and must keep its name and its keyboard reach.
+        assert_eq!(
+            window.find("settings-tag-link").label(),
+            Some("Open the sync tag's page in Immich"),
+            "#78: the tag-page link keeps its accessible name"
+        );
+        tab_to(window, "settings-tag-link", cx);
         window.click("settings-tag-link", cx);
     })
     .expect("open the tag page from the settings window");
@@ -2008,10 +2051,11 @@ fn the_tagging_section_has_no_immich_link_without_a_server_url(cx: &mut TestAppC
     let window = open_settings(cx, store, paths.clone(), FakeAutostart::new());
 
     cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
+        draw(window, cx);
+        open_page(window, PAGE_TAGGING, cx);
         assert!(
-            window.find("settings-tagging").visible(),
-            "the section is there without a server"
+            window.find("settings-tag-name").visible(),
+            "the tagging page is there without a server"
         );
         assert!(
             window.try_find("settings-tag-link").is_none(),
@@ -2101,7 +2145,8 @@ async fn the_tag_switch_persists_and_reaches_the_running_engine(cx: &mut TestApp
     cx.update(|cx| view.update(cx, |view, cx| view.set_engine(engine_model.clone(), cx)));
 
     cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
+        draw(window, cx);
+        open_page(window, PAGE_TAGGING, cx);
         tab_to(window, "settings-tag-upload", cx);
         window.press("space", cx);
     })
@@ -2225,7 +2270,8 @@ async fn the_tagging_section_shows_the_backfill_and_tags_the_library_again(
     cx.update(|cx| view.update(cx, |view, cx| view.set_engine(engine_model.clone(), cx)));
 
     cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
+        draw(window, cx);
+        open_page(window, PAGE_TAGGING, cx);
         assert!(
             window.try_find("settings-tag-backfill").is_none(),
             "R3.7: a switch that is off shows no backfill progress"
@@ -2354,7 +2400,8 @@ async fn a_missing_tag_permission_is_named_in_the_tagging_section(cx: &mut TestA
     // already hold its answer.
     server.fail(Operation::ApiKeyMe, Fault::Slow(Duration::from_secs(1)));
     cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
+        draw(window, cx);
+        open_page(window, PAGE_TAGGING, cx);
         tab_to(window, "settings-tag-upload", cx);
         window.press("space", cx);
     })
@@ -2447,5 +2494,570 @@ async fn a_missing_tag_permission_is_named_in_the_tagging_section(cx: &mut TestA
     assert!(
         server.upsert_calls().is_empty(),
         "R3.7: a key that may not create the tag sends no upsert"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #78: the settings surface is six pages of rows, with a search over their
+// words. These tests pin what each row promises *before* the layout moves:
+// its page, its element id, its accessible name, and its help sentence.
+// ---------------------------------------------------------------------------
+
+/// The six settings pages, in the order the sidebar lists them.
+const PAGE_CONNECTION: usize = 0;
+const PAGE_GENERAL: usize = 1;
+const PAGE_LIMITS: usize = 2;
+const PAGE_SYNC: usize = 3;
+const PAGE_TAGGING: usize = 4;
+const PAGE_STORAGE: usize = 5;
+/// The number of settings pages.
+const PAGE_COUNT: usize = 6;
+
+/// One settings row, as the surface promises it.
+struct RowPin {
+    /// The page the row lives on.
+    page: usize,
+    /// The control's element id.
+    id: &'static str,
+    /// The control's accessible name.
+    name: &'static str,
+    /// The element carrying the help sentence as its description.
+    help_id: &'static str,
+    /// The help sentence under the row's title.
+    help: &'static str,
+}
+
+/// A row whose control carries both its name and its help sentence.
+const fn row(page: usize, id: &'static str, name: &'static str, help: &'static str) -> RowPin {
+    RowPin {
+        page,
+        id,
+        name,
+        help_id: id,
+        help,
+    }
+}
+
+/// A row whose control is named but whose help hangs on the row around it.
+const fn control_row(
+    page: usize,
+    id: &'static str,
+    name: &'static str,
+    help_id: &'static str,
+    help: &'static str,
+) -> RowPin {
+    RowPin {
+        page,
+        id,
+        name,
+        help_id,
+        help,
+    }
+}
+
+/// Every row the surface always shows, in page order.
+const ROWS: &[RowPin] = &[
+    row(
+        PAGE_CONNECTION,
+        "settings-server-url",
+        "Server URL",
+        "For example https://immich.example.com. Certificate verification stays on.",
+    ),
+    row(
+        PAGE_CONNECTION,
+        "settings-email",
+        "Email address",
+        "The Immich account this client uploads as.",
+    ),
+    row(
+        PAGE_CONNECTION,
+        "settings-auth-method",
+        "Credential",
+        "A password for the account, or an API key from Immich.",
+    ),
+    row(
+        PAGE_CONNECTION,
+        "settings-secret",
+        "Password",
+        "Stored in the OS credential store, never in the settings file.",
+    ),
+    control_row(
+        PAGE_GENERAL,
+        "settings-autostart",
+        "Start Immich Sync at login",
+        "settings-autostart-row",
+        "Start Immich Sync when you log in. Off by default.",
+    ),
+    row(
+        PAGE_LIMITS,
+        "settings-bandwidth",
+        "Bandwidth limit",
+        "Zero means unlimited; under 0.001 MB/s the client uses 0.001 MB/s.",
+    ),
+    row(
+        PAGE_LIMITS,
+        "settings-concurrency",
+        "Concurrent uploads",
+        "Uploads that run at the same time.",
+    ),
+    row(
+        PAGE_SYNC,
+        "settings-scan-interval",
+        "Reconciliation scan interval",
+        "The watcher uploads changes as they happen; this scan finds what the watcher missed.",
+    ),
+    row(
+        PAGE_SYNC,
+        "settings-attempt-cap",
+        "Retry attempt cap",
+        "Attempts per file before it needs attention.",
+    ),
+    control_row(
+        PAGE_TAGGING,
+        "settings-tag-upload",
+        "Tag uploaded assets with immich-sync",
+        "settings-tag-upload-row",
+        "Adds the tag to every asset the client uploads. On by default.",
+    ),
+    control_row(
+        PAGE_TAGGING,
+        "settings-tag-name",
+        "immich-sync",
+        "settings-tag-name-row",
+        "Fixed. The client always uses this name.",
+    ),
+    row(
+        PAGE_STORAGE,
+        "settings-path-config",
+        "Settings file",
+        "Resolved from the platform.",
+    ),
+    row(
+        PAGE_STORAGE,
+        "settings-path-state",
+        "State database",
+        "Resolved from the platform.",
+    ),
+];
+
+/// Draws twice: a page body is a virtual list, which lays its rows out on the
+/// frame after the one that measured it.
+fn draw(window: &mut Window, cx: &mut App) {
+    window.render_frame(cx);
+    window.render_frame(cx);
+}
+
+/// Opens one settings page by clicking its sidebar entry.
+fn open_page(window: &mut Window, page: usize, cx: &mut App) {
+    window.click(format!("0-{page}"), cx);
+    draw(window, cx);
+}
+
+/// Types `query` into the settings search field; an empty query clears it.
+fn search(window: &mut Window, query: &str, cx: &mut App) {
+    tab_to(window, "settings-search", cx);
+    if query.is_empty() {
+        window.press(crate::common::select_all_chord(), cx);
+        window.press("backspace", cx);
+    } else {
+        retype(window, query, cx);
+    }
+    draw(window, cx);
+}
+
+/// Opens the shell at a chosen window size, so a layout test measures the
+/// surface in the geometry the app draws it in.
+fn open_shell_at(
+    cx: &mut TestAppContext,
+    paths: AppPaths,
+    window_size: (f32, f32),
+) -> AnyWindowHandle {
+    let store = SettingsStore::open(paths.config_file.clone());
+    let profile = profile_from_settings(store.settings());
+    let upload_paths = paths.clone();
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        let connection = cx.new(|_| {
+            let credentials: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+            ConnectionModel::new(profile, credentials)
+        });
+        gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: Point::default(),
+                    size: size(px(window_size.0), px(window_size.1)),
+                })),
+                ..Default::default()
+            },
+            cx,
+            |window, cx| {
+                let dashboard = cx.new(|_| Dashboard::new(status::sample()));
+                let settings = cx.new(|cx| {
+                    SettingsView::new(
+                        store,
+                        paths,
+                        FakeAutostart::new(),
+                        connection.clone(),
+                        window,
+                        cx,
+                    )
+                });
+                let store_model =
+                    cx.new(|cx| immich_sync::store::StoreModel::open(&upload_paths, cx));
+                let upload_model =
+                    cx.new(|cx| UploadModel::new(connection.clone(), store_model.clone(), cx));
+                let upload = cx.new(|cx| UploadView::new(upload_model, window, cx));
+                let engine_model = cx.new(|cx| {
+                    EngineModel::new(connection.clone(), store_model.clone(), &upload_paths, cx)
+                });
+                let failed = cx.new(|cx| {
+                    immich_sync::failed_view::FailedView::new(engine_model.clone(), window, cx)
+                });
+                let diagnostics_model = cx.new(|cx| {
+                    immich_sync::diagnostics::DiagnosticsModel::new(
+                        store_model.clone(),
+                        engine_model.clone(),
+                        connection.clone(),
+                        upload_paths.log_directory(),
+                        cx,
+                    )
+                });
+                let diagnostics = cx.new(|cx| {
+                    immich_sync::diagnostics_view::DiagnosticsView::new(diagnostics_model, cx)
+                });
+                let review = cx
+                    .new(|cx| immich_sync::review_view::ReviewView::new(engine_model, window, cx));
+                cx.new(|cx| {
+                    AppShell::new(
+                        dashboard,
+                        settings,
+                        upload,
+                        failed,
+                        diagnostics,
+                        review,
+                        connection.clone(),
+                        cx,
+                    )
+                })
+            },
+        )
+        .expect("open the shell window")
+        .0
+    })
+}
+
+/// #78: the surface is six pages, and each row is named and explained on its
+/// own page, not on another.
+#[gpui_kit::test]
+fn every_settings_row_is_named_and_explained_on_its_own_page(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let store = SettingsStore::open(paths.config_file.clone());
+    let window = open_settings(cx, store, paths, FakeAutostart::new());
+
+    cx.update_window(window, |_, window, cx| {
+        draw(window, cx);
+        for page in 0..PAGE_COUNT {
+            assert!(
+                window.try_find(format!("0-{page}")).is_some(),
+                "page {page} has no sidebar entry"
+            );
+        }
+        assert!(
+            window.try_find(format!("0-{PAGE_COUNT}")).is_none(),
+            "#78: the surface has exactly {PAGE_COUNT} pages"
+        );
+
+        for page in 0..PAGE_COUNT {
+            open_page(window, page, cx);
+            for pin in ROWS {
+                if pin.page == page {
+                    let found = window
+                        .try_find(pin.id)
+                        .unwrap_or_else(|| panic!("page {page} is missing {}", pin.id));
+                    assert!(found.visible(), "{} is not on screen", pin.id);
+                    assert_eq!(found.label(), Some(pin.name), "{} keeps its name", pin.id);
+                    assert!(
+                        found.bounds().size.width > px(0.) && found.bounds().size.height > px(0.),
+                        "{} has a layout size: {:?}",
+                        pin.id,
+                        found.bounds()
+                    );
+                    assert_eq!(
+                        window.find(pin.help_id).description(),
+                        Some(pin.help),
+                        "{} keeps its help sentence",
+                        pin.help_id
+                    );
+                } else {
+                    assert!(
+                        window.try_find(pin.id).is_none(),
+                        "{} belongs to page {}, so page {page} does not show it",
+                        pin.id,
+                        pin.page
+                    );
+                }
+            }
+        }
+    })
+    .expect("walk the settings pages");
+}
+
+/// #78: the search field is a named, keyboard-reachable control.
+#[gpui_kit::test]
+fn the_settings_search_field_is_named_and_reachable_from_the_keyboard(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let store = SettingsStore::open(paths.config_file.clone());
+    let window = open_settings(cx, store, paths, FakeAutostart::new());
+
+    cx.update_window(window, |_, window, cx| {
+        draw(window, cx);
+        assert!(
+            window.find("settings-search").visible(),
+            "#78: the surface shows a search field"
+        );
+        tab_to(window, "settings-search", cx);
+        assert_eq!(
+            window.find("settings-search").focused(),
+            Some(true),
+            "#78: the search field holds the keyboard focus"
+        );
+        assert_eq!(
+            row_text_input(window, "settings-search", Role::TextInput).label(),
+            Some("Search settings"),
+            "#78: the search field is named"
+        );
+    })
+    .expect("focus the settings search field");
+}
+
+/// #78: a query matches a row's title, lands on the page that holds it, and
+/// leaves the other rows out.
+#[gpui_kit::test]
+fn search_filters_by_title_and_lands_on_the_page_that_holds_the_match(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let store = SettingsStore::open(paths.config_file.clone());
+    let window = open_settings(cx, store, paths, FakeAutostart::new());
+
+    cx.update_window(window, |_, window, cx| {
+        draw(window, cx);
+        // The surface opens on the first page, so only a search can show
+        // `settings-bandwidth`: it proves both the match and the landing.
+        assert!(window.try_find("settings-bandwidth").is_none());
+
+        search(window, "bandwidth", cx);
+        assert!(
+            window.find("settings-bandwidth").visible(),
+            "#78: the title's match is shown"
+        );
+        assert!(
+            window.try_find("settings-concurrency").is_none(),
+            "#78: a filtered page shows only the matching row"
+        );
+        assert!(
+            window.try_find("settings-server-url").is_none(),
+            "#78: a page without a match is not shown"
+        );
+    })
+    .expect("search the settings surface");
+}
+
+/// #78: a query matches the help sentence too, and an empty result says so.
+#[gpui_kit::test]
+fn search_matches_the_help_sentence_and_an_empty_result_says_so(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let store = SettingsStore::open(paths.config_file.clone());
+    let window = open_settings(cx, store, paths, FakeAutostart::new());
+
+    cx.update_window(window, |_, window, cx| {
+        draw(window, cx);
+        // "watcher" is only in the scan interval's help sentence.
+        search(window, "watcher", cx);
+        assert!(
+            window.find("settings-scan-interval").visible(),
+            "#78: the help sentence's match is shown on its own page"
+        );
+        assert!(
+            window.try_find("settings-attempt-cap").is_none(),
+            "#78: the page's other row is filtered out"
+        );
+
+        search(window, "zzz-no-such-setting", cx);
+        let empty = window.find("settings-search-empty");
+        assert!(empty.visible(), "#78: an empty result is on screen");
+        assert_eq!(
+            empty.label(),
+            Some("No setting matches \"zzz-no-such-setting\"."),
+            "#78: the empty result says what it is"
+        );
+        assert!(
+            window.try_find("settings-scan-interval").is_none(),
+            "#78: nothing from the previous query is left behind"
+        );
+        assert!(
+            window.find("settings-search").visible(),
+            "#78: the field stays, so the search can be cleared"
+        );
+
+        // Clearing the query brings the pages back.
+        search(window, "", cx);
+        assert!(window.find("settings-server-url").visible());
+        assert!(
+            window.try_find("settings-search-empty").is_none(),
+            "#78: the empty result goes with the query"
+        );
+    })
+    .expect("search the settings surface");
+}
+
+/// #78: at the narrowest supported window, in both themes, every row of every
+/// page is reachable and keeps its control inside the surface.
+///
+/// The extra 780x480 pass measures the tight band just above the component's
+/// stacking breakpoint, where a long label word and a fixed-width field are
+/// closest to not fitting.
+#[gpui_kit::test]
+fn every_page_lays_out_its_rows_at_the_narrowest_window_in_both_themes(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    // 720x480 is the shell's minimum window; 780x480 is the tight band just
+    // above the component's stacking breakpoint, where the label column and a
+    // fixed-width field are closest to not fitting.
+    for (window_size, system) in [
+        ((720., 480.), theme::SystemTheme::Light),
+        ((720., 480.), theme::SystemTheme::Dark),
+        ((780., 480.), theme::SystemTheme::Light),
+    ] {
+        cx.update(|cx| theme::apply_system_theme(system, cx));
+        let window = open_shell_at(cx, paths.clone(), window_size);
+        cx.update_window(window, |_, window, cx| {
+            draw(window, cx);
+            tab_to(window, "nav-settings", cx);
+            window.press("enter", cx);
+            draw(window, cx);
+            for page in 0..PAGE_COUNT {
+                open_page(window, page, cx);
+                for pin in ROWS.iter().filter(|pin| pin.page == page) {
+                    let row = scroll_page_to(window, pin.id, cx);
+                    assert!(
+                        row.visible(),
+                        "{window_size:?} {system:?}: {} is unreachable",
+                        pin.id
+                    );
+                    let surface = window.find("settings-scroll").bounds();
+                    assert!(
+                        row.bounds().left() >= surface.left() - px(1.)
+                            && row.bounds().right() <= surface.right() + px(1.),
+                        "{window_size:?} {system:?}: {} overflows the surface: {:?} vs {surface:?}",
+                        pin.id,
+                        row.bounds()
+                    );
+                    let control = window.find(pin.help_id).bounds();
+                    assert!(
+                        control.size.width > px(0.) && control.size.height > px(0.),
+                        "{window_size:?} {system:?}: {} has no layout size: {control:?}",
+                        pin.help_id
+                    );
+                    assert!(
+                        control.right() <= surface.right() + px(1.),
+                        "{window_size:?} {system:?}: {} clips its control: {control:?} vs {surface:?}",
+                        pin.help_id
+                    );
+                    // A row wrapper that fits can still overflow its own text
+                    // field, which is the clip a screenshot shows first.
+                    for input in gpui_kit::base::test_support::snapshots(window)
+                        .into_iter()
+                        .filter(|element| {
+                            matches!(element.role(), Some(Role::TextInput | Role::PasswordInput))
+                                && element
+                                    .path()
+                                    .contains(&ElementId::Name(pin.help_id.into()))
+                        })
+                    {
+                        assert!(
+                            input.bounds().right() <= surface.right() + px(1.),
+                            "{window_size:?} {system:?}: the text field inside {} overflows the surface: {:?} vs {surface:?}",
+                            pin.help_id,
+                            input.bounds()
+                        );
+                    }
+                }
+            }
+        })
+        .expect("lay out the settings pages");
+    }
+}
+
+/// Scrolls the open page until `id` is laid out and on screen.
+fn scroll_page_to(
+    window: &mut Window,
+    id: &'static str,
+    cx: &mut App,
+) -> gpui_kit::base::test_support::ElementSnapshot {
+    for _ in 0..40 {
+        if let Some(row) = window.try_find(id)
+            && row.visible()
+        {
+            return row;
+        }
+        let surface = window.find("settings-scroll").bounds();
+        let viewport = Bounds::new(Point::default(), window.viewport_size());
+        let position = surface.intersect(&viewport).center();
+        window.dispatch_event(
+            ScrollEvent {
+                position,
+                delta: ScrollDelta::Lines(point(0., -4.)),
+                ..Default::default()
+            }
+            .to_platform_input(),
+            cx,
+        );
+        draw(window, cx);
+    }
+    panic!("{id} never became reachable inside the settings surface");
+}
+
+/// #78: a keystroke in the search field asks the surface to render, so the
+/// rows are filtered from the field's value on the same frame.
+#[gpui_kit::test]
+fn typing_in_the_search_field_asks_the_surface_to_render(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let store = SettingsStore::open(paths.config_file.clone());
+    let (window, view) = open_settings_over_connection(
+        cx,
+        store,
+        paths,
+        FakeAutostart::new(),
+        cx.update(|cx| {
+            let credentials: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+            cx.new(|_| ConnectionModel::new(ServerProfile::default(), credentials))
+        }),
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        draw(window, cx);
+        tab_to(window, "settings-search", cx);
+    })
+    .expect("focus the settings search field");
+
+    let repaints = Rc::new(Cell::new(0));
+    let _watch = {
+        let repaints = Rc::clone(&repaints);
+        cx.update(|cx| cx.observe(&view, move |_, _| repaints.set(repaints.get() + 1)))
+    };
+
+    cx.update_window(window, |_, window, cx| {
+        window.input("b", cx);
+    })
+    .expect("type one character");
+
+    assert!(
+        repaints.get() > 0,
+        "#78: a keystroke in the search field did not ask the surface to render"
     );
 }
