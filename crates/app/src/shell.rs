@@ -473,8 +473,9 @@ const FADE_RIGHT: &str = "nav-fade-right";
 /// The room the strip keeps inside its clip for the tabs' focus ring.
 ///
 /// [`ThemeStyled::focus_ring_style`] paints the ring 3 px outside the tab, and
-/// the strip clips, so its tabs are padded by this much and a reveal stops this
-/// far from the edge instead of flush: 4 px is the ring and one more.
+/// the strip clips, so the strip pads the tabs by this much on every side and a
+/// reveal stops this far from the edge instead of flush: 4 px is the ring and
+/// one more.
 const TAB_ROOM: Pixels = px(4.);
 
 /// The environment variable that pins the visible surface.
@@ -723,11 +724,11 @@ impl AppShell {
     ///
     /// The tabs ride in the kit's [`SurfaceTabs`] list, but each one is its own
     /// element rather than a `base::Tab`: in 0.8.1 that tab observes itself
-    /// before any caller can, so it cannot be read back as focused or carry the
-    /// focus handle a tab stop needs, and `component::TabBar` would rename it to
-    /// its integer index and lose the stable id the per-surface tests click. The
-    /// role, the label, the position, the selected state and the focus handle
-    /// below are the ones `base::Tab` writes.
+    /// before any caller can, so a caller's focus handle still makes it a tab
+    /// stop but nothing can read focus back from it, and `component::TabBar`
+    /// would rename it to its integer index and lose the stable id the
+    /// per-surface tests click. The role, the label, the position, the selected
+    /// state and the focus handle below are the ones `base::Tab` writes.
     fn switch(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let (background, border) = (theme.background, theme.border);
@@ -843,7 +844,10 @@ impl AppShell {
             .flex_row()
             .items_center()
             .px_6()
-            .py_2()
+            // The bar's vertical space sits on the strip instead, so the tabs'
+            // outward focus ring has room inside the strip's own clip; the bar
+            // and the tabs are where they were.
+            .py(TAB_ROOM)
             .bg(background)
             .border_b_1()
             .border_color(border)
@@ -863,8 +867,11 @@ impl AppShell {
                             .gap_1()
                             .flex_1()
                             .min_w_0()
-                            // Room for the end tabs' outward focus ring.
+                            // Room for the tabs' outward focus ring on every
+                            // side; the strip clips, so the ring would otherwise
+                            // lose its top and bottom band.
                             .px(TAB_ROOM)
+                            .py(TAB_ROOM)
                             .overflow_x_scroll()
                             .track_scroll(&self.nav_scroll)
                             .children(tabs),

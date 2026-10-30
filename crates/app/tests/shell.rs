@@ -959,8 +959,14 @@ fn focusing_a_tab_past_the_edge_scrolls_it_into_sight_with_room_for_its_ring(
         let left = f32::from(tab.origin.x) - f32::from(strip.origin.x);
         let right =
             f32::from(strip.origin.x + strip.size.width) - f32::from(tab.origin.x + tab.size.width);
+        // The ring is painted 3 px outside the tab on all four sides, and the
+        // strip clips, so the layout has to leave that band inside the strip's
+        // own bounds or the top and bottom of the ring are cut off.
+        let top = f32::from(tab.origin.y) - f32::from(strip.origin.y);
+        let bottom = f32::from(strip.origin.y + strip.size.height)
+            - f32::from(tab.origin.y + tab.size.height);
         assert!(
-            left >= 3.5 && right >= 3.5,
+            left >= 3.5 && right >= 3.5 && top >= 3.5 && bottom >= 3.5,
             "the strip scrolled the focused tab into sight with room for its ring: \
              {tab:?} in {strip:?}"
         );
