@@ -9,7 +9,9 @@
 //! - The state is one node: one name, one description. The titled box is a
 //!   `Role::Status` whose accessible name is the title and whose description
 //!   follows it, and the visible lines inside it are `Text::new_inaccessible`,
-//!   so the component adds no second node of its own. This is the lesson of
+//!   so the component adds no second node of its own. It is also a polite live
+//!   region, so a list that empties itself says so out loud
+//!   ([`crate::notice::polite_live_region`]). This is the lesson of
 //!   [`crate::notice`]: a bare child string produces no accessibility node at
 //!   all, so the status must carry the text. What surrounds the state is the
 //!   surface's business: the failed list's summary above it states the same
@@ -22,6 +24,7 @@
 //! The action slot stays empty where the surface has no next step it can carry
 //! out; an empty state never offers a control it cannot honour.
 
+use crate::notice::polite_live_region;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -92,6 +95,9 @@ impl RenderOnce for EmptyState {
                     .role(Role::Status)
                     .aria_label(self.title.clone())
                     .aria_description(self.description.clone())
+                    // The same live-region hook the notice uses: the adapters
+                    // announce nothing whose live is `Off`.
+                    .a11y_synthetic_children(|builder| polite_live_region(builder.parent_node()))
                     .flex()
                     .flex_col()
                     .gap_1()

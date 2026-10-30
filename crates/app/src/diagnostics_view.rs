@@ -19,16 +19,36 @@ use sync_core::store::SqliteInfo;
 pub struct DiagnosticsView {
     /// The model owns every read; the view renders what it last produced.
     model: Entity<DiagnosticsModel>,
-    /// How many times Copy path has been pressed. The confirmation is a new node
-    /// per press, so a repeated copy confirms again (#82).
-    copies: u32,
+    /// The archive path the last copy put on the clipboard, and how many presses
+    /// it has had since. Both are dropped once that path is no longer the last
+    /// archive, so the confirmation never describes a stale copy (#82).
+    copied: Option<(String, u32)>,
 }
 
 impl DiagnosticsView {
     /// A view over the diagnostics model.
     pub fn new(model: Entity<DiagnosticsModel>, cx: &mut Context<Self>) -> Self {
-        cx.observe(&model, |_, _, cx| cx.notify()).detach();
-        Self { model, copies: 0 }
+        cx.observe(&model, |this, model, cx| {
+            // The confirmation names the path it copied, so it goes when the last
+            // archive is no longer that path (#82).
+            let current = match model.read(cx).bundle() {
+                BundleState::Ready(report) => Some(report.path.display().to_string()),
+                _ => None,
+            };
+            let still_copied = this
+                .copied
+                .as_ref()
+                .is_some_and(|(copied, _)| current.as_deref() == Some(copied.as_str()));
+            if !still_copied {
+                this.copied = None;
+            }
+            cx.notify();
+        })
+        .detach();
+        Self {
+            model,
+            copied: None,
+        }
     }
 
     /// The page header.
@@ -444,7 +464,23 @@ impl DiagnosticsView {
                                 // #82: the confirmation sits beside the control
                                 // it belongs to, in the row, so it opens no
                                 // surface and adds no row above the control.
-                                .children(copy_confirmation("diagnostics-bundle-copy", self.copies))
+                                .flex_shrink_0()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .justify_end()
+                                        // #82: its slot is reserved whether or not
+                                        // it is showing, so the confirmation
+                                        // cannot rewrap the help text and slide
+                                        // the button out from under the pointer.
+                                        .w(rems(6.))
+                                        .children(copy_confirmation(
+                                            "diagnostics-copy-confirmation",
+                                            self.presses(),
+                                        )),
+                                )
                                 .child(
                                     Button::new("diagnostics-bundle-copy")
                                         .label("Copy path")
@@ -497,9 +533,17 @@ impl DiagnosticsView {
             BundleState::Ready(report) => report.path.display().to_string(),
             _ => return,
         };
-        cx.write_to_clipboard(ClipboardItem::new_string(path));
-        self.copies += 1;
+        cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+        self.copied = Some(match self.copied.take() {
+            Some((copied, presses)) if copied == path => (copied, presses + 1),
+            _ => (path, 1),
+        });
         cx.notify();
+    }
+
+    /// How many times the archive now on the clipboard has been copied (#82).
+    fn presses(&self) -> u32 {
+        self.copied.as_ref().map_or(0, |(_, presses)| *presses)
     }
 
     /// The upload rate from the engine's meter, and the live progress.

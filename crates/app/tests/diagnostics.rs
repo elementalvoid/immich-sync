@@ -51,11 +51,17 @@ const API_KEY: &str = "api-key-abc123";
 /// The word a copy confirmation shows (#82). The same word on every surface.
 const COPIED: &str = "Copied";
 
-/// The visible confirmations that say a copy happened (#82).
+/// The one identity a copy confirmation keeps across presses (#82).
+const CONFIRMATION: &str = "diagnostics-copy-confirmation";
+
+/// The visible confirmations that say a copy happened (#82). One id, whatever
+/// the press count says inside it.
 fn confirmations(window: &Window) -> Vec<ElementSnapshot> {
     snapshots(window)
         .into_iter()
-        .filter(|element| element.visible() && element.label() == Some(COPIED))
+        .filter(|element| {
+            element.visible() && confirmation_id(element) == ElementId::from(CONFIRMATION)
+        })
         .collect()
 }
 
@@ -300,6 +306,31 @@ fn show_diagnostics(window: &mut Window, cx: &mut App) {
     window.render_frame(cx);
     tab_to(window, "nav-diagnostics", cx);
     window.press("enter", cx);
+}
+
+/// Scrolls the diagnostics view until the element with `id` is on screen.
+///
+/// #82: at the shell's smallest window the debug bundle card sits below the
+/// fold, and a control is clicked only once it is really visible.
+fn scroll_diagnostics_into_view(window: &mut Window, cx: &mut App, id: impl Into<ElementId>) {
+    use gpui_kit::{ScrollDelta, point, px};
+
+    let id = id.into();
+    window.render_frame(cx);
+    for _ in 0..60 {
+        if window
+            .try_find(id.clone())
+            .is_some_and(|target| target.visible())
+        {
+            return;
+        }
+        window.scroll(
+            "diagnostics-view",
+            ScrollDelta::Pixels(point(px(0.), px(-120.))),
+            cx,
+        );
+    }
+    panic!("{id:?} never became visible on diagnostics");
 }
 
 /// Adds one source folder straight to the store, before the engine exists.
@@ -1106,7 +1137,29 @@ async fn the_bundle_action_saves_an_archive_shows_its_path_and_copies_it(cx: &mu
             confirmations(window).is_empty(),
             "nothing has been copied yet, so nothing confirms"
         );
-        window.click("diagnostics-bundle-copy", cx);
+        // #82: the shell's smallest window is where the copy row has the least
+        // width to spare, so a confirmation that took space would rewrap the
+        // help text and move the control under the pointer that pressed it.
+        window.resize(size(px(520.), px(480.)));
+        window.bounds_changed(cx);
+        scroll_diagnostics_into_view(window, cx, "diagnostics-bundle-copy");
+    })
+    .expect("update the shell window");
+    let (button_before, row_before) = cx
+        .update_window(window, |_, window, _| {
+            (
+                window.find("diagnostics-bundle-copy").bounds(),
+                window.find("diagnostics-bundle-copy-row").bounds(),
+            )
+        })
+        .expect("update the shell window");
+    assert!(
+        row_before.size.width < px(520.),
+        "the row is laid out at the narrow window: {row_before:?}"
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        window.click("diagnostics-bundle-copy", cx)
     })
     .expect("update the shell window");
     let copied = cx
@@ -1117,31 +1170,49 @@ async fn the_bundle_action_saves_an_archive_shows_its_path_and_copies_it(cx: &mu
         report.path.display().to_string(),
         "the copy control puts the archive's path on the clipboard"
     );
-    let first = cx
-        .update_window(window, |_, window, _| {
-            let confirmations = confirmations(window);
-            assert_eq!(
-                confirmations.len(),
-                1,
-                "one confirmation says the copy happened: {confirmations:?}"
-            );
-            assert_eq!(
-                confirmations[0].role(),
-                Some(Role::Alert),
-                "the confirmation is announced, not only drawn"
-            );
-            assert!(
-                confirmations[0]
-                    .path()
-                    .contains(&ElementId::from("diagnostics-bundle-copy-row")),
-                "the confirmation sits in the row of the control that copied: {:?}",
-                confirmations[0].path()
-            );
-            confirmation_id(&confirmations[0])
-        })
-        .expect("update the shell window");
+    cx.update_window(window, |_, window, _| {
+        let confirmations = confirmations(window);
+        assert_eq!(
+            confirmations.len(),
+            1,
+            "one confirmation says the copy happened: {confirmations:?}"
+        );
+        assert_eq!(
+            confirmations[0].role(),
+            Some(Role::Status),
+            "a copy that worked is a status, not an alert"
+        );
+        assert_eq!(
+            confirmations[0].label(),
+            Some(COPIED),
+            "the first press says what happened: {confirmations:?}"
+        );
+        assert_eq!(
+            confirmations[0].value(),
+            Some(COPIED),
+            "macOS announces a live node by value: {confirmations:?}"
+        );
+        assert!(
+            confirmations[0]
+                .path()
+                .contains(&ElementId::from("diagnostics-bundle-copy-row")),
+            "the confirmation sits in the row of the control that copied: {:?}",
+            confirmations[0].path()
+        );
+        assert_eq!(
+            (
+                window.find("diagnostics-bundle-copy").bounds(),
+                window.find("diagnostics-bundle-copy-row").bounds(),
+            ),
+            (button_before, row_before),
+            "the confirmation takes its reserved slot: nothing moves under the pointer"
+        );
+    })
+    .expect("update the shell window");
 
-    // #82: a second press must confirm again instead of staying silent.
+    // #82: a second press must confirm again instead of staying silent. One
+    // node, one id, and the press count in the announcement: every adapter
+    // announces a changed name or value, none announces a replaced node.
     cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string("SENTINEL".into())));
     cx.update_window(window, |_, window, cx| {
         window.click("diagnostics-bundle-copy", cx)
@@ -1162,10 +1233,45 @@ async fn the_bundle_action_saves_an_archive_shows_its_path_and_copies_it(cx: &mu
             1,
             "the second press replaces the confirmation instead of stacking one: {confirmations:?}"
         );
-        assert_ne!(
+        assert_eq!(
             confirmation_id(&confirmations[0]),
-            first,
-            "the second press is a fresh confirmation node, so a screen reader hears it again"
+            ElementId::from(CONFIRMATION),
+            "the confirmation keeps one stable identity across presses"
+        );
+        assert_eq!(
+            confirmations[0].role(),
+            Some(Role::Status),
+            "a repeat is still a status"
+        );
+        assert_eq!(
+            (confirmations[0].label(), confirmations[0].value()),
+            (Some("Copied 2 times"), Some("Copied 2 times")),
+            "the repeat is announced: a name change for Windows and AT-SPI, a value change for macOS"
+        );
+    })
+    .expect("update the shell window");
+
+    // #82: the confirmation describes the archive it copied, so a new archive
+    // takes it away instead of leaving a claim about the old path.
+    cx.update(|cx| diagnostics.update(cx, |model, cx| model.collect_bundle(cx)));
+    wait_until(cx, "the second debug bundle", |cx| {
+        matches!(diagnostics.read(cx).bundle(), BundleState::Ready(_))
+    })
+    .await;
+    let second = match cx.read(|cx| diagnostics.read(cx).bundle().clone()) {
+        BundleState::Ready(report) => report,
+        other => panic!("the second bundle is ready: {other:?}"),
+    };
+    assert_ne!(
+        second.path, report.path,
+        "a second collection in the same second is named apart"
+    );
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find(CONFIRMATION).is_none(),
+            "a copy of the previous archive is not confirmed beside a new one: {:?}",
+            window.try_find(CONFIRMATION)
         );
     })
     .expect("update the shell window");

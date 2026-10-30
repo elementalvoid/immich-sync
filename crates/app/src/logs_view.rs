@@ -75,8 +75,10 @@ pub struct LogsView {
     /// What the read in flight does when it lands. A read latches this before
     /// its file read starts, and the apply re-reads the viewport for a poll.
     follow: Follow,
-    /// How many times Copy all has been pressed. The confirmation is a new node
-    /// per press, so a repeated copy confirms again (#82).
+    /// How many times Copy all has been pressed since the displayed tail last
+    /// changed. The confirmation is one node whose announcement names the press,
+    /// and it goes when the rows it copied are no longer the rows on screen
+    /// (#82).
     copies: u32,
     /// The window the tail is painted in, where a selection is read from before
     /// a live replace would drop the rows under it. Set by every render.
@@ -273,6 +275,12 @@ impl LogsView {
             // file's name stays with the rows: it names the file they show.
             self.counted = tail;
         } else {
+            // The confirmation names the rows it copied, so it goes as soon as
+            // they are not the rows on screen. A poll that read the same tail
+            // leaves it alone, so the live tail cannot make it flicker (#82).
+            if self.lines != tail {
+                self.copies = 0;
+            }
             self.current_file = file;
             self.lines = tail.clone();
             self.counted = tail;
@@ -495,7 +503,7 @@ impl LogsView {
                         // #82: the confirmation sits beside the control it
                         // belongs to, in the row, so it opens no surface and
                         // adds no row to the card's floor.
-                        .children(copy_confirmation("logs-copy-all", self.copies))
+                        .children(copy_confirmation("logs-copy-confirmation", self.copies))
                         .child(
                             Button::new("logs-copy-all")
                                 .label("Copy all")
