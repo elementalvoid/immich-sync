@@ -18,8 +18,9 @@ use std::time::Duration;
 use gpui_kit::test::TestAppContextExt as _;
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, Bounds, ElementId, Entity, InputEvent as _, Point, Role,
-    ScrollDelta, ScrollEvent, TestAppContext, Window, WindowBounds, WindowOptions, point, px, size,
+    AnyWindowHandle, App, AppContext as _, Bounds, ClipboardItem, ElementId, Entity,
+    InputEvent as _, Point, Role, ScrollDelta, ScrollEvent, TestAppContext, Window, WindowBounds,
+    WindowOptions, point, px, size,
 };
 use immich_sync::autostart::Autostart;
 use immich_sync::connection::{ConnectionModel, profile_from_settings};
@@ -373,8 +374,11 @@ fn tab(window: &mut Window, cx: &mut App) {
 }
 
 /// Tabs until `id` holds the keyboard focus.
+///
+/// The bound is generous because Tab wraps: walking back from a page's controls
+/// to the page strip above them goes round the whole window.
 fn tab_to(window: &mut Window, id: &'static str, cx: &mut App) {
-    for _ in 0..16 {
+    for _ in 0..32 {
         if window.find(id).focused() == Some(true) {
             return;
         }
@@ -631,35 +635,45 @@ async fn stepping_the_bandwidth_keeps_the_fraction(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-async fn keyboard_reaches_every_control_and_steps_the_concurrency(cx: &mut TestAppContext) {
+async fn keyboard_walks_every_page_and_every_control(cx: &mut TestAppContext) {
     let temp = tempfile::tempdir().expect("create a temp dir");
     let paths = temporary_paths(temp.path());
+    // A server URL gives the Tagging page its link, so the walk reaches a
+    // Button there as well as the switch beside it.
+    let mut seed = SettingsStore::open(paths.config_file.clone());
+    seed.update(|settings| settings.server_url = "https://immich.example.com".to_string())
+        .expect("seed the server URL");
     let store = SettingsStore::open(paths.config_file.clone());
     let window = open_settings(cx, store, paths.clone(), FakeAutostart::new());
 
     cx.update_window(window, |_, window, cx| {
         draw(window, cx);
-        // #78: each page holds one group of controls, so the keyboard reaches
-        // a page's controls once that page is open. Every control on every
-        // page still takes the keyboard, in the order the page lists it.
-        for (page, id) in [
-            (PAGE_GENERAL, "settings-autostart"),
-            (PAGE_LIMITS, FieldKey::Bandwidth.id()),
-            (PAGE_LIMITS, FieldKey::Concurrency.id()),
-            (PAGE_SYNC, FieldKey::ScanInterval.id()),
-            (PAGE_SYNC, FieldKey::AttemptCap.id()),
-        ] {
-            open_page(window, page, cx);
-            tab_to(window, id, cx);
+        // #78: no pointer click opens a page. The strip is the keyboard's path
+        // between them: Tab reaches a page's own button, Enter opens it, and Tab
+        // then reaches every control that page holds.
+        for page in 0..PAGE_COUNT {
+            tab_to(window, PAGE_BUTTONS[page], cx);
             assert_eq!(
-                window.find(id).focused(),
+                window.find(PAGE_BUTTONS[page]).focused(),
                 Some(true),
-                "{id} holds the keyboard focus"
+                "the keyboard reaches page {page}'s button"
             );
+            window.press("enter", cx);
+            draw(window, cx);
+            for id in PAGE_CONTROLS[page] {
+                tab_to(window, id, cx);
+                assert_eq!(
+                    window.find(*id).focused(),
+                    Some(true),
+                    "{id} holds the keyboard focus on page {page}"
+                );
+            }
         }
 
-        // The Tab key itself moves focus between the controls of one page.
-        open_page(window, PAGE_LIMITS, cx);
+        // Tab walks a page's controls in the order the page lists them.
+        tab_to(window, PAGE_BUTTONS[PAGE_LIMITS], cx);
+        window.press("enter", cx);
+        draw(window, cx);
         tab_to(window, FieldKey::Bandwidth.id(), cx);
         window.press("tab", cx);
         assert_eq!(
@@ -669,7 +683,6 @@ async fn keyboard_reaches_every_control_and_steps_the_concurrency(cx: &mut TestA
         );
 
         // Up and Down step the focused field and save it.
-        tab_to(window, FieldKey::Concurrency.id(), cx);
         window.press("up", cx);
         window.press("up", cx);
         window.press("down", cx);
@@ -1131,6 +1144,18 @@ fn long_storage_paths_stay_inside_their_card(cx: &mut TestAppContext) {
     let deep = "a-very-long-directory-name".repeat(12);
     paths.config_file = temp.path().join(&deep).join("settings.toml");
     paths.state_db = temp.path().join(&deep).join("state.db");
+    let shown = [
+        (
+            "settings-path-config",
+            "settings-path-config-value",
+            paths.config_file.display().to_string(),
+        ),
+        (
+            "settings-path-state",
+            "settings-path-state-value",
+            paths.state_db.display().to_string(),
+        ),
+    ];
     let store = SettingsStore::open(paths.config_file.clone());
     let window = open_settings(cx, store, paths, FakeAutostart::new());
 
@@ -1140,10 +1165,7 @@ fn long_storage_paths_stay_inside_their_card(cx: &mut TestAppContext) {
         // #78: the house cards are gone, so the row's bound is the surface it
         // sits in rather than a card of its own.
         let surface = window.find("settings-scroll").bounds();
-        for (id, value_id) in [
-            ("settings-path-config", "settings-path-config-value"),
-            ("settings-path-state", "settings-path-state-value"),
-        ] {
+        for (id, value_id, path) in shown {
             let row = window.find(id).bounds();
             assert!(
                 row.right() <= surface.right() && row.left() >= surface.left(),
@@ -1160,6 +1182,13 @@ fn long_storage_paths_stay_inside_their_card(cx: &mut TestAppContext) {
             assert!(
                 value.size.width < surface.size.width,
                 "{value_id} shrank to fit instead of keeping its full width: {value:?} vs {surface:?}"
+            );
+            // #78: a read-only path a user has to hear needs a name of its own,
+            // and the row's title is not the path (S2).
+            assert_eq!(
+                window.find(value_id).label(),
+                Some(path.as_str()),
+                "{value_id} is named by the path it shows"
             );
         }
     })
@@ -2513,6 +2542,44 @@ const PAGE_STORAGE: usize = 5;
 /// The number of settings pages.
 const PAGE_COUNT: usize = 6;
 
+/// The page strip's buttons, in the order the surface lists them.
+const PAGE_BUTTONS: [&str; PAGE_COUNT] = [
+    "settings-page-connection",
+    "settings-page-general",
+    "settings-page-limits",
+    "settings-page-sync",
+    "settings-page-tagging",
+    "settings-page-storage",
+];
+
+/// The name each page button carries, which is the page's own name.
+const PAGE_TITLES: [&str; PAGE_COUNT] = [
+    "Connection",
+    "General",
+    "Limits",
+    "Sync",
+    "Tagging",
+    "Storage",
+];
+
+/// Every control that takes the keyboard, page by page. A read-only value, such
+/// as a resolved path, is not a control and holds no focus, so Storage has none.
+const PAGE_CONTROLS: [&[&str]; PAGE_COUNT] = [
+    &[
+        "settings-server-url",
+        "settings-email",
+        "settings-auth-password",
+        "settings-auth-apikey",
+        "settings-secret",
+        "settings-sign-in",
+    ],
+    &["settings-autostart"],
+    &["settings-bandwidth", "settings-concurrency"],
+    &["settings-scan-interval", "settings-attempt-cap"],
+    &["settings-tag-upload", "settings-tag-link"],
+    &[],
+];
+
 /// One settings row, as the surface promises it.
 struct RowPin {
     /// The page the row lives on.
@@ -2651,9 +2718,9 @@ fn draw(window: &mut Window, cx: &mut App) {
     window.render_frame(cx);
 }
 
-/// Opens one settings page by clicking its sidebar entry.
+/// Opens one settings page by clicking its page-strip button.
 fn open_page(window: &mut Window, page: usize, cx: &mut App) {
-    window.click(format!("0-{page}"), cx);
+    window.click(PAGE_BUTTONS[page], cx);
     draw(window, cx);
 }
 
@@ -2761,15 +2828,21 @@ fn every_settings_row_is_named_and_explained_on_its_own_page(cx: &mut TestAppCon
 
     cx.update_window(window, |_, window, cx| {
         draw(window, cx);
-        for page in 0..PAGE_COUNT {
-            assert!(
-                window.try_find(format!("0-{page}")).is_some(),
-                "page {page} has no sidebar entry"
+        // Each page's own button names it, and the kit's sidebar is not drawn:
+        // one page switch, not two (N3, S5).
+        for (page, id) in PAGE_BUTTONS.iter().enumerate() {
+            let button = window
+                .try_find(*id)
+                .unwrap_or_else(|| panic!("page {page} has no button"));
+            assert_eq!(
+                button.label(),
+                Some(PAGE_TITLES[page]),
+                "{id} carries the page's name"
             );
         }
         assert!(
-            window.try_find(format!("0-{PAGE_COUNT}")).is_none(),
-            "#78: the surface has exactly {PAGE_COUNT} pages"
+            window.try_find("0-0").is_none() && window.try_find("0-5").is_none(),
+            "#78: the kit's own sidebar entries are gone with the kit sidebar"
         );
 
         for page in 0..PAGE_COUNT {
@@ -3016,9 +3089,10 @@ fn scroll_page_to(
         {
             return row;
         }
+        // The wheel goes to the page body, the surface's only scrollable part:
+        // above it sits the page header and below it the reachability line.
         let surface = window.find("settings-scroll").bounds();
-        let viewport = Bounds::new(Point::default(), window.viewport_size());
-        let position = surface.intersect(&viewport).center();
+        let position = point(surface.center().x, surface.bottom() - px(44.));
         window.dispatch_event(
             ScrollEvent {
                 position,
@@ -3072,4 +3146,61 @@ fn typing_in_the_search_field_asks_the_surface_to_render(cx: &mut TestAppContext
         repaints.get() > 0,
         "#78: a keystroke in the search field did not ask the surface to render"
     );
+}
+
+/// #78: a paste into the search field refilters the rows, exactly as a keystroke
+/// does.
+///
+/// The harness re-renders the whole tree every frame, so asserting the rows
+/// after a paste proves nothing: they would be filtered by the next frame even
+/// with the bug. What is asserted instead is the view's own notification count
+/// across the paste, which stays zero until the surface subscribes to the
+/// field's `Change` event.
+#[gpui_kit::test]
+fn pasting_into_the_search_field_asks_the_surface_to_render(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let store = SettingsStore::open(paths.config_file.clone());
+    let (window, view) = open_settings_over_connection(
+        cx,
+        store,
+        paths,
+        FakeAutostart::new(),
+        cx.update(|cx| {
+            let credentials: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+            cx.new(|_| ConnectionModel::new(ServerProfile::default(), credentials))
+        }),
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        draw(window, cx);
+        tab_to(window, "settings-search", cx);
+    })
+    .expect("focus the settings search field");
+
+    let repaints = Rc::new(Cell::new(0));
+    let _watch = {
+        let repaints = Rc::clone(&repaints);
+        cx.update(|cx| cx.observe(&view, move |_, _| repaints.set(repaints.get() + 1)))
+    };
+
+    cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string("bandwidth".into())));
+    cx.update_window(window, |_, window, cx| {
+        window.dispatch_action(Box::new(gpui_kit::base::input::Paste), cx);
+        draw(window, cx);
+    })
+    .expect("paste into the search field");
+
+    assert!(
+        repaints.get() > 0,
+        "#78: a paste into the search field did not ask the surface to render"
+    );
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(
+            row_text_input(window, "settings-search", Role::TextInput).value(),
+            Some("bandwidth"),
+            "#78: the pasted text lands in the field"
+        );
+    })
+    .expect("read the search field");
 }

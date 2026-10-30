@@ -1,10 +1,11 @@
 //! The settings surface (SPEC R7, R8.5, R9): General, Limits, Sync, and the
 //! read-only Storage locations.
 //!
-//! Every control is keyboard reachable: `Switch` activates with Enter or Space,
-//! `NumberInput` edits with the keyboard and steps with Up and Down, and both
-//! draw the kit's focus ring. Each row also observes its control's focus handle
-//! so a test can assert reachability.
+//! Every control is keyboard reachable: the page strip puts all six pages in
+//! the Tab order, `Switch` activates with Enter or Space, `NumberInput` edits
+//! with the keyboard and steps with Up and Down, and both draw the kit's focus
+//! ring. Each row also observes its control's focus handle so a test can assert
+//! reachability.
 
 use std::rc::Rc;
 
@@ -18,12 +19,13 @@ use crate::paths::AppPaths;
 use crate::settings::{Settings, SettingsStore};
 
 use gpui_kit::base::ObservedElement;
+use gpui_kit::base::Selectable as _;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState, NumberInput};
 use gpui_kit::component::radio::Radio;
 use gpui_kit::component::setting::{
-    SettingField, SettingGroup, SettingItem, SettingPage, Settings as SettingsPages,
+    SelectIndex, SettingField, SettingGroup, SettingItem, SettingPage, Settings as SettingsPages,
 };
 use gpui_kit::component::switch::Switch;
 use gpui_kit::*;
@@ -35,6 +37,60 @@ use sync_core::tags::{BackfillStatus, SYNC_TAG, TagStatus};
 /// per second (SPEC R7.1); the UI shows MB/s with up to six decimals, which is
 /// one byte.
 pub const BYTES_PER_MEGABYTE: u64 = 1_000_000;
+
+/// One settings page: the element id of the button that opens it, its name, and
+/// the sentence under the name.
+struct Page {
+    id: &'static str,
+    title: &'static str,
+    description: &'static str,
+}
+
+/// The pages, in the order the surface lists them. The page strip and the page
+/// a button opens read the same entry, so a name cannot drift from its button.
+const PAGES: [Page; 6] = [
+    Page {
+        id: "settings-page-connection",
+        title: "Connection",
+        description: "The server and the account this client uploads to.",
+    },
+    Page {
+        id: "settings-page-general",
+        title: "General",
+        description: "How the client starts.",
+    },
+    Page {
+        id: "settings-page-limits",
+        title: "Limits",
+        description: "How much the client uses while it syncs.",
+    },
+    Page {
+        id: "settings-page-sync",
+        title: "Sync",
+        description: "How the client scans and retries.",
+    },
+    Page {
+        id: "settings-page-tagging",
+        title: "Tagging",
+        description: "Adds one tag to the assets this client uploads, so they can be found through \
+                      Immich's tag search.",
+    },
+    Page {
+        id: "settings-page-storage",
+        title: "Storage",
+        description: "Read-only. The database stays on this computer; it never lives on a network \
+                      share or in a cloud-sync folder.",
+    },
+];
+
+/// The index of each page in `PAGES`, so a page builder names the page it builds
+/// instead of repeating its title.
+const PAGE_CONNECTION: usize = 0;
+const PAGE_GENERAL: usize = 1;
+const PAGE_LIMITS: usize = 2;
+const PAGE_SYNC: usize = 3;
+const PAGE_TAGGING: usize = 4;
+const PAGE_STORAGE: usize = 5;
 
 /// One numeric setting the view edits, its text, and its bounds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -237,6 +293,9 @@ pub struct SettingsView {
     connection: Entity<ConnectionModel>,
     /// The search field over the pages' rows (#78).
     search: Entity<InputState>,
+    /// The page the strip shows (#78). The component is keyed on the page this
+    /// selects, so re-keying is what moves it.
+    page: usize,
     server_url_input: Entity<InputState>,
     email_input: Entity<InputState>,
     secret_input: Entity<InputState>,
@@ -286,7 +345,7 @@ impl SettingsView {
     ) -> Self {
         let initial = store.settings().clone();
         let mut fields = Vec::with_capacity(FieldKey::ALL.len());
-        let mut subscriptions = Vec::with_capacity(FieldKey::ALL.len() + 1);
+        let mut subscriptions = Vec::with_capacity(FieldKey::ALL.len() + 2);
         for key in FieldKey::ALL {
             let input = cx.new(|cx| {
                 InputState::new(window, cx)
@@ -336,12 +395,19 @@ impl SettingsView {
                 }
             },
         ));
-        // #78: the surface filters its own rows, so the field's changes are the
-        // view's own notifications, not the kit's search state.
         // #78: the surface filters its own rows from this field's value, the
         // way the kit's own settings search does: the value is read when the
         // surface renders, not kept as a second copy that an event can miss.
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search settings"));
+        // Every text replacement emits `Change`, a paste included, and a paste
+        // comes with no keystroke for a key listener to catch (S1).
+        subscriptions.push(
+            cx.subscribe_in(&search, window, |_, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            }),
+        );
         // The profile is persisted only once the model reaches connected, so
         // a refused sign-in leaves the saved profile and credential in step.
         subscriptions.push(cx.observe(&connection, |this, _, cx| {
@@ -354,6 +420,7 @@ impl SettingsView {
             autostart,
             connection,
             search,
+            page: 0,
             server_url_input,
             email_input,
             secret_input,
@@ -789,6 +856,10 @@ impl SettingsView {
                     .flex()
                     .flex_col()
                     .gap_0p5()
+                    // The field beside this is a fixed width, so the copy has to
+                    // wrap in what the minimum window leaves rather than push
+                    // the field past the edge (#75's minimum-window test).
+                    .min_w_0()
                     .child(
                         div()
                             .text_2xl()
@@ -806,19 +877,43 @@ impl SettingsView {
                 // #78: the surface owns the query, because it also owns the
                 // result when nothing matches. The component still owns the
                 // pages, the groups, the rows, and the sidebar; its own search
-                // field is dropped by `sidebar_header()`.
+                // field is dropped by `hidden()`.
                 div()
                     .id("settings-search")
                     .test_support()
                     .track_focus(&focus)
                     .w_64()
                     .flex_none()
-                    // The field's own state does not report every edit to this
-                    // view, so the keystroke that made it is what asks for the
-                    // render that reads the value.
-                    .on_key_down(cx.listener(|_, _, _, cx| cx.notify()))
                     .child(Input::new(&self.search).aria_label("Search settings")),
             )
+    }
+
+    /// The page strip: one button per page, the same shape as the shell's own
+    /// view switch.
+    ///
+    /// A kit sidebar entry has no focus handle and no key binding, so the strip
+    /// is the only keyboard path between the pages (#78).
+    fn page_strip(&self, selected: usize, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let mut strip = div().flex().flex_row().flex_wrap().items_center().gap_1();
+        for (ix, page) in PAGES.iter().enumerate() {
+            let active = ix == selected;
+            let button = Button::new(page.id).label(page.title).selected(active);
+            // The page the surface shows is prominent; the others are quiet.
+            let button = if active {
+                button.primary()
+            } else {
+                button.ghost()
+            };
+            strip = strip
+                .child(button.on_click(cx.listener(move |this, _, _, cx| this.show_page(ix, cx))));
+        }
+        strip
+    }
+
+    /// Opens one page from the strip.
+    fn show_page(&mut self, page: usize, cx: &mut Context<Self>) {
+        self.page = page;
+        cx.notify();
     }
 
     /// The problem notices, when the file failed to load or an action failed.
@@ -854,13 +949,12 @@ impl SettingsView {
         )
     }
 
-    /// Every page, filtered to the search query.
+    /// Every page that survives the search query, with the index it has in the
+    /// unfiltered set.
     ///
     /// A page keeps the rows whose title or help sentence contain the query,
-    /// and a page or group left without one is dropped. The component lands on
-    /// the first page it is given, so the search lands on the first page that
-    /// holds a match.
-    fn pages(&self, query: &str, cx: &mut Context<Self>) -> Vec<SettingPage> {
+    /// and a page or group left without one is dropped.
+    fn pages(&self, query: &str, cx: &mut Context<Self>) -> Vec<(usize, SettingPage)> {
         let query = query.trim().to_lowercase();
         [
             self.connection_page(&query, cx),
@@ -871,7 +965,8 @@ impl SettingsView {
             self.storage_page(&query, cx),
         ]
         .into_iter()
-        .flatten()
+        .enumerate()
+        .filter_map(|(index, page)| page.map(|page| (index, page)))
         .collect()
     }
 
@@ -953,8 +1048,7 @@ impl SettingsView {
         }
 
         page(
-            "Connection",
-            "The server and the account this client uploads to.",
+            PAGE_CONNECTION,
             vec![
                 group(Some("Server"), server, query),
                 group(Some("Sign in"), sign_in, query),
@@ -1088,18 +1182,13 @@ impl SettingsView {
                 },
             ));
         }
-        page(
-            "General",
-            "How the client starts.",
-            vec![group(None, rows, query)],
-        )
+        page(PAGE_GENERAL, vec![group(None, rows, query)])
     }
 
     /// The Limits page: bandwidth and concurrency (SPEC R7).
     fn limits_page(&self, query: &str, cx: &App) -> Option<SettingPage> {
         page(
-            "Limits",
-            "How much the client uses while it syncs.",
+            PAGE_LIMITS,
             vec![group(
                 None,
                 [FieldKey::Bandwidth, FieldKey::Concurrency]
@@ -1114,8 +1203,7 @@ impl SettingsView {
     /// The Sync page: scan interval and attempt cap (SPEC R2.3, R6.1).
     fn sync_page(&self, query: &str, cx: &App) -> Option<SettingPage> {
         page(
-            "Sync",
-            "How the client scans and retries.",
+            PAGE_SYNC,
             vec![group(
                 None,
                 [FieldKey::ScanInterval, FieldKey::AttemptCap]
@@ -1244,11 +1332,7 @@ impl SettingsView {
                 },
             ));
         }
-        page(
-            "Tagging",
-            "Adds one tag to the assets this client uploads, so they can be found through Immich's tag search.",
-            vec![group(None, rows, query)],
-        )
+        page(PAGE_TAGGING, vec![group(None, rows, query)])
     }
 
     /// The Storage page: the resolved locations, read-only (SPEC R9).
@@ -1257,8 +1341,7 @@ impl SettingsView {
         let mono = theme.mono_font_family.clone();
         let muted = theme.muted_foreground;
         page(
-            "Storage",
-            "Read-only. The database stays on this computer; it never lives on a network share or in a cloud-sync folder.",
+            PAGE_STORAGE,
             vec![group(
                 None,
                 vec![
@@ -1329,10 +1412,25 @@ impl Render for SettingsView {
         let theme = cx.theme();
         let background = theme.background;
         let foreground = theme.foreground;
+        let muted = theme.muted_foreground;
         let notices = self.notices();
         let header = self.header(cx);
         let query = self.search.read(cx).value().to_string();
         let pages = self.pages(&query, cx);
+        // The page the surface shows: the one the strip picked while the query
+        // leaves it a row, otherwise the first page the query landed on.
+        let shown = if pages.iter().any(|(index, _)| *index == self.page) {
+            self.page
+        } else {
+            pages.first().map_or(self.page, |(index, _)| *index)
+        };
+        // The component keys its selection on its own id, so the page it shows is
+        // seeded and re-keyed from here (S5).
+        let selected = pages
+            .iter()
+            .position(|(index, _)| *index == shown)
+            .unwrap_or(0);
+        let strip = self.page_strip(shown, cx);
         let body = if pages.is_empty() {
             div()
                 .flex_1()
@@ -1344,17 +1442,22 @@ impl Render for SettingsView {
                 .flex_1()
                 .min_h_0()
                 .w_full()
+                // The component's sidebar is collapsed to nothing but still draws
+                // its drag handle, a hairline one pixel inside this box: the
+                // inset and the clip take it out of the surface.
+                .pl(px(1.))
+                .overflow_hidden()
                 .child(RenderOnce::render(
-                    SettingsPages::new("settings-pages")
-                        .pages(pages)
-                        // A sidebar never narrower than this keeps the page
-                        // panel under the component's 480 px stacking
-                        // breakpoint at the shell's 720 px minimum window, so
-                        // every row lays its control out full width instead of
-                        // beside a squeezed label column.
-                        .sidebar_width(px(220.))
-                        .sidebar_size_range(px(220.)..px(300.))
-                        .header_style(&sidebar_header()),
+                    SettingsPages::new(("settings-pages", selected))
+                        .pages(pages.into_iter().map(|(_, page)| page))
+                        .default_selected_index(SelectIndex {
+                            page_ix: selected,
+                            group_ix: None,
+                        })
+                        .sidebar_width(px(0.))
+                        .sidebar_size_range(px(0.)..px(0.))
+                        .sidebar_style(&hidden())
+                        .header_style(&hidden()),
                     window,
                     cx,
                 ))
@@ -1373,12 +1476,25 @@ impl Render for SettingsView {
             .gap_2()
             .child(header)
             .children(notices)
+            .child(strip)
             .child(body)
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("Every control is reachable with the Tab key."),
+            )
     }
 }
 
 /// One row of the settings surface: the words the search compares, and the item
 /// the kit lays out.
+///
+/// The id, name and help attributes stay on the wrapper each row builder creates
+/// around its control, because that wrapper is also what tracks the control's
+/// focus handle: `text_row` and `numeric_row` forward the kit input's handle, and
+/// a `Switch` or `Button` names itself. A row cannot own that wrapper without
+/// also owning a handle it does not have (S4, recorded for #80).
 struct Row {
     /// The row's title, which names its control.
     title: &'static str,
@@ -1486,18 +1602,15 @@ fn group(title: Option<&'static str>, rows: Vec<Row>, query: &str) -> Option<Set
 }
 
 /// One page, kept only when a group of it survives the search.
-fn page(
-    title: &'static str,
-    description: &'static str,
-    groups: Vec<Option<SettingGroup>>,
-) -> Option<SettingPage> {
+fn page(index: usize, groups: Vec<Option<SettingGroup>>) -> Option<SettingPage> {
     let groups: Vec<SettingGroup> = groups.into_iter().flatten().collect();
     if groups.is_empty() {
         return None;
     }
+    let page = &PAGES[index];
     Some(
-        SettingPage::new(title)
-            .description(description)
+        SettingPage::new(page.title)
+            .description(page.description)
             .groups(groups),
     )
 }
@@ -1531,6 +1644,7 @@ fn storage_row(
                     div()
                         .id(value_id)
                         .test_support()
+                        .aria_label(path.clone())
                         .min_w_0()
                         .truncate()
                         .font_family(mono.clone())
@@ -1543,9 +1657,9 @@ fn storage_row(
     })
 }
 
-/// The sidebar header style that leaves the kit's own search field out: the
-/// surface draws its own, and two fields would be one too many.
-fn sidebar_header() -> StyleRefinement {
+/// A style that leaves an element out of the layout: the kit's own page sidebar
+/// duplicates the strip and its search field duplicates the surface's.
+fn hidden() -> StyleRefinement {
     StyleRefinement {
         display: Some(Display::None),
         ..StyleRefinement::default()
@@ -1576,8 +1690,11 @@ fn connection_severity(state: &ConnectionState) -> Severity {
 /// right.
 ///
 /// This and the card helpers below stay for the diagnostics and logs surfaces,
-/// which still borrow them; #78 took the settings surface off them, and #80
-/// owns deleting whichever is left with one user.
+/// which still borrow them; #78 took the settings surface off them.
+///
+/// `field_text` survives #78 with two callers, `diagnostics_view` and
+/// `logs_view`. #80 owns deleting it, and it owns the logs view's four uses
+/// too: no ticket in this spec covers that surface's share of the helper.
 pub(crate) fn field_text(label: &str, help: &str, palette: &CardPalette) -> impl IntoElement {
     div()
         .flex()

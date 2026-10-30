@@ -341,7 +341,7 @@ async fn every_long_surface_reaches_its_last_element_at_a_short_height(cx: &mut 
             cx.update_window(window, |_, window, cx| {
                 window.render_frame(cx);
                 window.render_frame(cx);
-                window.click("0-5", cx);
+                window.click("settings-page-storage", cx);
             })
             .expect("open the settings surface's last page");
         }
