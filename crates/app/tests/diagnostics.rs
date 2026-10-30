@@ -1592,6 +1592,15 @@ async fn every_value_row_keeps_its_element_id_and_accessible_name(cx: &mut TestA
                     Some(name.as_str()),
                     "{id} keeps its accessible name in {system:?}"
                 );
+                // #80: the term is announced as a term, not as flat text.
+                let term = window
+                    .try_find(ElementId::Name(format!("{id}-label").into()))
+                    .unwrap_or_else(|| panic!("{id} has no label in {system:?}"));
+                assert_eq!(
+                    term.role(),
+                    Some(Role::Term),
+                    "{id} is announced as its term in {system:?}"
+                );
             }
             // The rows whose value the run itself decides: each one still says
             // what it said before the migration, and none may be blank.
@@ -1627,6 +1636,87 @@ async fn every_value_row_keeps_its_element_id_and_accessible_name(cx: &mut TestA
                     .label()
                     .is_some_and(|size| !size.is_empty()),
                 "the database size is still shown"
+            );
+        })
+        .expect("update the shell window");
+    }
+}
+
+/// The most lines a value may take before it is cut. A copy of the view's
+/// clamp, deliberately not imported, so raising it fails here (#80).
+const VALUE_LINE_CLAMP: f32 = 6.;
+
+/// #80: a value long enough to fill the card is cut at a fixed number of lines,
+/// and the whole text stays in the row's accessible name.
+///
+/// `UploadFailure::message` is the raw error text, so a 2000-character server
+/// answer reaches this row. Unclamped it wraps to about 45 lines in the
+/// description column at 520 px and makes the errors card one tall row; the cut
+/// is visual only, so the name still carries every character.
+#[gpui_kit::test]
+async fn a_very_long_value_is_cut_at_the_clamp_and_keeps_its_whole_name(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let (_runtime, server) = mock_server();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let connection = connection_model(cx, &server, AuthMethod::ApiKey);
+    let (window, store, _engine, diagnostics) = open_shell(
+        cx,
+        SettingsStore::open(paths.config_file.clone()),
+        paths.clone(),
+        connection.clone(),
+    );
+    wait_until(cx, "the store", |cx| store.read(cx).store().is_some()).await;
+    let message: String = "the server answered 415 "
+        .repeat(84)
+        .chars()
+        .take(2000)
+        .collect();
+    assert_eq!(message.chars().count(), 2000, "the message is the long one");
+    cx.update(|cx| seed_failure(&store, cx, &message));
+    cx.update(|cx| diagnostics.update(cx, |model, cx| model.refresh(cx)));
+    wait_until(cx, "the last error per class", |cx| {
+        !diagnostics.read(cx).errors().is_empty()
+    })
+    .await;
+
+    cx.update_window(window, |_, window, cx| {
+        show_diagnostics(window, cx);
+        window.resize(size(px(520.), px(480.)));
+        window.bounds_changed(cx);
+        window.render_frame(cx);
+    })
+    .expect("update the shell window");
+
+    let name = format!("unsupported_format: {message}");
+    for system in [theme::SystemTheme::Light, theme::SystemTheme::Dark] {
+        cx.update(|cx| theme::apply_system_theme(system, cx));
+        cx.update_window(window, |_, window, cx| {
+            show_diagnostics(window, cx);
+            let one_line = f32::from(
+                window
+                    .find("diagnostics-throughput-value")
+                    .bounds()
+                    .size
+                    .height,
+            );
+            assert!(
+                one_line > 0.,
+                "a one-line value has a height to measure against"
+            );
+            scroll_diagnostics_into_view(window, cx, "diagnostics-error-unsupported_format");
+            let value = window.find("diagnostics-error-unsupported_format");
+            let lines = f32::from(value.bounds().size.height) / one_line;
+            assert!(
+                (lines - VALUE_LINE_CLAMP).abs() <= 1.,
+                "{system:?}: the 2000-character value takes {lines:.1} lines, the clamp's \
+                 {VALUE_LINE_CLAMP}"
+            );
+            // The cut is visual: every character is still in the name.
+            assert_eq!(
+                value.label(),
+                Some(name.as_str()),
+                "{system:?}: the whole 2000-character value stays announced"
             );
         })
         .expect("update the shell window");

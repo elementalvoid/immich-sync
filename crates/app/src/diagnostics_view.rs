@@ -389,13 +389,13 @@ impl DiagnosticsView {
             ),
             BundleState::Ready(report) => {
                 rows.push(
-                    value_list(vec![value_item(
+                    value_list(vec![mono_value_item(
                         "Archive",
                         Some("Attach this file to your support message."),
                         "diagnostics-bundle-path-value",
                         report.path.display().to_string(),
-                        None,
                         &palette,
+                        theme.mono_font_family.clone(),
                     )])
                     .into_any_element(),
                 );
@@ -557,6 +557,14 @@ impl DiagnosticsView {
 /// of taking the term's width (#80).
 const LABEL_COLUMN_REMS: f32 = 12.;
 
+/// The most lines a value may take before it is cut (#80).
+///
+/// A value can be as long as a server or a filesystem makes it — a failure
+/// message is the raw error text — and an unclamped one grows its card by that
+/// many lines. The cut is visual only: the value's accessible name still carries
+/// the whole text.
+const VALUE_LINE_CLAMP: usize = 6;
+
 /// The description list a card's value rows share (#80).
 ///
 /// `columns(1)` puts one row in each line. `bordered(false)` leaves the card's
@@ -583,10 +591,39 @@ fn value_item(
     name: Option<String>,
     palette: &CardPalette,
 ) -> DescriptionItem {
+    value_item_with_font(label, help, value_id, value, name, palette, None)
+}
+
+/// The archive path's row: [`value_item`] with its value set in the mono font,
+/// as every other read-only path in the app is, so `l`/`1` and `O`/`0` stay
+/// apart (#80).
+fn mono_value_item(
+    label: &str,
+    help: Option<&str>,
+    value_id: &str,
+    value: String,
+    palette: &CardPalette,
+    mono: SharedString,
+) -> DescriptionItem {
+    value_item_with_font(label, help, value_id, value, None, palette, Some(mono))
+}
+
+/// The one row shape both constructors build, with `font` as the value's family
+/// when it is not the UI's (#80).
+fn value_item_with_font(
+    label: &str,
+    help: Option<&str>,
+    value_id: &str,
+    value: String,
+    name: Option<String>,
+    palette: &CardPalette,
+    font: Option<SharedString>,
+) -> DescriptionItem {
     DescriptionItem::new(
         div()
             .id(ElementId::Name(format!("{value_id}-label").into()))
             .test_support()
+            .role(Role::Term)
             .min_w_0()
             .text_sm()
             .font_weight(FontWeight::MEDIUM)
@@ -605,8 +642,10 @@ fn value_item(
                     .test_support()
                     .aria_label(name.unwrap_or_else(|| value.clone()))
                     .min_w_0()
+                    .line_clamp(VALUE_LINE_CLAMP)
                     .text_xs()
                     .text_color(palette.text)
+                    .when_some(font, |this, font| this.font_family(font))
                     .child(value),
             )
             .when_some(help, |this, help| {
