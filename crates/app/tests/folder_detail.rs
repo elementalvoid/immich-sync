@@ -288,6 +288,18 @@ fn open_detail_now(cx: &mut TestAppContext, window: AnyWindowHandle) {
     });
 }
 
+/// Scrolls the detail's body to its end with the wheel, as a person does when
+/// the detail is taller than the panel (#81).
+fn scroll_detail_to_bottom(window: &mut Window, cx: &mut App) {
+    for _ in 0..8 {
+        window.scroll(
+            "folder-detail-body-dim",
+            ScrollDelta::Pixels(point(px(0.), px(-120.))),
+            cx,
+        );
+    }
+}
+
 #[gpui_kit::test]
 async fn a_card_click_and_its_details_control_open_the_detail(cx: &mut TestAppContext) {
     // A worker thread wakes the foreground executor, which the harness
@@ -348,12 +360,25 @@ async fn a_card_click_and_its_details_control_open_the_detail(cx: &mut TestAppCo
         );
     });
 
-    // Esc closes it and the card gets the keyboard back.
-    // A press on the card's own surface moves no focus: the card is not a
-    // control, and the test blurred first, so this only pins the close.
+    // Esc closes it and the card gets the keyboard back (#43).
     act(cx, window, |window, cx| window.press("escape", cx));
     read(cx, window, |window, _| {
         assert!(!detail_open(window), "#43: Escape closes the detail");
+        assert_eq!(
+            window.find(("folder-card", 0_usize)).focused(),
+            Some(true),
+            "#43, #81: a press on the card body gets the keyboard back on that card"
+        );
+    });
+    // The card is a container, not a tab stop: Tab descends to its Details
+    // control, which is where a keyboard user continues (#43).
+    act(cx, window, |window, cx| window.press("tab", cx));
+    read(cx, window, |window, _| {
+        assert_eq!(
+            window.find(("folder-details", 0_usize)).focused(),
+            Some(true),
+            "#43: Tab from the restored card reaches its Details control"
+        );
     });
 
     // #81: the layer hands the keyboard back to the control that opened the
@@ -584,9 +609,9 @@ async fn the_detail_settings_reach_the_store_by_pointer_and_by_keyboard(cx: &mut
     // With the mapping on, the scope radios take focus and answer the keyboard.
     act(cx, window, |window, cx| {
         tab_to(window, "folder-panel-album-whole", cx);
-        // #81: inside a dialog, the kit binds Enter to the dialog's Confirm, so
-        // a control is activated with Space (as every other button in the app).
-        window.press("space", cx);
+        // #81: Enter reaches the focused control inside the panel again, because
+        // the dialog no longer binds it to a Confirm the panel does not have.
+        window.press("enter", cx);
     });
     let whole = wait_for_folder(cx, &store, |folder| {
         folder.album_scope == AlbumScope::WholeFolder
@@ -664,6 +689,117 @@ async fn the_detail_traps_focus_and_every_control_is_keyboard_reachable(cx: &mut
         ] {
             tab_to(window, id, cx);
         }
+    });
+}
+
+/// #81: Enter activates the focused control inside the panel again.
+///
+/// The layer's dialog binds `enter` to its own `Confirm`, and a matched binding
+/// swallows the key before the raw event reaches the focused control, so Enter
+/// was inert on every non-text control in the panel while Space still worked.
+/// `.keyboard(false)` drops that context, so this test tells the fix from the
+/// bug for Enter, for Space, for Escape, and for the focus trap the same
+/// context supplied.
+#[gpui_kit::test]
+async fn enter_activates_the_focused_control_and_the_other_keys_still_work(
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+    seed_folder(&paths, &photos, true);
+    let (window, store, _view) = open_dashboard(cx, &paths);
+    wait_for_store(cx, &store).await;
+
+    // Enter on the panel's own Close control closes it, and the layer still
+    // hands the keyboard back to the control that opened the panel.
+    open_detail_now(cx, window);
+    act(cx, window, |window, cx| {
+        tab_to(window, "folder-detail-close", cx);
+        window.press("enter", cx);
+    });
+    read(cx, window, |window, _| {
+        assert!(
+            !detail_open(window),
+            "#81: Enter activates the focused Close control"
+        );
+        assert_eq!(
+            window.find(("folder-details", 0_usize)).focused(),
+            Some(true),
+            "#81: closing with Enter still returns the keyboard to the opener"
+        );
+    });
+
+    // Space is unchanged: it activates the same control. That the detail opens
+    // again at all is the other half of the first proof: the panel's own event
+    // closed it, not the layer confirming the dialog behind the panel's back
+    // (an open panel would refuse this reopen).
+    open_detail_now(cx, window);
+    act(cx, window, |window, cx| {
+        tab_to(window, "folder-detail-close", cx);
+        window.press("space", cx);
+    });
+    read(cx, window, |window, _| {
+        assert!(
+            !detail_open(window),
+            "#81: Space still activates the focused Close control"
+        );
+    });
+
+    // A second, non-closing control: Enter on Remove opens its confirmation
+    // over the panel, so the click that control dispatches really ran.
+    open_detail_now(cx, window);
+    act(cx, window, |window, cx| {
+        tab_to(window, "folder-detail-remove", cx);
+        window.press("enter", cx);
+        common::settle_alert(window, cx);
+    });
+    read(cx, window, |window, _| {
+        assert!(
+            window.try_find("folder-detail-confirm").is_some(),
+            "#81: Enter activates Remove, which asks before it removes"
+        );
+        assert!(
+            detail_open(window),
+            "#81: Enter on a panel control does not confirm the dialog away"
+        );
+    });
+
+    // Escape closes the topmost layer and then the panel, as before.
+    act(cx, window, |window, cx| {
+        window.press("escape", cx);
+        common::settle_alert(window, cx);
+    });
+    read(cx, window, |window, _| {
+        assert!(
+            window.try_find("folder-detail-confirm").is_none(),
+            "#81: Escape dismisses the confirmation first"
+        );
+        assert!(
+            detail_open(window),
+            "the panel is still there behind its confirmation"
+        );
+    });
+    act(cx, window, |window, cx| window.press("escape", cx));
+    read(cx, window, |window, _| {
+        assert!(!detail_open(window), "#81: Escape still closes the panel");
+    });
+
+    // The focus trap the layer supplies is not part of what `.keyboard(false)`
+    // turned off: Tab from the panel's last control wraps inside the dialog.
+    open_detail_now(cx, window);
+    act(cx, window, |window, cx| {
+        tab_to(window, "folder-detail-remove", cx);
+        window.press("tab", cx);
+    });
+    read(cx, window, |window, _| {
+        assert_eq!(
+            window.find("folder-detail-close").focused(),
+            Some(true),
+            "#81: Tab from the last control wraps to the panel's first, not to the page"
+        );
     });
 }
 
@@ -754,13 +890,15 @@ async fn both_panel_widths_go_through_the_layer_and_stay_centred(cx: &mut TestAp
 }
 
 /// #81: the layer sizes the panel, so at the widest content the detail carries
-/// (a full page of uploaded assets) every control is on screen and none needs a
-/// test-side scroll. That is #73's rule for the confirmation, extended to the
-/// panel itself.
+/// (a full page of uploaded assets) the list keeps #44's five rows, and the
+/// wheel — not a test-side scroll — reaches the last row of controls.
+///
+/// The detail with 50 assets loaded is 866 px tall and the layer allows the
+/// panel 734 px, so this window scrolls the panel's body: that is #44's list at
+/// its own 18rem cap, not a data view shrunk to fit. A folder with a few assets
+/// fits whole, and at 1200x480 the same body scrolls for the same reason (#43).
 #[gpui_kit::test]
-async fn every_control_in_the_detail_is_on_screen_without_a_test_side_scroll(
-    cx: &mut TestAppContext,
-) {
+async fn the_list_keeps_five_rows_and_the_wheel_reaches_the_last_control(cx: &mut TestAppContext) {
     cx.executor().allow_parking();
     let temp = tempfile::tempdir().expect("create a temp dir");
     let paths = temporary_paths(temp.path());
@@ -778,45 +916,66 @@ async fn every_control_in_the_detail_is_on_screen_without_a_test_side_scroll(
 
     open_detail_now(cx, window);
     wait_for_asset_rows(cx, window, 50).await;
-    read(cx, window, |window, _| {
+    read(cx, window, |window, cx| {
+        // #44, #81: the data view is not the region that pays for the controls.
+        let first = window.find(("folder-asset", 0_usize)).bounds().origin.y;
+        let second = window.find(("folder-asset", 1_usize)).bounds().origin.y;
+        let rows = f32::from(window.find("folder-assets-list").bounds().size.height)
+            / f32::from(second - first);
+        assert!(
+            rows >= 5.,
+            "#81: the list keeps five rows at the default window: {rows}"
+        );
+
         let viewport = Bounds::new(Point::default(), window.viewport_size());
-        // Bottom to top: the last row of the panel is what a body that grew
-        // past its surface would push off screen.
+        // Everything above the list is on screen before any scroll.
         for id in [
-            "folder-detail-remove",
-            "folder-detail-failed",
-            "folder-detail-review",
-            "folder-detail-open",
-            "folder-assets-more",
-            "folder-detail-scan",
-            "folder-detail-upload",
-            "folder-panel-album-whole",
-            "folder-panel-album-leaf",
-            "folder-panel-album",
-            "folder-panel-recursive",
-            "folder-panel-title",
-            "folder-detail-activity",
-            "folder-detail-counts",
-            "folder-detail-state",
-            "folder-panel-path",
-            "folder-detail-title",
             "folder-detail-close",
+            "folder-panel-path",
+            "folder-detail-state",
+            "folder-detail-counts",
+            "folder-panel-title",
+            "folder-panel-recursive",
+            "folder-detail-upload",
+            "folder-detail-scan",
         ] {
-            let found = window.find(id);
-            assert!(
-                found.visible(),
-                "#81: {id} is on screen without scrolling the panel"
-            );
-            let bounds = found.bounds();
+            let bounds = window.find(id).bounds();
+            assert!(window.find(id).visible(), "#81: {id} is on screen");
             assert!(
                 viewport.contains(&bounds.origin)
                     && viewport.contains(&point(bounds.right(), bounds.bottom())),
                 "#81: {id} is inside the window: {bounds:?} in {viewport:?}"
             );
         }
+
+        // The panel's own body is what scrolls; the dashboard stays put.
+        let title = window.find("folder-detail-title").bounds().origin.y;
+        scroll_detail_to_bottom(window, cx);
+        assert!(
+            window.find("folder-detail-title").bounds().origin.y < title,
+            "#81: the panel scrolled, not the dashboard behind it"
+        );
+        for id in [
+            "folder-assets-more",
+            "folder-detail-open",
+            "folder-detail-failed",
+            "folder-detail-review",
+            "folder-detail-remove",
+        ] {
+            let bounds = window.find(id).bounds();
+            assert!(
+                window.find(id).visible(),
+                "#81: {id} is on screen after a user's scroll"
+            );
+            assert!(
+                viewport.contains(&bounds.origin)
+                    && viewport.contains(&point(bounds.right(), bounds.bottom())),
+                "#81: {id} is inside the window after the scroll: {bounds:?} in {viewport:?}"
+            );
+        }
     });
     // The harness refuses a clipped target, so this press is the proof that the
-    // bottom-most control is reachable with no test-side scroll.
+    // bottom-most control is reachable with the wheel alone.
     act(cx, window, |window, cx| {
         window.click("folder-detail-remove", cx);
         common::settle_alert(window, cx);
@@ -824,7 +983,7 @@ async fn every_control_in_the_detail_is_on_screen_without_a_test_side_scroll(
     read(cx, window, |window, _| {
         assert!(
             window.try_find("folder-detail-confirm").is_some(),
-            "#81: Remove answers a press without scrolling"
+            "#81: Remove answers a press after a user's scroll"
         );
     });
 }
@@ -915,7 +1074,7 @@ async fn escape_the_backdrop_and_the_close_control_all_close_the_detail(cx: &mut
     });
 
     // #43: a click on a non-control area inside the dialog is not a backdrop
-    // click: the card is a mouse barrier above it.
+    // click: the layer's surface occludes the backdrop under it (#81).
     open_detail_now(cx, window);
     act(cx, window, |window, cx| {
         window.click("folder-detail-counts", cx)
@@ -1754,6 +1913,7 @@ async fn load_more_appends_the_next_page_and_keeps_the_loaded_rows(cx: &mut Test
     });
 
     act(cx, window, |window, cx| {
+        scroll_detail_to_bottom(window, cx);
         window.click("folder-assets-more", cx)
     });
     wait_for_asset_rows(cx, window, 100).await;
@@ -1863,9 +2023,8 @@ async fn an_asset_link_is_named_reachable_and_opens_the_configured_server(cx: &m
             "reaching the link does not open it"
         );
     });
-    // #81: a control inside a dialog answers Space; the kit binds Enter to the
-    // dialog's own Confirm.
-    act(cx, window, |window, cx| window.press("space", cx));
+    // #81: Enter reaches the focused control inside the panel again.
+    act(cx, window, |window, cx| window.press("enter", cx));
     assert_eq!(
         opened.lock().expect("the recorder lock").as_slice(),
         ["https://immich.example.com/immich/photos/asset-one"],
@@ -1974,6 +2133,7 @@ async fn the_list_reloads_on_a_new_upload_and_keeps_the_loaded_row_count(cx: &mu
     open_detail_now(cx, window);
     wait_for_asset_rows(cx, window, 50).await;
     act(cx, window, |window, cx| {
+        scroll_detail_to_bottom(window, cx);
         window.click("folder-assets-more", cx)
     });
     wait_for_asset_rows(cx, window, 100).await;

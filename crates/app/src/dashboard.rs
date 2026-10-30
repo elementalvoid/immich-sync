@@ -4,6 +4,7 @@
 //! A new folder is confirmed in the setup dialog (#40) before the client
 //! records and scans it; the dialog's panel lives in [`crate::folder_panel`].
 
+use std::cell::Cell;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -97,6 +98,16 @@ impl Dashboard {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        // #81: the panel's dialog drops the layer's key context so Enter
+        // reaches the control it is aimed at, which also drops the layer's own
+        // Escape binding. The panel supplies that binding in its own context,
+        // bound once per window here because the keymap is app state and the
+        // panel is the only surface that uses it.
+        cx.bind_keys([KeyBinding::new(
+            "escape",
+            gpui_kit::base::actions::Cancel,
+            Some(crate::folder_panel::KEY_CONTEXT),
+        )]);
         let folder_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("/home/you/Pictures")
@@ -312,9 +323,18 @@ impl Dashboard {
     /// its Cancel, Escape, or the space around it.
     fn open_panel_dialog(panel: Entity<FolderPanel>, window: &mut Window, cx: &mut App) {
         let dismissed = panel.downgrade();
+        // The layer focuses its own shell, and the shell has no key context
+        // once the dialog drops it (below), so the keyboard starts on the panel:
+        // that is what keeps the panel's own Escape binding on the dispatch
+        // path. Only the first build focuses: a rebuild must not take the
+        // keyboard from a control the user has reached.
+        let first = Cell::new(true);
         window.open_dialog(cx, move |dialog, window, cx| {
             let content = panel.clone();
             let dismissed = dismissed.clone();
+            if first.replace(false) {
+                window.focus(&panel.read(cx).focus_handle(), cx);
+            }
             dialog
                 .width(content.read(cx).dialog_width().to_pixels(window.rem_size()))
                 .centered()
@@ -324,10 +344,12 @@ impl Dashboard {
                 .content(move |content_el, _, _| content_el.min_h_0().child(content.clone()))
                 // The panel has no single OK: its own Add button confirms the
                 // setup and the detail confirms nothing. The layer binds a bare
-                // Enter to its Confirm, so an Enter meant for a panel control
-                // would close the dialog without the panel ever hearing about
-                // it.
-                .on_ok(|_, _, _| false)
+                // Enter to its Confirm, and a matched binding swallows the key
+                // before it reaches the focused control, so Enter on any panel
+                // control was inert. Dropping the key context unbinds Confirm
+                // (and Escape, which the panel binds itself) and leaves the
+                // focus trap, the backdrop and the focus return in place.
+                .keyboard(false)
                 .on_cancel(move |_, _, cx| {
                     // Escape and the outside press are the panel's dismissal, so
                     // the layer must not close it behind the panel's back: the
@@ -683,10 +705,35 @@ impl Render for Dashboard {
                                 // nothing needs to stop a click. Its settings
                                 // are read straight into the card's text.
                                 .when(live, |this| {
+                                    // #81: the card holds the keyboard, so the
+                                    // layer has something to give back when a
+                                    // press on the card itself opened the
+                                    // detail. It is no tab stop of its own, so
+                                    // Tab descends to its Details control.
+                                    let focus = window
+                                        .use_keyed_state(
+                                            format!("folder-card-focus:{path}"),
+                                            cx,
+                                            |_, cx| cx.focus_handle(),
+                                        )
+                                        .read(cx)
+                                        .clone();
+                                    let press = focus.clone();
                                     let path = path.clone();
-                                    this.on_click(cx.listener(move |this, _, window, cx| {
-                                        this.open_folder_detail(path.clone(), window, cx);
-                                    }))
+                                    this.track_focus(&focus)
+                                        .tab_stop(false)
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            // The card is what opened the detail, so
+                                            // it is what the keyboard goes back to
+                                            // when the detail closes (#43). Focusing
+                                            // it here also covers the harness's
+                                            // synthetic press, which transfers no
+                                            // focus of its own; a press on the
+                                            // Details control stops propagation, so
+                                            // that control keeps its own.
+                                            window.focus(&press, cx);
+                                            this.open_folder_detail(path.clone(), window, cx);
+                                        }))
                                 })
                                 .child(status_card(
                                     ("status-folder", index).into(),

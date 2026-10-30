@@ -222,11 +222,23 @@ fn subscribe_title(
     })
 }
 
+/// The key context the panel's root carries (#81).
+///
+/// The panel's dialog drops the layer's key context so Enter reaches the
+/// focused control, which also drops the layer's Escape binding; this context
+/// is where the panel binds Escape back.
+pub(crate) const KEY_CONTEXT: &str = "FolderPanel";
+
 /// The folder panel: a draft's settings or one folder's live detail, inside the
 /// focus-trapped modal host.
 pub struct FolderPanel {
     engine: Entity<EngineModel>,
     mode: FolderPanelMode,
+    /// The panel's own focus handle (#81). It is not a trap: the layer supplies
+    /// the trap. It anchors the panel's key context on the dispatch path, so the
+    /// panel's Escape binding is reachable whichever control holds the keyboard
+    /// inside the panel.
+    focus: FocusHandle,
     /// The draft: the path plus the three settings. In detail mode the path is
     /// the folder's identity and the settings are the live values, so one
     /// renderer serves both.
@@ -297,6 +309,7 @@ impl FolderPanel {
         Self {
             engine,
             mode: FolderPanelMode::Draft,
+            focus: cx.focus_handle(),
             draft: SourceFolder {
                 path,
                 recursive: true,
@@ -358,6 +371,7 @@ impl FolderPanel {
         let mut panel = Self {
             engine,
             mode: FolderPanelMode::Detail,
+            focus: cx.focus_handle(),
             draft,
             problem: None,
             pending: None,
@@ -793,6 +807,13 @@ impl FolderPanel {
         &self.draft.path
     }
 
+    /// The handle the layer opens with focus on (#81), so the panel's key
+    /// context is on the dispatch path before the user reaches any control.
+    #[must_use]
+    pub(crate) fn focus_handle(&self) -> FocusHandle {
+        self.focus.clone()
+    }
+
     /// The visible heading the setup dialog gives the panel; the detail's
     /// heading is the folder's own name (#43).
     fn draft_title(&self) -> &'static str {
@@ -1048,9 +1069,9 @@ impl FolderPanel {
             .flex_col()
             .gap_3()
             .w_full()
-            // #81: at least as tall as the surface, so the asset list is the
-            // row that gives up height when the detail is taller than the
-            // dialog; when even that is not enough, this column scrolls.
+            // #81: at least as tall as the surface, and the column that
+            // scrolls when the detail is taller than the dialog, so every
+            // row keeps its own height: nothing is squeezed to make it fit.
             .min_h_full()
             .overflow_y_scroll()
             .when(self.confirming, |this| this.opacity(0.4))
@@ -1248,10 +1269,9 @@ impl FolderPanel {
             .flex_col()
             .gap_3()
             .w_full()
-            // #81: the body fills the surface the layer sized, and its one row
-            // is the column that scrolls: it gives height to the asset list
-            // when the detail is taller than the dialog, and scrolls when even
-            // that is not enough, so no control is clipped away (#43).
+            // #81: the body fills the surface the layer sized, so the panel's
+            // own column is what scrolls when the detail is taller than the
+            // dialog and no control is clipped away (#43).
             .flex_1()
             .min_h_0()
             .child(inner)
@@ -1307,17 +1327,15 @@ impl FolderPanel {
         } else {
             // #44: the list scrolls inside the dialog, so a folder with hundreds
             // of assets does not push Load more or the actions out of reach.
-            // #81: it is the one row that gives up height when the layer's
-            // surface is shorter than the body, so the actions stay on screen
-            // and only the list scrolls.
+            // #81: it keeps #44's designed height (five rows), so the data view
+            // is not squeezed to buy room for the controls; when the detail is
+            // taller than the surface, the panel's body is what scrolls.
             let mut rows = div()
                 .id("folder-assets-list")
                 .test_support()
                 .flex()
                 .flex_col()
                 .w_full()
-                .flex_auto()
-                .min_h(rems(4.))
                 .max_h(rems(18.))
                 .overflow_y_scroll();
             for (index, asset) in self.assets.iter().enumerate() {
@@ -1333,9 +1351,6 @@ impl FolderPanel {
             .flex_col()
             .gap_2()
             .w_full()
-            // #81: the section keeps the heading, a row of the list and Load
-            // more when the surface is short; the list itself gives first.
-            .min_h(rems(8.))
             .child(heading)
             .child(state)
             .when(self.assets_more, |this| {
@@ -1450,6 +1465,13 @@ impl Render for FolderPanel {
             .test_support()
             .role(Role::Dialog)
             .aria_label(self.aria_label())
+            // #81: the panel's own key context, held by its root so that Escape
+            // is bound wherever the keyboard sits inside the panel; the layer
+            // opens with focus here, which is what puts this context on the
+            // dispatch path. Not a tab stop: Tab descends to the first control.
+            .key_context(KEY_CONTEXT)
+            .track_focus(&self.focus)
+            .tab_stop(false)
             .flex()
             .flex_col()
             .w_full()

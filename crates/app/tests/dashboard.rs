@@ -1623,11 +1623,11 @@ async fn cancel_and_escape_close_the_setup_and_write_nothing(cx: &mut TestAppCon
 
     cx.update_window(window, |_, window, cx| {
         open_setup_through_the_field(window, &path, cx);
-        // N5: Cancel answers the keyboard. Space activates the focused control;
-        // #81 made the panel a dialog, where the kit binds Enter to the dialog's
-        // own Confirm, which a panel with no single OK leaves inert.
+        // N5: Cancel answers the keyboard. #81: the panel's dialog no longer
+        // binds Enter to a Confirm the panel does not have, so Enter reaches
+        // the focused control.
         tab_to(window, "folder-panel-cancel", cx);
-        window.press("space", cx);
+        window.press("enter", cx);
     })
     .expect("press Cancel");
 
@@ -1696,13 +1696,12 @@ async fn cancel_while_an_add_is_pending_leaves_the_dialog_and_the_write(cx: &mut
 
     cx.update_window(window, |_, window, cx| {
         open_setup_through_the_field(window, &path, cx);
-        // Focus Cancel, then press Add with the mouse: Cancel is disabled once
-        // the write runs, and the modal must keep the keyboard (Escape and the
-        // focus trap) instead of dropping focus to the window root.
         // Add is pressed from the keyboard, so the control keeps the keyboard
         // while the write runs: the dialog never drops focus to the page.
+        // #81: Enter activates it like Space does, which is the key the layer's
+        // Confirm binding used to swallow.
         tab_to(window, "folder-panel-add", cx);
-        window.press("space", cx);
+        window.press("enter", cx);
         window.render_frame(cx);
         assert_eq!(
             window.find("folder-panel-add").focused(),
