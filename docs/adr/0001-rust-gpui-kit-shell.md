@@ -31,3 +31,9 @@ What the new snapshot broke, and what this app had to touch: the scroll-input re
 
 `gpui-tray` stays at `=0.1.4`: its `gpui-pre ^0.3.4` range admits 0.3.10, so the resolved graph still holds exactly one `gpui-pre` and no tray bump is needed. That single copy is the constraint to re-check on every future bump: if a tray release pins a `gpui-pre` that gpui-kit's exact pin excludes, the app would hold two GPUI runtimes, which is not a state to patch around.
 
+
+## Addendum: the surface switch is a tab list, not `base::Tab`s (2026-10-30)
+
+Adopting an identity the rest of the app already depends on is a real cost of a component, and it has to be checked before the component is used. In 0.8.1, `gpui_base::Tab` cannot carry either one: `Tab::ix` renames the element to its integer index, so a tab cannot keep the stable `nav-*` id the per-surface tests click, and `Tab::render` wraps itself in the test-support observer before any caller could call `track_focus`, so a tab can never be observed as focused. `Tab` also takes no focus handle of its own, and its own source records the missing keyboard model ("Tabs do not participate in keyboard focus by themselves").
+
+The surface switch therefore keeps the kit's tab-list root (`base::Tabs`) and writes the tab role, accessible label, position in the set, selected state and focus handle on each tab's own element. Those are the same accessibility fields `base::Tab` writes; what the app adds is a stable id, a tab stop per tab, and a horizontally scrolling strip, which is what lets the window minimum come from the narrowest surface instead of from seven labels. Treat the same question — can this component carry our id, our focus handle, and our keyboard path? — as part of choosing any further kit component on this pinned version, and prefer composing the base layer over dropping the identity.
