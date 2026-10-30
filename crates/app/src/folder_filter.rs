@@ -38,16 +38,15 @@ fn parent_key(item: &Path, case: PathCase) -> String {
         .map_or_else(String::new, |(parent, _)| parent.to_string())
 }
 
-/// The folder one list is narrowed to, and whether its options are showing.
+/// The folder one list is narrowed to.
 ///
-/// It is the control's whole state, so both views render it the same way
-/// (see [`crate::folder_filter_view`]).
+/// It is the control's whole domain state, so both views render it the same way
+/// (see [`crate::folder_filter_view`]). Whether the options are showing is the
+/// kit select's business since #79, so it is not part of this type.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FolderFilter {
     /// The selected folder path; `None` is [`ALL_FOLDERS`].
     selected: Option<String>,
-    /// Whether the option list is showing.
-    open: bool,
 }
 
 impl FolderFilter {
@@ -69,16 +68,14 @@ impl FolderFilter {
         self.selected.is_some()
     }
 
-    /// Selects one folder and closes the options.
+    /// Selects one folder.
     pub fn select(&mut self, path: impl Into<String>) {
         self.selected = Some(path.into());
-        self.open = false;
     }
 
     /// Goes back to [`ALL_FOLDERS`].
     pub fn clear(&mut self) {
         self.selected = None;
-        self.open = false;
     }
 
     /// The text the trigger and the chip show: the folder's name, or
@@ -88,17 +85,6 @@ impl FolderFilter {
         self.selected
             .as_deref()
             .map_or_else(|| ALL_FOLDERS.to_string(), folder_name)
-    }
-
-    /// Whether the option list is showing.
-    #[must_use]
-    pub fn is_open(&self) -> bool {
-        self.open
-    }
-
-    /// Shows the options, or hides them.
-    pub fn toggle(&mut self) {
-        self.open = !self.open;
     }
 
     /// Whether the filter keeps `item`.
