@@ -616,8 +616,32 @@ async fn choosing_a_folder_narrows_the_list_its_summary_and_its_empty_state(
             Some("Showing Camera Roll"),
             "the active folder has a chip"
         );
+
+        // #79: All folders is a choice of the list, not only the chip's Clear.
+        window.within("failed-folder-filter").click("input", cx);
+        window.click("failed-folder-option-0", cx);
     })
-    .expect("read the filtered failed-items view");
+    .expect("choose All folders from the list");
+    cx.run_until_parked();
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("failed-summary").label(),
+            Some("2 files could not be uploaded."),
+            "choosing All folders lists every item again"
+        );
+        assert_eq!(
+            window.find("failed-folder-filter").value(),
+            Some("All folders"),
+            "and the control says so"
+        );
+        assert!(
+            window.try_find("failed-folder-chip").is_none(),
+            "with no folder chosen there is no chip to clear"
+        );
+    })
+    .expect("read the unfiltered failed-items view");
 }
 
 #[gpui_kit::test]
