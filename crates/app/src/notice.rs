@@ -113,6 +113,28 @@ impl Notice {
     }
 }
 
+/// The confirmation a copy action shows (#82), or `None` before its first press.
+///
+/// It is the same notice on every surface that copies: visible beside the
+/// control that copied, named for assistive technology, and with no button and
+/// no dismiss timer, so nothing has to be dismissed and nothing disappears
+/// mid-read. The words are the same everywhere; the surface only names the id.
+///
+/// The id carries `pressed`, the number of copies so far. GPUI's accessibility
+/// guide is explicit that a node's identity is its element id, and a node that
+/// arrives under a new id is a new node to assistive technology
+/// (`gpui-pre/src/_accessibility.rs`), so a repeated copy is announced again
+/// instead of being silent behind an unchanged element.
+pub(crate) fn copy_confirmation(control: &str, pressed: u32) -> Option<Notice> {
+    (pressed > 0).then(|| {
+        Notice::new(
+            ElementId::Name(format!("{control}-copy-confirmation-{pressed}").into()),
+            Severity::Success,
+            "Copied",
+        )
+    })
+}
+
 impl RenderOnce for Notice {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();

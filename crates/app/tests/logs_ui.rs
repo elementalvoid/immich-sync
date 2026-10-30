@@ -72,6 +72,26 @@ fn window_options_at(width: f32, height: f32) -> WindowOptions {
 /// The sentence the empty tail explains itself with (#77).
 const EMPTY_DESCRIPTION: &str = "Lines appear as the client works.";
 
+/// The word a copy confirmation shows (#82). The same word on every surface.
+const COPIED: &str = "Copied";
+
+/// The visible confirmations that say a copy happened (#82).
+fn confirmations(window: &Window) -> Vec<ElementSnapshot> {
+    snapshots(window)
+        .into_iter()
+        .filter(|element| element.visible() && element.label() == Some(COPIED))
+        .collect()
+}
+
+/// The id of one observed confirmation, which is its accessibility identity.
+fn confirmation_id(confirmation: &ElementSnapshot) -> ElementId {
+    confirmation
+        .path()
+        .last()
+        .cloned()
+        .expect("the confirmation registers its own id")
+}
+
 /// The empty tail's one action, named for where it sits (#77).
 const EMPTY_ACTION_LABEL: &str = "Refresh the log tail";
 
@@ -1005,6 +1025,97 @@ async fn copy_all_with_an_empty_tail_copies_nothing_and_does_not_panic(cx: &mut 
         .update(|cx| cx.read_from_clipboard().and_then(|item| item.text()))
         .unwrap_or_default();
     assert_eq!(copied, "SENTINEL", "the clipboard is untouched");
+    // #82: a refused copy is still a refusal, not a confirmation.
+    cx.update_window(window, |_, window, _| {
+        assert!(
+            confirmations(window).is_empty(),
+            "the empty tail's copy is disabled and shows no confirmation"
+        );
+    })
+    .expect("update the shell window");
+}
+
+/// #82: a copy confirms where the control is, the confirmation reaches assistive
+/// technology, and a second press confirms again instead of staying silent.
+#[gpui_kit::test]
+async fn copy_all_confirms_each_press_and_keeps_the_copied_bytes(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    // The blank line is the part of the payload the selection copy path drops.
+    write_log(&paths, &["alpha first line", "", "charlie third line"]);
+    let store = SettingsStore::open(paths.config_file.clone());
+    let (window, _shell) = open_shell(cx, store, paths);
+
+    cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string("SENTINEL".into())));
+    show_logs(cx, window);
+    cx.update_window(window, |_, window, _| {
+        assert!(
+            confirmations(window).is_empty(),
+            "nothing has been copied yet, so nothing confirms"
+        );
+    })
+    .expect("update the shell window");
+
+    cx.update_window(window, |_, window, cx| window.click("logs-copy-all", cx))
+        .expect("update the shell window");
+    let copied = cx
+        .update(|cx| cx.read_from_clipboard().and_then(|item| item.text()))
+        .unwrap_or_default();
+    assert_eq!(
+        copied, "alpha first line\n\ncharlie third line",
+        "the confirmation changed nothing about the copied bytes, blank line included"
+    );
+    let first = cx
+        .update_window(window, |_, window, _| {
+            let confirmations = confirmations(window);
+            assert_eq!(
+                confirmations.len(),
+                1,
+                "one confirmation says the copy happened: {confirmations:?}"
+            );
+            assert_eq!(
+                confirmations[0].role(),
+                Some(Role::Alert),
+                "the confirmation is announced, not only drawn"
+            );
+            assert!(
+                confirmations[0]
+                    .path()
+                    .contains(&ElementId::from("logs-copy-row")),
+                "the confirmation sits in the row of the control that copied: {:?}",
+                confirmations[0].path()
+            );
+            confirmation_id(&confirmations[0])
+        })
+        .expect("update the shell window");
+
+    // A second press must confirm again: the clipboard is written again and the
+    // confirmation is a fresh node, which is what assistive technology
+    // announces on a repeat.
+    cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string("SENTINEL".into())));
+    cx.update_window(window, |_, window, cx| window.click("logs-copy-all", cx))
+        .expect("update the shell window");
+    let copied = cx
+        .update(|cx| cx.read_from_clipboard().and_then(|item| item.text()))
+        .unwrap_or_default();
+    assert_eq!(
+        copied, "alpha first line\n\ncharlie third line",
+        "the second press copies again"
+    );
+    cx.update_window(window, |_, window, _| {
+        let confirmations = confirmations(window);
+        assert_eq!(
+            confirmations.len(),
+            1,
+            "the second press replaces the confirmation instead of stacking one: {confirmations:?}"
+        );
+        assert_ne!(
+            confirmation_id(&confirmations[0]),
+            first,
+            "the second press is a fresh confirmation node, so a screen reader hears it again"
+        );
+    })
+    .expect("update the shell window");
 }
 
 #[gpui_kit::test]
