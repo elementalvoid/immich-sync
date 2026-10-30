@@ -716,6 +716,10 @@ async fn the_empty_list_is_one_status_and_offers_nothing_to_retry(cx: &mut TestA
             registered(window)
         );
         assert!(
+            window.try_find("failed-summary").is_none(),
+            "#77: with no row to count the summary states nothing"
+        );
+        assert!(
             window
                 .try_find((ElementId::from("failed-empty"), "action"))
                 .is_none(),

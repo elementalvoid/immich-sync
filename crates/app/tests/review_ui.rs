@@ -707,6 +707,10 @@ async fn the_empty_review_is_one_status_and_offers_no_decision(cx: &mut TestAppC
             "#77: the explanation is announced once"
         );
         assert!(
+            window.try_find("review-summary").is_none(),
+            "#77: with no row to count the summary states nothing"
+        );
+        assert!(
             window
                 .try_find((ElementId::from("review-empty"), "action"))
                 .is_none(),

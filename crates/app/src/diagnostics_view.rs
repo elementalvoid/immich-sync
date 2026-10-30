@@ -99,7 +99,6 @@ impl DiagnosticsView {
                 Some("The running binary: the package version and the short build revision."),
                 "diagnostics-client-version-value",
                 version::client_version().to_string(),
-                None,
                 &palette,
             ),
             value_item(
@@ -107,7 +106,6 @@ impl DiagnosticsView {
                 Some("GET /server/about with this credential."),
                 "diagnostics-server-version-value",
                 version,
-                None,
                 &palette,
             ),
             value_item(
@@ -115,7 +113,6 @@ impl DiagnosticsView {
                 Some("An API key's granted permissions, read from GET /api-keys/me."),
                 "diagnostics-permissions-value",
                 permissions,
-                None,
                 &palette,
             ),
         ];
@@ -130,7 +127,7 @@ impl DiagnosticsView {
                 .into_any_element(),
             );
         }
-        rows.push(value_list(items).into_any_element());
+        rows.push(value_list("diagnostics-server-values", items).into_any_element());
         rows.push(
             div()
                 .id("diagnostics-refresh-row")
@@ -202,7 +199,6 @@ impl DiagnosticsView {
             Some("The state database the client writes."),
             "diagnostics-state-path-value",
             path,
-            None,
             &palette,
         ));
         if let Some(info) = &info {
@@ -211,7 +207,6 @@ impl DiagnosticsView {
                 Some("PRAGMA user_version: the schema the client migrated to."),
                 "diagnostics-sqlite-version-value",
                 info.migration_version.to_string(),
-                None,
                 &palette,
             ));
             items.push(value_item(
@@ -219,7 +214,6 @@ impl DiagnosticsView {
                 Some("The pages SQLite holds for this database."),
                 "diagnostics-sqlite-size-value",
                 format_bytes(info.size_bytes),
-                None,
                 &palette,
             ));
             items.push(value_item(
@@ -227,12 +221,11 @@ impl DiagnosticsView {
                 Some("PRAGMA quick_check."),
                 "diagnostics-integrity-value",
                 info.integrity.clone(),
-                None,
                 &palette,
             ));
             items.extend(table_items(info, &palette));
         }
-        rows.push(value_list(items).into_any_element());
+        rows.push(value_list("diagnostics-state-values", items).into_any_element());
         if info.is_none() {
             rows.push(
                 div()
@@ -300,23 +293,18 @@ impl DiagnosticsView {
             let items = errors
                 .iter()
                 .map(|error| {
-                    // The row keeps the whole sentence as its accessible name, so
-                    // the class is heard once with its reason.
-                    let name = match &error.message {
-                        Some(message) => format!("{}: {message}", error.class.as_str()),
-                        None => error.class.as_str().to_string(),
-                    };
+                    // The term is the class and the value is the reason, so the
+                    // row does not name the class a second time (F1).
                     value_item(
                         error.class.as_str(),
                         None,
                         &format!("diagnostics-error-{}", error.class.as_str()),
                         error.message.clone().unwrap_or_default(),
-                        Some(name),
                         &palette,
                     )
                 })
                 .collect();
-            vec![value_list(items).into_any_element()]
+            vec![value_list("diagnostics-errors-values", items).into_any_element()]
         };
         section(
             "diagnostics-errors",
@@ -391,14 +379,17 @@ impl DiagnosticsView {
             ),
             BundleState::Ready(report) => {
                 rows.push(
-                    value_list(vec![mono_value_item(
-                        "Archive",
-                        Some("Attach this file to your support message."),
-                        "diagnostics-bundle-path-value",
-                        report.path.display().to_string(),
-                        &palette,
-                        theme.mono_font_family.clone(),
-                    )])
+                    value_list(
+                        "diagnostics-bundle-values",
+                        vec![mono_value_item(
+                            "Archive",
+                            Some("Attach this file to your support message."),
+                            "diagnostics-bundle-path-value",
+                            report.path.display().to_string(),
+                            &palette,
+                            theme.mono_font_family.clone(),
+                        )],
+                    )
                     .into_any_element(),
                 );
                 rows.push(
@@ -524,7 +515,6 @@ impl DiagnosticsView {
                 Some("Measured between the last two status polls."),
                 "diagnostics-throughput-value",
                 rate,
-                None,
                 &palette,
             ),
             value_item(
@@ -532,7 +522,6 @@ impl DiagnosticsView {
                 Some("What the engine is doing right now."),
                 "diagnostics-activity-value",
                 status.activity.label().to_string(),
-                None,
                 &palette,
             ),
             value_item(
@@ -540,7 +529,6 @@ impl DiagnosticsView {
                 Some("The counts across every folder."),
                 "diagnostics-counts-value",
                 counts,
-                None,
                 &palette,
             ),
         ];
@@ -548,7 +536,7 @@ impl DiagnosticsView {
             "diagnostics-throughput",
             "Throughput",
             "Upload bytes per second, from the same meter the bandwidth limit uses.",
-            vec![value_list(items).into_any_element()],
+            vec![value_list("diagnostics-throughput-values", items).into_any_element()],
             cx,
         )
     }
@@ -571,29 +559,35 @@ const VALUE_LINE_CLAMP: usize = 6;
 ///
 /// `columns(1)` puts one row in each line. `bordered(false)` leaves the card's
 /// own surface and border to carry the box: the rows are a grid inside the
-/// card, not a second card inside the first.
-fn value_list(items: Vec<DescriptionItem>) -> impl IntoElement {
-    DescriptionList::new()
-        .columns(1)
-        .bordered(false)
-        .label_width(rems(LABEL_COLUMN_REMS))
-        .children(items)
+/// card, not a second card inside the first. The kit's list is a `RenderOnce`
+/// with no role, so the wrapper is what gives the pairs their collection (F4).
+fn value_list(id: &'static str, items: Vec<DescriptionItem>) -> impl IntoElement {
+    div()
+        .id(id)
+        .test_support()
+        .role(Role::DescriptionList)
+        .child(
+            DescriptionList::new()
+                .columns(1)
+                .bordered(false)
+                .label_width(rems(LABEL_COLUMN_REMS))
+                .children(items),
+        )
 }
 
 /// One value row: the term in the label cell, and the value with its help
 /// sentence in the description cell.
 ///
-/// `name` is the value's accessible name when it is not the value itself: the
-/// per-table rows keep the `table: rows` name their hand-written row had.
+/// The value names itself and the term beside it states the label, so a row
+/// reads its term once and has no name to compose (F1).
 fn value_item(
     label: &str,
     help: Option<&str>,
     value_id: &str,
     value: String,
-    name: Option<String>,
     palette: &CardPalette,
 ) -> DescriptionItem {
-    value_item_with_font(label, help, value_id, value, name, palette, None)
+    value_item_with_font(label, help, value_id, value, palette, None)
 }
 
 /// The archive path's row: [`value_item`] with its value set in the mono font,
@@ -607,7 +601,7 @@ fn mono_value_item(
     palette: &CardPalette,
     mono: SharedString,
 ) -> DescriptionItem {
-    value_item_with_font(label, help, value_id, value, None, palette, Some(mono))
+    value_item_with_font(label, help, value_id, value, palette, Some(mono))
 }
 
 /// The one row shape both constructors build, with `font` as the value's family
@@ -617,7 +611,6 @@ fn value_item_with_font(
     help: Option<&str>,
     value_id: &str,
     value: String,
-    name: Option<String>,
     palette: &CardPalette,
     font: Option<SharedString>,
 ) -> DescriptionItem {
@@ -646,7 +639,7 @@ fn value_item_with_font(
                 crate::a11y::named(
                     Role::Definition,
                     ElementId::Name(value_id.into()),
-                    name.unwrap_or_else(|| value.clone()),
+                    value.clone(),
                     None,
                 )
                 .min_w_0()
@@ -678,7 +671,6 @@ fn table_items(info: &SqliteInfo, palette: &CardPalette) -> Vec<DescriptionItem>
                 None,
                 &format!("diagnostics-table-{}", count.table),
                 count.rows.to_string(),
-                Some(format!("{}: {}", count.table, count.rows)),
                 palette,
             )
         })

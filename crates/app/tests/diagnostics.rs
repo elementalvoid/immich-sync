@@ -473,7 +473,7 @@ async fn the_view_shows_the_sqlite_state_the_server_and_the_permissions(cx: &mut
             );
             assert_eq!(
                 window.find("diagnostics-table-sync_item").label(),
-                Some("sync_item: 0"),
+                Some("0"),
                 "every tracked table is counted"
             );
             assert_eq!(
@@ -1575,13 +1575,12 @@ async fn every_value_row_keeps_its_element_id_and_accessible_name(cx: &mut TestA
             DB_MIGRATION_VERSION.to_string(),
         ),
         ("diagnostics-integrity-value", "ok".to_string()),
-        // The seeded failed item is the one row `sync_item` holds.
-        ("diagnostics-table-sync_item", "sync_item: 1".to_string()),
+        // The seeded failed item is the one row `sync_item` holds. Both it and
+        // the error row name their value only: the term beside it states the
+        // label, so a row reads its term once (F1).
+        ("diagnostics-table-sync_item", "1".to_string()),
         ("diagnostics-throughput-value", "0 B/s".to_string()),
-        (
-            "diagnostics-error-unsupported_format",
-            format!("unsupported_format: {message}"),
-        ),
+        ("diagnostics-error-unsupported_format", message.to_string()),
     ];
     for system in [theme::SystemTheme::Light, theme::SystemTheme::Dark] {
         cx.update(|cx| theme::apply_system_theme(system, cx));
@@ -1613,6 +1612,20 @@ async fn every_value_row_keeps_its_element_id_and_accessible_name(cx: &mut TestA
                     window.find(*id).role(),
                     Some(Role::Definition),
                     "{id} is announced as its term's value in {system:?}"
+                );
+            }
+            // F4: the pairs sit in one description list per card, so a screen
+            // reader walks them as a collection and not as flat text.
+            for id in [
+                "diagnostics-server-values",
+                "diagnostics-state-values",
+                "diagnostics-throughput-values",
+                "diagnostics-errors-values",
+            ] {
+                assert_eq!(
+                    window.find(id).role(),
+                    Some(Role::DescriptionList),
+                    "{id} groups its term and definition pairs in {system:?}"
                 );
             }
             // The rows whose value the run itself decides: each one still says
@@ -1701,7 +1714,7 @@ async fn a_very_long_value_is_cut_at_the_clamp_and_keeps_its_whole_name(cx: &mut
     })
     .expect("update the shell window");
 
-    let name = format!("unsupported_format: {message}");
+    let name = &message;
     for system in [theme::SystemTheme::Light, theme::SystemTheme::Dark] {
         cx.update(|cx| theme::apply_system_theme(system, cx));
         cx.update_window(window, |_, window, cx| {
