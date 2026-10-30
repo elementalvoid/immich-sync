@@ -16,6 +16,7 @@ use crate::dashboard::CardPalette;
 use crate::engine::EngineModel;
 use crate::folder_filter::FolderFilter;
 use crate::folder_filter_view::folder_filter_bar;
+use crate::notice::{Notice, Severity};
 use crate::review::{ReviewRow, rows, summary};
 
 /// The deletion review surface.
@@ -77,8 +78,6 @@ impl Render for ReviewView {
         let palette = CardPalette::new(cx.theme());
         let radius = cx.theme().radius_lg;
         let border = cx.theme().border;
-        let danger = cx.theme().danger;
-        let warning = cx.theme().warning;
         let background = cx.theme().background;
         let foreground = cx.theme().foreground;
         let muted = cx.theme().muted_foreground;
@@ -131,16 +130,7 @@ impl Render for ReviewView {
                     )),
             )
             .when_some(problem, |this, problem| {
-                this.child(
-                    div()
-                        .id("review-problem")
-                        .test_support()
-                        .role(Role::Status)
-                        .aria_label(problem.clone())
-                        .text_sm()
-                        .text_color(danger)
-                        .child(problem),
-                )
+                this.child(Notice::new("review-problem", Severity::Error, problem))
             })
             .child(folder_filter_bar(
                 "review",
@@ -171,9 +161,11 @@ impl Render for ReviewView {
                     .when(rows.is_empty(), |this| {
                         this.child(empty_card("review-empty", &empty, &palette, radius, border))
                     })
-                    .children(rows.iter().enumerate().map(|(index, row)| {
-                        row_card(row, index, &palette, radius, border, warning, cx)
-                    })),
+                    .children(
+                        rows.iter()
+                            .enumerate()
+                            .map(|(index, row)| row_card(row, index, &palette, radius, border, cx)),
+                    ),
             )
     }
 }
@@ -185,7 +177,6 @@ fn row_card(
     palette: &CardPalette,
     radius: Pixels,
     border: Hsla,
-    warning: Hsla,
     cx: &mut Context<ReviewView>,
 ) -> impl IntoElement + use<> {
     let keep_path = row.path.clone();
@@ -227,13 +218,14 @@ fn row_card(
                         .child(row.path.clone()),
                 )
                 .child(
-                    div()
-                        .border_l_2()
-                        .border_color(warning)
-                        .pl_2()
-                        .text_xs()
-                        .text_color(palette.text)
-                        .child("Missing on this computer · the server copy is untouched"),
+                    // The row's accessible name states the row and its
+                    // reassurance, so the strip names nothing itself (#76).
+                    Notice::new(
+                        format!("review-row-notice-{index}"),
+                        Severity::Warning,
+                        "Missing on this computer · the server copy is untouched",
+                    )
+                    .quiet(),
                 ),
         )
         .child(

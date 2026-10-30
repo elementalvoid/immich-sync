@@ -18,7 +18,8 @@ use gpui_kit::*;
 
 use crate::dashboard::CardPalette;
 use crate::logging::{self, LogLevel, TAIL_LINES};
-use crate::settings_view::{SettingsView, field_text, filling_section, notice, section};
+use crate::notice::{Notice, Severity};
+use crate::settings_view::{SettingsView, field_text, filling_section, section};
 
 /// How often the live tail re-reads the newest log file while the Logs surface
 /// is visible.
@@ -419,15 +420,9 @@ impl LogsView {
         let current = self.level(cx);
         let mut rows = Vec::with_capacity(LogLevel::ALL.len() + 1);
         if let Some(problem) = &self.save_problem {
-            let palette = CardPalette::new(cx.theme());
             rows.push(
-                notice(
-                    "logs-level-problem",
-                    problem.clone(),
-                    cx.theme().danger,
-                    &palette,
-                )
-                .into_any_element(),
+                Notice::new("logs-level-problem", Severity::Error, problem.clone())
+                    .into_any_element(),
             );
         }
         for level in LogLevel::ALL {
@@ -499,11 +494,10 @@ impl LogsView {
                     // on a long path. Clamped to the two lines the floor's 4rem
                     // covers; the accessible label keeps the whole text (#54).
                     .line_clamp(2)
-                    .child(notice(
+                    .child(Notice::new(
                         "logs-problem",
+                        Severity::Error,
                         problem.clone(),
-                        theme.danger,
-                        &palette,
                     ))
                     .into_any_element(),
             );
