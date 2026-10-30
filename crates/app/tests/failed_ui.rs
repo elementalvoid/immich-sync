@@ -490,8 +490,8 @@ async fn the_failed_view_offers_every_source_folder_under_all_folders(cx: &mut T
             "#79: all folders is a choice of the list, and the current one says so"
         );
         assert!(
-            window.try_find("failed-folder-option-0-check").is_some(),
-            "the current choice carries a check, so the selection is not colour alone"
+            window.try_find("failed-folder-option-0-selected").is_some(),
+            "the current choice carries a visible marker, so the selection is not colour alone"
         );
         assert_eq!(
             window.find("failed-folder-option-1").label(),
@@ -503,8 +503,8 @@ async fn the_failed_view_offers_every_source_folder_under_all_folders(cx: &mut T
             Some(format!("Show only {}", photos.display()).as_str())
         );
         assert!(
-            window.try_find("failed-folder-option-1-check").is_none(),
-            "only the current choice is checked"
+            window.try_find("failed-folder-option-1-selected").is_none(),
+            "only the current choice is marked"
         );
         assert!(
             window.try_find("review-folder-option-0").is_none(),

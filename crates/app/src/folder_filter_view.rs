@@ -14,10 +14,10 @@
 //! folder-detail seam) is pushed into the select on the next frame.
 
 use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::IndexPath;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::searchable_list::{SearchableListDelegate, SearchableListItem};
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
-use gpui_kit::component::{Icon, IconName, IndexPath, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use sync_core::store::SourceFolder;
@@ -314,18 +314,17 @@ impl SearchableListDelegate for FolderChoices {
                 .min_w_0()
                 .child(div().min_w_0().truncate().child(item.label.clone()))
                 .when(checked, |this| {
+                    // A word, not the component family's checkmark: this
+                    // application installs no icon assets, so an icon would
+                    // draw nothing. The name says it too, for the same reason.
                     this.child(
                         div()
-                            .id(format!("{id}-check"))
+                            .id(format!("{id}-selected"))
                             .test_support()
-                            .flex()
-                            .items_center()
                             .flex_shrink_0()
-                            .child(
-                                Icon::new(IconName::Check)
-                                    .xsmall()
-                                    .text_color(cx.theme().foreground),
-                            ),
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Selected"),
                     )
                 })
                 .into_any_element(),
