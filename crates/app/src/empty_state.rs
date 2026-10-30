@@ -6,11 +6,14 @@
 //!
 //! Two rules live here:
 //!
-//! - The state is announced once. The titled box is a `Role::Status` whose
-//!   accessible name is the title and whose description follows it, and the
-//!   visible lines inside it are `Text::new_inaccessible`, so no second node
-//!   repeats them. This is the lesson of [`crate::notice`]: a bare child string
-//!   produces no accessibility node at all, so the status must carry the text.
+//! - The state is one node: one name, one description. The titled box is a
+//!   `Role::Status` whose accessible name is the title and whose description
+//!   follows it, and the visible lines inside it are `Text::new_inaccessible`,
+//!   so the component adds no second node of its own. This is the lesson of
+//!   [`crate::notice`]: a bare child string produces no accessibility node at
+//!   all, so the status must carry the text. What surrounds the state is the
+//!   surface's business: the failed list's summary above it states the same
+//!   fact, so that window announces both.
 //! - A filtered list says which folder it is empty for. The title is the
 //!   caller's sentence and already names the folder
 //!   ([`crate::folder_filter::FolderFilter::empty_heading`]), so the component

@@ -515,7 +515,9 @@ impl LogsView {
                 .action(
                     Button::new("logs-empty-refresh")
                         .label("Refresh")
-                        .accessibility_label("Refresh the log lines")
+                        // Its own name: at an empty tail both refreshes are
+                        // on screen and must not sound alike.
+                        .accessibility_label("Refresh the log tail")
                         .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx))),
                 )
                 .into_any_element(),

@@ -72,6 +72,9 @@ fn window_options_at(width: f32, height: f32) -> WindowOptions {
 /// The sentence the empty tail explains itself with (#77).
 const EMPTY_DESCRIPTION: &str = "Lines appear as the client works.";
 
+/// The empty tail's one action, named for where it sits (#77).
+const EMPTY_ACTION_LABEL: &str = "Refresh the log tail";
+
 /// How many observed elements announce `text`: as a name, as a value, or as the
 /// description a screen reader reads after the name.
 fn announced(window: &Window, text: &str) -> usize {
@@ -83,6 +86,15 @@ fn announced(window: &Window, text: &str) -> usize {
                 || element.description() == Some(text)
         })
         .count()
+}
+
+/// The accessible name of every control in the view, in tree order.
+fn control_names(window: &Window) -> Vec<String> {
+    snapshots(window)
+        .into_iter()
+        .filter(|element| element.role() == Some(Role::Button))
+        .filter_map(|element| element.label().map(str::to_owned))
+        .collect()
 }
 
 fn autostart() -> Rc<dyn Autostart> {
@@ -327,7 +339,7 @@ async fn an_empty_tail_is_re_read_from_where_it_is_shown(cx: &mut TestAppContext
         assert!(window.find("logs-empty").visible(), "the tail starts empty");
         assert_eq!(
             window.find("logs-empty-refresh").label(),
-            Some("Refresh the log lines"),
+            Some(EMPTY_ACTION_LABEL),
             "the empty tail's one action is named"
         );
         write_log(&paths, &["the first line ever written"]);
@@ -656,12 +668,40 @@ async fn ten_refreshes_keep_every_row_at_full_height(cx: &mut TestAppContext) {
 async fn every_logs_control_is_named_and_keyboard_reachable(cx: &mut TestAppContext) {
     let temp = tempfile::tempdir().expect("create a temp dir");
     let paths = temporary_paths(temp.path());
-    // One line, so Copy all is enabled and therefore a tab stop.
-    write_log(&paths, &["a stable line"]);
     let store = SettingsStore::open(paths.config_file.clone());
-    let (window, _shell) = open_shell(cx, store, paths);
+    let (window, _shell) = open_shell(cx, store, paths.clone());
 
     show_logs(cx, window);
+    // The empty tail is the one state that shows both refreshes at once, so it
+    // is where two controls could end up sharing one name (#77).
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("logs-empty-refresh").label(),
+            Some(EMPTY_ACTION_LABEL),
+            "the empty tail's action is named for where it sits"
+        );
+        let names = control_names(window);
+        let mut unique = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            names.len(),
+            "two controls share an accessible name: {names:?}"
+        );
+        tab_to(window, "logs-empty-refresh", cx);
+        // Walk the tab order below from its start again.
+        window.blur(cx);
+    })
+    .expect("update the shell window");
+
+    // One line, so Copy all is enabled and therefore a tab stop.
+    write_log(&paths, &["a stable line"]);
+    cx.update_window(window, |_, window, cx| window.click("logs-refresh", cx))
+        .expect("update the shell window");
+    settle(cx, window);
+
     cx.update_window(window, |_, window, cx| {
         for (id, label) in [
             ("nav-logs", "Logs"),

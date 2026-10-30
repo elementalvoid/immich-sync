@@ -596,7 +596,8 @@ async fn the_empty_list_is_one_status_and_offers_nothing_to_retry(cx: &mut TestA
         assert_eq!(
             announced(window, "Nothing has failed"),
             1,
-            "#77: the title is announced once: {}",
+            "#77: the empty state carries its title in one node; the summary above \
+             states the same fact as \"Nothing has failed.\": {}",
             registered(window)
         );
         assert_eq!(
