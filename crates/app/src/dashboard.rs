@@ -11,6 +11,7 @@ use std::sync::Arc;
 use crate::asset_link::{self, LinkOpener};
 use crate::engine::{EngineModel, SyncNowOutcome};
 use crate::folder_panel::{FolderOpener, FolderPanel, FolderPanelEvent};
+use crate::notice::{Notice, Severity};
 use crate::path_picker::{self, Picked};
 use crate::shell::ViewMode;
 use crate::status::{ActivityState, DashboardModel, StatusCard};
@@ -433,8 +434,6 @@ impl Dashboard {
 
     /// The folder add field, its Browse… control, and its button (R2.1).
     fn folder_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let accent = cx.theme().danger;
-        let palette = CardPalette::new(cx.theme());
         let muted = cx.theme().muted_foreground;
         let input = self.folder_input.clone();
         div()
@@ -502,19 +501,16 @@ impl Dashboard {
                     }),
             )
             .when_some(self.pick_notice.clone(), |this, notice| {
-                this.child(crate::settings_view::notice(
+                this.child(Notice::new(
                     "dashboard-browse-notice",
+                    Severity::Error,
                     notice,
-                    accent,
-                    &palette,
                 ))
             })
     }
 
     fn header(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let muted = cx.theme().muted_foreground;
-        let accent = cx.theme().warning;
-        let palette = CardPalette::new(cx.theme());
         let paused = self.is_paused(cx);
         let (sync_label, sync_name) = crate::status::sync_now_copy(self.model.scanning);
         // #56: the reason is asked for again on every frame, so a notice that
@@ -592,11 +588,10 @@ impl Dashboard {
             // #56: a click that cannot scan says why, in the same notice idiom
             // the folder bar uses.
             .when_some(sync_notice, |this, notice| {
-                this.child(crate::settings_view::notice(
+                this.child(Notice::new(
                     "dashboard-sync-notice",
+                    Severity::Warning,
                     notice,
-                    accent,
-                    &palette,
                 ))
             })
     }
@@ -921,13 +916,17 @@ fn status_card(
         );
     }
     if let Some(review) = content.review {
-        root = root.child(notice(review, theme.warning, &palette));
+        root = root.child(Notice::new(
+            (id.clone(), "review"),
+            Severity::Warning,
+            review,
+        ));
     }
     if let Some(error) = content.error {
-        root = root.child(notice(
+        root = root.child(Notice::new(
+            (id.clone(), "error"),
+            Severity::Error,
             format!("Last error: {error}"),
-            theme.danger,
-            &palette,
         ));
     }
     if let Some(footer) = footer {
@@ -951,16 +950,4 @@ pub(crate) fn state_tag(
         .text_color(palette.pill_text)
         .border_color(state_border(state, theme))
         .child(Text::new_inaccessible(label.into()))
-}
-
-/// A card notice: a colored edge marks the kind, and the text keeps the
-/// card's readable ink.
-fn notice(text: String, accent: Hsla, palette: &CardPalette) -> impl IntoElement {
-    div()
-        .border_l_2()
-        .border_color(accent)
-        .pl_2()
-        .text_xs()
-        .text_color(palette.text)
-        .child(text)
 }

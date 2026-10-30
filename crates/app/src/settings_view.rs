@@ -13,12 +13,12 @@ use crate::connection::{ConnectionModel, apply_profile, profile_from_settings};
 use crate::dashboard::CardPalette;
 use crate::engine::EngineModel;
 use crate::logging::LogLevel;
+use crate::notice::{Notice, Severity};
 use crate::paths::AppPaths;
 use crate::settings::{Settings, SettingsStore};
 
 use gpui_kit::base::ObservedElement;
 use gpui_kit::component::ActiveTheme as _;
-use gpui_kit::component::Theme;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState, NumberInput};
 use gpui_kit::component::radio::Radio;
@@ -784,35 +784,23 @@ impl SettingsView {
     }
 
     /// The problem notices, when the file failed to load or an action failed.
-    fn notices(&self, cx: &App) -> Vec<AnyElement> {
-        let theme = cx.theme();
-        let palette = CardPalette::new(theme);
+    fn notices(&self) -> Vec<AnyElement> {
         let mut notices = Vec::new();
         if let Some(problem) = self.store.problem() {
             notices.push(
-                notice(
-                    "settings-problem",
-                    problem.to_string(),
-                    theme.warning,
-                    &palette,
-                )
-                .into_any_element(),
+                Notice::new("settings-problem", Severity::Warning, problem.to_string())
+                    .into_any_element(),
             );
         } else if let Some(problem) = &self.environment_problem {
             notices.push(
-                notice("settings-problem", problem.clone(), theme.warning, &palette)
+                Notice::new("settings-problem", Severity::Warning, problem.clone())
                     .into_any_element(),
             );
         }
         if let Some(error) = &self.action_error {
             notices.push(
-                notice(
-                    "settings-action-error",
-                    error.clone(),
-                    theme.danger,
-                    &palette,
-                )
-                .into_any_element(),
+                Notice::new("settings-action-error", Severity::Error, error.clone())
+                    .into_any_element(),
             );
         }
         notices
@@ -821,7 +809,6 @@ impl SettingsView {
     /// The Connection section: server, account, credential, and sign-in
     /// (R1.1 to R1.6).
     fn connection(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let palette = CardPalette::new(cx.theme());
         let (state, form_error) = {
             let model = self.connection.read(cx);
             (
@@ -833,11 +820,7 @@ impl SettingsView {
             &state,
             ConnectionState::NeedsAttention(attention) if attention.needs_api_key()
         );
-        // The accents are read before the row builders borrow `cx` mutably.
-        let (state_accent, hint_accent, error_accent) = {
-            let theme = cx.theme();
-            (connection_accent(&state, theme), theme.info, theme.danger)
-        };
+        let state_severity = connection_severity(&state);
 
         let mut rows = vec![
             self.text_row(
@@ -873,31 +856,23 @@ impl SettingsView {
         ];
 
         rows.push(
-            notice(
-                "settings-connection-state",
-                state.message(),
-                state_accent,
-                &palette,
-            )
-            .into_any_element(),
+            Notice::new("settings-connection-state", state_severity, state.message())
+                .into_any_element(),
         );
         if needs_api_key {
             rows.push(
-                notice(
+                Notice::new(
                     "settings-connection-hint",
+                    Severity::Info,
                     "Switch the credential to API key and paste a key from Immich (Account \
-                     settings, then API keys)."
-                        .to_string(),
-                    hint_accent,
-                    &palette,
+                     settings, then API keys).",
                 )
                 .into_any_element(),
             );
         }
         if let Some(error) = form_error {
             rows.push(
-                notice("settings-connection-error", error, error_accent, &palette)
-                    .into_any_element(),
+                Notice::new("settings-connection-error", Severity::Error, error).into_any_element(),
             );
         }
 
@@ -1215,11 +1190,10 @@ impl SettingsView {
         }
         if let Some(problem) = problem {
             rows.push(
-                notice(
+                Notice::new(
                     "settings-tag-problem",
+                    Severity::Warning,
                     format!("The sync tag is not being applied: {problem}"),
-                    theme.warning,
-                    &palette,
                 )
                 .into_any_element(),
             );
@@ -1390,7 +1364,7 @@ impl Render for SettingsView {
         let palette = CardPalette::new(theme);
         let background = theme.background;
         let foreground = theme.foreground;
-        let notices = self.notices(cx);
+        let notices = self.notices();
         let connection = self.connection(cx);
         let general = self.general(cx);
         let limits = self.limits(cx);
@@ -1438,12 +1412,12 @@ fn secret_placeholder_for(method: AuthMethod) -> &'static str {
 }
 
 /// The accent that marks one connection state on the settings notice.
-fn connection_accent(state: &ConnectionState, theme: &Theme) -> Hsla {
+fn connection_severity(state: &ConnectionState) -> Severity {
     match state {
-        ConnectionState::Connected => theme.success,
-        ConnectionState::NeedsAttention(_) => theme.danger,
-        ConnectionState::Connecting => theme.info,
-        ConnectionState::NotConfigured => theme.muted_foreground,
+        ConnectionState::Connected => Severity::Success,
+        ConnectionState::NeedsAttention(_) => Severity::Error,
+        ConnectionState::Connecting => Severity::Info,
+        ConnectionState::NotConfigured => Severity::Info,
     }
 }
 
@@ -1591,28 +1565,6 @@ pub fn sync_tag_url(server_url: &str) -> Option<String> {
         "{}/tags?path={SYNC_TAG}",
         crate::asset_link::web_root(server_url)?
     ))
-}
-
-/// A notice with a colored edge, named by `id`. The accessible name carries
-/// the message, so the visible copy is not announced a second time.
-pub(crate) fn notice(
-    id: impl Into<ElementId>,
-    text: String,
-    accent: Hsla,
-    palette: &CardPalette,
-) -> impl IntoElement {
-    div()
-        .id(id)
-        .test_support()
-        .role(Role::Alert)
-        .aria_label(text.clone())
-        .border_l_2()
-        .border_color(accent)
-        .pl_2()
-        .py_1()
-        .text_xs()
-        .text_color(palette.text)
-        .child(Text::new_inaccessible(text.into()))
 }
 
 #[cfg(test)]

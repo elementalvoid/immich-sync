@@ -7,10 +7,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use gpui_kit::base::test_support::snapshots;
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, Bounds, Point, Role, SharedString, TestAppContext,
-    Window, WindowBounds, WindowOptions, px, size,
+    AnyWindowHandle, App, AppContext as _, Bounds, ElementId, Point, Role, SharedString,
+    TestAppContext, Window, WindowBounds, WindowOptions, px, size,
 };
 use immich_sync::connection::ConnectionModel;
 use immich_sync::engine::EngineModel;
@@ -211,6 +212,96 @@ async fn the_failed_view_names_every_row_and_its_retry_control(cx: &mut TestAppC
             window.find("failed-row-2").label(),
             Some("CLIP_0003.mp4, unclassified: The client did not record a reason."),
             "a row without a recorded reason says so instead of inventing one"
+        );
+    })
+    .expect("read the failed-items window");
+}
+
+/// #76: a failed row states its class and error once, and a list of N rows is
+/// N names, not N alerts.
+///
+/// The row's accessible name carries the reason; the strip inside it paints the
+/// accent edge and the class, and adds no accessibility node of its own, so the
+/// same information does not arrive a second time and nothing announces over
+/// the list.
+#[gpui_kit::test]
+async fn a_failed_row_states_its_reason_once_and_the_list_is_not_a_stack_of_alerts(
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let reasons = [
+        "the server does not accept this file format",
+        "the server answered 503",
+    ];
+    {
+        let store = StateStore::open(&paths.state_db).expect("open the state database");
+        for (index, reason) in reasons.iter().enumerate() {
+            store
+                .record(&parked(
+                    &format!("/photos/IMG_000{index}.cr3"),
+                    ItemState::FailedPermanent,
+                    Some(FailureClass::ServerTransient),
+                    Some(reason),
+                    2,
+                ))
+                .expect("write the parked row");
+        }
+    }
+    let (window, _view) = open_failed_view(cx, &paths);
+    wait_for_rows(cx, window, 2).await;
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        for (index, reason) in reasons.iter().enumerate() {
+            let row: ElementId = format!("failed-row-{index}").into();
+            let carrying: Vec<_> = snapshots(window)
+                .into_iter()
+                .filter(|element| element.path().contains(&row))
+                .filter(|element| {
+                    [element.label(), element.value()]
+                        .into_iter()
+                        .flatten()
+                        .any(|text| text.contains(reason))
+                })
+                .collect();
+            assert_eq!(
+                carrying.len(),
+                1,
+                "#76: row {index} states its error once: {:?}",
+                carrying
+                    .iter()
+                    .map(|element| (element.role(), element.path().to_vec()))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                carrying[0].role(),
+                Some(Role::ListItem),
+                "#76: the row's own name is the announcement"
+            );
+            let strip = window.find(format!("failed-row-notice-{index}"));
+            assert!(
+                strip.visible(),
+                "#76: the quiet strip is still painted: {strip:?}"
+            );
+            assert_eq!(
+                (strip.role(), strip.label()),
+                (None, None),
+                "#76: the quiet strip names nothing, so it cannot repeat the row"
+            );
+        }
+        let alerts: Vec<_> = snapshots(window)
+            .into_iter()
+            .filter(|element| element.role() == Some(Role::Alert))
+            .collect();
+        assert!(
+            alerts.is_empty(),
+            "#76: two failed rows are two names, not two alerts: {:?}",
+            alerts
+                .iter()
+                .map(|element| (element.label(), element.path().to_vec()))
+                .collect::<Vec<_>>()
         );
     })
     .expect("read the failed-items window");

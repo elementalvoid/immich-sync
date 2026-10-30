@@ -211,11 +211,14 @@ fn the_upload_view_names_its_controls(cx: &mut TestAppContext) {
         );
         assert_eq!(window.find("upload-button").label(), Some("Upload"));
         let result = window.find("upload-result");
-        assert_eq!(result.role(), Some(Role::Alert), "the result is announced");
+        assert!(
+            result.visible(),
+            "the empty state's copy is on screen: {result:?}"
+        );
         assert_eq!(
-            result.label(),
-            Some(UploadReport::Idle.message().as_str()),
-            "the notice states the current outcome"
+            (result.role(), result.label()),
+            (None, None),
+            "#76: no upload yet is an empty state, not a severity to announce"
         );
     })
     .expect("update the upload window");
@@ -441,8 +444,8 @@ async fn browsing_for_a_file_fills_the_field_and_upload_sends_it(cx: &mut TestAp
         );
         assert_eq!(
             window.find("upload-result").label(),
-            Some(UploadReport::Idle.message().as_str()),
-            "picking a file is not an outcome"
+            None,
+            "picking a file is not an outcome, so there is no notice"
         );
         window.click("upload-button", cx);
     })
@@ -514,8 +517,8 @@ fn cancelling_the_file_picker_changes_nothing(cx: &mut TestAppContext) {
         );
         assert_eq!(
             window.find("upload-result").label(),
-            Some(UploadReport::Idle.message().as_str()),
-            "#30: a cancel uploads nothing"
+            None,
+            "#30: a cancel uploads nothing, so there is no notice"
         );
     })
     .expect("read the field after the cancel");

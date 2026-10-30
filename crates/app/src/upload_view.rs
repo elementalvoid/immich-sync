@@ -14,6 +14,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::dashboard::CardPalette;
+use crate::notice::{Notice, Severity};
 use crate::path_picker::{self, Picked};
 use crate::upload::UploadModel;
 
@@ -104,49 +105,41 @@ impl UploadView {
         self.model.update(cx, |model, cx| model.upload(path, cx));
     }
 
-    /// The outcome notice: the headline, the full message, and the accent for
-    /// the result kind.
-    fn result(&self, cx: &App) -> impl IntoElement + use<> {
-        let theme = cx.theme();
-        let palette = CardPalette::new(theme);
+    /// The outcome notice: the headline over the full message, marked by the
+    /// severity of the result kind. Before the first upload there is no outcome
+    /// to report, so the area holds plain copy instead of a severity (#76).
+    fn result(&self, cx: &App) -> AnyElement {
         let report = self.model.read(cx).report().clone();
-        let accent = match &report {
+        let severity = match &report {
+            crate::upload::UploadReport::Idle => {
+                return div()
+                    .id("upload-result")
+                    .test_support()
+                    .pl_2()
+                    .py_1()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    // Accessible text, so the empty state's words still reach
+                    // assistive technology without a severity (#77 owns the
+                    // empty state itself).
+                    .child(Text::new(
+                        "upload-result-copy".into(),
+                        report.message().into(),
+                    ))
+                    .into_any_element();
+            }
             crate::upload::UploadReport::Created { .. }
-            | crate::upload::UploadReport::Duplicate { .. } => theme.success,
+            | crate::upload::UploadReport::Duplicate { .. } => Severity::Success,
             crate::upload::UploadReport::Failed {
                 permanent: true, ..
-            } => theme.danger,
-            crate::upload::UploadReport::Failed { .. } => theme.warning,
-            crate::upload::UploadReport::CannotRun { .. } => theme.danger,
-            crate::upload::UploadReport::Idle | crate::upload::UploadReport::Running => {
-                theme.muted_foreground
             }
+            | crate::upload::UploadReport::CannotRun { .. } => Severity::Error,
+            crate::upload::UploadReport::Failed { .. } => Severity::Warning,
+            crate::upload::UploadReport::Running => Severity::Info,
         };
-        let message = report.message();
-        div()
-            .id("upload-result")
-            .test_support()
-            .role(Role::Alert)
-            .aria_label(message.clone())
-            .flex()
-            .flex_col()
-            .gap_0p5()
-            .border_l_2()
-            .border_color(accent)
-            .pl_2()
-            .py_1()
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(report.headline()),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(palette.meta)
-                    .child(Text::new_inaccessible(message.into())),
-            )
+        Notice::new("upload-result", severity, report.message())
+            .headline(report.headline())
+            .into_any_element()
     }
 }
 
@@ -247,12 +240,7 @@ impl Render for UploadView {
                             ),
                     )
                     .when_some(self.pick_notice.clone(), |this, notice| {
-                        this.child(crate::settings_view::notice(
-                            "upload-browse-notice",
-                            notice,
-                            theme.danger,
-                            &palette,
-                        ))
+                        this.child(Notice::new("upload-browse-notice", Severity::Error, notice))
                     })
                     .child(
                         div().flex().flex_row().justify_end().child(

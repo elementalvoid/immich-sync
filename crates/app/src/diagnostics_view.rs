@@ -10,7 +10,8 @@ use gpui_kit::*;
 use crate::dashboard::CardPalette;
 use crate::debug_bundle::{LOG_BYTES, LOG_FILES};
 use crate::diagnostics::{BundleState, DiagnosticsModel, Permissions, format_bytes, format_rate};
-use crate::settings_view::{field_text, notice, section};
+use crate::notice::{Notice, Severity};
+use crate::settings_view::{field_text, section};
 use crate::version;
 use sync_core::store::SqliteInfo;
 
@@ -103,11 +104,10 @@ impl DiagnosticsView {
         let mut rows = Vec::with_capacity(5);
         if let Some(problem) = &server.problem {
             rows.push(
-                notice(
+                Notice::new(
                     "diagnostics-server-problem",
+                    Severity::Error,
                     problem.clone(),
-                    cx.theme().danger,
-                    &palette,
                 )
                 .into_any_element(),
             );
@@ -180,22 +180,20 @@ impl DiagnosticsView {
         let mut rows = Vec::with_capacity(12);
         if let Some(problem) = &problem {
             rows.push(
-                notice(
+                Notice::new(
                     "diagnostics-state-problem",
+                    Severity::Error,
                     problem.clone(),
-                    cx.theme().danger,
-                    &palette,
                 )
                 .into_any_element(),
             );
         }
         if rebuilding {
             rows.push(
-                notice(
+                Notice::new(
                     "diagnostics-rebuilding",
-                    "Rebuilding the state database and rescanning the folders…".to_string(),
-                    cx.theme().info,
-                    &palette,
+                    Severity::Info,
+                    "Rebuilding the state database and rescanning the folders…",
                 )
                 .into_any_element(),
             );
@@ -336,14 +334,12 @@ impl DiagnosticsView {
         let collecting = matches!(state, BundleState::Collecting);
         let mut rows: Vec<AnyElement> = Vec::with_capacity(6);
         rows.push(
-            notice(
+            Notice::new(
                 "diagnostics-bundle-privacy",
+                Severity::Info,
                 "The archive holds your folder paths, account email, server URL, and the log \
                  files. It never holds your password, an API key, or a session token: the log \
-                 files are already redacted. Review it before you attach it to a message."
-                    .to_string(),
-                theme.info,
-                &palette,
+                 files are already redacted. Review it before you attach it to a message.",
             )
             .into_any_element(),
         );
@@ -381,11 +377,10 @@ impl DiagnosticsView {
         match &state {
             BundleState::Idle => {}
             BundleState::Collecting => rows.push(
-                notice(
+                Notice::new(
                     "diagnostics-bundle-collecting",
-                    "Collecting the debug bundle…".to_string(),
-                    theme.info,
-                    &palette,
+                    Severity::Info,
+                    "Collecting the debug bundle…",
                 )
                 .into_any_element(),
             ),
@@ -449,22 +444,20 @@ impl DiagnosticsView {
                 // words its README uses.
                 for (index, note) in report.notes.iter().enumerate() {
                     rows.push(
-                        notice(
+                        Notice::new(
                             ElementId::Name(format!("diagnostics-bundle-note-{index}").into()),
+                            Severity::Warning,
                             note.clone(),
-                            theme.warning,
-                            &palette,
                         )
                         .into_any_element(),
                     );
                 }
             }
             BundleState::Failed(problem) => rows.push(
-                notice(
+                Notice::new(
                     "diagnostics-bundle-problem",
+                    Severity::Error,
                     problem.clone(),
-                    theme.danger,
-                    &palette,
                 )
                 .into_any_element(),
             ),

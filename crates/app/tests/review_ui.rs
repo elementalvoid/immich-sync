@@ -9,6 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use gpui_kit::base::test_support::snapshots;
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
     AnyWindowHandle, App, AppContext as _, Bounds, Point, Role, TestAppContext, Window,
@@ -223,6 +224,30 @@ async fn the_review_names_every_row_and_both_actions(cx: &mut TestAppContext) {
                 .is_some_and(|label| label.starts_with("CLIP_0002.mp4, missing from ")),
             "R5.3: the row is announced with its file: {:?}",
             row.label()
+        );
+        assert!(
+            row.label()
+                .is_some_and(|label| label.ends_with("The server copy is untouched.")),
+            "#76: the row keeps the reassurance its quiet strip no longer announces: {:?}",
+            row.label()
+        );
+        let alerts: Vec<_> = snapshots(window)
+            .into_iter()
+            .filter(|element| element.role() == Some(Role::Alert))
+            .collect();
+        assert!(
+            alerts.is_empty(),
+            "#76: two review rows are two names, not two alerts: {:?}",
+            alerts
+                .iter()
+                .map(|element| element.label())
+                .collect::<Vec<_>>()
+        );
+        let strip = window.find("review-row-notice-0");
+        assert_eq!(
+            (strip.role(), strip.label()),
+            (None, None),
+            "#76: the per-row strip names nothing, so 50 rows cannot shout 50 times"
         );
         assert_eq!(
             window.find("review-keep-0").label(),
