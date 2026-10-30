@@ -8,7 +8,7 @@
 
 mod common;
 
-use common::mock_server;
+use common::{contrast, mock_server};
 
 use std::fs;
 use std::path::Path;
@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_kit::base::test_support::snapshots;
+use gpui_kit::component::Theme;
 use gpui_kit::test::{ElementSnapshot, TestWindowExt as _};
 use gpui_kit::{
     AnyWindowHandle, App, AppContext as _, Bounds, ClipboardItem, ElementId, Entity, Point, Role,
@@ -24,7 +25,7 @@ use gpui_kit::{
 };
 use immich_sync::autostart::{Autostart, UnavailableAutostart};
 use immich_sync::connection::ConnectionModel;
-use immich_sync::dashboard::Dashboard;
+use immich_sync::dashboard::{CardPalette, Dashboard};
 use immich_sync::debug_bundle::BUNDLE_PREFIX;
 use immich_sync::diagnostics::{BundleState, DiagnosticsModel, Permissions};
 use immich_sync::diagnostics_view::DiagnosticsView;
@@ -35,6 +36,7 @@ use immich_sync::settings::SettingsStore;
 use immich_sync::settings_view::SettingsView;
 use immich_sync::shell::{self, AppShell, ViewMode};
 use immich_sync::store::StoreModel;
+use immich_sync::theme::{SystemTheme, apply_system_theme};
 use immich_sync::upload::UploadModel;
 use immich_sync::upload_view::UploadView;
 use immich_sync::{status, theme};
@@ -331,6 +333,20 @@ fn scroll_diagnostics_into_view(window: &mut Window, cx: &mut App, id: impl Into
         );
     }
     panic!("{id:?} never became visible on diagnostics");
+}
+
+/// Scrolls the diagnostics view back to the top, so the next row is found by
+/// scrolling down to it rather than left behind above the viewport.
+fn scroll_diagnostics_to_top(window: &mut Window, cx: &mut App) {
+    use gpui_kit::{ScrollDelta, point, px};
+
+    window.render_frame(cx);
+    window.scroll(
+        "diagnostics-view",
+        ScrollDelta::Pixels(point(px(0.), px(4000.))),
+        cx,
+    );
+    window.render_frame(cx);
 }
 
 /// Adds one source folder straight to the store, before the engine exists.
@@ -1472,4 +1488,371 @@ async fn an_unreachable_server_makes_a_partial_bundle_with_a_note(cx: &mut TestA
         }
     })
     .expect("update the shell window");
+}
+
+/// Seeds one failed attempt with a message, so the last-error card has a row.
+fn seed_failure(store: &Entity<StoreModel>, cx: &mut App, message: &str) {
+    let store = store.read(cx);
+    let store = store.store().expect("the store is open");
+    let mut failed = bundle_item("/photos/one.cr3", ItemState::FailedPermanent);
+    failed.error_class = Some(FailureClass::UnsupportedFormat);
+    failed.error_message = Some(message.to_string());
+    store.record(&failed).expect("write the failed item");
+    store
+        .record_attempt(&AttemptRecord {
+            path: failed.path.clone(),
+            started_ns: 10,
+            outcome: AttemptOutcome::Failed,
+            error_class: Some(FailureClass::UnsupportedFormat),
+        })
+        .expect("record the attempt");
+}
+
+/// #80: the description-list rows keep every value's element id and accessible
+/// name. The literals are the ones the hand-written rows showed, copied from
+/// the pre-migration source, not read back from the view: a row that loses its
+/// id, its name, or its value fails here.
+#[gpui_kit::test]
+async fn every_value_row_keeps_its_element_id_and_accessible_name(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let (_runtime, server) = mock_server();
+    server.set_api_key(API_KEY);
+    server.set_api_key_permissions(&["asset.upload", "server.about"]);
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let connection = connection_model(cx, &server, AuthMethod::ApiKey);
+    let (window, store, _engine, diagnostics) = open_shell(
+        cx,
+        SettingsStore::open(paths.config_file.clone()),
+        paths.clone(),
+        connection.clone(),
+    );
+    wait_until(cx, "the store", |cx| store.read(cx).store().is_some()).await;
+    let message = "the server answered 415";
+    cx.update(|cx| seed_failure(&store, cx, message));
+    cx.update(|cx| diagnostics.update(cx, |model, cx| model.refresh(cx)));
+    sign_in(cx, &connection, &server, AuthMethod::ApiKey, API_KEY);
+    wait_until(cx, "the server probe", |cx| {
+        diagnostics.read(cx).server().version.is_some()
+    })
+    .await;
+    wait_until(cx, "the sqlite read", |cx| {
+        diagnostics.read(cx).info().is_some()
+    })
+    .await;
+    wait_until(cx, "the last error per class", |cx| {
+        !diagnostics.read(cx).errors().is_empty()
+    })
+    .await;
+
+    let rows: Vec<(&str, String)> = vec![
+        (
+            "diagnostics-client-version-value",
+            concat!(
+                env!("CARGO_PKG_VERSION"),
+                " (",
+                env!("IMMICH_SYNC_GIT_REVISION"),
+                ")"
+            )
+            .to_string(),
+        ),
+        ("diagnostics-server-version-value", "v3.3.1".to_string()),
+        (
+            "diagnostics-permissions-value",
+            "Mock API Key: asset.upload, server.about".to_string(),
+        ),
+        (
+            "diagnostics-state-path-value",
+            paths.state_db.display().to_string(),
+        ),
+        (
+            "diagnostics-sqlite-version-value",
+            DB_MIGRATION_VERSION.to_string(),
+        ),
+        ("diagnostics-integrity-value", "ok".to_string()),
+        // The seeded failed item is the one row `sync_item` holds.
+        ("diagnostics-table-sync_item", "sync_item: 1".to_string()),
+        ("diagnostics-throughput-value", "0 B/s".to_string()),
+        (
+            "diagnostics-error-unsupported_format",
+            format!("unsupported_format: {message}"),
+        ),
+    ];
+    for system in [theme::SystemTheme::Light, theme::SystemTheme::Dark] {
+        cx.update(|cx| theme::apply_system_theme(system, cx));
+        cx.update_window(window, |_, window, cx| {
+            show_diagnostics(window, cx);
+            for (id, name) in &rows {
+                let row = window
+                    .try_find(*id)
+                    .unwrap_or_else(|| panic!("{id} is no longer shown in {system:?}"));
+                assert!(row.visible(), "{id} is visible in {system:?}");
+                assert_eq!(
+                    row.label(),
+                    Some(name.as_str()),
+                    "{id} keeps its accessible name in {system:?}"
+                );
+                // #80: the term is announced as a term, not as flat text.
+                let term = window
+                    .try_find(ElementId::Name(format!("{id}-label").into()))
+                    .unwrap_or_else(|| panic!("{id} has no label in {system:?}"));
+                assert_eq!(
+                    term.role(),
+                    Some(Role::Term),
+                    "{id} is announced as its term in {system:?}"
+                );
+            }
+            // The rows whose value the run itself decides: each one still says
+            // what it said before the migration, and none may be blank.
+            let activity = window
+                .find("diagnostics-activity-value")
+                .label()
+                .expect("the activity is shown")
+                .to_string();
+            assert!(
+                ["Idle", "Syncing", "Paused", "Needs attention"].contains(&activity.as_str()),
+                "the activity is one of its four labels: {activity}"
+            );
+            let counts = window
+                .find("diagnostics-counts-value")
+                .label()
+                .expect("the counts are shown")
+                .to_string();
+            let parts: Vec<&str> = counts.split(", ").collect();
+            assert_eq!(parts.len(), 3, "three counts, in one sentence: {counts}");
+            for (part, word) in parts.iter().zip(["uploaded", "pending", "failed"]) {
+                assert!(
+                    part.ends_with(&format!(" {word}"))
+                        && part
+                            .trim_end_matches(&format!(" {word}"))
+                            .parse::<u64>()
+                            .is_ok(),
+                    "the counts keep their wording: {counts}"
+                );
+            }
+            assert!(
+                window
+                    .find("diagnostics-sqlite-size-value")
+                    .label()
+                    .is_some_and(|size| !size.is_empty()),
+                "the database size is still shown"
+            );
+        })
+        .expect("update the shell window");
+    }
+}
+
+/// The most lines a value may take before it is cut. A copy of the view's
+/// clamp, deliberately not imported, so raising it fails here (#80).
+const VALUE_LINE_CLAMP: f32 = 6.;
+
+/// #80: a value long enough to fill the card is cut at a fixed number of lines,
+/// and the whole text stays in the row's accessible name.
+///
+/// `UploadFailure::message` is the raw error text, so a 2000-character server
+/// answer reaches this row. Unclamped it wraps to about 45 lines in the
+/// description column at 520 px and makes the errors card one tall row; the cut
+/// is visual only, so the name still carries every character.
+#[gpui_kit::test]
+async fn a_very_long_value_is_cut_at_the_clamp_and_keeps_its_whole_name(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let (_runtime, server) = mock_server();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let connection = connection_model(cx, &server, AuthMethod::ApiKey);
+    let (window, store, _engine, diagnostics) = open_shell(
+        cx,
+        SettingsStore::open(paths.config_file.clone()),
+        paths.clone(),
+        connection.clone(),
+    );
+    wait_until(cx, "the store", |cx| store.read(cx).store().is_some()).await;
+    let message: String = "the server answered 415 "
+        .repeat(84)
+        .chars()
+        .take(2000)
+        .collect();
+    assert_eq!(message.chars().count(), 2000, "the message is the long one");
+    cx.update(|cx| seed_failure(&store, cx, &message));
+    cx.update(|cx| diagnostics.update(cx, |model, cx| model.refresh(cx)));
+    wait_until(cx, "the last error per class", |cx| {
+        !diagnostics.read(cx).errors().is_empty()
+    })
+    .await;
+
+    cx.update_window(window, |_, window, cx| {
+        show_diagnostics(window, cx);
+        window.resize(size(px(520.), px(480.)));
+        window.bounds_changed(cx);
+        window.render_frame(cx);
+    })
+    .expect("update the shell window");
+
+    let name = format!("unsupported_format: {message}");
+    for system in [theme::SystemTheme::Light, theme::SystemTheme::Dark] {
+        cx.update(|cx| theme::apply_system_theme(system, cx));
+        cx.update_window(window, |_, window, cx| {
+            show_diagnostics(window, cx);
+            let one_line = f32::from(
+                window
+                    .find("diagnostics-throughput-value")
+                    .bounds()
+                    .size
+                    .height,
+            );
+            assert!(
+                one_line > 0.,
+                "a one-line value has a height to measure against"
+            );
+            scroll_diagnostics_into_view(window, cx, "diagnostics-error-unsupported_format");
+            let value = window.find("diagnostics-error-unsupported_format");
+            let lines = f32::from(value.bounds().size.height) / one_line;
+            assert!(
+                (lines - VALUE_LINE_CLAMP).abs() <= 1.,
+                "{system:?}: the 2000-character value takes {lines:.1} lines, the clamp's \
+                 {VALUE_LINE_CLAMP}"
+            );
+            // The cut is visual: every character is still in the name.
+            assert_eq!(
+                value.label(),
+                Some(name.as_str()),
+                "{system:?}: the whole 2000-character value stays announced"
+            );
+        })
+        .expect("update the shell window");
+    }
+}
+
+/// The label column every value row shares, in rems: wide enough for the
+/// longest term and fixed, so a long value can never take its width.
+const LABEL_COLUMN_REMS: f32 = 12.;
+
+/// #80: a long value wraps inside its own column and never narrows the label,
+/// at the shell's smallest window and in both themes.
+///
+/// The deep temp directory makes the state database's path longer than the
+/// description column at 520 px, and the failure message does the same in the
+/// errors card, so both rows have to wrap instead of pushing the label aside.
+#[gpui_kit::test]
+async fn a_long_value_wraps_and_never_narrows_the_label_at_the_narrowest_window(
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let (_runtime, server) = mock_server();
+    server.set_api_key(API_KEY);
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let deep = temp
+        .path()
+        .join("a-deep-directory-name-long-enough-to-wrap-the-database-path")
+        .join("and-a-second-segment-for-good-measure");
+    fs::create_dir_all(&deep).expect("create the deep directory");
+    let paths = temporary_paths(&deep);
+    let connection = connection_model(cx, &server, AuthMethod::ApiKey);
+    let (window, store, _engine, diagnostics) = open_shell(
+        cx,
+        SettingsStore::open(paths.config_file.clone()),
+        paths.clone(),
+        connection.clone(),
+    );
+    wait_until(cx, "the store", |cx| store.read(cx).store().is_some()).await;
+    let message = "the server answered 415 with a long explanation that cannot fit on one line \
+                   of the description column";
+    cx.update(|cx| seed_failure(&store, cx, message));
+    cx.update(|cx| diagnostics.update(cx, |model, cx| model.refresh(cx)));
+    wait_until(cx, "the last error per class", |cx| {
+        !diagnostics.read(cx).errors().is_empty()
+    })
+    .await;
+
+    cx.update_window(window, |_, window, cx| {
+        show_diagnostics(window, cx);
+        window.resize(size(px(520.), px(480.)));
+        window.bounds_changed(cx);
+        window.render_frame(cx);
+    })
+    .expect("update the shell window");
+
+    for system in [theme::SystemTheme::Light, theme::SystemTheme::Dark] {
+        cx.update(|cx| theme::apply_system_theme(system, cx));
+        cx.update_window(window, |_, window, cx| {
+            show_diagnostics(window, cx);
+            let label_width = f32::from(window.rem_size()) * LABEL_COLUMN_REMS;
+            let one_line = f32::from(
+                window
+                    .find("diagnostics-throughput-value")
+                    .bounds()
+                    .size
+                    .height,
+            );
+            assert!(
+                one_line > 0.,
+                "a one-line value has a height to measure against"
+            );
+            scroll_diagnostics_to_top(window, cx);
+            for (card_id, value_id) in [
+                ("diagnostics-state", "diagnostics-state-path-value"),
+                ("diagnostics-errors", "diagnostics-error-unsupported_format"),
+            ] {
+                scroll_diagnostics_into_view(window, cx, value_id);
+                let card = window.find(card_id).bounds();
+                let label = window
+                    .try_find(ElementId::Name(format!("{value_id}-label").into()))
+                    .unwrap_or_else(|| panic!("{value_id} has no label box in {system:?}"))
+                    .bounds();
+                let value = window.find(value_id).bounds();
+                assert!(
+                    (f32::from(label.size.width) - label_width).abs() <= 1.,
+                    "{system:?}: {value_id} keeps its label column ({label_width} px): {label:?}"
+                );
+                assert!(
+                    label.origin.x >= card.origin.x + px(12.) - px(1.)
+                        && label.origin.x + label.size.width <= card.origin.x + card.size.width,
+                    "{system:?}: the {value_id} label sits inside its card: {label:?} in {card:?}"
+                );
+                assert!(
+                    value.origin.x >= label.origin.x + label.size.width - px(1.),
+                    "{system:?}: the {value_id} value starts after the label, not over it: \
+                     {value:?} vs {label:?}"
+                );
+                assert!(
+                    value.origin.x + value.size.width <= card.origin.x + card.size.width,
+                    "{system:?}: the {value_id} value stays inside its card: {value:?} in {card:?}"
+                );
+                assert!(
+                    f32::from(value.size.height) >= one_line * 1.5,
+                    "{system:?}: the long {value_id} wraps instead of being clipped to one \
+                     line: {value:?} vs a {one_line} px line"
+                );
+            }
+        })
+        .expect("update the shell window");
+    }
+}
+
+/// #80: the value rows read on the card surface in both themes.
+///
+/// The terms take the kit's description-list label ink and the values keep the
+/// card's own two inks, so the three pairs are measured against the card
+/// surface the rows are drawn on.
+#[gpui_kit::test]
+fn the_label_and_value_ink_reads_on_the_card_in_both_themes(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    for system in [SystemTheme::Light, SystemTheme::Dark] {
+        cx.update(|cx| apply_system_theme(system, cx));
+        cx.read(|cx| {
+            let theme = Theme::global(cx);
+            let palette = CardPalette::new(theme);
+            for (what, ink) in [
+                ("the term", theme.description_list_label_foreground),
+                ("the value", palette.text),
+                ("the help", palette.meta),
+            ] {
+                let ratio = contrast(ink, palette.surface);
+                assert!(
+                    ratio >= 4.5,
+                    "{system:?}: {what} on the card surface is {ratio:.2}:1, below 4.5:1"
+                );
+            }
+        });
+    }
 }
