@@ -222,22 +222,14 @@ fn subscribe_title(
     })
 }
 
-/// The key context the panel's root carries (#81).
-///
-/// The panel's dialog drops the layer's key context so Enter reaches the
-/// focused control, which also drops the layer's Escape binding; this context
-/// is where the panel binds Escape back.
-pub(crate) const KEY_CONTEXT: &str = "FolderPanel";
-
 /// The folder panel: a draft's settings or one folder's live detail, inside the
 /// focus-trapped modal host.
 pub struct FolderPanel {
     engine: Entity<EngineModel>,
     mode: FolderPanelMode,
     /// The panel's own focus handle (#81). It is not a trap: the layer supplies
-    /// the trap. It anchors the panel's key context on the dispatch path, so the
-    /// panel's Escape binding is reachable whichever control holds the keyboard
-    /// inside the panel.
+    /// the trap. It is where the keyboard lands when the panel opens, so Tab
+    /// descends into the panel's controls.
     focus: FocusHandle,
     /// The draft: the path plus the three settings. In detail mode the path is
     /// the folder's identity and the settings are the live values, so one
@@ -807,8 +799,8 @@ impl FolderPanel {
         &self.draft.path
     }
 
-    /// The handle the layer opens with focus on (#81), so the panel's key
-    /// context is on the dispatch path before the user reaches any control.
+    /// The handle the layer opens with focus on (#81), so Tab starts inside the
+    /// panel before the user reaches any control.
     #[must_use]
     pub(crate) fn focus_handle(&self) -> FocusHandle {
         self.focus.clone()
@@ -1057,11 +1049,11 @@ impl FolderPanel {
         let percent = format!("{}%", (progress.clamp(0.0, 1.0) * 100.0).round() as u32);
 
         // #43: while the Remove confirmation shows, the normal body dims. The
-        // opacity sits on this inner wrapper, never on the whole body, so the
-        // answer is never dimmed with the panel (#73 moved the answer into its
-        // own window-level layer). Opacity is not one of the things the test
-        // harness observes, so no test pins this; the flag is pinned by the
-        // alert opening and closing.
+        // opacity sits on the scrolling wrapper and the footer, never on the
+        // whole body, so the answer is never dimmed with the panel (#73 moved
+        // the answer into its own window-level layer). Opacity is not one of the
+        // things the test harness observes, so no test pins this; the flag is
+        // pinned by the alert opening and closing.
         let inner = div()
             .id("folder-detail-body-dim")
             .test_support()
@@ -1069,10 +1061,11 @@ impl FolderPanel {
             .flex_col()
             .gap_3()
             .w_full()
-            // #81: at least as tall as the surface, and the column that
-            // scrolls when the detail is taller than the dialog, so every
-            // row keeps its own height: nothing is squeezed to make it fit.
-            .min_h_full()
+            // #81: the region that scrolls when the detail is taller than the
+            // dialog, so every row keeps its own height: nothing is squeezed to
+            // make it fit, and the footer below it never moves.
+            .flex_1()
+            .min_h_0()
             .overflow_y_scroll()
             .when(self.confirming, |this| this.opacity(0.4))
             .child(
@@ -1200,7 +1193,30 @@ impl FolderPanel {
                     .text_color(muted)
                     .child(scan_line),
             )
-            .child(self.assets_section(palette, theme, cx))
+            .child(self.assets_section(palette, theme, cx));
+
+        // #81: the list's Load more and the row that acts on the whole folder
+        // sit in a footer that never scrolls, so neither is behind a wheel at
+        // any window height. The body above keeps the wheel, and the list keeps
+        // its own.
+        let footer = div()
+            .id("folder-detail-footer")
+            .test_support()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .w_full()
+            .flex_shrink_0()
+            .when(self.confirming, |this| this.opacity(0.4))
+            .when(self.assets_more, |this| {
+                this.child(
+                    Button::new("folder-assets-more")
+                        .secondary()
+                        .label("Load more")
+                        .accessibility_label(format!("Load the next {ASSET_PAGE} uploaded assets"))
+                        .on_click(cx.listener(|this, _, _, cx| this.load_more_assets(cx))),
+                )
+            })
             .child(
                 div()
                     .flex()
@@ -1269,9 +1285,8 @@ impl FolderPanel {
             .flex_col()
             .gap_3()
             .w_full()
-            // #81: the body fills the surface the layer sized, so the panel's
-            // own column is what scrolls when the detail is taller than the
-            // dialog and no control is clipped away (#43).
+            // #81: the body fills the surface the layer sized and splits it: the
+            // content above scrolls, the footer below never does (#43).
             .flex_1()
             .min_h_0()
             .child(inner)
@@ -1285,6 +1300,7 @@ impl FolderPanel {
                     problem,
                 ))
             })
+            .child(footer)
             .into_any_element()
     }
 
@@ -1326,10 +1342,10 @@ impl FolderPanel {
                 .into_any_element()
         } else {
             // #44: the list scrolls inside the dialog, so a folder with hundreds
-            // of assets does not push Load more or the actions out of reach.
-            // #81: it keeps #44's designed height (five rows), so the data view
-            // is not squeezed to buy room for the controls; when the detail is
-            // taller than the surface, the panel's body is what scrolls.
+            // of assets does not push the controls out of reach. #81: it keeps
+            // #44's designed height (five rows), so the data view is not
+            // squeezed to buy room for them; when the detail is taller than the
+            // surface, the body above the footer is what scrolls.
             let mut rows = div()
                 .id("folder-assets-list")
                 .test_support()
@@ -1353,15 +1369,6 @@ impl FolderPanel {
             .w_full()
             .child(heading)
             .child(state)
-            .when(self.assets_more, |this| {
-                this.child(
-                    Button::new("folder-assets-more")
-                        .secondary()
-                        .label("Load more")
-                        .accessibility_label(format!("Load the next {ASSET_PAGE} uploaded assets"))
-                        .on_click(cx.listener(|this, _, _, cx| this.load_more_assets(cx))),
-                )
-            })
     }
 
     /// One uploaded asset: its name, size, upload time, and Immich link (#44).
@@ -1458,18 +1465,14 @@ impl Render for FolderPanel {
         };
         // The window's dialog layer supplies the surface, the backdrop, the
         // focus trap, Escape and the sizing (#81); the panel is the body it
-        // hosts. Nothing here scrolls unless the window is too short for the
-        // detail, and then the wheel still reaches every control (#43).
+        // hosts. Escape is bound for the whole window, so it reaches the layer
+        // from anywhere the trap puts the keyboard, the panel's own root
+        // included: the panel declares no key context of its own.
         div()
             .id("folder-panel")
             .test_support()
             .role(Role::Dialog)
             .aria_label(self.aria_label())
-            // #81: the panel's own key context, held by its root so that Escape
-            // is bound wherever the keyboard sits inside the panel; the layer
-            // opens with focus here, which is what puts this context on the
-            // dispatch path. Not a tab stop: Tab descends to the first control.
-            .key_context(KEY_CONTEXT)
             .track_focus(&self.focus)
             .tab_stop(false)
             .flex()

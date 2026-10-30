@@ -288,18 +288,6 @@ fn open_detail_now(cx: &mut TestAppContext, window: AnyWindowHandle) {
     });
 }
 
-/// Scrolls the detail's body to its end with the wheel, as a person does when
-/// the detail is taller than the panel (#81).
-fn scroll_detail_to_bottom(window: &mut Window, cx: &mut App) {
-    for _ in 0..8 {
-        window.scroll(
-            "folder-detail-body-dim",
-            ScrollDelta::Pixels(point(px(0.), px(-120.))),
-            cx,
-        );
-    }
-}
-
 #[gpui_kit::test]
 async fn a_card_click_and_its_details_control_open_the_detail(cx: &mut TestAppContext) {
     // A worker thread wakes the foreground executor, which the harness
@@ -803,6 +791,131 @@ async fn enter_activates_the_focused_control_and_the_other_keys_still_work(
     });
 }
 
+/// #81: Escape keeps working when the layer's focus trap walks backwards out of
+/// the panel.
+///
+/// The trap's order starts at the dialog's own host, which is outside the panel,
+/// so Shift-Tab from the panel's first control — or as the first key after it
+/// opens — leaves the panel's subtree. The layer's `on_cancel` is still what
+/// dismisses it there, because Escape is bound for the whole window, and it is
+/// the only Escape path either way.
+#[gpui_kit::test]
+async fn escape_survives_backward_traversal_out_of_the_panel(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+    seed_folder(&paths, &photos, true);
+    let (window, store, _view) = open_dashboard(cx, &paths);
+    wait_for_store(cx, &store).await;
+
+    // Escape as the very first key after opening, with the keyboard still where
+    // the layer put it.
+    open_detail_now(cx, window);
+    act(cx, window, |window, cx| window.press("escape", cx));
+    read(cx, window, |window, _| {
+        assert!(
+            !detail_open(window),
+            "#81: Escape closes the detail without a control having been reached"
+        );
+    });
+
+    // Shift-Tab as the very first key: the trap hands the keyboard to its own
+    // host, and Escape is dispatched from outside the panel.
+    open_detail_now(cx, window);
+    act(cx, window, |window, cx| window.press("shift-tab", cx));
+    read(cx, window, |window, _| {
+        assert_eq!(
+            window.find("folder-panel").focused(),
+            Some(false),
+            "#81: Shift-Tab leaves the panel's own subtree"
+        );
+        assert_eq!(
+            window.find(("folder-details", 0_usize)).focused(),
+            Some(false),
+            "#81: and stays inside the dialog, not on the page behind it"
+        );
+    });
+    act(cx, window, |window, cx| window.press("escape", cx));
+    read(cx, window, |window, _| {
+        assert!(
+            !detail_open(window),
+            "#81: Escape closes the detail from the layer's host"
+        );
+    });
+
+    // The same from the panel's first control, which is what a Tab reaches.
+    open_detail_now(cx, window);
+    act(cx, window, |window, cx| {
+        tab_to(window, "folder-detail-close", cx);
+        window.press("shift-tab", cx);
+    });
+    read(cx, window, |window, _| {
+        assert_eq!(
+            (
+                window.find("folder-panel").focused(),
+                window.find("folder-detail-close").focused()
+            ),
+            (Some(false), Some(false)),
+            "#81: Shift-Tab from the first control leaves the panel too"
+        );
+    });
+    act(cx, window, |window, cx| window.press("escape", cx));
+    read(cx, window, |window, _| {
+        assert!(
+            !detail_open(window),
+            "#81: Escape closes the detail after a backward step out of the panel"
+        );
+    });
+
+    // The setup dialog takes the same path through the same layer: its keyboard
+    // starts on the panel root, and one backward step hands it to the host.
+    act(cx, window, |window, cx| {
+        window.click("dashboard-add-folder", cx)
+    });
+    act(cx, window, |window, cx| window.press("shift-tab", cx));
+    read(cx, window, |window, _| {
+        assert_eq!(
+            window.find("folder-panel").focused(),
+            Some(false),
+            "#81: one Shift-Tab takes the setup's keyboard out of the panel"
+        );
+    });
+    act(cx, window, |window, cx| window.press("escape", cx));
+    read(cx, window, |window, _| {
+        assert!(
+            !detail_open(window),
+            "#81: Escape closes the setup dialog from the layer's host"
+        );
+    });
+
+    // From the setup's first control the keyboard stays inside the panel: the
+    // text field takes Shift-Tab for its own editing and does not forward it,
+    // which is why the host state above is the one that has to work.
+    act(cx, window, |window, cx| {
+        window.click("dashboard-add-folder", cx)
+    });
+    act(cx, window, |window, cx| {
+        tab_to(window, "folder-panel-title", cx);
+        window.press("shift-tab", cx);
+    });
+    read(cx, window, |window, _| {
+        assert_eq!(
+            window.find("folder-panel-title").focused(),
+            Some(true),
+            "#81: the setup's text field keeps the keyboard on itself"
+        );
+    });
+    act(cx, window, |window, cx| window.press("escape", cx));
+    read(cx, window, |window, _| {
+        assert!(
+            !detail_open(window),
+            "#81: Escape closes the setup dialog from its first control too"
+        );
+    });
+}
+
 /// The panel's surface is centred on the window in both axes (#81).
 fn assert_centred(window: &Window, what: &str) {
     let surface = window.find("surface").bounds();
@@ -889,16 +1002,16 @@ async fn both_panel_widths_go_through_the_layer_and_stay_centred(cx: &mut TestAp
     });
 }
 
-/// #81: the layer sizes the panel, so at the widest content the detail carries
-/// (a full page of uploaded assets) the list keeps #44's five rows, and the
-/// wheel — not a test-side scroll — reaches the last row of controls.
+/// #81: the row that acts on the folder and the list's Load more are a footer
+/// outside the body's scroll region, so no window height and no wheel stands
+/// between a person and a control; the body keeps the wheel and #44's list
+/// keeps its own five rows.
 ///
-/// The detail with 50 assets loaded is 866 px tall and the layer allows the
-/// panel 734 px, so this window scrolls the panel's body: that is #44's list at
-/// its own 18rem cap, not a data view shrunk to fit. A folder with a few assets
-/// fits whole, and at 1200x480 the same body scrolls for the same reason (#43).
+/// Escape's backward traversal is pinned in
+/// `escape_survives_backward_traversal_out_of_the_panel`, the forward wrap in
+/// `enter_activates_the_focused_control_and_the_other_keys_still_work`.
 #[gpui_kit::test]
-async fn the_list_keeps_five_rows_and_the_wheel_reaches_the_last_control(cx: &mut TestAppContext) {
+async fn the_list_keeps_five_rows_and_the_actions_never_scroll_away(cx: &mut TestAppContext) {
     cx.executor().allow_parking();
     let temp = tempfile::tempdir().expect("create a temp dir");
     let paths = temporary_paths(temp.path());
@@ -927,8 +1040,9 @@ async fn the_list_keeps_five_rows_and_the_wheel_reaches_the_last_control(cx: &mu
             "#81: the list keeps five rows at the default window: {rows}"
         );
 
+        // #81: the content above the list, and every control below it, are on
+        // screen before any scroll.
         let viewport = Bounds::new(Point::default(), window.viewport_size());
-        // Everything above the list is on screen before any scroll.
         for id in [
             "folder-detail-close",
             "folder-panel-path",
@@ -938,24 +1052,6 @@ async fn the_list_keeps_five_rows_and_the_wheel_reaches_the_last_control(cx: &mu
             "folder-panel-recursive",
             "folder-detail-upload",
             "folder-detail-scan",
-        ] {
-            let bounds = window.find(id).bounds();
-            assert!(window.find(id).visible(), "#81: {id} is on screen");
-            assert!(
-                viewport.contains(&bounds.origin)
-                    && viewport.contains(&point(bounds.right(), bounds.bottom())),
-                "#81: {id} is inside the window: {bounds:?} in {viewport:?}"
-            );
-        }
-
-        // The panel's own body is what scrolls; the dashboard stays put.
-        let title = window.find("folder-detail-title").bounds().origin.y;
-        scroll_detail_to_bottom(window, cx);
-        assert!(
-            window.find("folder-detail-title").bounds().origin.y < title,
-            "#81: the panel scrolled, not the dashboard behind it"
-        );
-        for id in [
             "folder-assets-more",
             "folder-detail-open",
             "folder-detail-failed",
@@ -963,51 +1059,18 @@ async fn the_list_keeps_five_rows_and_the_wheel_reaches_the_last_control(cx: &mu
             "folder-detail-remove",
         ] {
             let bounds = window.find(id).bounds();
-            assert!(
-                window.find(id).visible(),
-                "#81: {id} is on screen after a user's scroll"
-            );
+            assert!(window.find(id).visible(), "#81: {id} is on screen");
             assert!(
                 viewport.contains(&bounds.origin)
                     && viewport.contains(&point(bounds.right(), bounds.bottom())),
-                "#81: {id} is inside the window after the scroll: {bounds:?} in {viewport:?}"
+                "#81: {id} is inside the window without a scroll: {bounds:?} in {viewport:?}"
             );
         }
-    });
-    // The harness refuses a clipped target, so this press is the proof that the
-    // bottom-most control is reachable with the wheel alone.
-    act(cx, window, |window, cx| {
-        window.click("folder-detail-remove", cx);
-        common::settle_alert(window, cx);
-    });
-    read(cx, window, |window, _| {
-        assert!(
-            window.try_find("folder-detail-confirm").is_some(),
-            "#81: Remove answers a press after a user's scroll"
-        );
-    });
-}
 
-/// #43, #81: on a window too short for the panel the body scrolls, so the wheel
-/// still reaches the last control instead of clipping it away.
-#[gpui_kit::test]
-async fn a_short_window_scrolls_the_panels_body_instead_of_clipping_it(cx: &mut TestAppContext) {
-    cx.executor().allow_parking();
-    let temp = tempfile::tempdir().expect("create a temp dir");
-    let paths = temporary_paths(temp.path());
-    let photos = temp.path().join("photos");
-    std::fs::create_dir_all(&photos).expect("create the source folder");
-    seed_folder(&paths, &photos, true);
-    let (window, store, _view) = open_dashboard_at(cx, &paths, "", window_options_of(1200., 480.));
-    wait_for_store(cx, &store).await;
-
-    open_detail_now(cx, window);
-    read(cx, window, |window, cx| {
-        assert!(
-            !window.find("folder-detail-remove").visible(),
-            "a window this short pushes the last control past the panel's edge"
-        );
-        let first = window.find("folder-detail-title").bounds().origin.y;
+        // The footer is outside the body's scroll region: the wheel moves the
+        // content under it and leaves it where it is.
+        let title = window.find("folder-detail-title").bounds().origin.y;
+        let footer = window.find("folder-detail-footer").bounds();
         for _ in 0..8 {
             window.scroll(
                 "folder-detail-body-dim",
@@ -1016,16 +1079,116 @@ async fn a_short_window_scrolls_the_panels_body_instead_of_clipping_it(cx: &mut 
             );
         }
         assert!(
-            window.find("folder-detail-remove").visible(),
-            "#43: the body scrolls, so the wheel reaches the last control"
+            window.find("folder-detail-title").bounds().origin.y < title,
+            "#81: the body scrolled, not the dashboard behind it"
         );
+        assert_eq!(
+            window.find("folder-detail-footer").bounds(),
+            footer,
+            "#81: the footer does not scroll with the body"
+        );
+        for id in ["folder-assets-more", "folder-detail-remove"] {
+            assert!(
+                window.find(id).visible(),
+                "#81: {id} is on screen after the body scrolled under it"
+            );
+        }
+    });
+    // The harness refuses a clipped target, so this press is the proof that the
+    // bottom-most control answers the pointer without any scroll first.
+    act(cx, window, |window, cx| {
+        window.click("folder-detail-remove", cx);
+        common::settle_alert(window, cx);
+    });
+    read(cx, window, |window, _| {
         assert!(
-            window.find("folder-detail-title").bounds().origin.y < first,
-            "#81: the panel scrolled, not the dashboard behind it"
+            window.try_find("folder-detail-confirm").is_some(),
+            "#81: Remove answers a press without a scroll"
+        );
+    });
+}
+
+/// #81: on a window too short for the detail the body scrolls, but the footer
+/// stays on screen: Remove and Load more answer there too, and the list keeps
+/// its five rows rather than being squeezed to pay for the footer.
+#[gpui_kit::test]
+async fn a_short_window_keeps_the_footer_on_screen_and_scrolls_the_body_below_it(
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+    seed_folder(&paths, &photos, true);
+    seed_assets(
+        &paths,
+        &photos,
+        120,
+        times::now_ns() - THREE_AND_A_HALF_HOURS_NS,
+    );
+    let (window, store, _view) = open_dashboard_at(cx, &paths, "", window_options_of(1200., 480.));
+    wait_for_store(cx, &store).await;
+
+    open_detail_now(cx, window);
+    wait_for_asset_rows(cx, window, 50).await;
+    read(cx, window, |window, cx| {
+        let viewport = Bounds::new(Point::default(), window.viewport_size());
+        for id in ["folder-assets-more", "folder-detail-remove"] {
+            let bounds = window.find(id).bounds();
+            assert!(
+                window.find(id).visible(),
+                "#81: {id} is on screen on a 480 px window without a scroll"
+            );
+            assert!(
+                viewport.contains(&bounds.origin)
+                    && viewport.contains(&point(bounds.right(), bounds.bottom())),
+                "#81: {id} is inside the window: {bounds:?} in {viewport:?}"
+            );
+        }
+
+        // The unsqueezed list is what the footer above it must not eat.
+        let first = window.find(("folder-asset", 0_usize)).bounds().origin.y;
+        let second = window.find(("folder-asset", 1_usize)).bounds().origin.y;
+        let rows = f32::from(window.find("folder-assets-list").bounds().size.height)
+            / f32::from(second - first);
+        assert!(
+            rows >= 5.,
+            "#81: the list keeps five rows on the short window: {rows}"
+        );
+
+        // The body still scrolls, so the rows above the footer are reachable.
+        let footer = window.find("folder-detail-footer").bounds();
+        let first_row = window.find(("folder-asset", 0_usize)).bounds();
+        for _ in 0..8 {
+            window.scroll(
+                "folder-detail-body-dim",
+                ScrollDelta::Pixels(point(px(0.), px(-120.))),
+                cx,
+            );
+        }
+        assert!(
+            window.find(("folder-asset", 0_usize)).bounds().origin.y < first_row.origin.y,
+            "#43: the body scrolls, so the list is reachable on a short window"
+        );
+        assert_eq!(
+            window.find("folder-detail-footer").bounds(),
+            footer,
+            "#81: the footer stays put while the body scrolls"
         );
         assert!(
             window.find("folder-panel").bounds().bottom() <= window.viewport_size().height,
             "the panel never runs past the window"
+        );
+    });
+    act(cx, window, |window, cx| {
+        window.click("folder-detail-remove", cx);
+        common::settle_alert(window, cx);
+    });
+    read(cx, window, |window, _| {
+        assert!(
+            window.try_find("folder-detail-remove-confirm").is_some(),
+            "#81: Remove answers a press on the short window"
         );
     });
 }
@@ -1913,7 +2076,6 @@ async fn load_more_appends_the_next_page_and_keeps_the_loaded_rows(cx: &mut Test
     });
 
     act(cx, window, |window, cx| {
-        scroll_detail_to_bottom(window, cx);
         window.click("folder-assets-more", cx)
     });
     wait_for_asset_rows(cx, window, 100).await;
@@ -2133,7 +2295,6 @@ async fn the_list_reloads_on_a_new_upload_and_keeps_the_loaded_row_count(cx: &mu
     open_detail_now(cx, window);
     wait_for_asset_rows(cx, window, 50).await;
     act(cx, window, |window, cx| {
-        scroll_detail_to_bottom(window, cx);
         window.click("folder-assets-more", cx)
     });
     wait_for_asset_rows(cx, window, 100).await;

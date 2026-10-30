@@ -100,13 +100,16 @@ impl Dashboard {
     ) -> Self {
         // #81: the panel's dialog drops the layer's key context so Enter
         // reaches the control it is aimed at, which also drops the layer's own
-        // Escape binding. The panel supplies that binding in its own context,
-        // bound once per window here because the keymap is app state and the
-        // panel is the only surface that uses it.
+        // Escape binding. The layer's focus trap can rest on the dialog's own
+        // host, which is outside the panel, so this binding is unscoped: it
+        // matches wherever the keyboard is. The one handler is the layer's
+        // `on_cancel`, which asks the panel to dismiss itself either way. Bound
+        // once per window here because the keymap is app state and the panel is
+        // the only surface that uses it.
         cx.bind_keys([KeyBinding::new(
             "escape",
             gpui_kit::base::actions::Cancel,
-            Some(crate::folder_panel::KEY_CONTEXT),
+            None,
         )]);
         let folder_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -323,11 +326,10 @@ impl Dashboard {
     /// its Cancel, Escape, or the space around it.
     fn open_panel_dialog(panel: Entity<FolderPanel>, window: &mut Window, cx: &mut App) {
         let dismissed = panel.downgrade();
-        // The layer focuses its own shell, and the shell has no key context
-        // once the dialog drops it (below), so the keyboard starts on the panel:
-        // that is what keeps the panel's own Escape binding on the dispatch
-        // path. Only the first build focuses: a rebuild must not take the
-        // keyboard from a control the user has reached.
+        // The keyboard starts on the panel, so Tab descends into its controls
+        // rather than from the layer's shell. Only the first build focuses: a
+        // rebuild must not take the keyboard from a control the user has
+        // reached.
         let first = Cell::new(true);
         window.open_dialog(cx, move |dialog, window, cx| {
             let content = panel.clone();
@@ -347,8 +349,9 @@ impl Dashboard {
                 // Enter to its Confirm, and a matched binding swallows the key
                 // before it reaches the focused control, so Enter on any panel
                 // control was inert. Dropping the key context unbinds Confirm
-                // (and Escape, which the panel binds itself) and leaves the
-                // focus trap, the backdrop and the focus return in place.
+                // (and Escape, which `with_engine` binds back for the whole
+                // window) and leaves the focus trap, the backdrop and the focus
+                // return in place.
                 .keyboard(false)
                 .on_cancel(move |_, _, cx| {
                     // Escape and the outside press are the panel's dismissal, so
