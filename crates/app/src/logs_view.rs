@@ -578,7 +578,7 @@ impl LogsView {
                             // the delta to every scroll hitbox under the pointer,
                             // so without this any scrolling ancestor would move
                             // by the same delta (#54).
-                            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                            .on_scroll(|_, _, cx| cx.stop_propagation())
                             .flex()
                             .flex_col()
                             .gap_0p5()

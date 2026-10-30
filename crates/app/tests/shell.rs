@@ -456,12 +456,13 @@ async fn the_folder_detail_links_open_a_filtered_view(cx: &mut TestAppContext) {
 fn the_menu_shortcuts_are_bound_only_on_macos(cx: &mut TestAppContext) {
     boot(cx);
     let (quit, hide) = cx.update(|cx| {
+        let os = cx.platform_info().os;
         let keymap = cx.key_bindings();
         let keymap = keymap.borrow();
         let chords = |action: &dyn Action| -> Vec<String> {
             keymap
                 .bindings_for_action(action)
-                .map(|binding| binding.keystrokes()[0].inner().unparse())
+                .map(|binding| binding.keystrokes()[0].inner().unparse(os))
                 .collect()
         };
         (chords(&Quit), chords(&Hide))

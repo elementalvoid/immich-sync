@@ -386,21 +386,31 @@ fn tab_to(window: &mut Window, id: &'static str, cx: &mut App) {
     );
 }
 
-/// The text input the kit nests inside the row `id`.
+/// The text input the kit nests inside the row `id`, which must carry `role`.
 ///
 /// The number input the kit renders nests the editable text field, so the row
-/// alone is not proof of what assistive technology reaches.
+/// alone is not proof of what assistive technology reaches. The role is
+/// asserted, not accepted: gpui-kit 0.8 reports a masked field as
+/// `Role::PasswordInput`, so a regression that started masking another field
+/// would fail here instead of passing silently.
 fn row_text_input(
     window: &Window,
     id: &'static str,
+    role: Role,
 ) -> gpui_kit::base::test_support::ElementSnapshot {
-    gpui_kit::base::test_support::snapshots(window)
+    let snapshot = gpui_kit::base::test_support::snapshots(window)
         .into_iter()
         .find(|snapshot| {
-            snapshot.role() == Some(Role::TextInput)
+            matches!(snapshot.role(), Some(Role::TextInput | Role::PasswordInput))
                 && snapshot.path().contains(&ElementId::Name(id.into()))
         })
-        .expect("a text input inside the row")
+        .expect("a text input inside the row");
+    assert_eq!(
+        snapshot.role(),
+        Some(role),
+        "{id} carries the expected role"
+    );
+    snapshot
 }
 
 #[test]
@@ -533,7 +543,7 @@ fn every_numeric_field_has_an_accessible_name(cx: &mut TestAppContext) {
                 key.label()
             );
             assert_eq!(
-                row_text_input(window, key.id()).label(),
+                row_text_input(window, key.id(), Role::TextInput).label(),
                 Some(key.label()),
                 "the {} text field is named for assistive technology",
                 key.label()
@@ -558,7 +568,7 @@ fn opening_the_view_leaves_a_fractional_bandwidth_alone(cx: &mut TestAppContext)
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
         assert_eq!(
-            row_text_input(window, FieldKey::Bandwidth.id()).value(),
+            row_text_input(window, FieldKey::Bandwidth.id(), Role::TextInput).value(),
             Some("1.5"),
             "the field shows the stored fraction, not a truncated whole number"
         );
@@ -587,7 +597,7 @@ async fn stepping_the_bandwidth_keeps_the_fraction(cx: &mut TestAppContext) {
         tab_to(window, FieldKey::Bandwidth.id(), cx);
         window.press("up", cx);
         assert_eq!(
-            row_text_input(window, FieldKey::Bandwidth.id()).value(),
+            row_text_input(window, FieldKey::Bandwidth.id(), Role::TextInput).value(),
             Some("2.5"),
             "a step keeps the decimal place"
         );
@@ -1200,20 +1210,22 @@ fn the_connection_form_names_its_controls(cx: &mut TestAppContext) {
             assert_eq!(row.label(), Some(label), "{id} is named");
         }
         // The nested text fields carry the same names to assistive technology.
-        for (id, label) in [
-            ("settings-server-url", "Server URL"),
-            ("settings-email", "Email address"),
-            ("settings-secret", "Password"),
+        for (id, label, role) in [
+            ("settings-server-url", "Server URL", Role::TextInput),
+            ("settings-email", "Email address", Role::TextInput),
+            ("settings-secret", "Password", Role::PasswordInput),
         ] {
             assert_eq!(
-                row_text_input(window, id).label(),
+                row_text_input(window, id, role).label(),
                 Some(label),
                 "{id} names its text field"
             );
         }
         // The secret field is masked, so its value is never announced.
         assert!(
-            row_text_input(window, "settings-secret").value().is_none(),
+            row_text_input(window, "settings-secret", Role::PasswordInput)
+                .value()
+                .is_none(),
             "the password field is masked"
         );
         assert_eq!(
@@ -1230,7 +1242,7 @@ fn the_connection_form_names_its_controls(cx: &mut TestAppContext) {
         // Switching the credential relabels the secret field (R1.5).
         window.click("settings-auth-apikey", cx);
         assert_eq!(
-            row_text_input(window, "settings-secret").label(),
+            row_text_input(window, "settings-secret", Role::PasswordInput).label(),
             Some("API key"),
             "the secret field follows the credential choice"
         );
@@ -1552,7 +1564,7 @@ fn a_wrong_password_shows_an_error_and_the_form_stays_usable(cx: &mut TestAppCon
         // The form itself stays enabled, so the user can try again.
         assert_ne!(window.find("settings-sign-in").disabled(), Some(true));
         assert_ne!(
-            row_text_input(window, "settings-secret").disabled(),
+            row_text_input(window, "settings-secret", Role::PasswordInput).disabled(),
             Some(true),
             "the secret field stays enabled"
         );
