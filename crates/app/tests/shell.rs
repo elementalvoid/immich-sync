@@ -599,7 +599,13 @@ fn show_filtered_opens_either_view_on_one_source_folder(cx: &mut TestAppContext)
         );
         assert_eq!(
             window.find("failed-folder-filter").label(),
-            Some("Folder filter: Camera Roll")
+            Some("Folder filter"),
+            "#79: the control's name is stable across surfaces"
+        );
+        assert_eq!(
+            window.find("failed-folder-filter").value(),
+            Some("Camera Roll"),
+            "#79: the seam's folder is the control's value"
         );
     })
     .expect("read the filtered failed-items view");
