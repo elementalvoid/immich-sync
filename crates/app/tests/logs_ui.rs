@@ -1638,8 +1638,9 @@ async fn a_short_window_keeps_the_tail_on_screen_and_scrolls_the_cards_above_it(
 /// enough for the paused row plus the tail's own minimum (#54).
 #[gpui_kit::test]
 async fn a_paused_tail_keeps_the_jump_control_inside_a_short_window(cx: &mut TestAppContext) {
-    // 900x600 is the window the review measured, and 720x480 is the shell's
-    // minimum: the narrowest window wraps the paused row's labels the most.
+    // 900x600 is the window the review measured, and 720x480 is a window at the
+    // shell's minimum height: the narrowest window wraps the paused row's
+    // labels the most.
     for window_size in [(900., 600.), (720., 480.)] {
         let temp = tempfile::tempdir().expect("create a temp dir");
         let paths = temporary_paths(temp.path());
@@ -1699,8 +1700,9 @@ async fn a_paused_tail_keeps_the_jump_control_inside_a_short_window(cx: &mut Tes
 async fn a_failed_tail_read_keeps_its_notice_and_paused_row_inside_the_card(
     cx: &mut TestAppContext,
 ) {
-    // 900x600 is the window the review measured, and 720x480 is the shell's
-    // minimum: the narrowest window wraps the notice and the paused row most.
+    // 900x600 is the window the review measured, and 720x480 is a window at the
+    // shell's minimum height: the narrowest window wraps the notice and the
+    // paused row most.
     for window_size in [(900., 600.), (720., 480.)] {
         // A long prefix stands in for a long data directory, and it is long
         // enough that the unclamped notice wraps to four lines at both sizes,

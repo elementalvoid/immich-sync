@@ -12,8 +12,8 @@ use std::sync::Arc;
 use common::scroll_dashboard_into_view;
 use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
 use gpui_kit::{
-    Action, AnyWindowHandle, AppContext as _, Bounds, MenuItem, Point, TestAppContext,
-    WindowBounds, WindowOptions, px, size,
+    Action, AnyWindowHandle, App, AppContext as _, Bounds, MenuItem, Point, Role, ScrollDelta,
+    TestAppContext, Window, WindowBounds, WindowOptions, point, px, size,
 };
 use immich_sync::connection::ConnectionModel;
 use immich_sync::dashboard::Dashboard;
@@ -294,6 +294,16 @@ fn open_shell(
     cx: &mut TestAppContext,
     paths: &AppPaths,
 ) -> (AnyWindowHandle, gpui_kit::Entity<AppShell>) {
+    open_shell_at(cx, paths, (1200., 800.))
+}
+
+/// The same shell in a window of the given size, so a test can stand at the
+/// window's own minimum.
+fn open_shell_at(
+    cx: &mut TestAppContext,
+    paths: &AppPaths,
+    (width, height): (f32, f32),
+) -> (AnyWindowHandle, gpui_kit::Entity<AppShell>) {
     let paths = paths.clone();
     cx.update(|cx| {
         gpui_kit::init(cx);
@@ -310,7 +320,7 @@ fn open_shell(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds {
                     origin: Point::default(),
-                    size: size(px(1200.), px(800.)),
+                    size: size(px(width), px(height)),
                 })),
                 ..Default::default()
             },
@@ -606,4 +616,232 @@ fn show_filtered_opens_either_view_on_one_source_folder(cx: &mut TestAppContext)
         );
     })
     .expect("read the dashboard");
+}
+
+// ---------------------------------------------------------------------------
+// The surface switch (#75). The switch is the kit's tab bar, so it is asserted
+// through the ids the other surfaces' tests click, the labels it announces, and
+// the selection it reports.
+
+/// The seven surfaces in the switch's order: the surface, the nav element id its
+/// tab carries, and the label it announces. Written out here rather than read
+/// back from the shell, so a renamed id or label fails instead of following the
+/// code.
+const SWITCH: [(ViewMode, &str, &str); 7] = [
+    (ViewMode::Dashboard, "nav-dashboard", "Dashboard"),
+    (ViewMode::Upload, "nav-upload", "Upload"),
+    (ViewMode::Failed, "nav-failed", "Failed items"),
+    (ViewMode::Review, "nav-review", "Review"),
+    (ViewMode::Settings, "nav-settings", "Settings"),
+    (ViewMode::Logs, "nav-logs", "Logs"),
+    (ViewMode::Diagnostics, "nav-diagnostics", "Diagnostics"),
+];
+
+/// The strip the tabs scroll in. It clips them at a narrow window, so it is what
+/// the overflow assertions measure against.
+const STRIP: &str = "nav-tabs";
+
+/// Focuses `id` with Tab presses, the way a keyboard user reaches it.
+fn tab_to(window: &mut Window, id: &'static str, cx: &mut App) {
+    for _ in 0..16 {
+        if window.find(id).focused() == Some(true) {
+            return;
+        }
+        window.focus_next(cx);
+        window.render_frame(cx);
+    }
+    assert_eq!(
+        window.find(id).focused(),
+        Some(true),
+        "{id} is not keyboard reachable"
+    );
+}
+
+/// The window's minimum size, as the frame would apply it.
+fn window_minimum(cx: &TestAppContext) -> (f32, f32) {
+    let options = cx.read(shell::main_window_options);
+    let minimum = options.window_min_size.expect("a minimum window size");
+    (f32::from(minimum.width), f32::from(minimum.height))
+}
+
+/// #75: pointer and keyboard both reach all seven surfaces. Each tab is its own
+/// tab stop in the bar's order, and Enter shows it.
+#[gpui_kit::test]
+fn every_surface_is_reachable_by_pointer_and_by_keyboard(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let (window, shell) = open_shell(cx, &paths);
+
+    for (mode, id, _) in SWITCH {
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.click(id, cx);
+        })
+        .expect("click the surface's tab");
+        assert_eq!(
+            cx.read(|cx| shell.read(cx).mode()),
+            mode,
+            "the pointer shows {mode:?} through {id}"
+        );
+    }
+
+    for (mode, id, _) in SWITCH {
+        cx.update_window(window, |_, window, cx| {
+            // Start from no focus, so every round walks the same stops.
+            window.blur(cx);
+            window.render_frame(cx);
+            tab_to(window, id, cx);
+            window.press("enter", cx);
+        })
+        .expect("show the surface from the keyboard");
+        assert_eq!(
+            cx.read(|cx| shell.read(cx).mode()),
+            mode,
+            "the keyboard shows {mode:?} through {id}"
+        );
+    }
+}
+
+/// #75: the bar is a tab list, and every tab is named and reports whether it is
+/// the surface on screen, so the selection reaches assistive technology and not
+/// only the eye.
+#[gpui_kit::test]
+fn the_switch_names_every_surface_and_reports_the_selected_one(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let (window, shell) = open_shell(cx, &paths);
+
+    for (mode, _, _) in SWITCH {
+        cx.update(|cx| shell.update(cx, |shell, cx| shell.show(mode, cx)));
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            for (other, id, label) in SWITCH {
+                let tab = window.find(id);
+                assert_eq!(tab.role(), Some(Role::Tab), "{id} is announced as a tab");
+                assert_eq!(
+                    tab.label(),
+                    Some(label),
+                    "{id} is announced by its surface's name"
+                );
+                assert_eq!(
+                    tab.selected(),
+                    Some(other == mode),
+                    "{id} reports whether {mode:?} is the surface on screen"
+                );
+            }
+        })
+        .expect("read the switch");
+    }
+}
+
+/// #75: a window narrower than the seven labels clips nothing. The strip
+/// scrolls, and a tab that was out of sight both comes into sight and selects
+/// its surface once it is picked.
+#[gpui_kit::test]
+fn a_narrow_window_scrolls_the_switch_instead_of_clipping_it(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let (window, shell) = open_shell_at(cx, &paths, (420., 600.));
+
+    let (strip, last) = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            let strip = window.find(STRIP).bounds();
+            let last = window.find("nav-diagnostics").bounds();
+            let viewport = f32::from(window.viewport_size().width);
+            assert!(
+                f32::from(strip.origin.x + strip.size.width) <= viewport + 0.5,
+                "the strip stays inside the window: {strip:?} in {viewport} px"
+            );
+            assert!(
+                f32::from(last.origin.x + last.size.width)
+                    > f32::from(strip.origin.x + strip.size.width),
+                "the seven labels do not fit at 420 px, so the last tab starts out of \
+                 sight: {last:?} in {strip:?}"
+            );
+            (strip, last)
+        })
+        .expect("measure the switch");
+
+    // A plain wheel's vertical lines scroll the strip sideways, the way the
+    // kit's tab bars do for a wheel that has no horizontal axis.
+    cx.update_window(window, |_, window, cx| {
+        window.scroll(STRIP, ScrollDelta::Lines(point(0., -100.)), cx);
+    })
+    .expect("scroll the strip");
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let scrolled = window.find("nav-diagnostics").bounds();
+        assert!(
+            f32::from(scrolled.origin.x) < f32::from(last.origin.x),
+            "the wheel moved the tabs: {scrolled:?} was {last:?}"
+        );
+        assert!(
+            f32::from(scrolled.origin.x + scrolled.size.width)
+                <= f32::from(strip.origin.x + strip.size.width) + 0.5,
+            "the last tab is on screen after scrolling: {scrolled:?} in {strip:?}"
+        );
+        window.click("nav-diagnostics", cx);
+    })
+    .expect("pick the tab that was out of sight");
+
+    assert_eq!(
+        cx.read(|cx| shell.read(cx).mode()),
+        ViewMode::Diagnostics,
+        "picking a tab that was out of sight shows its surface"
+    );
+}
+
+/// #75: the window's minimum is the narrowest the seven surfaces still lay out
+/// in, not the width the seven labels need. At the minimum the strip has to
+/// scroll, so the tab row is provably not what holds the window open; and every
+/// surface still fits inside it, so the floor is theirs.
+#[gpui_kit::test]
+fn the_minimum_window_comes_from_the_surfaces_not_the_tab_row(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let (width, height) = window_minimum(cx);
+    assert!(
+        width > 320. && height > 320.,
+        "the minimum stays a real window: {width} by {height}"
+    );
+    let (window, shell) = open_shell_at(cx, &paths, (width, height));
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let strip = window.find(STRIP).bounds();
+        let last = window.find("nav-diagnostics").bounds();
+        assert!(
+            f32::from(last.origin.x + last.size.width)
+                > f32::from(strip.origin.x + strip.size.width),
+            "the seven labels fit at the {width} px minimum, so the tab row can still \
+             be what sets it: {last:?} in {strip:?}"
+        );
+    })
+    .expect("measure the switch at the minimum");
+
+    for (mode, _, _) in SWITCH {
+        cx.update(|cx| shell.update(cx, |shell, cx| shell.show(mode, cx)));
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            let viewport_right = f32::from(window.viewport_size().width);
+            for element in gpui_kit::base::test_support::snapshots(window) {
+                let path = format!("{:?}", element.path());
+                // The tabs are the one thing allowed past the edge: that is the
+                // strip scrolling instead of the row widening the window.
+                if path.contains("nav-") {
+                    continue;
+                }
+                let bounds = element.bounds();
+                let right = f32::from(bounds.origin.x + bounds.size.width);
+                assert!(
+                    right <= viewport_right + 0.5,
+                    "{mode:?}: {path} reaches {right} px, past the {viewport_right} px \
+                     minimum window at {bounds:?}"
+                );
+            }
+        })
+        .expect("lay out the surface at the minimum");
+    }
 }

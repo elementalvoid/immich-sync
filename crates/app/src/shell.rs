@@ -1,7 +1,8 @@
 //! The tray shell: one GPUI window, one tray icon, and the actions they share.
 
+use gpui_kit::base::Tabs as SurfaceTabs;
 use gpui_kit::component::ActiveTheme as _;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::scroll::ScrollableMask;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use gpui_tray::{Icon, Tray};
@@ -290,8 +291,8 @@ pub fn hide_window(cx: &mut App) {
 }
 
 /// The main window's bounds and limits: compact by default, resizable from
-/// every edge and corner, and never smaller than the shell still works at
-/// (issue #26).
+/// every edge and corner, and never smaller than the narrowest surface still
+/// lays out at (issues #26 and #75).
 #[must_use]
 pub fn main_window_options(cx: &App) -> WindowOptions {
     WindowOptions {
@@ -299,8 +300,15 @@ pub fn main_window_options(cx: &App) -> WindowOptions {
         // cannot cover the window (issue #26).
         window_bounds: Some(WindowBounds::centered(size(px(900.), px(650.)), cx)),
         is_resizable: true,
-        // Narrower and the seven view tabs no longer fit on one row.
-        window_min_size: Some(size(px(720.), px(480.))),
+        // The narrowest surface's layout sets this floor, not the surface
+        // switch (#75): the switch scrolls its seven tabs instead of clipping
+        // them, so the labels no longer hold the window open. 520 px is the
+        // width the widest row of any surface still fits in, the Dashboard's
+        // header, whose title block beside the Sync now and Pause buttons needs
+        // 509 px; 480 px is the height the Logs surface's cards keep their
+        // floors at in their narrowest wrap (#54). `tests/shell.rs` stands at
+        // exactly this size, so a layout that outgrows it fails there.
+        window_min_size: Some(size(px(520.), px(480.))),
         ..Default::default()
     }
 }
@@ -391,12 +399,68 @@ pub enum ViewMode {
     Diagnostics,
 }
 
+impl ViewMode {
+    /// Every surface, in the order the switch shows them.
+    const ALL: [Self; 7] = [
+        Self::Dashboard,
+        Self::Upload,
+        Self::Failed,
+        Self::Review,
+        Self::Settings,
+        Self::Logs,
+        Self::Diagnostics,
+    ];
+
+    /// The element id this surface's tab carries.
+    ///
+    /// The tests that click their way to one surface find the switch by these
+    /// ids, so they are part of the surface's contract, not a rendering detail.
+    const fn nav_id(self) -> &'static str {
+        match self {
+            Self::Dashboard => "nav-dashboard",
+            Self::Upload => "nav-upload",
+            Self::Failed => "nav-failed",
+            Self::Review => "nav-review",
+            Self::Settings => "nav-settings",
+            Self::Logs => "nav-logs",
+            Self::Diagnostics => "nav-diagnostics",
+        }
+    }
+
+    /// The tab's label, which is also what assistive technology announces.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Dashboard => "Dashboard",
+            Self::Upload => "Upload",
+            Self::Failed => "Failed items",
+            Self::Review => "Review",
+            Self::Settings => "Settings",
+            Self::Logs => "Logs",
+            Self::Diagnostics => "Diagnostics",
+        }
+    }
+
+    /// This surface's place in the switch, counted from zero.
+    fn index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|mode| *mode == self)
+            .expect("every ViewMode is in ViewMode::ALL")
+    }
+}
+
 /// The environment variable that pins a folder detail open (#43).
 ///
 /// Set it to a source folder's stored path and the dashboard opens that
 /// folder's detail once the store has loaded it, so a screenshot run captures
 /// the dialog. A product run never sets it.
 pub const FORCE_DETAIL_ENV: &str = "IMMICH_SYNC_FOLDER_DETAIL";
+
+/// The element id of the strip the surface switch's tabs scroll in.
+///
+/// It clips the tabs at a narrow window and is what a wheel over the switch
+/// scrolls, so it names the switch's viewport rather than any one surface.
+const NAV_STRIP: &str = "nav-tabs";
 
 /// The environment variable that pins the visible surface.
 ///
@@ -431,6 +495,13 @@ pub fn view_for_name(value: &str) -> Option<ViewMode> {
 /// upload, the logs, or the diagnostics.
 pub struct AppShell {
     mode: ViewMode,
+    /// Where the switch's tabs are scrolled to. The strip scrolls instead of
+    /// clipping its tabs, so the tab of the surface on screen has to be brought
+    /// into sight at a narrow window (#75).
+    nav_scroll: ScrollHandle,
+    /// The tab the switch last revealed. Compared against, so a frame that only
+    /// repaints does not undo the user's own scrolling.
+    revealed: Option<usize>,
     dashboard: Entity<Dashboard>,
     settings: Entity<SettingsView>,
     logs: Entity<LogsView>,
@@ -486,8 +557,10 @@ impl AppShell {
                 this.show_filtered(*mode, folder.clone(), cx);
             },
         );
-        Self {
+        let mut shell = Self {
             mode,
+            nav_scroll: ScrollHandle::new(),
+            revealed: None,
             dashboard,
             settings,
             logs,
@@ -498,7 +571,11 @@ impl AppShell {
             _connection: connection,
             _connection_subscription: subscription,
             _dashboard_subscription: dashboard_subscription,
-        }
+        };
+        // A pinned surface (#43) can be one of the last tabs, so the first frame
+        // already scrolls its tab into sight.
+        shell.reveal(shell.mode);
+        shell
     }
 
     /// The visible surface.
@@ -522,8 +599,20 @@ impl AppShell {
             // (R10.3).
             self.logs
                 .update(cx, |logs, cx| logs.set_visible(mode == ViewMode::Logs, cx));
+            self.reveal(mode);
         }
         cx.notify();
+    }
+
+    /// Scrolls the switch until `mode`'s tab is in sight.
+    ///
+    /// The strip scrolls rather than clips, so at a window too narrow for the
+    /// seven labels the tab of the surface on screen could sit past the strip's
+    /// edge; the tray, a pinned surface, and a folder-detail link all switch
+    /// without the pointer ever touching the switch (#75).
+    fn reveal(&mut self, mode: ViewMode) {
+        self.revealed = Some(mode.index());
+        self.nav_scroll.scroll_to_item(mode.index());
     }
 
     /// Opens a list view narrowed to one source folder (#41).
@@ -551,91 +640,125 @@ impl AppShell {
         self.logs.clone()
     }
 
-    /// The view switch. Every button is a keyboard reachable tab stop.
-    fn switch(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    /// The surface switch: one tab per surface, in a strip that scrolls when the
+    /// window is too narrow for all seven labels (#75).
+    ///
+    /// Every tab is its own tab stop, so the keyboard reaches every surface and
+    /// Enter or Space shows it (GPUI turns a key on the focused element into a
+    /// click). The tab of the surface on screen is filled and set in semibold,
+    /// and reports itself as selected, so the selection is not colour alone.
+    ///
+    /// The tabs ride in the kit's [`SurfaceTabs`] list, but each one is its own
+    /// element rather than a `base::Tab`: in 0.8.1 that tab renames itself to
+    /// its index and observes itself, so it can carry neither the stable id the
+    /// per-surface tests click nor the focus handle that makes it reachable.
+    /// The role, the label, the position and the selected state below are the
+    /// same ones `base::Tab` writes.
+    fn switch(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
-        let background = theme.background;
-        let border = theme.border;
+        let (background, border) = (theme.background, theme.border);
+        let (primary, primary_foreground) = (theme.primary, theme.primary_foreground);
+        let (foreground, muted_foreground) = (theme.foreground, theme.muted_foreground);
+        let (accent, radius) = (theme.accent, theme.radius);
+        // The focus handles are claimed first: the tab loop below needs `cx` for
+        // its listeners, and a tab's handle has to outlive that borrow.
+        let focus: Vec<FocusHandle> = ViewMode::ALL
+            .iter()
+            .map(|mode| {
+                window
+                    .use_keyed_state(mode.nav_id(), cx, |_, cx| cx.focus_handle().tab_stop(true))
+                    .read(cx)
+                    .clone()
+            })
+            .collect();
+        // A tab that holds the keyboard is scrolled into the strip. The strip
+        // clips what does not fit, and a clipped tab would clip its focus ring
+        // with it.
+        if let Some(ix) = focus.iter().position(|handle| handle.is_focused(window))
+            && self.revealed != Some(ix)
+        {
+            self.revealed = Some(ix);
+            self.nav_scroll.scroll_to_item(ix);
+        }
+
+        let mut tabs = Vec::with_capacity(ViewMode::ALL.len());
+        for (ix, (mode, focus)) in ViewMode::ALL.iter().zip(&focus).enumerate() {
+            let mode = *mode;
+            let selected = mode == self.mode;
+            tabs.push(
+                div()
+                    .id(mode.nav_id())
+                    .test_support()
+                    .role(Role::Tab)
+                    .aria_label(mode.label())
+                    // Both states are always reported, so a tab that is not the
+                    // surface on screen says so instead of saying nothing.
+                    .aria_selected(selected)
+                    .aria_position_in_set(ix + 1)
+                    .aria_size_of_set(ViewMode::ALL.len())
+                    .track_focus(focus)
+                    .on_click(cx.listener(move |this, _, _, cx| this.show(mode, cx)))
+                    .flex()
+                    .items_center()
+                    .px_3()
+                    .py_1()
+                    .rounded(radius)
+                    .text_sm()
+                    .text_color(if selected {
+                        primary_foreground
+                    } else {
+                        muted_foreground
+                    })
+                    .when(selected, |tab| {
+                        tab.bg(primary).font_weight(FontWeight::SEMIBOLD)
+                    })
+                    .when(!selected, |tab| {
+                        tab.hover(move |style| style.bg(accent).text_color(foreground))
+                    })
+                    .child(mode.label())
+                    .into_any_element(),
+            );
+        }
+
         div()
             .flex()
             .flex_row()
             .items_center()
-            .gap_2()
             .px_6()
             .py_2()
             .bg(background)
             .border_b_1()
             .border_color(border)
-            .child(view_button(
-                "nav-dashboard",
-                "Dashboard",
-                ViewMode::Dashboard,
-                self.mode,
-                cx,
-            ))
-            .child(view_button(
-                "nav-upload",
-                "Upload",
-                ViewMode::Upload,
-                self.mode,
-                cx,
-            ))
-            .child(view_button(
-                "nav-failed",
-                "Failed items",
-                ViewMode::Failed,
-                self.mode,
-                cx,
-            ))
-            .child(view_button(
-                "nav-review",
-                "Review",
-                ViewMode::Review,
-                self.mode,
-                cx,
-            ))
-            .child(view_button(
-                "nav-settings",
-                "Settings",
-                ViewMode::Settings,
-                self.mode,
-                cx,
-            ))
-            .child(view_button(
-                "nav-logs",
-                "Logs",
-                ViewMode::Logs,
-                self.mode,
-                cx,
-            ))
-            .child(view_button(
-                "nav-diagnostics",
-                "Diagnostics",
-                ViewMode::Diagnostics,
-                self.mode,
-                cx,
-            ))
+            .child(
+                div()
+                    .id(NAV_STRIP)
+                    .test_support()
+                    .flex()
+                    .items_center()
+                    .flex_1()
+                    .min_w_0()
+                    .relative()
+                    .child(
+                        SurfaceTabs::new("nav-switch")
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_x_scroll()
+                            .track_scroll(&self.nav_scroll)
+                            .children(tabs),
+                    )
+                    // Over the strip, not inside it, so a plain wheel's vertical
+                    // lines scroll the tabs sideways the way the kit's tab bars
+                    // do; tab indices stay the strip's own children.
+                    .child(ScrollableMask::vertical_wheel(&self.nav_scroll)),
+            )
     }
 }
 
-/// One view-switch button: the active surface is prominent, the other is not.
-fn view_button(
-    id: &'static str,
-    label: &'static str,
-    mode: ViewMode,
-    current: ViewMode,
-    cx: &mut Context<AppShell>,
-) -> impl IntoElement + use<> {
-    let active = mode == current;
-    Button::new(id)
-        .label(label)
-        .when(active, |button| button.primary())
-        .when(!active, |button| button.ghost())
-        .on_click(cx.listener(move |this, _, _, cx| this.show(mode, cx)))
-}
-
 impl Render for AppShell {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let background = theme.background;
         let foreground = theme.foreground;
@@ -655,7 +778,7 @@ impl Render for AppShell {
             .size_full()
             .bg(background)
             .text_color(foreground)
-            .child(self.switch(cx))
+            .child(self.switch(window, cx))
             .child(content)
     }
 }
