@@ -20,6 +20,7 @@ mod git_revision;
 pub mod instance;
 pub mod logging;
 pub mod logs_view;
+mod notice;
 pub mod notify;
 pub mod path_picker;
 pub mod paths;

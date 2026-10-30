@@ -38,7 +38,7 @@ use crate::dashboard::{CardPalette, state_tag};
 use crate::diagnostics::format_bytes;
 use crate::engine::EngineModel;
 use crate::folder_controls::{SettingsControls, SettingsIds, SettingsValues};
-use crate::settings_view::notice;
+use crate::notice::{Notice, Severity};
 use crate::shell::ViewMode;
 use crate::status::{ActivityState, StatusCard, folder_name};
 use crate::times;
@@ -950,12 +950,7 @@ impl FolderPanel {
     }
 
     /// The setup dialog's body: title, path, settings, and the Add footer.
-    fn draft_body(
-        &self,
-        palette: &CardPalette,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn draft_body(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         div()
             .flex()
             .flex_col()
@@ -972,11 +967,10 @@ impl FolderPanel {
             .child(self.album_title_field(theme, cx))
             .child(self.settings(cx))
             .when_some(self.problem.clone(), |this, problem| {
-                this.child(notice(
+                this.child(Notice::new(
                     "folder-panel-problem",
+                    Severity::Error,
                     problem,
-                    theme.danger,
-                    palette,
                 ))
             })
             .child(self.draft_actions(cx))
@@ -1130,11 +1124,10 @@ impl FolderPanel {
                     .child(activity_line),
             )
             .when(!available, |this| {
-                this.child(notice(
+                this.child(Notice::new(
                     "folder-detail-unavailable",
+                    Severity::Warning,
                     format!("Folder unavailable: {path}"),
-                    theme.warning,
-                    palette,
                 ))
             })
             .child(self.album_title_field(theme, cx))
@@ -1145,29 +1138,20 @@ impl FolderPanel {
                 |this, rename| {
                     // #47: the field keeps the desired title, and this says why
                     // the server does not hold it yet.
-                    this.child(notice(
+                    this.child(Notice::new(
                         "folder-detail-album-rename",
+                        Severity::Warning,
                         format!("Album title pending: {}.", rename.reason()),
-                        theme.warning,
-                        palette,
                     ))
                 },
             )
             .child(self.settings(cx))
             .when_some(last_error, |this, error| {
-                this.child(
-                    div()
-                        .id("folder-detail-error")
-                        .test_support()
-                        .role(Role::Alert)
-                        .aria_label(format!("Last error: {error}"))
-                        .border_l_2()
-                        .border_color(theme.danger)
-                        .pl_2()
-                        .text_sm()
-                        .text_color(theme.foreground)
-                        .child(error),
-                )
+                this.child(Notice::new(
+                    "folder-detail-error",
+                    Severity::Error,
+                    format!("Last error: {error}"),
+                ))
             })
             .child(
                 div()
@@ -1261,11 +1245,10 @@ impl FolderPanel {
             // stays outside the dimmed wrapper, so a refused Remove is readable
             // while the confirmation is up.
             .when_some(self.problem.clone(), |this, problem| {
-                this.child(notice(
+                this.child(Notice::new(
                     "folder-panel-problem",
+                    Severity::Error,
                     problem,
-                    theme.danger,
-                    palette,
                 ))
             })
             .into_any_element()
@@ -1289,7 +1272,7 @@ impl FolderPanel {
             .text_color(palette.text)
             .child("Uploaded assets");
         let state = if let Some(problem) = self.assets_problem.clone() {
-            notice("folder-assets-problem", problem, theme.danger, palette).into_any_element()
+            Notice::new("folder-assets-problem", Severity::Error, problem).into_any_element()
         } else if self.assets.is_empty() {
             let (id, text) = if self.assets_loading {
                 ("folder-assets-loading", "Reading the folder's assets…")
@@ -1502,7 +1485,7 @@ impl Render for FolderPanel {
             FolderPanelMode::Detail => rems(34.),
         };
         let body = match self.mode {
-            FolderPanelMode::Draft => self.draft_body(&palette, &theme, cx),
+            FolderPanelMode::Draft => self.draft_body(&theme, cx),
             FolderPanelMode::Detail => self.detail_body(&palette, &theme, cx),
         };
         let card = div()

@@ -17,6 +17,7 @@ use crate::engine::EngineModel;
 use crate::failed::{FailedRow, rows, summary};
 use crate::folder_filter::FolderFilter;
 use crate::folder_filter_view::folder_filter_bar;
+use crate::notice::{Notice, Severity};
 
 /// The failed-items surface.
 pub struct FailedView {
@@ -71,7 +72,6 @@ impl Render for FailedView {
         let palette = CardPalette::new(cx.theme());
         let radius = cx.theme().radius_lg;
         let border = cx.theme().border;
-        let danger = cx.theme().danger;
         let background = cx.theme().background;
         let foreground = cx.theme().foreground;
         let muted = cx.theme().muted_foreground;
@@ -123,7 +123,7 @@ impl Render for FailedView {
                     )),
             )
             .when_some(problem, |this, problem| {
-                this.child(div().text_sm().text_color(danger).child(problem))
+                this.child(Notice::new("failed-problem", Severity::Error, problem))
             })
             .child(folder_filter_bar(
                 "failed",
@@ -154,9 +154,11 @@ impl Render for FailedView {
                     .when(rows.is_empty(), |this| {
                         this.child(empty_card("failed-empty", &empty, &palette, radius, border))
                     })
-                    .children(rows.iter().enumerate().map(|(index, row)| {
-                        row_card(row, index, &palette, radius, border, danger, cx)
-                    })),
+                    .children(
+                        rows.iter()
+                            .enumerate()
+                            .map(|(index, row)| row_card(row, index, &palette, radius, border, cx)),
+                    ),
             )
     }
 }
@@ -168,7 +170,6 @@ fn row_card(
     palette: &CardPalette,
     radius: Pixels,
     border: Hsla,
-    danger: Hsla,
     cx: &mut Context<FailedView>,
 ) -> impl IntoElement + use<> {
     let path = row.path.clone();
@@ -208,15 +209,11 @@ fn row_card(
                         .text_color(palette.meta)
                         .child(row.path.clone()),
                 )
-                .child(
-                    div()
-                        .border_l_2()
-                        .border_color(danger)
-                        .pl_2()
-                        .text_xs()
-                        .text_color(palette.text)
-                        .child(format!("{} — {}", row.class, row.error)),
-                )
+                .child(Notice::new(
+                    format!("failed-row-notice-{index}"),
+                    Severity::Error,
+                    format!("{} — {}", row.class, row.error),
+                ))
                 .child(
                     div()
                         .text_xs()
