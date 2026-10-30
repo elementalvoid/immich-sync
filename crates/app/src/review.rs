@@ -46,7 +46,12 @@ pub fn rows(items: &[ReviewItem]) -> Vec<ReviewRow> {
             let name = folder_name(&item.path);
             let keep_label = format!("Keep {name} on the server");
             let trash_label = format!("Move {name} to the trash");
-            let accessible_name = format!("{name}, missing from {}", item.path);
+            // The strip below now names nothing, so the row name keeps the
+            // reassurance a screen reader would otherwise lose (#76).
+            let accessible_name = format!(
+                "{name}, missing from {}. The server copy is untouched.",
+                item.path
+            );
             ReviewRow {
                 path: item.path.clone(),
                 name,
@@ -107,7 +112,7 @@ mod tests {
         assert_eq!(rows[0].trash_label, "Move IMG_0001.jpg to the trash");
         assert_eq!(
             rows[0].accessible_name,
-            "IMG_0001.jpg, missing from /photos/IMG_0001.jpg"
+            "IMG_0001.jpg, missing from /photos/IMG_0001.jpg. The server copy is untouched."
         );
     }
 

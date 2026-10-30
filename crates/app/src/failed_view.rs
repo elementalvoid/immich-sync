@@ -209,11 +209,16 @@ fn row_card(
                         .text_color(palette.meta)
                         .child(row.path.clone()),
                 )
-                .child(Notice::new(
-                    format!("failed-row-notice-{index}"),
-                    Severity::Error,
-                    format!("{} — {}", row.class, row.error),
-                ))
+                // The row's accessible name already states the class and the
+                // error, so the strip names nothing itself (#76).
+                .child(
+                    Notice::new(
+                        format!("failed-row-notice-{index}"),
+                        Severity::Error,
+                        format!("{} — {}", row.class, row.error),
+                    )
+                    .quiet(),
+                )
                 .child(
                     div()
                         .text_xs()

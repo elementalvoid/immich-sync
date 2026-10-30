@@ -5,11 +5,16 @@
 //!
 //! - [`Severity`] is the only place a severity becomes a theme colour.
 //! - A notice is announced once. The wrapper carries the message as its
-//!   accessible name and every visible line inside it is invisible to
-//!   assistive technology, so the copy is not read a second time.
+//!   accessible name, every visible line inside it is `Text::new_inaccessible`,
+//!   and the only other node inside is the severity caption, which exposes the
+//!   severity word as a `Role::Label`. A [`Notice::quiet`] notice adds no node
+//!   at all, because the container holding it already names the same fact.
 //!
 //! The severity is also stated in a visible word, so the accent colour is never
 //! the only thing that says how urgent a notice is.
+//!
+//! A headline is visible emphasis, not content: it stays out of the accessible
+//! name, so it must not carry information the message lacks.
 
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::Theme;
@@ -34,7 +39,7 @@ pub(crate) enum Severity {
 impl Severity {
     /// The theme colour that marks this severity. The one severity-to-theme
     /// mapping in the app.
-    pub(crate) fn accent(self, theme: &Theme) -> Hsla {
+    fn accent(self, theme: &Theme) -> Hsla {
         match self {
             Self::Error => theme.danger,
             Self::Warning => theme.warning,
@@ -44,7 +49,7 @@ impl Severity {
     }
 
     /// The word that carries this severity without relying on the colour.
-    pub(crate) fn label(self) -> &'static str {
+    fn label(self) -> &'static str {
         match self {
             Self::Error => "Error",
             Self::Warning => "Warning",
@@ -65,6 +70,7 @@ pub(crate) struct Notice {
     severity: Severity,
     message: SharedString,
     headline: Option<SharedString>,
+    quiet: bool,
 }
 
 impl Notice {
@@ -79,6 +85,7 @@ impl Notice {
             severity,
             message: message.into(),
             headline: None,
+            quiet: false,
         }
     }
 
@@ -88,6 +95,20 @@ impl Notice {
     /// outcome, and the summary would be read twice.
     pub(crate) fn headline(mut self, headline: impl Into<SharedString>) -> Self {
         self.headline = Some(headline.into());
+        self
+    }
+
+    /// Makes the notice decoration for a container that already names the same
+    /// fact, such as a list row whose accessible name carries the class and the
+    /// error.
+    ///
+    /// A quiet notice paints the accent edge and the severity word but adds no
+    /// accessibility node at all: the container's own name is the one
+    /// announcement, and a list of N rows stays N names instead of N alerts.
+    /// Use it only where the container's accessible name says everything the
+    /// message says.
+    pub(crate) fn quiet(mut self) -> Self {
+        self.quiet = true;
         self
     }
 }
@@ -104,12 +125,13 @@ impl RenderOnce for Notice {
         // A notice with a summary line states the outcome there, so the message
         // below it is the supporting detail.
         let message_ink = if self.headline.is_some() { muted } else { ink };
+        // A quiet notice names nothing, so it is no alert and has no label.
+        let name = (!self.quiet).then(|| self.message.clone());
 
         div()
             .id(self.id.clone())
             .test_support()
-            .role(Role::Alert)
-            .aria_label(self.message.clone())
+            .when_some(name, |this, name| this.role(Role::Alert).aria_label(name))
             .flex()
             .flex_row()
             .items_start()
@@ -123,8 +145,7 @@ impl RenderOnce for Notice {
                 div()
                     .id((self.id.clone(), "severity"))
                     .test_support()
-                    .role(Role::Label)
-                    .aria_label(word)
+                    .when(!self.quiet, |this| this.role(Role::Label).aria_label(word))
                     .flex_shrink_0()
                     .text_xs()
                     .text_color(muted)

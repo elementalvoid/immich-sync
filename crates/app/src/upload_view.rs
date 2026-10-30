@@ -106,10 +106,28 @@ impl UploadView {
     }
 
     /// The outcome notice: the headline over the full message, marked by the
-    /// severity of the result kind.
-    fn result(&self, cx: &App) -> impl IntoElement + use<> {
+    /// severity of the result kind. Before the first upload there is no outcome
+    /// to report, so the area holds plain copy instead of a severity (#76).
+    fn result(&self, cx: &App) -> AnyElement {
         let report = self.model.read(cx).report().clone();
         let severity = match &report {
+            crate::upload::UploadReport::Idle => {
+                return div()
+                    .id("upload-result")
+                    .test_support()
+                    .pl_2()
+                    .py_1()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    // Accessible text, so the empty state's words still reach
+                    // assistive technology without a severity (#77 owns the
+                    // empty state itself).
+                    .child(Text::new(
+                        "upload-result-copy".into(),
+                        report.message().into(),
+                    ))
+                    .into_any_element();
+            }
             crate::upload::UploadReport::Created { .. }
             | crate::upload::UploadReport::Duplicate { .. } => Severity::Success,
             crate::upload::UploadReport::Failed {
@@ -117,11 +135,11 @@ impl UploadView {
             }
             | crate::upload::UploadReport::CannotRun { .. } => Severity::Error,
             crate::upload::UploadReport::Failed { .. } => Severity::Warning,
-            crate::upload::UploadReport::Idle | crate::upload::UploadReport::Running => {
-                Severity::Info
-            }
+            crate::upload::UploadReport::Running => Severity::Info,
         };
-        Notice::new("upload-result", severity, report.message()).headline(report.headline())
+        Notice::new("upload-result", severity, report.message())
+            .headline(report.headline())
+            .into_any_element()
     }
 }
 

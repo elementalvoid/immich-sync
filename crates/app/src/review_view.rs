@@ -217,11 +217,16 @@ fn row_card(
                         .text_color(palette.meta)
                         .child(row.path.clone()),
                 )
-                .child(Notice::new(
-                    format!("review-row-notice-{index}"),
-                    Severity::Warning,
-                    "Missing on this computer · the server copy is untouched",
-                )),
+                .child(
+                    // The row's accessible name states the row and its
+                    // reassurance, so the strip names nothing itself (#76).
+                    Notice::new(
+                        format!("review-row-notice-{index}"),
+                        Severity::Warning,
+                        "Missing on this computer · the server copy is untouched",
+                    )
+                    .quiet(),
+                ),
         )
         .child(
             div()
