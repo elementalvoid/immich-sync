@@ -1,7 +1,9 @@
 //! The tray shell: one GPUI window, one tray icon, and the actions they share.
 
+use gpui_kit::base::Tabs as SurfaceTabs;
 use gpui_kit::component::ActiveTheme as _;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::ThemeStyled as _;
+use gpui_kit::component::scroll::ScrollableMask;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use gpui_tray::{Icon, Tray};
@@ -290,8 +292,8 @@ pub fn hide_window(cx: &mut App) {
 }
 
 /// The main window's bounds and limits: compact by default, resizable from
-/// every edge and corner, and never smaller than the shell still works at
-/// (issue #26).
+/// every edge and corner, and never smaller than the narrowest surface still
+/// lays out at (issues #26 and #75).
 #[must_use]
 pub fn main_window_options(cx: &App) -> WindowOptions {
     WindowOptions {
@@ -299,8 +301,15 @@ pub fn main_window_options(cx: &App) -> WindowOptions {
         // cannot cover the window (issue #26).
         window_bounds: Some(WindowBounds::centered(size(px(900.), px(650.)), cx)),
         is_resizable: true,
-        // Narrower and the seven view tabs no longer fit on one row.
-        window_min_size: Some(size(px(720.), px(480.))),
+        // The narrowest surface's layout sets this floor, not the surface
+        // switch (#75): the switch scrolls its seven tabs instead of clipping
+        // them, so the labels no longer hold the window open. 520 px is the
+        // width the widest row of any surface still fits in, the Dashboard's
+        // header, whose title block beside the Sync now and Pause buttons needs
+        // 509 px; 480 px is the height the Logs surface's cards keep their
+        // floors at in their narrowest wrap (#54). `tests/shell.rs` stands at
+        // exactly this size, so a layout that outgrows it fails there.
+        window_min_size: Some(size(px(520.), px(480.))),
         ..Default::default()
     }
 }
@@ -391,12 +400,83 @@ pub enum ViewMode {
     Diagnostics,
 }
 
+impl ViewMode {
+    /// Every surface, in the order the switch shows them.
+    const ALL: [Self; 7] = [
+        Self::Dashboard,
+        Self::Upload,
+        Self::Failed,
+        Self::Review,
+        Self::Settings,
+        Self::Logs,
+        Self::Diagnostics,
+    ];
+
+    /// The element id this surface's tab carries.
+    ///
+    /// The tests that click their way to one surface find the switch by these
+    /// ids, so they are part of the surface's contract, not a rendering detail.
+    const fn nav_id(self) -> &'static str {
+        match self {
+            Self::Dashboard => "nav-dashboard",
+            Self::Upload => "nav-upload",
+            Self::Failed => "nav-failed",
+            Self::Review => "nav-review",
+            Self::Settings => "nav-settings",
+            Self::Logs => "nav-logs",
+            Self::Diagnostics => "nav-diagnostics",
+        }
+    }
+
+    /// The tab's label, which is also what assistive technology announces.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Dashboard => "Dashboard",
+            Self::Upload => "Upload",
+            Self::Failed => "Failed items",
+            Self::Review => "Review",
+            Self::Settings => "Settings",
+            Self::Logs => "Logs",
+            Self::Diagnostics => "Diagnostics",
+        }
+    }
+
+    /// This surface's place in the switch, counted from zero.
+    fn index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|mode| *mode == self)
+            .expect("every ViewMode is in ViewMode::ALL")
+    }
+}
+
 /// The environment variable that pins a folder detail open (#43).
 ///
 /// Set it to a source folder's stored path and the dashboard opens that
 /// folder's detail once the store has loaded it, so a screenshot run captures
 /// the dialog. A product run never sets it.
 pub const FORCE_DETAIL_ENV: &str = "IMMICH_SYNC_FOLDER_DETAIL";
+
+/// The element id of the wrapper around the strip the surface switch's tabs
+/// scroll in.
+///
+/// It sits at the same bounds as the `nav-switch` scroller inside it and hosts
+/// the wheel mask, so it is what a wheel over the switch scrolls; the clipping
+/// is that scroller's own. It names the switch's viewport rather than any one
+/// surface.
+const NAV_STRIP: &str = "nav-tabs";
+
+/// The ids of the fades that say the strip continues past an edge.
+const FADE_LEFT: &str = "nav-fade-left";
+const FADE_RIGHT: &str = "nav-fade-right";
+
+/// The room the strip keeps inside its clip for the tabs' focus ring.
+///
+/// [`ThemeStyled::focus_ring_style`] paints the ring 3 px outside the tab, and
+/// the strip clips, so the strip pads the tabs by this much on every side and a
+/// reveal stops this far from the edge instead of flush: 4 px is the ring and
+/// one more.
+const TAB_ROOM: Pixels = px(4.);
 
 /// The environment variable that pins the visible surface.
 ///
@@ -431,6 +511,23 @@ pub fn view_for_name(value: &str) -> Option<ViewMode> {
 /// upload, the logs, or the diagnostics.
 pub struct AppShell {
     mode: ViewMode,
+    /// Where the switch's tabs are scrolled to. The strip scrolls instead of
+    /// clipping its tabs, so the tab of the surface on screen has to be brought
+    /// into sight at a narrow window (#75).
+    nav_scroll: ScrollHandle,
+    /// The tab the switch still owes the user a look at, and how many frames it
+    /// has asked for. A reveal needs the strip's own layout, which arrives a
+    /// frame after the surface it follows.
+    reveal: Option<usize>,
+    reveal_tries: u8,
+    /// The tab that held the keyboard in the last frame, so a tab is only
+    /// scrolled to when the keyboard moves and not on every repaint, which
+    /// would undo the user's own scrolling.
+    focused_tab: Option<usize>,
+    /// The strip's width in the last frame. A resize re-clips it, and the
+    /// surface on screen must stay on it; a wheel does not, so the user's own
+    /// scrolling survives.
+    strip_width: Option<Pixels>,
     dashboard: Entity<Dashboard>,
     settings: Entity<SettingsView>,
     logs: Entity<LogsView>,
@@ -486,8 +583,13 @@ impl AppShell {
                 this.show_filtered(*mode, folder.clone(), cx);
             },
         );
-        Self {
+        let mut shell = Self {
             mode,
+            nav_scroll: ScrollHandle::new(),
+            reveal: None,
+            reveal_tries: 0,
+            focused_tab: None,
+            strip_width: None,
             dashboard,
             settings,
             logs,
@@ -498,7 +600,12 @@ impl AppShell {
             _connection: connection,
             _connection_subscription: subscription,
             _dashboard_subscription: dashboard_subscription,
-        }
+        };
+        // A pinned surface (#43, #75) can be one of the last tabs, so the switch
+        // starts out owing it a look: at a narrow window its tab is past the
+        // strip's edge until the strip scrolls to it.
+        shell.want_tab(shell.mode.index());
+        shell
     }
 
     /// The visible surface.
@@ -522,8 +629,60 @@ impl AppShell {
             // (R10.3).
             self.logs
                 .update(cx, |logs, cx| logs.set_visible(mode == ViewMode::Logs, cx));
+            self.want_tab(mode.index());
         }
         cx.notify();
+    }
+
+    /// Asks the switch to bring tab `ix` into sight.
+    ///
+    /// The strip scrolls rather than clips, so at a window too narrow for the
+    /// seven labels the tab of the surface on screen could sit past the strip's
+    /// edge; the tray, a pinned surface, and a folder-detail link all switch
+    /// without the pointer ever touching the switch (#75). The scroll itself
+    /// waits for the strip's layout, which [`Self::switch`] applies.
+    fn want_tab(&mut self, ix: usize) {
+        self.reveal = Some(ix);
+        self.reveal_tries = 0;
+    }
+
+    /// Whether the tab at `ix` lay wholly inside the strip in the last frame.
+    fn tab_in_sight(&self, ix: usize) -> bool {
+        let Some(tab) = self.nav_scroll.bounds_for_item(ix) else {
+            // The strip has not laid out yet, so nothing is known to be in
+            // sight.
+            return false;
+        };
+        let strip = self.nav_scroll.bounds();
+        let left = tab.origin.x + self.nav_scroll.offset().x;
+        let strip_left = strip.origin.x + TAB_ROOM;
+        let strip_right = strip.origin.x + strip.size.width - TAB_ROOM;
+        left >= strip_left - px(0.5) && left + tab.size.width <= strip_right + px(0.5)
+    }
+
+    /// Scrolls the strip the least it can and still shows tab `ix` with room for
+    /// its focus ring.
+    ///
+    /// [`ScrollHandle::scroll_to_item`] would stop the tab flush against the
+    /// strip's edge, which cuts off the ring drawn outside it, so the offset is
+    /// set to keep [`TAB_ROOM`] instead.
+    fn scroll_tab_into_sight(&self, ix: usize) {
+        let Some(tab) = self.nav_scroll.bounds_for_item(ix) else {
+            // The strip has not laid out yet; the next frame has its bounds.
+            return;
+        };
+        let strip = self.nav_scroll.bounds();
+        let offset = self.nav_scroll.offset();
+        let x = if tab.left() + offset.x < strip.left() + TAB_ROOM {
+            strip.left() + TAB_ROOM - tab.left()
+        } else if tab.right() + offset.x > strip.right() - TAB_ROOM {
+            strip.right() - TAB_ROOM - tab.right()
+        } else {
+            return;
+        };
+        let max = self.nav_scroll.max_offset().x;
+        self.nav_scroll
+            .set_offset(point(x.clamp(-max, px(0.)), offset.y));
     }
 
     /// Opens a list view narrowed to one source folder (#41).
@@ -551,91 +710,221 @@ impl AppShell {
         self.logs.clone()
     }
 
-    /// The view switch. Every button is a keyboard reachable tab stop.
-    fn switch(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    /// The surface switch: one tab per surface, in a strip that scrolls when the
+    /// window is too narrow for all seven labels (#75).
+    ///
+    /// Every tab is its own tab stop, so the keyboard reaches every surface and
+    /// Enter or Space shows it (GPUI turns a key on the focused element into a
+    /// click). The tab of the surface on screen is filled and set in semibold,
+    /// and reports itself as selected, so the selection is not colour alone.
+    ///
+    /// The tab that holds the keyboard wears the kit's focus ring, and the strip
+    /// keeps room for it inside its clip, so the keyboard path is visible rather
+    /// than only reachable.
+    ///
+    /// The tabs ride in the kit's [`SurfaceTabs`] list, but each one is its own
+    /// element rather than a `base::Tab`: in 0.8.1 that tab observes itself
+    /// before any caller can, so a caller's focus handle still makes it a tab
+    /// stop but nothing can read focus back from it, and `component::TabBar`
+    /// would rename it to its integer index and lose the stable id the
+    /// per-surface tests click. The role, the label, the position, the selected
+    /// state and the focus handle below are the ones `base::Tab` writes.
+    fn switch(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
-        let background = theme.background;
-        let border = theme.border;
+        let (background, border) = (theme.background, theme.border);
+        let (primary, primary_foreground) = (theme.primary, theme.primary_foreground);
+        let (foreground, muted_foreground) = (theme.foreground, theme.muted_foreground);
+        let (accent, radius) = (theme.accent, theme.radius);
+        // The focus handles are claimed first: the tab loop below needs `cx` for
+        // its listeners, and a tab's handle has to outlive that borrow.
+        let focus: Vec<FocusHandle> = ViewMode::ALL
+            .iter()
+            .map(|mode| {
+                window
+                    .use_keyed_state(mode.nav_id(), cx, |_, cx| cx.focus_handle().tab_stop(true))
+                    .read(cx)
+                    .clone()
+            })
+            .collect();
+        // The strip clips what does not fit, and a clipped tab clips its focus
+        // ring with it, so the tab the keyboard moved to is scrolled into sight.
+        let focused = focus.iter().position(|handle| handle.is_focused(window));
+        if focused != self.focused_tab {
+            self.focused_tab = focused;
+            if let Some(ix) = focused {
+                self.want_tab(ix);
+            }
+        }
+        // A resize re-clips the strip around whatever the window now shows, so
+        // the tab of the surface on screen is brought back into sight. The new
+        // width also decides whether an edge hides a tab, and it is measured a
+        // frame after the layout that gives it, so that frame is asked for —
+        // the fade the strip draws from it would otherwise wait for whatever
+        // repaints next.
+        let width = self.nav_scroll.bounds().size.width;
+        if self.strip_width != Some(width) {
+            self.strip_width = Some(width);
+            let view = window.current_view();
+            window.on_next_frame(move |_, cx| cx.notify(view));
+            let shown = self.mode.index();
+            if !self.tab_in_sight(shown) {
+                self.want_tab(shown);
+            }
+        }
+        // A scroll request is applied by the strip's own prepaint, and the strip
+        // does not know it overflows until it has laid out once, so the frame a
+        // surface changes in drops its request. Asking for the next frame is
+        // what turns the request into a scroll; the count stops a tab wider than
+        // the strip from asking forever.
+        if let Some(ix) = self.reveal {
+            if self.tab_in_sight(ix) || self.reveal_tries >= 3 {
+                self.reveal = None;
+                self.reveal_tries = 0;
+            } else {
+                self.scroll_tab_into_sight(ix);
+                self.reveal_tries += 1;
+                let view = window.current_view();
+                window.on_next_frame(move |_, cx| cx.notify(view));
+            }
+        }
+
+        let mut tabs = Vec::with_capacity(ViewMode::ALL.len());
+        for (ix, (mode, focus)) in ViewMode::ALL.iter().zip(&focus).enumerate() {
+            let mode = *mode;
+            let selected = mode == self.mode;
+            tabs.push(
+                div()
+                    .id(mode.nav_id())
+                    .test_support()
+                    .role(Role::Tab)
+                    .aria_label(mode.label())
+                    // Both states are always reported, so a tab that is not the
+                    // surface on screen says so instead of saying nothing.
+                    .aria_selected(selected)
+                    .aria_position_in_set(ix + 1)
+                    .aria_size_of_set(ViewMode::ALL.len())
+                    .track_focus(focus)
+                    .on_click(cx.listener(move |this, _, _, cx| this.show(mode, cx)))
+                    .flex()
+                    .items_center()
+                    .px_3()
+                    .py_1()
+                    .rounded(radius)
+                    .text_sm()
+                    .text_color(if selected {
+                        primary_foreground
+                    } else {
+                        muted_foreground
+                    })
+                    .when(selected, |tab| {
+                        tab.bg(primary).font_weight(FontWeight::SEMIBOLD)
+                    })
+                    .when(!selected, |tab| {
+                        tab.hover(move |style| style.bg(accent).text_color(foreground))
+                    })
+                    .when(focus.is_focused(window), |tab| {
+                        tab.focus_ring_style(window, cx)
+                    })
+                    .child(mode.label())
+                    .into_any_element(),
+            );
+        }
+
+        // Which edges of the strip have tabs hidden past them: the offset only
+        // leaves zero by the wheel, a reveal, or a resize. Compared as `f32`
+        // because a strip that fits leaves a zero here, and `Pixels` orders by
+        // `total_cmp`, where `px(0.)` is greater than `-px(0.)`.
+        let offset = f32::from(self.nav_scroll.offset().x);
+        let room = f32::from(self.nav_scroll.max_offset().x);
+        let hidden_left = offset < 0.;
+        let hidden_right = offset > -room;
+
         div()
             .flex()
             .flex_row()
             .items_center()
-            .gap_2()
             .px_6()
-            .py_2()
+            // The bar's vertical space sits on the strip instead, so the tabs'
+            // outward focus ring has room inside the strip's own clip; the bar
+            // and the tabs are where they were.
+            .py(TAB_ROOM)
             .bg(background)
             .border_b_1()
             .border_color(border)
-            .child(view_button(
-                "nav-dashboard",
-                "Dashboard",
-                ViewMode::Dashboard,
-                self.mode,
-                cx,
-            ))
-            .child(view_button(
-                "nav-upload",
-                "Upload",
-                ViewMode::Upload,
-                self.mode,
-                cx,
-            ))
-            .child(view_button(
-                "nav-failed",
-                "Failed items",
-                ViewMode::Failed,
-                self.mode,
-                cx,
-            ))
-            .child(view_button(
-                "nav-review",
-                "Review",
-                ViewMode::Review,
-                self.mode,
-                cx,
-            ))
-            .child(view_button(
-                "nav-settings",
-                "Settings",
-                ViewMode::Settings,
-                self.mode,
-                cx,
-            ))
-            .child(view_button(
-                "nav-logs",
-                "Logs",
-                ViewMode::Logs,
-                self.mode,
-                cx,
-            ))
-            .child(view_button(
-                "nav-diagnostics",
-                "Diagnostics",
-                ViewMode::Diagnostics,
-                self.mode,
-                cx,
-            ))
+            .child(
+                div()
+                    .id(NAV_STRIP)
+                    .test_support()
+                    .flex()
+                    .items_center()
+                    .flex_1()
+                    .min_w_0()
+                    .relative()
+                    .child(
+                        SurfaceTabs::new("nav-switch")
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .flex_1()
+                            .min_w_0()
+                            // Room for the tabs' outward focus ring on every
+                            // side; the strip clips, so the ring would otherwise
+                            // lose its top and bottom band.
+                            .px(TAB_ROOM)
+                            .py(TAB_ROOM)
+                            .overflow_x_scroll()
+                            .track_scroll(&self.nav_scroll)
+                            .children(tabs),
+                    )
+                    // A tab hidden past either edge is otherwise invisible, so
+                    // a fade in the bar's own colour says the strip continues,
+                    // the way the kit's tab bar keeps a neighbouring tab in
+                    // sight; it sits over the strip rather than beside it, so
+                    // the tabs stay the scroller's own children.
+                    .when(hidden_left, |this| {
+                        this.child(
+                            div()
+                                .id(FADE_LEFT)
+                                .test_support()
+                                .absolute()
+                                .left_0()
+                                .top_0()
+                                .bottom_0()
+                                .w_6()
+                                .bg(linear_gradient(
+                                    90.,
+                                    linear_color_stop(background, 0.),
+                                    linear_color_stop(background.opacity(0.), 1.),
+                                )),
+                        )
+                    })
+                    .when(hidden_right, |this| {
+                        this.child(
+                            div()
+                                .id(FADE_RIGHT)
+                                .test_support()
+                                .absolute()
+                                .right_0()
+                                .top_0()
+                                .bottom_0()
+                                .w_6()
+                                .bg(linear_gradient(
+                                    90.,
+                                    linear_color_stop(background.opacity(0.), 0.),
+                                    linear_color_stop(background, 1.),
+                                )),
+                        )
+                    })
+                    // Over the strip, not inside it, so a plain wheel's vertical
+                    // lines scroll the tabs sideways the way the kit's tab bars
+                    // do; tab indices stay the strip's own children.
+                    .child(ScrollableMask::vertical_wheel(&self.nav_scroll)),
+            )
     }
 }
 
-/// One view-switch button: the active surface is prominent, the other is not.
-fn view_button(
-    id: &'static str,
-    label: &'static str,
-    mode: ViewMode,
-    current: ViewMode,
-    cx: &mut Context<AppShell>,
-) -> impl IntoElement + use<> {
-    let active = mode == current;
-    Button::new(id)
-        .label(label)
-        .when(active, |button| button.primary())
-        .when(!active, |button| button.ghost())
-        .on_click(cx.listener(move |this, _, _, cx| this.show(mode, cx)))
-}
-
 impl Render for AppShell {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let background = theme.background;
         let foreground = theme.foreground;
@@ -655,7 +944,7 @@ impl Render for AppShell {
             .size_full()
             .bg(background)
             .text_color(foreground)
-            .child(self.switch(cx))
+            .child(self.switch(window, cx))
             .child(content)
     }
 }
