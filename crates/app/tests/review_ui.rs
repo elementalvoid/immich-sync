@@ -12,7 +12,7 @@ use std::time::Duration;
 use gpui_kit::base::test_support::snapshots;
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, Bounds, Point, Role, TestAppContext, Window,
+    AnyWindowHandle, App, AppContext as _, Bounds, ElementId, Point, Role, TestAppContext, Window,
     WindowBounds, WindowOptions, px, size,
 };
 use immich_sync::connection::ConnectionModel;
@@ -58,6 +58,23 @@ fn missing(path: &str) -> ItemRecord {
         attempts: 0,
         sidecar: None,
     }
+}
+
+/// The sentence the empty review explains itself with (#77).
+const EMPTY_DESCRIPTION: &str = "A file that disappears from a source folder appears here, and \
+                               the server copy waits for your choice.";
+
+/// How many observed elements announce `text`: as a name, as a value, or as the
+/// description a screen reader reads after the name.
+fn announced(window: &Window, text: &str) -> usize {
+    snapshots(window)
+        .into_iter()
+        .filter(|element| {
+            element.label() == Some(text)
+                || element.value() == Some(text)
+                || element.description() == Some(text)
+        })
+        .count()
 }
 
 /// Seeds one source folder and `names` missing files under it.
@@ -577,10 +594,21 @@ async fn choosing_a_folder_narrows_the_review_its_summary_and_its_empty_state(
         );
         window.click("review-folder-option-2", cx);
         window.render_frame(cx);
+        let empty = window.find("review-empty");
         assert_eq!(
-            window.find("review-empty").label(),
+            empty.label(),
             Some("No missing files in Videos"),
             "the empty state names the folder the filter shows"
+        );
+        assert_eq!(
+            empty.description(),
+            Some(EMPTY_DESCRIPTION),
+            "#77: the filtered state explains the list in the same words as before"
+        );
+        assert_eq!(
+            announced(window, "Every tracked file is present"),
+            0,
+            "#77: an empty filtered list never claims every tracked file is present"
         );
         assert_eq!(
             window.find("review-summary").label(),
@@ -604,6 +632,56 @@ async fn choosing_a_folder_narrows_the_review_its_summary_and_its_empty_state(
         );
     })
     .expect("read the filtered review");
+}
+
+#[gpui_kit::test]
+async fn the_empty_review_is_one_status_and_offers_no_decision(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    seed(&paths, &temp.path().join("Camera Roll"), &[]);
+    let (window, _engine, _view) = open_review_view(cx, &paths);
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let empty = window.find("review-empty");
+        assert_eq!(
+            empty.label(),
+            Some("Every tracked file is present"),
+            "#77: the unfiltered review states what it found"
+        );
+        assert_eq!(
+            empty.description(),
+            Some(EMPTY_DESCRIPTION),
+            "#77: the explanation is announced after the title, not instead of it"
+        );
+        assert_eq!(
+            empty.role(),
+            Some(Role::Status),
+            "#77: the empty state is a status for assistive technology"
+        );
+        assert!(
+            empty.visible(),
+            "#77: the empty state is on screen: {empty:?}"
+        );
+        assert_eq!(
+            announced(window, "Every tracked file is present"),
+            1,
+            "#77: the title is announced once"
+        );
+        assert_eq!(
+            announced(window, EMPTY_DESCRIPTION),
+            1,
+            "#77: the explanation is announced once"
+        );
+        assert!(
+            window
+                .try_find((ElementId::from("review-empty"), "action"))
+                .is_none(),
+            "#77: with no file to decide on the empty review offers no action"
+        );
+    })
+    .expect("read the empty review view");
 }
 
 #[gpui_kit::test]
