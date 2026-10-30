@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_kit::base::test_support::snapshots;
-use gpui_kit::test::TestWindowExt as _;
+use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
 use gpui_kit::{
     AnyWindowHandle, App, AppContext as _, Bounds, ElementId, Point, Role, SharedString,
     TestAppContext, Window, WindowBounds, WindowOptions, px, size,
@@ -454,27 +454,54 @@ async fn the_failed_view_offers_every_source_folder_under_all_folders(cx: &mut T
 
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
+        let trigger = window.find("failed-folder-filter");
         assert_eq!(
-            window.find("failed-folder-filter").label(),
-            Some("Folder filter: All folders"),
-            "the filter starts on All folders and is named for the keyboard"
+            trigger.role(),
+            Some(Role::ComboBox),
+            "#79: the filter is the kit's select, which a screen reader can place"
         );
-
-        window.click("failed-folder-filter", cx);
         assert_eq!(
-            window.find("failed-folder-options").role(),
-            Some(Role::List),
-            "the options are one list"
+            trigger.label(),
+            Some("Folder filter"),
+            "#79: the control's own name is stable; the choice is its value"
+        );
+        assert_eq!(
+            trigger.value(),
+            Some("All folders"),
+            "the filter starts on All folders and says so as its value"
+        );
+        assert_eq!(trigger.expanded(), Some(false));
+
+        window.within("failed-folder-filter").click("input", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("failed-folder-filter").expanded(),
+            Some(true),
+            "clicking the control opens its options"
         );
         assert_eq!(
             window.find("failed-folder-option-0").role(),
-            Some(Role::ListItem),
-            "each option is a list item of that list"
+            Some(Role::ListBoxOption),
+            "#79: each option is an option of the select's list"
         );
         assert_eq!(
             window.find("failed-folder-option-0").label(),
-            Some("Show items from all folders, selected"),
-            "the option list marks the current choice, not only with colour"
+            Some("Show items from all folders"),
+            "#79: the name says what the choice does; its state is not part of it"
+        );
+        assert_eq!(
+            window.find("failed-folder-option-0").selected(),
+            Some(true),
+            "#79: the current choice reports itself as selected, so a screen reader gets the state"
+        );
+        assert_eq!(
+            window.find("failed-folder-option-1").selected(),
+            Some(false),
+            "#79: every option reports the state, so an unchecked one says it is unchecked"
+        );
+        assert!(
+            window.try_find("failed-folder-option-0-selected").is_some(),
+            "the current choice carries a visible marker, so the selection is not colour alone"
         );
         assert_eq!(
             window.find("failed-folder-option-1").label(),
@@ -484,6 +511,35 @@ async fn the_failed_view_offers_every_source_folder_under_all_folders(cx: &mut T
         assert_eq!(
             window.find("failed-folder-option-2").label(),
             Some(format!("Show only {}", photos.display()).as_str())
+        );
+        assert!(
+            window.try_find("failed-folder-option-1-selected").is_none(),
+            "only the current choice is marked"
+        );
+        assert!(
+            window.try_find("review-folder-option-0").is_none(),
+            "#79: each surface keeps its own element ids"
+        );
+
+        // #79: Escape dismisses the options the way the kit's overlay contract
+        // says, and the keyboard focus stays with the control.
+        window.press("escape", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("failed-folder-filter").expanded(),
+            Some(false),
+            "Escape closes the options"
+        );
+        assert!(window.try_find("failed-folder-option-0").is_none());
+        assert_eq!(
+            window.find("failed-folder-filter").focused(),
+            Some(true),
+            "Escape leaves the keyboard focus on the filter control"
+        );
+        assert_eq!(
+            window.find("failed-folder-filter").value(),
+            Some("All folders"),
+            "dismissing without choosing keeps the choice"
         );
     })
     .expect("read the folder filter");
@@ -514,13 +570,19 @@ async fn choosing_a_folder_narrows_the_list_its_summary_and_its_empty_state(
         );
 
         // Videos sorts after Camera Roll, so it is the second folder option.
-        window.click("failed-folder-filter", cx);
+        window.within("failed-folder-filter").click("input", cx);
         assert_eq!(
             window.find("failed-folder-option-2").label(),
             Some(format!("Show only {}", videos.display()).as_str()),
             "labels stay short; the accessible name carries the full path"
         );
         window.click("failed-folder-option-2", cx);
+    })
+    .expect("choose the Videos folder");
+    // The kit commits the selection after the click handler returns.
+    cx.run_until_parked();
+
+    cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
         let empty = window.find("failed-empty");
         assert_eq!(
@@ -545,8 +607,13 @@ async fn choosing_a_folder_narrows_the_list_its_summary_and_its_empty_state(
         );
         assert!(window.try_find("failed-row-0").is_none());
 
-        window.click("failed-folder-filter", cx);
+        window.within("failed-folder-filter").click("input", cx);
         window.click("failed-folder-option-1", cx);
+    })
+    .expect("choose the Camera Roll folder");
+    cx.run_until_parked();
+
+    cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
         assert_eq!(
             window.find("failed-summary").label(),
@@ -559,8 +626,32 @@ async fn choosing_a_folder_narrows_the_list_its_summary_and_its_empty_state(
             Some("Showing Camera Roll"),
             "the active folder has a chip"
         );
+
+        // #79: All folders is a choice of the list, not only the chip's Clear.
+        window.within("failed-folder-filter").click("input", cx);
+        window.click("failed-folder-option-0", cx);
     })
-    .expect("read the filtered failed-items view");
+    .expect("choose All folders from the list");
+    cx.run_until_parked();
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("failed-summary").label(),
+            Some("2 files could not be uploaded."),
+            "choosing All folders lists every item again"
+        );
+        assert_eq!(
+            window.find("failed-folder-filter").value(),
+            Some("All folders"),
+            "and the control says so"
+        );
+        assert!(
+            window.try_find("failed-folder-chip").is_none(),
+            "with no folder chosen there is no chip to clear"
+        );
+    })
+    .expect("read the unfiltered failed-items view");
 }
 
 #[gpui_kit::test]
@@ -638,21 +729,45 @@ async fn the_filter_and_its_clear_action_are_keyboard_reachable_and_named(cx: &m
     let (window, _view) = open_failed_view(cx, &paths);
     wait_for_rows(cx, window, 2).await;
 
+    // #79: the whole choice is made from the keyboard — no pointer, and no
+    // tabbing through the options: Enter opens the list the way the kit
+    // defines it, Down moves the cursor, Enter commits.
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
-        // N5: the keyboard reaches the filter and its options.
         tab_to(window, "failed-folder-filter", cx);
-        window.click("failed-folder-filter", cx);
+        window.press("enter", cx);
         window.render_frame(cx);
-        tab_to(window, "failed-folder-option-0", cx);
-        tab_to(window, "failed-folder-option-1", cx);
-        window.click("failed-folder-option-1", cx);
+        assert_eq!(
+            window.find("failed-folder-filter").expanded(),
+            Some(true),
+            "Enter on the control opens its options"
+        );
+        window.press("down", cx);
+        window.press("enter", cx);
         window.render_frame(cx);
-        assert_eq!(failed_rows(window), 1);
+    })
+    .expect("choose a folder from the keyboard");
+
+    cx.wait_for(window, Duration::from_secs(5), |window, _| {
+        window.find("failed-folder-filter").value() == Some("Camera Roll")
+    })
+    .await;
+    assert_eq!(
+        failed_count(cx, window),
+        1,
+        "the keyboard choice narrows the list"
+    );
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
         assert_eq!(
             window.find("failed-folder-filter").focused(),
             Some(true),
-            "choosing a folder keeps the keyboard focus on the trigger"
+            "choosing a folder keeps the keyboard focus on the control"
+        );
+        assert_eq!(
+            window.find("failed-folder-chip").label(),
+            Some("Showing Camera Roll"),
+            "the chip still names the folder on screen"
         );
 
         // The clear action is named and a tab stop of its own.
@@ -663,14 +778,13 @@ async fn the_filter_and_its_clear_action_are_keyboard_reachable_and_named(cx: &m
         tab_to(window, "failed-folder-clear", cx);
         window.click("failed-folder-clear", cx);
         window.render_frame(cx);
-        assert_eq!(
-            window.find("failed-folder-filter").focused(),
-            Some(true),
-            "clearing keeps the keyboard focus on the filter's trigger"
-        );
     })
-    .expect("tab through the folder filter");
+    .expect("tab to the clear action and use it");
 
+    cx.wait_for(window, Duration::from_secs(5), |window, _| {
+        window.find("failed-folder-filter").value() == Some("All folders")
+    })
+    .await;
     assert_eq!(
         failed_count(cx, window),
         2,
@@ -679,9 +793,11 @@ async fn the_filter_and_its_clear_action_are_keyboard_reachable_and_named(cx: &m
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
         assert_eq!(
-            window.find("failed-folder-filter").label(),
-            Some("Folder filter: All folders")
+            window.find("failed-folder-filter").focused(),
+            Some(true),
+            "clearing keeps the keyboard focus on the filter control"
         );
+        assert!(window.try_find("failed-folder-chip").is_none());
     })
     .expect("read the cleared filter");
 }
@@ -715,8 +831,68 @@ async fn the_view_opens_with_a_folder_already_selected(cx: &mut TestAppContext) 
             window.find("failed-folder-chip").label(),
             Some("Showing Camera Roll")
         );
+        assert_eq!(
+            window.find("failed-folder-filter").value(),
+            Some("Camera Roll"),
+            "#79: a folder chosen elsewhere shows as the control's value"
+        );
     })
     .expect("read the selected folder");
+}
+
+/// #79 S4: a folder that is no longer a source folder is no longer offered as a
+/// choice, and the filter that names it still filters instead of quietly
+/// listing everything.
+#[gpui_kit::test]
+async fn a_folder_that_is_no_longer_a_source_folder_still_filters(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    // `gone` was a source folder when the filter was chosen; it is not one now.
+    let gone = temp.path().join("Gone");
+    seed_folder(&paths, &photos, true);
+    failed_under(&paths, &photos.join("IMG_0001.jpg"));
+    failed_under(&paths, &gone.join("IMG_0002.jpg"));
+    let (window, view) = open_failed_view(cx, &paths);
+    wait_for_rows(cx, window, 2).await;
+
+    let selected = gone.display().to_string();
+    cx.update(|cx| {
+        view.update(cx, |view, cx| view.select_folder(selected.clone(), cx));
+    });
+    cx.update_window(window, |_, window, cx| window.render_frame(cx))
+        .expect("render the selected folder");
+
+    assert_eq!(
+        failed_count(cx, window),
+        1,
+        "the folder still narrows the list, so it does not list every item"
+    );
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("failed-folder-chip").label(),
+            Some("Showing Gone")
+        );
+        assert_eq!(
+            window.find("failed-folder-filter").value(),
+            Some("Gone"),
+            "#79: the control still names the folder the list is narrowed to"
+        );
+        window.within("failed-folder-filter").click("input", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("failed-folder-option-1").label(),
+            Some(format!("Show only {}", photos.display()).as_str()),
+            "the list holds only the folder that is still a source folder"
+        );
+        assert!(
+            window.try_find("failed-folder-option-2").is_none(),
+            "a folder that is no longer a source folder is not offered as a choice"
+        );
+    })
+    .expect("read the stale filter");
 }
 
 /// The rows the rendered view holds, counted from `window`'s element tree.

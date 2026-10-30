@@ -1,14 +1,23 @@
 //! The folder filter control the failed-items and deletion-review views share
-//! (#41): the trigger, the source-folder options it shows while open, and the
-//! chip that clears an active folder.
+//! (#41, #79): the kit select that chooses the folder, and the chip that names
+//! the active one.
 //!
 //! The rule it applies lives in [`crate::folder_filter`]. Rendering it once here
-//! is what keeps the two views from growing two dropdowns (N5 keeps it a named,
+//! is what keeps the two views from growing two selects (N5 keeps it a named,
 //! keyboard-reachable tab stop in both).
+//!
+//! #79 replaced the hand-built trigger, option list and focus workaround with
+//! [`Select`], so the open state, the option list, arrows, Enter, Escape and the
+//! focus return are the kit's contract instead of ours. The select is a
+//! controlled view of [`FolderFilter`]: the filter stays the owner of the
+//! choice, and every way of changing it (a chosen option, the chip's Clear, the
+//! folder-detail seam) is pushed into the select on the next frame.
 
 use gpui_kit::component::ActiveTheme as _;
-use gpui_kit::component::Selectable as _;
+use gpui_kit::component::IndexPath;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::searchable_list::{SearchableListDelegate, SearchableListItem};
+use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use sync_core::store::SourceFolder;
@@ -19,10 +28,10 @@ use crate::status::folder_name;
 
 /// The filter row for one list view.
 ///
-/// `prefix` names the element ids (`<prefix>-folder-filter`, `-option-<index>`,
+/// `prefix` names the element ids (`<prefix>-folder-filter`, `-option-<row>`,
 /// `-chip`, `-clear`), so the two views never collide. The filter entity owns
-/// the selection and the open state; the view that owns it observes the entity
-/// and re-renders its list.
+/// the selection; the view that owns it observes the entity and re-renders its
+/// list.
 pub fn folder_filter_bar(
     prefix: &'static str,
     filter: &Entity<FolderFilter>,
@@ -34,31 +43,19 @@ pub fn folder_filter_bar(
     let radius = cx.theme().radius_lg;
     let border = cx.theme().border;
     let muted = cx.theme().muted_foreground;
-    // The row outlives the option list and the chip, so a choice or a clear
-    // parks the keyboard focus back on the trigger instead of on the window's
-    // first tab stop (N5). A focusable row is how gpui reaches a child: the row
-    // is an anchor, not a tab stop of its own, and `focus_next` from it descends
-    // to its first tab stop, the trigger.
-    let row_focus = window
-        .use_keyed_state(
-            ElementId::Name(format!("{prefix}-folder-focus").into()),
-            cx,
-            |_, cx| cx.focus_handle(),
-        )
-        .read(cx)
-        .clone()
-        .tab_stop(false);
-    let state = filter.read(cx);
-    let label = state.label();
-    let selected = state.selected().map(str::to_string);
-    let open = state.is_open();
-    let active = state.is_active();
-    let trigger = filter.clone();
+    let label = filter.read(cx).label();
+    let selected = filter.read(cx).selected().map(str::to_string);
+    let active = filter.read(cx).is_active();
+    let binding = folder_select(prefix, filter, folders, selected.as_deref(), window, cx);
+    let choices = binding.read(cx).choices.clone();
+    // The trigger shows the filter's own label. A folder that is no longer a
+    // source folder is not in the list, so it arrives as the placeholder
+    // instead — the control still names what the list is narrowed to.
+    let placeholder = label.clone();
 
-    let mut bar = div()
+    div()
         .id(format!("{prefix}-folder-bar"))
         .test_support()
-        .track_focus(&row_focus)
         .flex()
         .flex_row()
         // A narrow window wraps the chip onto its own row.
@@ -66,22 +63,16 @@ pub fn folder_filter_bar(
         .items_center()
         .gap_2()
         .child(
-            Button::new(format!("{prefix}-folder-filter"))
-                .secondary()
-                .label(label.clone())
-                .accessibility_label(format!("Folder filter: {label}"))
-                .dropdown_caret(true)
-                .toggled(open)
-                .on_click(move |_, _, cx| {
-                    trigger.update(cx, |filter, cx| {
-                        filter.toggle();
-                        cx.notify();
-                    });
-                }),
+            div().w_48().flex_shrink_0().child(
+                Select::new(&choices)
+                    .id(format!("{prefix}-folder-filter"))
+                    .accessibility_label("Folder filter")
+                    .placeholder(placeholder),
+            ),
         )
         .when(active, |this| {
             let clear = filter.clone();
-            let clear_focus = row_focus.clone();
+            let trigger = choices.clone();
             this.child(
                 div()
                     .id(format!("{prefix}-folder-chip"))
@@ -114,104 +105,244 @@ pub fn folder_filter_bar(
                                     filter.clear();
                                     cx.notify();
                                 });
-                                focus_trigger(&clear_focus, window, cx);
+                                // The Clear button unmounts with the chip, so
+                                // the focus goes to the control that survives
+                                // instead of the window's first tab stop.
+                                trigger.update(cx, |state, cx| state.focus(window, cx));
                             }),
                     ),
             )
-        });
-
-    if open {
-        let options = std::iter::once(None)
-            .chain(folders.iter().map(Some))
-            .enumerate()
-            .map(|(index, choice)| {
-                option(
-                    prefix,
-                    index,
-                    choice,
-                    filter,
-                    selected.as_deref(),
-                    &row_focus,
-                )
-                .into_any_element()
-            });
-        bar = bar.child(
-            div()
-                .id(format!("{prefix}-folder-options"))
-                .test_support()
-                .role(Role::List)
-                .aria_label("Source folders")
-                .flex()
-                .flex_col()
-                .gap_1()
-                .p_1()
-                .rounded(radius)
-                .bg(palette.surface)
-                .border_1()
-                .border_color(border)
-                .children(options),
-        );
-    }
-
-    bar
-}
-
-/// One choice in the option list: "All folders", or one source folder.
-///
-/// The visible label stays the folder's name; the accessible name carries the
-/// full path, because two source folders can share a leaf name, and says when
-/// the choice is the current one, so the selection is not colour alone.
-fn option(
-    prefix: &'static str,
-    index: usize,
-    choice: Option<&SourceFolder>,
-    filter: &Entity<FolderFilter>,
-    selected: Option<&str>,
-    row_focus: &FocusHandle,
-) -> Button {
-    let filter = filter.clone();
-    let row_focus = row_focus.clone();
-    let path = choice.map(|folder| folder.path.clone());
-    let is_selected = path.as_deref() == selected;
-    let label = choice.map_or_else(
-        || ALL_FOLDERS.to_string(),
-        |folder| folder_name(&folder.path),
-    );
-    let accessibility_label = choice.map_or_else(
-        || "Show items from all folders".to_string(),
-        |folder| format!("Show only {}", folder.path),
-    );
-    let accessibility_label = if is_selected {
-        format!("{accessibility_label}, selected")
-    } else {
-        accessibility_label
-    };
-    Button::new(format!("{prefix}-folder-option-{index}"))
-        .ghost()
-        // #41 review: the options live under a `Role::List`, so each one is a
-        // list item instead of a bare button a screen reader cannot place.
-        .role(Role::ListItem)
-        .label(label)
-        .accessibility_label(accessibility_label)
-        .selected(is_selected)
-        .on_click(move |_, window, cx| {
-            let path = path.clone();
-            filter.update(cx, |filter, cx| {
-                match path {
-                    Some(path) => filter.select(path),
-                    None => filter.clear(),
-                }
-                cx.notify();
-            });
-            focus_trigger(&row_focus, window, cx);
         })
 }
 
-/// Puts the focus back on the trigger after a choice closed the control.
+/// The select state the bar renders, created once per prefix and kept in sync
+/// with the filter and the source folders.
 ///
-/// The activated option and the chip both unmount, so without this the keyboard
-/// focus would fall back to the window's first tab stop.
-fn focus_trigger(row_focus: &FocusHandle, window: &mut Window, cx: &mut App) {
-    row_focus.focus(window, cx);
-    window.focus_next(cx);
+/// Keyed element state, so both views get their own select without owning it,
+/// and the state survives re-renders the way a widget's does.
+fn folder_select(
+    prefix: &'static str,
+    filter: &Entity<FolderFilter>,
+    folders: &[SourceFolder],
+    selected: Option<&str>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<FolderSelect> {
+    let binding = window.use_keyed_state(
+        ElementId::Name(format!("{prefix}-folder-select").into()),
+        cx,
+        |window, cx| {
+            let choices = FolderChoices::new(prefix, folders);
+            let chosen = choices.index_of(selected);
+            let filter = filter.clone();
+            let choices = cx.new(|cx| SelectState::new(choices, chosen, window, cx));
+            let confirmed = cx.subscribe(
+                &choices,
+                move |this: &mut FolderSelect,
+                      _: Entity<SelectState<FolderChoices>>,
+                      event: &SelectEvent<FolderChoices>,
+                      cx| {
+                    let SelectEvent::Confirm(value) = event;
+                    let Some(value) = value else {
+                        // The kit's own clear button, which the bar does not
+                        // show: the chip's Clear owns that job.
+                        return;
+                    };
+                    this.chosen = value.clone();
+                    filter.update(cx, |filter, cx| {
+                        match value {
+                            Some(path) => filter.select(path.clone()),
+                            None => filter.clear(),
+                        }
+                        cx.notify();
+                    });
+                },
+            );
+            FolderSelect {
+                prefix,
+                choices,
+                folders: folders.to_vec(),
+                chosen: selected.map(str::to_string),
+                _confirmed: confirmed,
+            }
+        },
+    );
+    binding.update(cx, |this, cx| this.sync(folders, selected, window, cx));
+    binding
+}
+
+/// One select control's whole state: the kit state, the folders it was built
+/// from, and the choice last read from (or written to) the filter.
+struct FolderSelect {
+    /// Names this control's element ids; each list surface has its own.
+    prefix: &'static str,
+    choices: Entity<SelectState<FolderChoices>>,
+    /// The folder list the items were built from.
+    folders: Vec<SourceFolder>,
+    /// The filter's selection as the select last saw it, so a frame that changed
+    /// nothing does not push a value back into the control.
+    chosen: Option<String>,
+    _confirmed: Subscription,
+}
+
+impl FolderSelect {
+    /// Pushes the filter and the folders into the control when they differ.
+    ///
+    /// Only a real difference touches the state: a kit setter notifies, so
+    /// calling one every frame would schedule a frame every frame.
+    fn sync(
+        &mut self,
+        folders: &[SourceFolder],
+        selected: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.folders != folders {
+            self.folders = folders.to_vec();
+            let choices = FolderChoices::new(self.prefix, folders);
+            self.choices
+                .update(cx, |state, cx| state.set_items(choices, window, cx));
+        }
+        if self.chosen.as_deref() != selected {
+            self.chosen = selected.map(str::to_string);
+            let value = self.chosen.clone();
+            self.choices.update(cx, |state, cx| {
+                state.set_selected_value(&value, window, cx);
+            });
+        }
+    }
+}
+
+/// The select's items: "All folders" first, then one row per source folder.
+struct FolderChoices {
+    prefix: &'static str,
+    items: Vec<FolderChoice>,
+}
+
+/// One choice in the list.
+#[derive(Clone)]
+struct FolderChoice {
+    /// `None` is [`ALL_FOLDERS`].
+    path: Option<String>,
+    /// What the row and the trigger show: the folder's name, not its path.
+    label: SharedString,
+    /// The accessible name: the full path, because two source folders can share
+    /// a leaf name.
+    accessible: SharedString,
+}
+
+impl FolderChoices {
+    fn new(prefix: &'static str, folders: &[SourceFolder]) -> Self {
+        let all = FolderChoice {
+            path: None,
+            label: ALL_FOLDERS.into(),
+            accessible: "Show items from all folders".into(),
+        };
+        let items = std::iter::once(all)
+            .chain(folders.iter().map(|folder| FolderChoice {
+                path: Some(folder.path.clone()),
+                label: folder_name(&folder.path).into(),
+                accessible: format!("Show only {}", folder.path).into(),
+            }))
+            .collect();
+        Self { prefix, items }
+    }
+
+    /// The row that holds `path`, so the control opens on the current choice.
+    fn index_of(&self, path: Option<&str>) -> Option<IndexPath> {
+        self.items
+            .iter()
+            .position(|item| item.path.as_deref() == path)
+            .map(IndexPath::new)
+    }
+}
+
+impl SearchableListDelegate for FolderChoices {
+    type Item = FolderChoice;
+
+    fn items_count(&self, section: usize) -> usize {
+        if section == 0 { self.items.len() } else { 0 }
+    }
+
+    fn item(&self, ix: IndexPath) -> Option<&Self::Item> {
+        self.items.get(ix.row)
+    }
+
+    fn position<V>(&self, value: &V) -> Option<IndexPath>
+    where
+        Self::Item: SearchableListItem<Value = V>,
+        V: PartialEq,
+    {
+        self.items
+            .iter()
+            .position(|item| item.value() == value)
+            .map(IndexPath::new)
+    }
+
+    /// The row the kit paints for each choice.
+    ///
+    /// The kit's default row is text only, so the accessible name and the state
+    /// of the current choice are supplied here. `checked` is the committed
+    /// selection, so it is reported as `aria_selected` rather than written into
+    /// the name, and drawn as heavier weight on the label, so the state is never
+    /// colour alone.
+    fn render_item(
+        &self,
+        ix: IndexPath,
+        item: &Self::Item,
+        checked: bool,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<AnyElement> {
+        let id = format!("{}-folder-option-{}", self.prefix, ix.row);
+        Some(
+            div()
+                .id(id.clone())
+                .test_support()
+                .role(Role::ListBoxOption)
+                .aria_label(item.accessible.clone())
+                .aria_selected(checked)
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .w_full()
+                .min_w_0()
+                .child(
+                    div()
+                        // The id carries the state, so a headless test can prove
+                        // the marker below is drawn as well as reported: weight
+                        // alone is not observable without pixels.
+                        .id(if checked {
+                            format!("{id}-selected")
+                        } else {
+                            format!("{id}-label")
+                        })
+                        .test_support()
+                        .min_w_0()
+                        .truncate()
+                        .when(checked, |label| {
+                            // The design guides' selected row: the item's own
+                            // surface carries the state. Weight needs no icon
+                            // assets, so it draws until #86 registers them; the
+                            // kit's checkmark can join it then.
+                            label.font_weight(FontWeight::SEMIBOLD)
+                        })
+                        .child(item.label.clone()),
+                )
+                .into_any_element(),
+        )
+    }
+}
+
+impl SearchableListItem for FolderChoice {
+    type Value = Option<String>;
+
+    fn title(&self) -> SharedString {
+        self.label.clone()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.path
+    }
 }
