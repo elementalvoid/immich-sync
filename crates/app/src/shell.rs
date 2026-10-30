@@ -588,7 +588,7 @@ impl AppShell {
         // A pinned surface (#43, #75) can be one of the last tabs, so the switch
         // starts out owing it a look: at a narrow window its tab is past the
         // strip's edge until the strip scrolls to it.
-        shell.want_tab(shell.mode);
+        shell.want_tab(shell.mode.index());
         shell
     }
 
@@ -613,20 +613,20 @@ impl AppShell {
             // (R10.3).
             self.logs
                 .update(cx, |logs, cx| logs.set_visible(mode == ViewMode::Logs, cx));
-            self.want_tab(mode);
+            self.want_tab(mode.index());
         }
         cx.notify();
     }
 
-    /// Asks the switch to bring `mode`'s tab into sight.
+    /// Asks the switch to bring tab `ix` into sight.
     ///
     /// The strip scrolls rather than clips, so at a window too narrow for the
     /// seven labels the tab of the surface on screen could sit past the strip's
     /// edge; the tray, a pinned surface, and a folder-detail link all switch
     /// without the pointer ever touching the switch (#75). The scroll itself
     /// waits for the strip's layout, which [`Self::switch`] applies.
-    fn want_tab(&mut self, mode: ViewMode) {
-        self.reveal = Some(mode.index());
+    fn want_tab(&mut self, ix: usize) {
+        self.reveal = Some(ix);
         self.reveal_tries = 0;
     }
 
@@ -705,8 +705,7 @@ impl AppShell {
         if focused != self.focused_tab {
             self.focused_tab = focused;
             if let Some(ix) = focused {
-                self.reveal = Some(ix);
-                self.reveal_tries = 0;
+                self.want_tab(ix);
             }
         }
         // A resize re-clips the strip around whatever the window now shows, so
@@ -714,8 +713,8 @@ impl AppShell {
         let width = self.nav_scroll.bounds().size.width;
         if self.strip_width != Some(width) {
             self.strip_width = Some(width);
-            let shown = self.mode;
-            if !self.tab_in_sight(shown.index()) {
+            let shown = self.mode.index();
+            if !self.tab_in_sight(shown) {
                 self.want_tab(shown);
             }
         }
