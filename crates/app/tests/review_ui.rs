@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_kit::base::test_support::snapshots;
-use gpui_kit::test::TestWindowExt as _;
+use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
 use gpui_kit::{
     AnyWindowHandle, App, AppContext as _, Bounds, ElementId, Point, Role, TestAppContext, Window,
     WindowBounds, WindowOptions, px, size,
@@ -581,18 +581,29 @@ async fn choosing_a_folder_narrows_the_review_its_summary_and_its_empty_state(
         window.render_frame(cx);
         assert_eq!(
             window.find("review-folder-filter").label(),
-            Some("Folder filter: All folders"),
-            "the review starts on All folders too"
+            Some("Folder filter"),
+            "#79: the review's filter is the same kit select, named for its job"
+        );
+        assert_eq!(
+            window.find("review-folder-filter").value(),
+            Some("All folders"),
+            "the review starts on All folders too, as the control's value"
         );
 
         // Videos sorts after Camera Roll, so it is the second folder option.
-        window.click("review-folder-filter", cx);
+        window.within("review-folder-filter").click("input", cx);
         assert_eq!(
             window.find("review-folder-option-2").label(),
             Some(format!("Show only {}", videos.display()).as_str()),
             "labels stay short; the accessible name carries the full path"
         );
         window.click("review-folder-option-2", cx);
+    })
+    .expect("choose the Videos folder");
+    // The kit commits the selection after the click handler returns.
+    cx.run_until_parked();
+
+    cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
         let empty = window.find("review-empty");
         assert_eq!(
@@ -617,8 +628,13 @@ async fn choosing_a_folder_narrows_the_review_its_summary_and_its_empty_state(
         );
         assert!(window.try_find("review-row-0").is_none());
 
-        window.click("review-folder-filter", cx);
+        window.within("review-folder-filter").click("input", cx);
         window.click("review-folder-option-1", cx);
+    })
+    .expect("choose the Camera Roll folder");
+    cx.run_until_parked();
+
+    cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
         assert_eq!(
             window.find("review-summary").label(),
@@ -692,26 +708,56 @@ async fn the_review_filter_and_its_clear_action_are_keyboard_reachable_and_named
     let temp = tempfile::tempdir().expect("create a temp dir");
     let paths = temporary_paths(temp.path());
     let photos = temp.path().join("Camera Roll");
-    seed(&paths, &photos, &["IMG_0001.jpg", "IMG_0002.jpg"]);
+    seed(&paths, &photos, &["IMG_0001.jpg"]);
     seed_folder(&paths, &temp.path().join("Videos"));
+    // One file outside every source folder, so the unfiltered review and the
+    // Camera Roll one differ by a row.
+    StateStore::open(&paths.state_db)
+        .expect("open the state database")
+        .record(&missing(
+            &temp.path().join("outside.jpg").display().to_string(),
+        ))
+        .expect("write the missing row outside every source folder");
     let (window, _engine, _view) = open_review_view(cx, &paths);
     wait_for_rows(cx, window, 2).await;
 
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
-        // N5: the keyboard reaches the filter and its options.
+        // #79: the whole choice is made from the keyboard — Enter opens the
+        // list, Down moves the cursor, Enter commits.
         tab_to(window, "review-folder-filter", cx);
-        window.click("review-folder-filter", cx);
+        window.press("enter", cx);
         window.render_frame(cx);
-        tab_to(window, "review-folder-option-0", cx);
-        tab_to(window, "review-folder-option-1", cx);
-        window.click("review-folder-option-1", cx);
+        assert_eq!(
+            window.find("review-folder-filter").expanded(),
+            Some(true),
+            "Enter on the control opens its options"
+        );
+        window.press("down", cx);
+        window.press("enter", cx);
         window.render_frame(cx);
+    })
+    .expect("choose a folder from the keyboard");
 
+    cx.wait_for(window, Duration::from_secs(5), |window, _| {
+        window.find("review-folder-filter").value() == Some("Camera Roll")
+    })
+    .await;
+    assert_eq!(
+        review_count(cx, window),
+        1,
+        "the keyboard choice narrows the review to its folder"
+    );
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
         assert_eq!(
             window.find("review-folder-filter").focused(),
             Some(true),
-            "choosing a folder keeps the keyboard focus on the trigger"
+            "choosing a folder keeps the keyboard focus on the control"
+        );
+        assert!(
+            window.try_find("failed-folder-option-0").is_none(),
+            "#79: each surface keeps its own element ids"
         );
 
         // The clear action is named and a tab stop of its own.
@@ -722,14 +768,13 @@ async fn the_review_filter_and_its_clear_action_are_keyboard_reachable_and_named
         tab_to(window, "review-folder-clear", cx);
         window.click("review-folder-clear", cx);
         window.render_frame(cx);
-        assert_eq!(
-            window.find("review-folder-filter").focused(),
-            Some(true),
-            "clearing keeps the keyboard focus on the filter's trigger"
-        );
     })
-    .expect("tab through the review filter");
+    .expect("tab to the clear action and use it");
 
+    cx.wait_for(window, Duration::from_secs(5), |window, _| {
+        window.find("review-folder-filter").value() == Some("All folders")
+    })
+    .await;
     assert_eq!(
         review_count(cx, window),
         2,
@@ -738,8 +783,9 @@ async fn the_review_filter_and_its_clear_action_are_keyboard_reachable_and_named
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
         assert_eq!(
-            window.find("review-folder-filter").label(),
-            Some("Folder filter: All folders")
+            window.find("review-folder-filter").focused(),
+            Some(true),
+            "clearing keeps the keyboard focus on the filter control"
         );
     })
     .expect("read the cleared review filter");
@@ -771,6 +817,11 @@ async fn the_review_opens_with_a_folder_already_selected(cx: &mut TestAppContext
         assert_eq!(
             window.find("review-folder-chip").label(),
             Some("Showing Videos")
+        );
+        assert_eq!(
+            window.find("review-folder-filter").value(),
+            Some("Videos"),
+            "#79: a folder chosen elsewhere shows as the control's value"
         );
     })
     .expect("read the selected folder");
