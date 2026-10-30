@@ -784,6 +784,12 @@ fn open_live_dashboard(
     };
     cx.update(|cx| {
         gpui_kit::init(cx);
+        // #81: the panel opens through the dialog layer, whose entrance slides
+        // for a quarter second on the wall clock. A press is dispatched at the
+        // bounds read a moment earlier, so it would land beside a control that
+        // is still moving (#73). Reduced motion shows the final surface on the
+        // first frame, as the kit's own dialog tests do.
+        cx.set_reduce_motion(true);
         let credentials: std::sync::Arc<dyn sync_core::credential::CredentialStore> =
             std::sync::Arc::new(sync_core::credential::MemoryCredentialStore::new());
         let connection = cx.new(|_| {
@@ -1240,6 +1246,58 @@ async fn browsing_for_a_folder_fills_the_field_and_opens_the_setup_dialog(cx: &m
     );
 }
 
+/// #81: the setup Browse opened returns the keyboard to Browse when it closes,
+/// because the dialog layer hands focus back to the control that opened it.
+#[gpui_kit::test]
+async fn closing_the_setup_returns_focus_to_the_browse_control(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the fixture folder");
+    let (window, store, _view) = open_live_dashboard(cx, temp.path());
+    wait_for_store(cx, &store).await;
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        // The control is focused before the press, because the harness's
+        // synthetic press moves no keyboard focus where a real press does.
+        tab_to(window, "dashboard-browse-folder", cx);
+        window.click("dashboard-browse-folder", cx);
+    })
+    .expect("open the folder picker");
+    assert!(cx.did_prompt_for_paths(), "R2.1: Browse opens the picker");
+    cx.simulate_path_prompt_response(|_| Some(vec![photos.clone()]));
+    cx.run_until_parked();
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.find("folder-panel").visible(),
+            "#40: the chosen folder opens the setup dialog"
+        );
+        window.press("escape", cx);
+    })
+    .expect("close the setup");
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("folder-panel").is_none(),
+            "#81: Escape closes the setup Browse opened"
+        );
+        assert_eq!(
+            window.find("dashboard-browse-folder").focused(),
+            Some(true),
+            "#81: closing the setup returns focus to the Browse control"
+        );
+    })
+    .expect("read the window after the close");
+    assert!(
+        cx.read(|cx| store.read(cx).folders().is_empty()),
+        "#40: an escaped setup writes nothing"
+    );
+}
+
 #[gpui_kit::test]
 async fn cancelling_the_folder_picker_changes_nothing(cx: &mut TestAppContext) {
     cx.executor().allow_parking();
@@ -1565,9 +1623,11 @@ async fn cancel_and_escape_close_the_setup_and_write_nothing(cx: &mut TestAppCon
 
     cx.update_window(window, |_, window, cx| {
         open_setup_through_the_field(window, &path, cx);
-        // N5: Cancel answers the keyboard.
+        // N5: Cancel answers the keyboard. Space activates the focused control;
+        // #81 made the panel a dialog, where the kit binds Enter to the dialog's
+        // own Confirm, which a panel with no single OK leaves inert.
         tab_to(window, "folder-panel-cancel", cx);
-        window.press("enter", cx);
+        window.press("space", cx);
     })
     .expect("press Cancel");
 
@@ -1590,7 +1650,11 @@ async fn cancel_and_escape_close_the_setup_and_write_nothing(cx: &mut TestAppCon
             "#30: Cancel leaves the typed path usable"
         );
 
-        // Escape does the same.
+        // Escape does the same. This one opens from Add folder, so the layer
+        // hands the keyboard back to that control rather than to the field.
+        // The control is focused first, because the harness's synthetic press
+        // moves no keyboard focus where a real press does.
+        tab_to(window, "dashboard-add-folder", cx);
         window.click("dashboard-add-folder", cx);
         window.render_frame(cx);
         assert!(window.find("folder-panel").visible());
@@ -1605,9 +1669,9 @@ async fn cancel_and_escape_close_the_setup_and_write_nothing(cx: &mut TestAppCon
             "#40: Escape cancels the dialog"
         );
         assert_eq!(
-            window.find("dashboard-folder-path").focused(),
+            window.find("dashboard-add-folder").focused(),
             Some(true),
-            "#40: Escape returns focus to the add field"
+            "#81: Escape returns focus to the control that opened the dialog"
         );
     })
     .expect("read the dialog after Escape");
@@ -1635,12 +1699,15 @@ async fn cancel_while_an_add_is_pending_leaves_the_dialog_and_the_write(cx: &mut
         // Focus Cancel, then press Add with the mouse: Cancel is disabled once
         // the write runs, and the modal must keep the keyboard (Escape and the
         // focus trap) instead of dropping focus to the window root.
-        tab_to(window, "folder-panel-cancel", cx);
-        add_in_setup(window, cx);
+        // Add is pressed from the keyboard, so the control keeps the keyboard
+        // while the write runs: the dialog never drops focus to the page.
+        tab_to(window, "folder-panel-add", cx);
+        window.press("space", cx);
+        window.render_frame(cx);
         assert_eq!(
-            window.find("folder-panel-trap").focused(),
+            window.find("folder-panel-add").focused(),
             Some(true),
-            "#40: a pending Add leaves focus on the modal host, which owns Escape"
+            "#81: a pending Add leaves the keyboard inside the dialog, on the control pressed"
         );
         window.click("folder-panel-cancel", cx);
         window.press("escape", cx);

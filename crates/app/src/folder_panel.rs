@@ -2,10 +2,12 @@
 //! (#40) and opened as its live detail (#43).
 //!
 //! One panel serves both: the draft is the setup dialog, and the detail is the
-//! same card in live mode. The title, the path block, the three settings
-//! controls, the modal host, the focus trap, and Escape are shared, so the two
-//! modes cannot drift apart. The dashboard owns which panel is open: it creates
-//! one when the add field, Browse, a card, or its Details control asks for it.
+//! same body in live mode. The title, the path block, and the three settings
+//! controls are shared, so the two modes cannot drift apart. The dashboard owns
+//! which panel is open: it creates one when the add field, Browse, a card, or
+//! its Details control asks for it, and opens it through the window's dialog
+//! layer (#81), which owns the backdrop, the focus trap, Escape, the outside
+//! press and the focus return to that opener.
 //!
 //! In detail mode the panel reads the folder's live status from the engine on
 //! every engine notification, so counts, state, progress, the last error, and
@@ -17,7 +19,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use gpui_kit::base::Disableable as _;
-use gpui_kit::base::FocusTrapElement as _;
 use gpui_kit::base::SelectableText;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::Theme;
@@ -272,7 +273,6 @@ pub struct FolderPanel {
     /// The folder's uploaded count and recursion setting the loaded rows were
     /// read at, so the next status poll that changes either reloads them.
     assets_read_at: Option<(u32, bool)>,
-    focus: FocusHandle,
     _subscription: Subscription,
     _title_subscription: Subscription,
 }
@@ -290,7 +290,6 @@ impl FolderPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let focus = cx.focus_handle();
         let subscription = cx.observe(&engine, |this, engine, cx| this.engine_changed(&engine, cx));
         let path = path.trim().to_string();
         let title_input = title_field(&path, None, window, cx);
@@ -321,7 +320,6 @@ impl FolderPanel {
             assets_problem: None,
             assets_loading: false,
             assets_read_at: None,
-            focus,
             _subscription: subscription,
             _title_subscription: title_subscription,
         }
@@ -341,7 +339,6 @@ impl FolderPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let focus = cx.focus_handle();
         let subscription = cx.observe(&engine, |this, engine, cx| this.engine_changed(&engine, cx));
         let card = folder_card(&engine, &path, cx);
         let server_url = engine.read(cx).server_url(cx);
@@ -378,7 +375,6 @@ impl FolderPanel {
             assets_problem: None,
             assets_loading: false,
             assets_read_at: None,
-            focus,
             _subscription: subscription,
             _title_subscription: title_subscription,
         };
@@ -558,7 +554,7 @@ impl FolderPanel {
     ///
     /// One request at a time: a second Add while the first is in flight is
     /// ignored, so a slow store cannot write the folder twice.
-    fn add(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn add(&mut self, cx: &mut Context<Self>) {
         if self.mode != FolderPanelMode::Draft || self.pending.is_some() {
             return;
         }
@@ -568,11 +564,6 @@ impl FolderPanel {
         let engine = self.engine.clone();
         let request = engine.update(cx, |engine, cx| engine.add_folder_settings(draft, cx));
         self.pending = Some(request);
-        // Cancel is disabled while the request runs, and a disabled control
-        // drops focus to the window root, which would stop the modal host
-        // receiving Escape. Keep the host focused so the dialog stays
-        // cancellable from the keyboard.
-        window.focus(&self.focus, cx);
         // A failed worker reports synchronously, before `pending` was set;
         // read the result back so that failure cannot be missed.
         self.engine_changed(&engine, cx);
@@ -758,18 +749,13 @@ impl FolderPanel {
     }
 
     /// Escape, the backdrop, and the close control, each respecting what may
-    /// still be in flight.
-    fn dismiss(&mut self, cx: &mut Context<Self>) {
+    /// still be in flight. The dialog layer turns Escape and an outside press
+    /// into this dismissal, so the panel has one close path (#81).
+    pub(crate) fn dismiss(&mut self, cx: &mut Context<Self>) {
         match self.mode {
             FolderPanelMode::Draft => self.cancel(cx),
             FolderPanelMode::Detail => cx.emit(FolderPanelEvent::Closed),
         }
-    }
-
-    /// Escape inside the dialog (#43). While the confirmation alert is up,
-    /// focus is in that layer and its own Escape closes only the alert (#73).
-    fn escape(&mut self, cx: &mut Context<Self>) {
-        self.dismiss(cx);
     }
 
     /// Cancels the draft. While an Add is in flight this is a no-op: its result
@@ -788,6 +774,23 @@ impl FolderPanel {
             FolderPanelMode::Draft => "Folder setup",
             FolderPanelMode::Detail => "Folder detail",
         }
+    }
+
+    /// The width this mode's dialog takes (#40, #81): the detail carries more
+    /// than the setup, so it gets the wider surface.
+    #[must_use]
+    pub fn dialog_width(&self) -> Rems {
+        match self.mode {
+            FolderPanelMode::Draft => rems(30.),
+            FolderPanelMode::Detail => rems(34.),
+        }
+    }
+
+    /// The folder this panel is about: the draft's path, and in detail mode the
+    /// tracked folder's identity (#43).
+    #[must_use]
+    pub fn folder_path(&self) -> &str {
+        &self.draft.path
     }
 
     /// The visible heading the setup dialog gives the panel; the detail's
@@ -945,7 +948,7 @@ impl FolderPanel {
                     // silence; the control stays enabled so focus does not move.
                     .label(if pending { "Adding…" } else { "Add" })
                     .accessibility_label("Add the folder")
-                    .on_click(cx.listener(|this, _, window, cx| this.add(window, cx))),
+                    .on_click(cx.listener(|this, _, _, cx| this.add(cx))),
             )
     }
 
@@ -1045,6 +1048,11 @@ impl FolderPanel {
             .flex_col()
             .gap_3()
             .w_full()
+            // #81: at least as tall as the surface, so the asset list is the
+            // row that gives up height when the detail is taller than the
+            // dialog; when even that is not enough, this column scrolls.
+            .min_h_full()
+            .overflow_y_scroll()
             .when(self.confirming, |this| this.opacity(0.4))
             .child(
                 div()
@@ -1240,6 +1248,12 @@ impl FolderPanel {
             .flex_col()
             .gap_3()
             .w_full()
+            // #81: the body fills the surface the layer sized, and its one row
+            // is the column that scrolls: it gives height to the asset list
+            // when the detail is taller than the dialog, and scrolls when even
+            // that is not enough, so no control is clipped away (#43).
+            .flex_1()
+            .min_h_0()
             .child(inner)
             // The problem notice is the dialog's answer, not body content: it
             // stays outside the dimmed wrapper, so a refused Remove is readable
@@ -1291,14 +1305,19 @@ impl FolderPanel {
                 .child(text)
                 .into_any_element()
         } else {
-            // The list scrolls inside the dialog, so a folder with hundreds of
-            // assets does not push Load more or the actions out of reach.
+            // #44: the list scrolls inside the dialog, so a folder with hundreds
+            // of assets does not push Load more or the actions out of reach.
+            // #81: it is the one row that gives up height when the layer's
+            // surface is shorter than the body, so the actions stay on screen
+            // and only the list scrolls.
             let mut rows = div()
                 .id("folder-assets-list")
                 .test_support()
                 .flex()
                 .flex_col()
                 .w_full()
+                .flex_auto()
+                .min_h(rems(4.))
                 .max_h(rems(18.))
                 .overflow_y_scroll();
             for (index, asset) in self.assets.iter().enumerate() {
@@ -1314,6 +1333,9 @@ impl FolderPanel {
             .flex_col()
             .gap_2()
             .w_full()
+            // #81: the section keeps the heading, a row of the list and Load
+            // more when the surface is short; the list itself gives first.
+            .min_h(rems(8.))
             .child(heading)
             .child(state)
             .when(self.assets_more, |this| {
@@ -1394,62 +1416,6 @@ impl FolderPanel {
             )
             .into_any_element()
     }
-
-    /// The modal host: centered over a backdrop, focus trapped, Escape cancels.
-    ///
-    /// The backdrop is the host's sibling rather than an ancestor of the card,
-    /// so a click on the dialog never reaches it (#43).
-    fn modal(&self, card: AnyElement, window: &Window, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().clone();
-        let focus = self.focus.clone();
-        let viewport = window.viewport_size();
-        let backdrop = div()
-            .id("folder-panel-backdrop")
-            .test_support()
-            .absolute()
-            .top_0()
-            .left_0()
-            .w(viewport.width)
-            .h(viewport.height)
-            .bg(theme.background.opacity(0.75))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.dismiss(cx);
-                    cx.stop_propagation();
-                }),
-            );
-        deferred(
-            anchored().position(point(px(0.), px(0.))).child(
-                div()
-                    .id("folder-panel-host")
-                    .test_support()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .w(viewport.width)
-                    .h(viewport.height)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .track_focus(&focus)
-                    .focus_trap("folder-panel-trap", &focus)
-                    // The host swallows pointer and wheel events, so the
-                    // dashboard behind the modal stays inert.
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_scroll(|_, _, cx| cx.stop_propagation())
-                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                        if event.keystroke.key == "escape" {
-                            this.escape(cx);
-                        }
-                    }))
-                    .child(backdrop)
-                    .child(card),
-            ),
-        )
-        .with_priority(10)
-        .into_any_element()
-    }
 }
 
 /// The live card the engine's status holds for `path`, when it holds one.
@@ -1466,52 +1432,31 @@ fn folder_card(
         .find(|card| card.path.as_deref() == Some(path))
 }
 
-impl Focusable for FolderPanel {
-    fn focus_handle(&self, _: &App) -> FocusHandle {
-        self.focus.clone()
-    }
-}
-
 impl Render for FolderPanel {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The theme is copied before the controls borrow the context mutably.
         let theme = cx.theme().clone();
         let palette = CardPalette::new(&theme);
-        let viewport = window.viewport_size();
-        // The detail carries more than the setup, so it gets the wider card; a
-        // short window scrolls the body instead of clipping its last control.
-        let width = match self.mode {
-            FolderPanelMode::Draft => rems(30.),
-            FolderPanelMode::Detail => rems(34.),
-        };
         let body = match self.mode {
             FolderPanelMode::Draft => self.draft_body(&theme, cx),
             FolderPanelMode::Detail => self.detail_body(&palette, &theme, cx),
         };
-        let card = div()
+        // The window's dialog layer supplies the surface, the backdrop, the
+        // focus trap, Escape and the sizing (#81); the panel is the body it
+        // hosts. Nothing here scrolls unless the window is too short for the
+        // detail, and then the wheel still reaches every control (#43).
+        div()
             .id("folder-panel")
             .test_support()
             .role(Role::Dialog)
             .aria_label(self.aria_label())
             .flex()
             .flex_col()
-            .gap_3()
-            .w(width)
-            .max_h(viewport.height - px(96.))
-            .overflow_y_scroll()
-            .p_5()
-            .rounded(theme.radius_lg)
-            .bg(theme.popover)
+            .w_full()
+            .h_full()
+            .min_h_0()
             .text_color(theme.foreground)
-            .border_1()
-            .border_color(theme.border)
-            // The card is a mouse barrier above the backdrop: a press inside
-            // the dialog never reaches the backdrop that dismisses it, and it
-            // is what lets the path's text selection see the drag (#43).
-            .block_mouse_except_scroll()
             .child(body)
-            .into_any_element();
-        self.modal(card, window, cx)
     }
 }
 
@@ -2113,8 +2058,8 @@ mod tests {
         // Add starts a request and this test drops its answer, as a panicking
         // worker drops it. Both happen in one update, so the real answer cannot
         // land in between.
-        cx.update_window(window, |_, window, cx| {
-            panel.update(cx, |panel, cx| panel.add(window, cx));
+        cx.update_window(window, |_, _, cx| {
+            panel.update(cx, |panel, cx| panel.add(cx));
             let request = panel.read(cx).pending.expect("Add waits for its answer");
             engine.update(cx, |engine, cx| engine.folder_add_lost(request, cx));
         })

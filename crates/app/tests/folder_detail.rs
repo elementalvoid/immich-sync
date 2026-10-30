@@ -14,8 +14,8 @@ use std::time::Duration;
 use common::scroll_dashboard_into_view;
 use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, ElementId, Entity, Point, ScrollDelta, TestAppContext,
-    Window, WindowBounds, WindowOptions, point, px, size,
+    AnyWindowHandle, App, AppContext as _, Bounds, ElementId, Entity, Point, ScrollDelta,
+    TestAppContext, Window, WindowBounds, WindowOptions, point, px, rems, size,
 };
 use immich_sync::connection::ConnectionModel;
 use immich_sync::dashboard::Dashboard;
@@ -42,10 +42,15 @@ fn temporary_paths(dir: &Path) -> AppPaths {
 }
 
 fn window_options() -> WindowOptions {
+    window_options_of(1200., 800.)
+}
+
+/// The same window at an explicit size, for a test about a short one.
+fn window_options_of(width: f32, height: f32) -> WindowOptions {
     WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(gpui_kit::Bounds {
+        window_bounds: Some(WindowBounds::Windowed(Bounds {
             origin: Point::default(),
-            size: size(px(1200.), px(800.)),
+            size: size(px(width), px(height)),
         })),
         ..Default::default()
     }
@@ -125,6 +130,16 @@ fn open_dashboard_with_server(
     paths: &AppPaths,
     server_url: &str,
 ) -> (AnyWindowHandle, Entity<StoreModel>, Entity<Dashboard>) {
+    open_dashboard_at(cx, paths, server_url, window_options())
+}
+
+/// Opens the live dashboard in a window of `options`, as the shell does.
+fn open_dashboard_at(
+    cx: &mut TestAppContext,
+    paths: &AppPaths,
+    server_url: &str,
+    options: WindowOptions,
+) -> (AnyWindowHandle, Entity<StoreModel>, Entity<Dashboard>) {
     let paths = paths.clone();
     let profile = ServerProfile {
         server_url: server_url.to_string(),
@@ -132,11 +147,17 @@ fn open_dashboard_with_server(
     };
     cx.update(|cx| {
         gpui_kit::init(cx);
+        // #81: the panel is a dialog layer now, and its entrance slides for a
+        // quarter second on the wall clock. A press is dispatched at the bounds
+        // read a moment earlier, so under load it would land beside a control
+        // that is still moving (#73). Reduced motion shows the final surface on
+        // the first frame, as the kit's own dialog tests do.
+        cx.set_reduce_motion(true);
         let credentials: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
         let connection = cx.new(|_| ConnectionModel::new(profile, credentials));
         let store = cx.new(|cx| StoreModel::open(&paths, cx));
         let engine = cx.new(|cx| EngineModel::new(connection, store.clone(), &paths, cx));
-        let (window, view) = gpui_kit::open_window(window_options(), cx, |window, cx| {
+        let (window, view) = gpui_kit::open_window(options, cx, |window, cx| {
             let engine = engine.clone();
             cx.new(|cx| Dashboard::with_engine(engine, window, cx))
         })
@@ -246,36 +267,17 @@ fn read<R>(
     .expect("read the window")
 }
 
-/// Scrolls the dialog until the element with `id` is on screen.
-///
-/// The detail card scrolls its body when the window is short (#43), and the
-/// album title field above the list pushes Load more below the fold, so a
-/// control is clicked only after its center is really on screen: a sliver
-/// peeking past the card's edge would put the click on the backdrop.
-fn scroll_into_view(window: &mut Window, cx: &mut App, id: impl Into<ElementId>) {
-    let id = id.into();
-    window.render_frame(cx);
-    for _ in 0..60 {
-        let card = window.find("folder-panel").bounds();
-        if window
-            .try_find(id.clone())
-            .is_some_and(|target| card.contains(&target.bounds().center()))
-        {
-            return;
-        }
-        window.scroll(
-            "folder-panel",
-            ScrollDelta::Pixels(point(px(0.), px(-120.))),
-            cx,
-        );
-    }
-    panic!("{id:?} never became visible in the dialog");
-}
-
 /// Opens the detail and waits for it to be on screen.
+///
+/// The Details control is focused before it is pressed, because the harness's
+/// synthetic press moves no keyboard focus (a real one does, through the
+/// button's own focus handle). That makes the state the layer sees the same one
+/// a person leaves behind, so the focus return it performs is what the tests
+/// below read (#81).
 fn open_detail_now(cx: &mut TestAppContext, window: AnyWindowHandle) {
     act(cx, window, |window, cx| {
         scroll_dashboard_into_view(window, cx, ("folder-details", 0_usize));
+        tab_to(window, ("folder-details", 0_usize), cx);
         window.click(("folder-details", 0_usize), cx);
     });
     read(cx, window, |window, _| {
@@ -347,18 +349,18 @@ async fn a_card_click_and_its_details_control_open_the_detail(cx: &mut TestAppCo
     });
 
     // Esc closes it and the card gets the keyboard back.
+    // A press on the card's own surface moves no focus: the card is not a
+    // control, and the test blurred first, so this only pins the close.
     act(cx, window, |window, cx| window.press("escape", cx));
     read(cx, window, |window, _| {
         assert!(!detail_open(window), "#43: Escape closes the detail");
-        assert_eq!(
-            window.find(("folder-details", 0_usize)).focused(),
-            Some(true),
-            "#43: focus returns to the card's Details control"
-        );
     });
 
-    // The named Details control opens the same dialog.
+    // #81: the layer hands the keyboard back to the control that opened the
+    // panel. The Details control is focused before it is pressed, because the
+    // harness's synthetic press moves no keyboard focus where a real one does.
     act(cx, window, |window, cx| {
+        tab_to(window, ("folder-details", 0_usize), cx);
         window.click(("folder-details", 0_usize), cx);
     });
     read(cx, window, |window, _| {
@@ -367,6 +369,11 @@ async fn a_card_click_and_its_details_control_open_the_detail(cx: &mut TestAppCo
     act(cx, window, |window, cx| window.press("escape", cx));
     read(cx, window, |window, _| {
         assert!(!detail_open(window), "Escape closes it again");
+        assert_eq!(
+            window.find(("folder-details", 0_usize)).focused(),
+            Some(true),
+            "#43, #81: Escape returns focus to the card's Details control"
+        );
     });
 
     // #57: the card states the settings and offers no control of its own, so
@@ -577,7 +584,9 @@ async fn the_detail_settings_reach_the_store_by_pointer_and_by_keyboard(cx: &mut
     // With the mapping on, the scope radios take focus and answer the keyboard.
     act(cx, window, |window, cx| {
         tab_to(window, "folder-panel-album-whole", cx);
-        window.press("enter", cx);
+        // #81: inside a dialog, the kit binds Enter to the dialog's Confirm, so
+        // a control is activated with Space (as every other button in the app).
+        window.press("space", cx);
     });
     let whole = wait_for_folder(cx, &store, |folder| {
         folder.album_scope == AlbumScope::WholeFolder
@@ -658,6 +667,210 @@ async fn the_detail_traps_focus_and_every_control_is_keyboard_reachable(cx: &mut
     });
 }
 
+/// The panel's surface is centred on the window in both axes (#81).
+fn assert_centred(window: &Window, what: &str) {
+    let surface = window.find("surface").bounds();
+    let viewport = Bounds::new(Point::default(), window.viewport_size());
+    assert!(
+        (surface.center().x - viewport.center().x).abs() <= px(1.),
+        "#81: {what} is centred across the window: {surface:?} in {viewport:?}"
+    );
+    assert!(
+        (surface.center().y - viewport.center().y).abs() <= px(1.),
+        "#81: {what} is centred down the window: {surface:?} in {viewport:?}"
+    );
+}
+
+/// #81: the layer sizes the panel, and both modes keep the width they had:
+/// the setup is the narrow one and the detail carries more.
+#[gpui_kit::test]
+async fn both_panel_widths_go_through_the_layer_and_stay_centred(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+    seed_folder(&paths, &photos, true);
+    let (window, store, _view) = open_dashboard(cx, &paths);
+    wait_for_store(cx, &store).await;
+
+    // #40: the setup dialog.
+    act(cx, window, |window, cx| {
+        window.click("dashboard-add-folder", cx);
+    });
+    read(cx, window, |window, _| {
+        assert_eq!(label(window, "folder-panel"), "Folder setup");
+        let rem = window.rem_size();
+        assert_eq!(
+            window.find("surface").bounds().size.width,
+            rems(30.).to_pixels(rem),
+            "#81: the setup keeps its 30rem width"
+        );
+        // The layer sizes the surface from its content, so the short setup
+        // dialog does not become a full-height page.
+        assert!(
+            window.find("surface").bounds().size.height < px(600.),
+            "#81: the setup keeps its short surface: {:?}",
+            window.find("surface").bounds()
+        );
+        assert_centred(window, "the setup dialog");
+    });
+
+    // #43: the detail.
+    act(cx, window, |window, cx| window.press("escape", cx));
+    read(cx, window, |window, _| {
+        assert!(!detail_open(window), "Escape closes the setup")
+    });
+    open_detail_now(cx, window);
+    read(cx, window, |window, _| {
+        assert_eq!(label(window, "folder-panel"), "Folder detail");
+        let rem = window.rem_size();
+        assert_eq!(
+            window.find("surface").bounds().size.width,
+            rems(34.).to_pixels(rem),
+            "#81: the detail keeps its 34rem width"
+        );
+        assert_centred(window, "the folder detail");
+    });
+
+    // #81: the narrowest window the shell allows (720×480). The detail is too
+    // tall for it, so the layer caps the surface and centres what is left.
+    let (window, store, _view) = open_dashboard_at(cx, &paths, "", window_options_of(720., 480.));
+    wait_for_store(cx, &store).await;
+    open_detail_now(cx, window);
+    read(cx, window, |window, _| {
+        let surface = window.find("surface").bounds();
+        let viewport = Bounds::new(Point::default(), window.viewport_size());
+        assert_centred(window, "the folder detail at the narrowest window");
+        assert!(
+            surface.top() >= px(0.) && surface.bottom() <= viewport.size.height,
+            "#81: the detail fits the narrowest window: {surface:?} in {viewport:?}"
+        );
+        assert!(
+            surface.size.width <= viewport.size.width - px(32.),
+            "#81: the detail keeps the layer's margin at the narrowest window: {surface:?}"
+        );
+    });
+}
+
+/// #81: the layer sizes the panel, so at the widest content the detail carries
+/// (a full page of uploaded assets) every control is on screen and none needs a
+/// test-side scroll. That is #73's rule for the confirmation, extended to the
+/// panel itself.
+#[gpui_kit::test]
+async fn every_control_in_the_detail_is_on_screen_without_a_test_side_scroll(
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+    seed_folder(&paths, &photos, true);
+    seed_assets(
+        &paths,
+        &photos,
+        120,
+        times::now_ns() - THREE_AND_A_HALF_HOURS_NS,
+    );
+    let (window, store, _view) = open_dashboard(cx, &paths);
+    wait_for_store(cx, &store).await;
+
+    open_detail_now(cx, window);
+    wait_for_asset_rows(cx, window, 50).await;
+    read(cx, window, |window, _| {
+        let viewport = Bounds::new(Point::default(), window.viewport_size());
+        // Bottom to top: the last row of the panel is what a body that grew
+        // past its surface would push off screen.
+        for id in [
+            "folder-detail-remove",
+            "folder-detail-failed",
+            "folder-detail-review",
+            "folder-detail-open",
+            "folder-assets-more",
+            "folder-detail-scan",
+            "folder-detail-upload",
+            "folder-panel-album-whole",
+            "folder-panel-album-leaf",
+            "folder-panel-album",
+            "folder-panel-recursive",
+            "folder-panel-title",
+            "folder-detail-activity",
+            "folder-detail-counts",
+            "folder-detail-state",
+            "folder-panel-path",
+            "folder-detail-title",
+            "folder-detail-close",
+        ] {
+            let found = window.find(id);
+            assert!(
+                found.visible(),
+                "#81: {id} is on screen without scrolling the panel"
+            );
+            let bounds = found.bounds();
+            assert!(
+                viewport.contains(&bounds.origin)
+                    && viewport.contains(&point(bounds.right(), bounds.bottom())),
+                "#81: {id} is inside the window: {bounds:?} in {viewport:?}"
+            );
+        }
+    });
+    // The harness refuses a clipped target, so this press is the proof that the
+    // bottom-most control is reachable with no test-side scroll.
+    act(cx, window, |window, cx| {
+        window.click("folder-detail-remove", cx);
+        common::settle_alert(window, cx);
+    });
+    read(cx, window, |window, _| {
+        assert!(
+            window.try_find("folder-detail-confirm").is_some(),
+            "#81: Remove answers a press without scrolling"
+        );
+    });
+}
+
+/// #43, #81: on a window too short for the panel the body scrolls, so the wheel
+/// still reaches the last control instead of clipping it away.
+#[gpui_kit::test]
+async fn a_short_window_scrolls_the_panels_body_instead_of_clipping_it(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+    seed_folder(&paths, &photos, true);
+    let (window, store, _view) = open_dashboard_at(cx, &paths, "", window_options_of(1200., 480.));
+    wait_for_store(cx, &store).await;
+
+    open_detail_now(cx, window);
+    read(cx, window, |window, cx| {
+        assert!(
+            !window.find("folder-detail-remove").visible(),
+            "a window this short pushes the last control past the panel's edge"
+        );
+        let first = window.find("folder-detail-title").bounds().origin.y;
+        for _ in 0..8 {
+            window.scroll(
+                "folder-detail-body-dim",
+                ScrollDelta::Pixels(point(px(0.), px(-120.))),
+                cx,
+            );
+        }
+        assert!(
+            window.find("folder-detail-remove").visible(),
+            "#43: the body scrolls, so the wheel reaches the last control"
+        );
+        assert!(
+            window.find("folder-detail-title").bounds().origin.y < first,
+            "#81: the panel scrolled, not the dashboard behind it"
+        );
+        assert!(
+            window.find("folder-panel").bounds().bottom() <= window.viewport_size().height,
+            "the panel never runs past the window"
+        );
+    });
+}
+
 #[gpui_kit::test]
 async fn escape_the_backdrop_and_the_close_control_all_close_the_detail(cx: &mut TestAppContext) {
     // A worker thread wakes the foreground executor, which the harness
@@ -685,9 +898,12 @@ async fn escape_the_backdrop_and_the_close_control_all_close_the_detail(cx: &mut
     });
 
     open_detail_now(cx, window);
-    // The backdrop is everything outside the centered dialog.
+    // #81: the outside press is the window dialog layer's backdrop now, so
+    // this aims at the layer's own surface frame, well clear of the panel. The
+    // base dialog ignores presses in its title-bar band, so the point is below
+    // it.
     act(cx, window, |window, cx| {
-        window.click_at("folder-panel-backdrop", point(px(8.), px(8.)), cx);
+        window.click_at("dialog", point(px(8.), px(160.)), cx);
     });
     read(cx, window, |window, _| {
         assert!(!detail_open(window), "#43: the backdrop closes it");
@@ -1050,7 +1266,6 @@ async fn a_refused_remove_keeps_the_detail_open_with_its_reason(cx: &mut TestApp
     }
 
     act(cx, window, |window, cx| {
-        scroll_into_view(window, cx, "folder-detail-remove");
         window.click("folder-detail-remove", cx);
         common::settle_alert(window, cx);
     });
@@ -1076,7 +1291,6 @@ async fn a_refused_remove_keeps_the_detail_open_with_its_reason(cx: &mut TestApp
     // The button is usable again, not stuck on Removing…: a disabled control
     // ignores the click, so the confirmation appearing is what proves it.
     act(cx, window, |window, cx| {
-        scroll_into_view(window, cx, "folder-detail-remove");
         window.click("folder-detail-remove", cx);
         common::settle_alert(window, cx);
     });
@@ -1540,7 +1754,6 @@ async fn load_more_appends_the_next_page_and_keeps_the_loaded_rows(cx: &mut Test
     });
 
     act(cx, window, |window, cx| {
-        scroll_into_view(window, cx, "folder-assets-more");
         window.click("folder-assets-more", cx)
     });
     wait_for_asset_rows(cx, window, 100).await;
@@ -1650,7 +1863,9 @@ async fn an_asset_link_is_named_reachable_and_opens_the_configured_server(cx: &m
             "reaching the link does not open it"
         );
     });
-    act(cx, window, |window, cx| window.press("enter", cx));
+    // #81: a control inside a dialog answers Space; the kit binds Enter to the
+    // dialog's own Confirm.
+    act(cx, window, |window, cx| window.press("space", cx));
     assert_eq!(
         opened.lock().expect("the recorder lock").as_slice(),
         ["https://immich.example.com/immich/photos/asset-one"],
@@ -1759,7 +1974,6 @@ async fn the_list_reloads_on_a_new_upload_and_keeps_the_loaded_row_count(cx: &mu
     open_detail_now(cx, window);
     wait_for_asset_rows(cx, window, 50).await;
     act(cx, window, |window, cx| {
-        scroll_into_view(window, cx, "folder-assets-more");
         window.click("folder-assets-more", cx)
     });
     wait_for_asset_rows(cx, window, 100).await;

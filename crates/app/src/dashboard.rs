@@ -4,7 +4,6 @@
 //! A new folder is confirmed in the setup dialog (#40) before the client
 //! records and scans it; the dialog's panel lives in [`crate::folder_panel`].
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -58,12 +57,6 @@ pub struct Dashboard {
     /// inside it.
     panel: Option<Entity<FolderPanel>>,
     panel_subscription: Option<Subscription>,
-    /// Where focus goes back to when the detail closes: the card's Details
-    /// anchor and the folder's stored path (#43).
-    detail_return: Option<(String, FocusHandle)>,
-    /// One focus anchor per folder card, keyed by the stored path so a removal
-    /// cannot shift a deleted folder's focus onto its neighbour (#43).
-    card_focus: HashMap<String, FocusHandle>,
     /// What "Open folder" runs (#43). The product opens the platform's file
     /// manager; a test injects a recorder.
     folder_opener: FolderOpener,
@@ -91,8 +84,6 @@ impl Dashboard {
             sync_notice: None,
             panel: None,
             panel_subscription: None,
-            detail_return: None,
-            card_focus: HashMap::new(),
             folder_opener: Arc::new(crate::folder_panel::open_in_file_manager),
             link_opener: asset_link::browser_opener(),
             capture_detail: None,
@@ -125,8 +116,6 @@ impl Dashboard {
             sync_notice: None,
             panel: None,
             panel_subscription: None,
-            detail_return: None,
-            card_focus: HashMap::new(),
             folder_opener: Arc::new(crate::folder_panel::open_in_file_manager),
             link_opener: asset_link::browser_opener(),
             capture_detail: std::env::var(crate::shell::FORCE_DETAIL_ENV).ok(),
@@ -272,7 +261,6 @@ impl Dashboard {
             return;
         };
         let panel = cx.new(|cx| FolderPanel::setup(engine, path, window, cx));
-        let focus = panel.read(cx).focus_handle(cx);
         let subscription = cx.subscribe_in(
             &panel,
             window,
@@ -280,9 +268,9 @@ impl Dashboard {
                 this.panel_event(event, window, cx);
             },
         );
-        self.panel = Some(panel);
+        self.panel = Some(panel.clone());
         self.panel_subscription = Some(subscription);
-        window.focus(&focus, cx);
+        Self::open_panel_dialog(panel, window, cx);
         cx.notify();
     }
 
@@ -301,7 +289,6 @@ impl Dashboard {
         let link_opener = self.link_opener.clone();
         let panel =
             cx.new(|cx| FolderPanel::detail(engine, path.clone(), opener, link_opener, window, cx));
-        let focus = panel.read(cx).focus_handle(cx);
         let subscription = cx.subscribe_in(
             &panel,
             window,
@@ -309,11 +296,46 @@ impl Dashboard {
                 this.panel_event(event, window, cx);
             },
         );
-        self.detail_return = Some((path.clone(), self.details_focus(&path, cx).tab_stop(false)));
-        self.panel = Some(panel);
+        self.panel = Some(panel.clone());
         self.panel_subscription = Some(subscription);
-        window.focus(&focus, cx);
+        Self::open_panel_dialog(panel, window, cx);
         cx.notify();
+    }
+
+    /// Opens `panel` through the window's dialog layer (#81).
+    ///
+    /// The layer owns everything the panel used to build for itself: the
+    /// surface and its width, the backdrop and its outside press, the focus
+    /// trap, Escape, and handing the keyboard back to whatever opened the
+    /// panel. The panel only reports that it should close, through its own
+    /// event, so one path closes it whether the user pressed its Close control,
+    /// its Cancel, Escape, or the space around it.
+    fn open_panel_dialog(panel: Entity<FolderPanel>, window: &mut Window, cx: &mut App) {
+        let dismissed = panel.downgrade();
+        window.open_dialog(cx, move |dialog, window, cx| {
+            let content = panel.clone();
+            let dismissed = dismissed.clone();
+            dialog
+                .width(content.read(cx).dialog_width().to_pixels(window.rem_size()))
+                .centered()
+                // The panel keeps its own Close control, whose label names the
+                // folder; the layer's bare ✕ would be a second way out.
+                .close_button(false)
+                .content(move |content_el, _, _| content_el.min_h_0().child(content.clone()))
+                // The panel has no single OK: its own Add button confirms the
+                // setup and the detail confirms nothing. The layer binds a bare
+                // Enter to its Confirm, so an Enter meant for a panel control
+                // would close the dialog without the panel ever hearing about
+                // it.
+                .on_ok(|_, _, _| false)
+                .on_cancel(move |_, _, cx| {
+                    // Escape and the outside press are the panel's dismissal, so
+                    // the layer must not close it behind the panel's back: the
+                    // event it reports is what closes the dialog.
+                    let _ = dismissed.update(cx, |panel, cx| panel.dismiss(cx));
+                    false
+                })
+        });
     }
 
     /// Opens the pinned detail once the store has loaded its folder (#43).
@@ -364,56 +386,42 @@ impl Dashboard {
         }
     }
 
-    /// The focus anchor of one card's Details control (#43).
-    ///
-    /// The anchor is kept per stored path, not per index a removal can shift.
-    /// It is created on demand, because a click handler is not inside a render
-    /// pass and cannot use a keyed window state.
-    fn details_focus(&mut self, path: &str, cx: &mut Context<Self>) -> FocusHandle {
-        self.card_focus
-            .entry(path.to_string())
-            .or_insert_with(|| cx.focus_handle())
-            .clone()
-    }
-
-    /// Closes the detail dialog and puts focus back on the folder's card
-    /// (#43), or on the folder field when the card is gone.
+    /// Closes the detail dialog (#43) and its Remove confirmation with it, and
+    /// puts the keyboard back where the detail was opened from.
     fn close_folder_detail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // The Remove confirmation is a window-level layer: it must not outlive
-        // the panel that opened it (#73).
-        window.close_dialog(cx);
+        let path = self
+            .panel
+            .as_ref()
+            .map(|panel| panel.read(cx).folder_path().to_string());
         self.panel = None;
         self.panel_subscription = None;
-        if let Some((path, anchor)) = self.detail_return.take() {
-            if self
+        // The layer restores focus to the control that opened the detail. The
+        // Remove confirmation is a window-level layer of its own, so it must
+        // not outlive the panel that opened it (#73).
+        window.close_all_dialogs(cx);
+        let card_gone = path.is_some_and(|path| {
+            !self
                 .model
                 .folders
                 .iter()
                 .any(|card| card.path.as_deref() == Some(path.as_str()))
-            {
-                // The anchor is not a tab stop of its own: its first tab stop is
-                // the card's Details control.
-                window.focus(&anchor, cx);
-                window.focus_next(cx);
-            } else if let Some(input) = self.folder_input.clone() {
-                // A successful Remove took the card with it, so the card's
-                // anchor renders nowhere: the keyboard goes to the folder field
-                // instead of landing on nothing (#43).
-                let focus = input.read(cx).focus_handle(cx);
-                window.focus(&focus, cx);
-            }
+        });
+        if let (true, Some(input)) = (card_gone, self.folder_input.clone()) {
+            // A successful Remove took the card with it, so the Details control
+            // that opened the detail renders nowhere: the keyboard goes to the
+            // folder field instead of landing on nothing (#43).
+            let focus = input.read(cx).focus_handle(cx);
+            window.focus(&focus, cx);
         }
         cx.notify();
     }
 
-    /// Closes the setup dialog and puts focus back on the folder field (#40).
+    /// Closes the setup dialog and puts focus back where it was opened from
+    /// (#40), which the layer does.
     fn close_folder_setup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.panel = None;
         self.panel_subscription = None;
-        if let Some(input) = self.folder_input.clone() {
-            let focus = input.read(cx).focus_handle(cx);
-            window.focus(&focus, cx);
-        }
+        window.close_all_dialogs(cx);
         cx.notify();
     }
 
@@ -647,7 +655,6 @@ impl Render for Dashboard {
                         .map(|(index, folder)| {
                             let path = folder.path.clone().unwrap_or_default();
                             let title = folder.title.clone();
-                            let details_focus = self.details_focus(&path, cx);
                             // #53: removal is the detail's confirmed action.
                             let footer = live.then(|| {
                                 let path = path.clone();
@@ -655,29 +662,14 @@ impl Render for Dashboard {
                                     .flex()
                                     .flex_row()
                                     .child(
-                                        div()
-                                            .id(("folder-details-anchor", index))
-                                            .test_support()
-                                            .track_focus(&details_focus)
-                                            .tab_stop(false)
-                                            .child(
-                                                Button::new(("folder-details", index))
-                                                    .secondary()
-                                                    .label("Details")
-                                                    .accessibility_label(format!(
-                                                        "Details for {title}"
-                                                    ))
-                                                    .on_click(cx.listener(
-                                                        move |this, _, window, cx| {
-                                                            cx.stop_propagation();
-                                                            this.open_folder_detail(
-                                                                path.clone(),
-                                                                window,
-                                                                cx,
-                                                            );
-                                                        },
-                                                    )),
-                                            ),
+                                        Button::new(("folder-details", index))
+                                            .secondary()
+                                            .label("Details")
+                                            .accessibility_label(format!("Details for {title}"))
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                cx.stop_propagation();
+                                                this.open_folder_detail(path.clone(), window, cx);
+                                            })),
                                     )
                                     .into_any_element()
                             });
@@ -707,7 +699,6 @@ impl Render for Dashboard {
                         }),
                 ),
             )
-            .when_some(self.panel.clone(), |this, panel| this.child(panel))
     }
 }
 
