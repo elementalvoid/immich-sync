@@ -18,8 +18,8 @@ use std::time::Duration;
 
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, Bounds, ElementId, Entity, Point, Role, TestAppContext,
-    Window, WindowBounds, WindowOptions, px, size,
+    AnyWindowHandle, App, AppContext as _, Bounds, ElementId, Entity, Point, Role, ScrollDelta,
+    TestAppContext, Window, WindowBounds, WindowOptions, point, px, size,
 };
 use immich_sync::autostart::{Autostart, UnavailableAutostart};
 use immich_sync::connection::ConnectionModel;
@@ -1073,6 +1073,12 @@ async fn the_bundle_action_saves_an_archive_shows_its_path_and_copies_it(cx: &mu
             "the view shows the archive's full path"
         );
         window.click("diagnostics-bundle-copy", cx);
+        let notice = window.find("diagnostics-bundle-copy-notice");
+        assert_eq!(notice.role(), Some(Role::Alert));
+        assert_eq!(
+            notice.label(),
+            Some("Debug bundle path copied to the clipboard.")
+        );
     })
     .expect("update the shell window");
     let copied = cx
@@ -1082,6 +1088,35 @@ async fn the_bundle_action_saves_an_archive_shows_its_path_and_copies_it(cx: &mu
         copied,
         report.path.display().to_string(),
         "the copy control puts the archive's path on the clipboard"
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        window.scroll(
+            "diagnostics-view",
+            ScrollDelta::Pixels(point(px(0.), px(-1200.))),
+            cx,
+        );
+        window.render_frame(cx);
+        window.click("diagnostics-bundle-copy-folder", cx);
+        let notice = window.find("diagnostics-bundle-copy-notice");
+        assert_eq!(
+            notice.role(),
+            Some(Role::Alert),
+            "copy confirmation is announced once"
+        );
+        assert_eq!(
+            notice.label(),
+            Some("Debug bundle folder path copied to the clipboard.")
+        );
+    })
+    .expect("update the shell window");
+    let copied_folder = cx
+        .update(|cx| cx.read_from_clipboard().and_then(|item| item.text()))
+        .unwrap_or_default();
+    assert_eq!(
+        copied_folder,
+        report.path.parent().unwrap().display().to_string(),
+        "the folder copy control puts the debug bundle folder on the clipboard"
     );
 
     let (entries, bytes) = read_archive(&report.path);

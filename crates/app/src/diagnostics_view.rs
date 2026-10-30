@@ -18,13 +18,17 @@ use sync_core::store::SqliteInfo;
 pub struct DiagnosticsView {
     /// The model owns every read; the view renders what it last produced.
     model: Entity<DiagnosticsModel>,
+    copied_notice: Option<String>,
 }
 
 impl DiagnosticsView {
     /// A view over the diagnostics model.
     pub fn new(model: Entity<DiagnosticsModel>, cx: &mut Context<Self>) -> Self {
         cx.observe(&model, |_, _, cx| cx.notify()).detach();
-        Self { model }
+        Self {
+            model,
+            copied_notice: None,
+        }
     }
 
     /// The page header.
@@ -421,6 +425,17 @@ impl DiagnosticsView {
                         )
                         .into_any_element(),
                 );
+                if let Some(message) = &self.copied_notice {
+                    rows.push(
+                        notice(
+                            "diagnostics-bundle-copy-notice",
+                            message.clone(),
+                            theme.info,
+                            &palette,
+                        )
+                        .into_any_element(),
+                    );
+                }
                 rows.push(
                     div()
                         .id("diagnostics-bundle-copy-row")
@@ -442,6 +457,29 @@ impl DiagnosticsView {
                                 .label("Copy path")
                                 .accessibility_label("Copy the debug bundle's path")
                                 .on_click(cx.listener(|this, _, _, cx| this.copy_bundle_path(cx))),
+                        )
+                        .into_any_element(),
+                );
+                rows.push(
+                    div()
+                        .id("diagnostics-bundle-copy-folder-row")
+                        .test_support()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .gap_6()
+                        .min_h(rems(2.25))
+                        .child(field_text(
+                            "Copy folder",
+                            "Puts the debug bundle folder on the clipboard, so it can be opened in a file manager.",
+                            &palette,
+                        ))
+                        .child(
+                            Button::new("diagnostics-bundle-copy-folder")
+                                .label("Copy folder")
+                                .accessibility_label("Copy the debug bundle folder path")
+                                .on_click(cx.listener(|this, _, _, cx| this.copy_bundle_folder(cx))),
                         )
                         .into_any_element(),
                 );
@@ -486,6 +524,24 @@ impl DiagnosticsView {
             _ => return,
         };
         cx.write_to_clipboard(ClipboardItem::new_string(path));
+        self.copied_notice = Some("Debug bundle path copied to the clipboard.".to_string());
+        cx.notify();
+    }
+
+    /// Puts the folder for the last archive on the clipboard.
+    fn copy_bundle_folder(&mut self, cx: &mut Context<Self>) {
+        let directory = match self.model.read(cx).bundle() {
+            BundleState::Ready(report) => {
+                report.path.parent().map(|path| path.display().to_string())
+            }
+            _ => None,
+        };
+        if let Some(directory) = directory {
+            cx.write_to_clipboard(ClipboardItem::new_string(directory));
+            self.copied_notice =
+                Some("Debug bundle folder path copied to the clipboard.".to_string());
+            cx.notify();
+        }
     }
 
     /// The upload rate from the engine's meter, and the live progress.
