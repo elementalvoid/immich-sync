@@ -1454,7 +1454,7 @@ impl FolderPanel {
                     // The host swallows pointer and wheel events, so the
                     // dashboard behind the modal stays inert.
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                    .on_scroll(|_, _, cx| cx.stop_propagation())
                     .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                         if event.keystroke.key == "escape" {
                             this.escape(cx);

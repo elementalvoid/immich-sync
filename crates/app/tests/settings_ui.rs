@@ -389,7 +389,9 @@ fn tab_to(window: &mut Window, id: &'static str, cx: &mut App) {
 /// The text input the kit nests inside the row `id`.
 ///
 /// The number input the kit renders nests the editable text field, so the row
-/// alone is not proof of what assistive technology reaches.
+/// alone is not proof of what assistive technology reaches. A masked input
+/// carries the password role, which gpui-kit 0.8 reports so screen readers
+/// announce it as one.
 fn row_text_input(
     window: &Window,
     id: &'static str,
@@ -397,7 +399,7 @@ fn row_text_input(
     gpui_kit::base::test_support::snapshots(window)
         .into_iter()
         .find(|snapshot| {
-            snapshot.role() == Some(Role::TextInput)
+            matches!(snapshot.role(), Some(Role::TextInput | Role::PasswordInput))
                 && snapshot.path().contains(&ElementId::Name(id.into()))
         })
         .expect("a text input inside the row")

@@ -15,8 +15,7 @@ use std::time::Duration;
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
     AnyWindowHandle, App, AppContext as _, Bounds, ElementId, Entity, InputEvent as _, Point,
-    ScrollDelta, ScrollWheelEvent, TestAppContext, Window, WindowBounds, WindowOptions, point, px,
-    size,
+    ScrollDelta, ScrollEvent, TestAppContext, Window, WindowBounds, WindowOptions, point, px, size,
 };
 use immich_sync::autostart::{Autostart, UnavailableAutostart};
 use immich_sync::connection::{ConnectionModel, profile_from_settings};
@@ -277,7 +276,7 @@ fn scroll_until_visible(
         }
         let position = visible_center(window, container);
         window.dispatch_event(
-            ScrollWheelEvent {
+            ScrollEvent {
                 position,
                 delta: ScrollDelta::Lines(point(0., lines)),
                 ..Default::default()
@@ -401,7 +400,7 @@ async fn the_log_tail_scrolls_inside_its_own_container(cx: &mut TestAppContext) 
             - f32::from(window.find("logs-lines").bounds().origin.y);
         let box_bounds = window.find("logs-lines").bounds();
         window.dispatch_event(
-            ScrollWheelEvent {
+            ScrollEvent {
                 position: point(box_bounds.center().x, box_bounds.origin.y + px(20.)),
                 delta: ScrollDelta::Lines(point(0., 4.)),
                 ..Default::default()
