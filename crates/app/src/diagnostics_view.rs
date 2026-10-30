@@ -5,6 +5,8 @@
 use gpui_kit::base::Disableable as _;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::Button;
+use gpui_kit::component::description_list::{DescriptionItem, DescriptionList};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::dashboard::CardPalette;
@@ -69,39 +71,6 @@ impl DiagnosticsView {
             ))
     }
 
-    /// One labelled row: the name and help on the left, the value on the right.
-    fn value_row(
-        label: &'static str,
-        help: &'static str,
-        value_id: &'static str,
-        value: String,
-        palette: &CardPalette,
-    ) -> AnyElement {
-        div()
-            .id(ElementId::Name(format!("{value_id}-row").into()))
-            .test_support()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .gap_6()
-            .min_h(rems(2.25))
-            .child(field_text(label, help, palette))
-            .child(
-                div()
-                    .id(value_id)
-                    .test_support()
-                    .aria_label(value.clone())
-                    .min_w_0()
-                    .max_w(rems(36.))
-                    .text_right()
-                    .text_xs()
-                    .text_color(palette.meta)
-                    .child(value),
-            )
-            .into_any_element()
-    }
-
     /// The server version, the granted permissions, and the refresh action.
     fn server_section(&self, cx: &mut Context<Self>) -> AnyElement {
         let palette = CardPalette::new(cx.theme());
@@ -124,7 +93,33 @@ impl DiagnosticsView {
             }
             Permissions::Unavailable(reason) => reason.clone(),
         };
-        let mut rows = Vec::with_capacity(5);
+        let items = vec![
+            value_item(
+                "Client version",
+                Some("The running binary: the package version and the short build revision."),
+                "diagnostics-client-version-value",
+                version::client_version().to_string(),
+                None,
+                &palette,
+            ),
+            value_item(
+                "Server version",
+                Some("GET /server/about with this credential."),
+                "diagnostics-server-version-value",
+                version,
+                None,
+                &palette,
+            ),
+            value_item(
+                "Permissions",
+                Some("An API key's granted permissions, read from GET /api-keys/me."),
+                "diagnostics-permissions-value",
+                permissions,
+                None,
+                &palette,
+            ),
+        ];
+        let mut rows = Vec::with_capacity(3);
         if let Some(problem) = &server.problem {
             rows.push(
                 Notice::new(
@@ -135,27 +130,7 @@ impl DiagnosticsView {
                 .into_any_element(),
             );
         }
-        rows.push(Self::value_row(
-            "Client version",
-            "The running binary: the package version and the short build revision.",
-            "diagnostics-client-version-value",
-            version::client_version().to_string(),
-            &palette,
-        ));
-        rows.push(Self::value_row(
-            "Server version",
-            "GET /server/about with this credential.",
-            "diagnostics-server-version-value",
-            version,
-            &palette,
-        ));
-        rows.push(Self::value_row(
-            "Permissions",
-            "An API key's granted permissions, read from GET /api-keys/me.",
-            "diagnostics-permissions-value",
-            permissions,
-            &palette,
-        ));
+        rows.push(value_list(items).into_any_element());
         rows.push(
             div()
                 .id("diagnostics-refresh-row")
@@ -221,39 +196,45 @@ impl DiagnosticsView {
                 .into_any_element(),
             );
         }
-        rows.push(Self::value_row(
+        let mut items = Vec::with_capacity(12);
+        items.push(value_item(
             "Database",
-            "The state database the client writes.",
+            Some("The state database the client writes."),
             "diagnostics-state-path-value",
             path,
+            None,
             &palette,
         ));
-        match &info {
-            Some(info) => {
-                rows.push(Self::value_row(
-                    "Migration version",
-                    "PRAGMA user_version: the schema the client migrated to.",
-                    "diagnostics-sqlite-version-value",
-                    info.migration_version.to_string(),
-                    &palette,
-                ));
-                rows.push(Self::value_row(
-                    "Size",
-                    "The pages SQLite holds for this database.",
-                    "diagnostics-sqlite-size-value",
-                    format_bytes(info.size_bytes),
-                    &palette,
-                ));
-                rows.push(Self::value_row(
-                    "Integrity",
-                    "PRAGMA quick_check.",
-                    "diagnostics-integrity-value",
-                    info.integrity.clone(),
-                    &palette,
-                ));
-                rows.extend(table_rows(info, &palette));
-            }
-            None => rows.push(
+        if let Some(info) = &info {
+            items.push(value_item(
+                "Migration version",
+                Some("PRAGMA user_version: the schema the client migrated to."),
+                "diagnostics-sqlite-version-value",
+                info.migration_version.to_string(),
+                None,
+                &palette,
+            ));
+            items.push(value_item(
+                "Size",
+                Some("The pages SQLite holds for this database."),
+                "diagnostics-sqlite-size-value",
+                format_bytes(info.size_bytes),
+                None,
+                &palette,
+            ));
+            items.push(value_item(
+                "Integrity",
+                Some("PRAGMA quick_check."),
+                "diagnostics-integrity-value",
+                info.integrity.clone(),
+                None,
+                &palette,
+            ));
+            items.extend(table_items(info, &palette));
+        }
+        rows.push(value_list(items).into_any_element());
+        if info.is_none() {
+            rows.push(
                 div()
                     .id("diagnostics-state-empty")
                     .test_support()
@@ -261,7 +242,7 @@ impl DiagnosticsView {
                     .text_color(palette.meta)
                     .child("The state database is opening.")
                     .into_any_element(),
-            ),
+            );
         }
         rows.push(
             div()
@@ -314,27 +295,26 @@ impl DiagnosticsView {
                     .into_any_element(),
             ]
         } else {
-            errors
+            let items = errors
                 .iter()
                 .map(|error| {
-                    let text = match &error.message {
+                    // The row keeps the whole sentence as its accessible name, so
+                    // the class is heard once with its reason.
+                    let name = match &error.message {
                         Some(message) => format!("{}: {message}", error.class.as_str()),
                         None => error.class.as_str().to_string(),
                     };
-                    div()
-                        .id(ElementId::Name(
-                            format!("diagnostics-error-{}", error.class.as_str()).into(),
-                        ))
-                        .test_support()
-                        .aria_label(text.clone())
-                        .min_w_0()
-                        .w_full()
-                        .text_xs()
-                        .text_color(palette.text)
-                        .child(text)
-                        .into_any_element()
+                    value_item(
+                        error.class.as_str(),
+                        None,
+                        &format!("diagnostics-error-{}", error.class.as_str()),
+                        error.message.clone().unwrap_or_default(),
+                        Some(name),
+                        &palette,
+                    )
                 })
-                .collect()
+                .collect();
+            vec![value_list(items).into_any_element()]
         };
         section(
             "diagnostics-errors",
@@ -408,36 +388,16 @@ impl DiagnosticsView {
                 .into_any_element(),
             ),
             BundleState::Ready(report) => {
-                let path = report.path.display().to_string();
                 rows.push(
-                    div()
-                        .id("diagnostics-bundle-path-row")
-                        .test_support()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .justify_between()
-                        .gap_6()
-                        .min_h(rems(2.25))
-                        .child(field_text(
-                            "Archive",
-                            "Attach this file to your support message.",
-                            &palette,
-                        ))
-                        .child(
-                            div()
-                                .id("diagnostics-bundle-path-value")
-                                .test_support()
-                                .aria_label(path.clone())
-                                .min_w_0()
-                                .max_w(rems(48.))
-                                .text_right()
-                                .font_family(theme.mono_font_family.clone())
-                                .text_xs()
-                                .text_color(palette.meta)
-                                .child(path.clone()),
-                        )
-                        .into_any_element(),
+                    value_list(vec![value_item(
+                        "Archive",
+                        Some("Attach this file to your support message."),
+                        "diagnostics-bundle-path-value",
+                        report.path.display().to_string(),
+                        None,
+                        &palette,
+                    )])
+                    .into_any_element(),
                 );
                 rows.push(
                     div()
@@ -556,67 +516,124 @@ impl DiagnosticsView {
             "{} uploaded, {} pending, {} failed",
             status.counts.uploaded, status.counts.pending, status.counts.failed
         );
+        let items = vec![
+            value_item(
+                "Upload rate",
+                Some("Measured between the last two status polls."),
+                "diagnostics-throughput-value",
+                rate,
+                None,
+                &palette,
+            ),
+            value_item(
+                "Activity",
+                Some("What the engine is doing right now."),
+                "diagnostics-activity-value",
+                status.activity.label().to_string(),
+                None,
+                &palette,
+            ),
+            value_item(
+                "Items",
+                Some("The counts across every folder."),
+                "diagnostics-counts-value",
+                counts,
+                None,
+                &palette,
+            ),
+        ];
         section(
             "diagnostics-throughput",
             "Throughput",
             "Upload bytes per second, from the same meter the bandwidth limit uses.",
-            vec![
-                Self::value_row(
-                    "Upload rate",
-                    "Measured between the last two status polls.",
-                    "diagnostics-throughput-value",
-                    rate,
-                    &palette,
-                ),
-                Self::value_row(
-                    "Activity",
-                    "What the engine is doing right now.",
-                    "diagnostics-activity-value",
-                    status.activity.label().to_string(),
-                    &palette,
-                ),
-                Self::value_row(
-                    "Items",
-                    "The counts across every folder.",
-                    "diagnostics-counts-value",
-                    counts,
-                    &palette,
-                ),
-            ],
+            vec![value_list(items).into_any_element()],
             cx,
         )
     }
 }
 
-/// One row per tracked table, with its row count.
-fn table_rows(info: &SqliteInfo, palette: &CardPalette) -> Vec<AnyElement> {
-    info.tables
-        .iter()
-        .map(|count| {
-            let id = ElementId::Name(format!("diagnostics-table-{}", count.table).into());
-            div()
-                .id(id)
-                .test_support()
-                .aria_label(format!("{}: {}", count.table, count.rows))
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .gap_6()
-                .min_h(rems(1.75))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(palette.text)
-                        .child(count.table.clone()),
-                )
-                .child(
+/// The label column every value row shares, in rems: wide enough for the
+/// longest term, and fixed, so a long value wraps inside its own column instead
+/// of taking the term's width (#80).
+const LABEL_COLUMN_REMS: f32 = 12.;
+
+/// The description list a card's value rows share (#80).
+///
+/// `columns(1)` puts one row in each line. `bordered(false)` leaves the card's
+/// own surface and border to carry the box: the rows are a grid inside the
+/// card, not a second card inside the first.
+fn value_list(items: Vec<DescriptionItem>) -> impl IntoElement {
+    DescriptionList::new()
+        .columns(1)
+        .bordered(false)
+        .label_width(rems(LABEL_COLUMN_REMS))
+        .children(items)
+}
+
+/// One value row: the term in the label cell, and the value with its help
+/// sentence in the description cell.
+///
+/// `name` is the value's accessible name when it is not the value itself: the
+/// per-table rows keep the `table: rows` name their hand-written row had.
+fn value_item(
+    label: &str,
+    help: Option<&str>,
+    value_id: &str,
+    value: String,
+    name: Option<String>,
+    palette: &CardPalette,
+) -> DescriptionItem {
+    DescriptionItem::new(
+        div()
+            .id(ElementId::Name(format!("{value_id}-label").into()))
+            .test_support()
+            .min_w_0()
+            .text_sm()
+            .font_weight(FontWeight::MEDIUM)
+            .child(label.to_string())
+            .into_any_element(),
+    )
+    .value(
+        div()
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .min_w_0()
+            .child(
+                div()
+                    .id(ElementId::Name(value_id.into()))
+                    .test_support()
+                    .aria_label(name.unwrap_or_else(|| value.clone()))
+                    .min_w_0()
+                    .text_xs()
+                    .text_color(palette.text)
+                    .child(value),
+            )
+            .when_some(help, |this, help| {
+                this.child(
                     div()
                         .text_xs()
                         .text_color(palette.meta)
-                        .child(count.rows.to_string()),
+                        .child(help.to_string()),
                 )
-                .into_any_element()
+            })
+            .into_any_element(),
+    )
+}
+
+/// One row per tracked table, with its row count (#80).
+fn table_items(info: &SqliteInfo, palette: &CardPalette) -> Vec<DescriptionItem> {
+    info.tables
+        .iter()
+        .map(|count| {
+            value_item(
+                &count.table,
+                None,
+                &format!("diagnostics-table-{}", count.table),
+                count.rows.to_string(),
+                Some(format!("{}: {}", count.table, count.rows)),
+                palette,
+            )
         })
         .collect()
 }

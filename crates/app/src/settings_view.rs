@@ -1509,7 +1509,7 @@ impl Render for SettingsView {
 /// around its control, because that wrapper is also what tracks the control's
 /// focus handle: `text_row` and `numeric_row` forward the kit input's handle, and
 /// a `Switch` or `Button` names itself. A row cannot own that wrapper without
-/// also owning a handle it does not have (S4, recorded for #80).
+/// also owning a handle it does not have (S4).
 struct Row {
     /// The row's title, which names its control.
     title: &'static str,
@@ -1728,9 +1728,12 @@ fn connection_severity(state: &ConnectionState) -> Severity {
 /// This and the card helpers below stay for the diagnostics and logs surfaces,
 /// which still borrow them; #78 took the settings surface off them.
 ///
-/// `field_text` survives #78 with two callers, `diagnostics_view` and
-/// `logs_view`. #80 owns deleting it, and it owns the logs view's four uses
-/// too: no ticket in this spec covers that surface's share of the helper.
+/// What is left calls it for a label and its help sentence *beside a control*,
+/// not for a label-and-value pair: `diagnostics_view` ×4 (Refresh, Rebuild,
+/// Collect, Copy path) and `logs_view` ×4 (Refresh, Copy all, Live tail paused,
+/// and the log path row). #80 moved every diagnostics value row to a kit
+/// `DescriptionList` instead, so the helper is not dead — those rows would each
+/// need a kit `SettingItem` to retire it, and no ticket in this spec owns them.
 pub(crate) fn field_text(label: &str, help: &str, palette: &CardPalette) -> impl IntoElement {
     div()
         .flex()
