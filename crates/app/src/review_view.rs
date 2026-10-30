@@ -13,6 +13,7 @@ use gpui_kit::*;
 use sync_core::paths::PathCase;
 
 use crate::dashboard::CardPalette;
+use crate::empty_state::EmptyState;
 use crate::engine::EngineModel;
 use crate::folder_filter::FolderFilter;
 use crate::folder_filter_view::folder_filter_bar;
@@ -88,7 +89,8 @@ impl Render for ReviewView {
         items.retain(|item| filter.keeps(&item.path, &folders, case));
         let rows = rows(&items);
         let problem = self.engine.read(cx).review_problem().map(str::to_string);
-        // R5.3, #41: the empty state names the folder the filter shows.
+        // R5.3, #41: the empty state names the folder the filter shows, and only
+        // the list it stands in for (#77).
         let empty = self
             .filter
             .read(cx)
@@ -159,7 +161,12 @@ impl Render for ReviewView {
                     .flex_col()
                     .gap_3()
                     .when(rows.is_empty(), |this| {
-                        this.child(empty_card("review-empty", &empty, &palette, radius, border))
+                        this.child(EmptyState::new(
+                            "review-empty",
+                            empty,
+                            "A file that disappears from a source folder appears here, and the \
+                             server copy waits for your choice.",
+                        ))
                     })
                     .children(
                         rows.iter()
@@ -252,42 +259,5 @@ fn row_card(
                             this.trash(trash_path.clone(), cx);
                         })),
                 ),
-        )
-}
-
-/// The empty state: the view is a normal place to be, not a broken one.
-fn empty_card(
-    id: &'static str,
-    heading: &str,
-    palette: &CardPalette,
-    radius: Pixels,
-    border: Hsla,
-) -> impl IntoElement + use<> {
-    let heading = heading.to_string();
-    div()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .p_4()
-        .w_full()
-        .rounded(radius)
-        .bg(palette.surface)
-        .border_1()
-        .border_color(border)
-        .child(
-            div()
-                .id(id)
-                .test_support()
-                .role(Role::Status)
-                .aria_label(heading.clone())
-                .text_base()
-                .font_weight(FontWeight::MEDIUM)
-                .child(heading),
-        )
-        .child(
-            div()
-                .text_xs()
-                .text_color(palette.meta)
-                .child("A file that disappears from a source folder appears here, and the server copy waits for your choice."),
         )
 }
