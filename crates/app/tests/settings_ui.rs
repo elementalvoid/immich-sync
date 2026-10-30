@@ -2640,6 +2640,10 @@ const ROWS: &[RowPin] = &[
     ),
 ];
 
+/// The rows whose field is a text input as wide as the page, so a field that
+/// shrank to a sliver is a layout bug rather than the kit's own control size.
+const WIDE_TEXT_FIELDS: [&str; 3] = ["settings-server-url", "settings-email", "settings-secret"];
+
 /// Draws twice: a page body is a virtual list, which lays its rows out on the
 /// frame after the one that measured it.
 fn draw(window: &mut Window, cx: &mut App) {
@@ -2984,6 +2988,14 @@ fn every_page_lays_out_its_rows_at_the_narrowest_window_in_both_themes(cx: &mut 
                             pin.help_id,
                             input.bounds()
                         );
+                        if WIDE_TEXT_FIELDS.contains(&pin.help_id) {
+                            assert!(
+                                input.bounds().size.width >= px(200.),
+                                "{window_size:?} {system:?}: the text field inside {} is squeezed to {}",
+                                pin.help_id,
+                                input.bounds().size.width
+                            );
+                        }
                     }
                 }
             }
