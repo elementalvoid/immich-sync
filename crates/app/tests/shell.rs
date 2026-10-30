@@ -302,7 +302,21 @@ fn open_shell(
 fn open_shell_at(
     cx: &mut TestAppContext,
     paths: &AppPaths,
+    size: (f32, f32),
+) -> (AnyWindowHandle, gpui_kit::Entity<AppShell>) {
+    open_shell_on(cx, paths, size, None)
+}
+
+/// The same shell, showing `pin` from the first frame on.
+///
+/// Showing it before the window draws is the state [`FORCE_VIEW_ENV`] leaves
+/// `AppShell::new` in, without writing the process environment the rest of this
+/// binary's tests share. `open_shell_at` is this with no pin.
+fn open_shell_on(
+    cx: &mut TestAppContext,
+    paths: &AppPaths,
     (width, height): (f32, f32),
+    pin: Option<ViewMode>,
 ) -> (AnyWindowHandle, gpui_kit::Entity<AppShell>) {
     let paths = paths.clone();
     cx.update(|cx| {
@@ -343,7 +357,7 @@ fn open_shell_at(
                 let diagnostics = cx.new(|cx| DiagnosticsView::new(diagnostics_model, cx));
                 let review = cx.new(|cx| ReviewView::new(engine.clone(), window, cx));
                 cx.new(|cx| {
-                    AppShell::new(
+                    let mut shell = AppShell::new(
                         dashboard,
                         settings,
                         upload_view,
@@ -352,7 +366,11 @@ fn open_shell_at(
                         review,
                         connection,
                         cx,
-                    )
+                    );
+                    if let Some(mode) = pin {
+                        shell.show(mode, cx);
+                    }
+                    shell
                 })
             },
         )
@@ -641,6 +659,10 @@ const SWITCH: [(ViewMode, &str, &str); 7] = [
 /// the overflow assertions measure against.
 const STRIP: &str = "nav-tabs";
 
+/// The fades that say the strip continues past an edge, and the edge each names.
+const FADE_LEFT: &str = "nav-fade-left";
+const FADE_RIGHT: &str = "nav-fade-right";
+
 /// Focuses `id` with Tab presses, the way a keyboard user reaches it.
 fn tab_to(window: &mut Window, id: &'static str, cx: &mut App) {
     for _ in 0..16 {
@@ -909,4 +931,134 @@ fn narrowing_the_window_keeps_the_shown_surface_on_the_strip(cx: &mut TestAppCon
         );
     })
     .expect("narrow the window");
+}
+
+/// #75: the keyboard moves the strip. A tab that sits past the strip's edge is
+/// scrolled into sight when focus lands on it, and with the room its focus ring
+/// is painted in: the ring is drawn outside the tab, so a reveal that stopped
+/// flush would cut it off the very tab the keyboard is on.
+#[gpui_kit::test]
+fn focusing_a_tab_past_the_edge_scrolls_it_into_sight_with_room_for_its_ring(
+    cx: &mut TestAppContext,
+) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let (window, shell) = open_shell_at(cx, &paths, (520., 480.));
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let strip = window.find(STRIP).bounds();
+        let start = window.find("nav-diagnostics").bounds();
+        assert!(
+            f32::from(start.origin.x + start.size.width)
+                > f32::from(strip.origin.x + strip.size.width),
+            "the last tab starts out of sight at 520 px: {start:?} in {strip:?}"
+        );
+        tab_to(window, "nav-diagnostics", cx);
+        let tab = window.find("nav-diagnostics").bounds();
+        let left = f32::from(tab.origin.x) - f32::from(strip.origin.x);
+        let right =
+            f32::from(strip.origin.x + strip.size.width) - f32::from(tab.origin.x + tab.size.width);
+        assert!(
+            left >= 3.5 && right >= 3.5,
+            "the strip scrolled the focused tab into sight with room for its ring: \
+             {tab:?} in {strip:?}"
+        );
+        window.press("enter", cx);
+    })
+    .expect("walk the switch by keyboard");
+
+    assert_eq!(
+        cx.read(|cx| shell.read(cx).mode()),
+        ViewMode::Diagnostics,
+        "Enter shows the surface the keyboard moved to"
+    );
+}
+
+/// #75: a strip with tabs hidden past an edge says so, and a strip the labels
+/// fit in says nothing. Without the cue the only pointer path to the last tabs
+/// at 520 px is a wheel that nothing announces.
+#[gpui_kit::test]
+fn a_strip_that_hides_tabs_fades_the_edge_they_are_hidden_past(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let (window, _shell) = open_shell(cx, &paths);
+
+    cx.update_window(window, |_, window, cx| {
+        for _ in 0..3 {
+            window.render_frame(cx);
+        }
+        for id in [FADE_LEFT, FADE_RIGHT] {
+            assert!(
+                window.try_find(id).is_none(),
+                "all seven labels fit at 1200 px, so {id} marks nothing"
+            );
+        }
+    })
+    .expect("render the switch that fits");
+
+    cx.simulate_window_resize(window, size(px(520.), px(480.)));
+    cx.update_window(window, |_, window, cx| {
+        for _ in 0..3 {
+            window.render_frame(cx);
+        }
+        let strip = window.find(STRIP).bounds();
+        let fade = window
+            .try_find(FADE_RIGHT)
+            .expect("the strip hides tabs past its right edge at 520 px");
+        assert_eq!(
+            f32::from(fade.bounds().origin.x + fade.bounds().size.width),
+            f32::from(strip.origin.x + strip.size.width),
+            "the fade sits against the edge that hides the tabs"
+        );
+        assert!(
+            window.try_find(FADE_LEFT).is_none(),
+            "nothing is hidden at the left edge while the strip is at its start"
+        );
+
+        window.scroll(STRIP, ScrollDelta::Lines(point(0., -100.)), cx);
+        for _ in 0..3 {
+            window.render_frame(cx);
+        }
+        assert!(
+            window.try_find(FADE_LEFT).is_some(),
+            "at the strip's end the hidden tabs are the ones to the left"
+        );
+        assert!(
+            window.try_find(FADE_RIGHT).is_none(),
+            "with nothing hidden past the right edge there is no fade there"
+        );
+    })
+    .expect("render the overflowing switch");
+}
+
+/// #75: the surface a pin opens on is on the strip. A reveal asked for before
+/// the strip has ever laid out is dropped by the strip's own prepaint — it does
+/// not know it overflows yet — so the switch keeps the request and re-asks for
+/// it; `b56efde` asked once, in the constructor, and the tab stayed off the
+/// strip. The harness draws the frames itself, so what this pins is the reveal
+/// surviving that first drop; the request for the next frame is the capture's.
+#[gpui_kit::test]
+fn the_surface_a_pin_opens_on_reaches_the_strip(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let (window, shell) = open_shell_on(cx, &paths, (520., 480.), Some(ViewMode::Diagnostics));
+    assert_eq!(
+        cx.read(|cx| shell.read(cx).mode()),
+        ViewMode::Diagnostics,
+        "the pin is the surface the shell starts on"
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let strip = window.find(STRIP).bounds();
+        let tab = window.find("nav-diagnostics").bounds();
+        assert!(
+            f32::from(tab.origin.x) >= f32::from(strip.origin.x) - 0.5
+                && f32::from(tab.origin.x + tab.size.width)
+                    <= f32::from(strip.origin.x + strip.size.width) + 0.5,
+            "the strip scrolled to the surface the pin opened on: {tab:?} in {strip:?}"
+        );
+    })
+    .expect("read the pinned switch");
 }

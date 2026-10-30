@@ -2,6 +2,7 @@
 
 use gpui_kit::base::Tabs as SurfaceTabs;
 use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::ThemeStyled as _;
 use gpui_kit::component::scroll::ScrollableMask;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -456,11 +457,25 @@ impl ViewMode {
 /// the dialog. A product run never sets it.
 pub const FORCE_DETAIL_ENV: &str = "IMMICH_SYNC_FOLDER_DETAIL";
 
-/// The element id of the strip the surface switch's tabs scroll in.
+/// The element id of the wrapper around the strip the surface switch's tabs
+/// scroll in.
 ///
-/// It clips the tabs at a narrow window and is what a wheel over the switch
-/// scrolls, so it names the switch's viewport rather than any one surface.
+/// It sits at the same bounds as the `nav-switch` scroller inside it and hosts
+/// the wheel mask, so it is what a wheel over the switch scrolls; the clipping
+/// is that scroller's own. It names the switch's viewport rather than any one
+/// surface.
 const NAV_STRIP: &str = "nav-tabs";
+
+/// The ids of the fades that say the strip continues past an edge.
+const FADE_LEFT: &str = "nav-fade-left";
+const FADE_RIGHT: &str = "nav-fade-right";
+
+/// The room the strip keeps inside its clip for the tabs' focus ring.
+///
+/// [`ThemeStyled::focus_ring_style`] paints the ring 3 px outside the tab, and
+/// the strip clips, so its tabs are padded by this much and a reveal stops this
+/// far from the edge instead of flush: 4 px is the ring and one more.
+const TAB_ROOM: Pixels = px(4.);
 
 /// The environment variable that pins the visible surface.
 ///
@@ -639,8 +654,34 @@ impl AppShell {
         };
         let strip = self.nav_scroll.bounds();
         let left = tab.origin.x + self.nav_scroll.offset().x;
-        let (strip_left, strip_right) = (strip.origin.x, strip.origin.x + strip.size.width);
+        let strip_left = strip.origin.x + TAB_ROOM;
+        let strip_right = strip.origin.x + strip.size.width - TAB_ROOM;
         left >= strip_left - px(0.5) && left + tab.size.width <= strip_right + px(0.5)
+    }
+
+    /// Scrolls the strip the least it can and still shows tab `ix` with room for
+    /// its focus ring.
+    ///
+    /// [`ScrollHandle::scroll_to_item`] would stop the tab flush against the
+    /// strip's edge, which cuts off the ring drawn outside it, so the offset is
+    /// set to keep [`TAB_ROOM`] instead.
+    fn scroll_tab_into_sight(&self, ix: usize) {
+        let Some(tab) = self.nav_scroll.bounds_for_item(ix) else {
+            // The strip has not laid out yet; the next frame has its bounds.
+            return;
+        };
+        let strip = self.nav_scroll.bounds();
+        let offset = self.nav_scroll.offset();
+        let x = if tab.left() + offset.x < strip.left() + TAB_ROOM {
+            strip.left() + TAB_ROOM - tab.left()
+        } else if tab.right() + offset.x > strip.right() - TAB_ROOM {
+            strip.right() - TAB_ROOM - tab.right()
+        } else {
+            return;
+        };
+        let max = self.nav_scroll.max_offset().x;
+        self.nav_scroll
+            .set_offset(point(x.clamp(-max, px(0.)), offset.y));
     }
 
     /// Opens a list view narrowed to one source folder (#41).
@@ -676,12 +717,17 @@ impl AppShell {
     /// click). The tab of the surface on screen is filled and set in semibold,
     /// and reports itself as selected, so the selection is not colour alone.
     ///
+    /// The tab that holds the keyboard wears the kit's focus ring, and the strip
+    /// keeps room for it inside its clip, so the keyboard path is visible rather
+    /// than only reachable.
+    ///
     /// The tabs ride in the kit's [`SurfaceTabs`] list, but each one is its own
-    /// element rather than a `base::Tab`: in 0.8.1 that tab renames itself to
-    /// its index and observes itself, so it can carry neither the stable id the
-    /// per-surface tests click nor the focus handle that makes it reachable.
-    /// The role, the label, the position and the selected state below are the
-    /// same ones `base::Tab` writes.
+    /// element rather than a `base::Tab`: in 0.8.1 that tab observes itself
+    /// before any caller can, so it cannot be read back as focused or carry the
+    /// focus handle a tab stop needs, and `component::TabBar` would rename it to
+    /// its integer index and lose the stable id the per-surface tests click. The
+    /// role, the label, the position, the selected state and the focus handle
+    /// below are the ones `base::Tab` writes.
     fn switch(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let (background, border) = (theme.background, theme.border);
@@ -709,10 +755,16 @@ impl AppShell {
             }
         }
         // A resize re-clips the strip around whatever the window now shows, so
-        // the tab of the surface on screen is brought back into sight.
+        // the tab of the surface on screen is brought back into sight. The new
+        // width also decides whether an edge hides a tab, and it is measured a
+        // frame after the layout that gives it, so that frame is asked for —
+        // the fade the strip draws from it would otherwise wait for whatever
+        // repaints next.
         let width = self.nav_scroll.bounds().size.width;
         if self.strip_width != Some(width) {
             self.strip_width = Some(width);
+            let view = window.current_view();
+            window.on_next_frame(move |_, cx| cx.notify(view));
             let shown = self.mode.index();
             if !self.tab_in_sight(shown) {
                 self.want_tab(shown);
@@ -728,7 +780,7 @@ impl AppShell {
                 self.reveal = None;
                 self.reveal_tries = 0;
             } else {
-                self.nav_scroll.scroll_to_item(ix);
+                self.scroll_tab_into_sight(ix);
                 self.reveal_tries += 1;
                 let view = window.current_view();
                 window.on_next_frame(move |_, cx| cx.notify(view));
@@ -769,10 +821,22 @@ impl AppShell {
                     .when(!selected, |tab| {
                         tab.hover(move |style| style.bg(accent).text_color(foreground))
                     })
+                    .when(focus.is_focused(window), |tab| {
+                        tab.focus_ring_style(window, cx)
+                    })
                     .child(mode.label())
                     .into_any_element(),
             );
         }
+
+        // Which edges of the strip have tabs hidden past them: the offset only
+        // leaves zero by the wheel, a reveal, or a resize. Compared as `f32`
+        // because a strip that fits leaves a zero here, and `Pixels` orders by
+        // `total_cmp`, where `px(0.)` is greater than `-px(0.)`.
+        let offset = f32::from(self.nav_scroll.offset().x);
+        let room = f32::from(self.nav_scroll.max_offset().x);
+        let hidden_left = offset < 0.;
+        let hidden_right = offset > -room;
 
         div()
             .flex()
@@ -799,10 +863,51 @@ impl AppShell {
                             .gap_1()
                             .flex_1()
                             .min_w_0()
+                            // Room for the end tabs' outward focus ring.
+                            .px(TAB_ROOM)
                             .overflow_x_scroll()
                             .track_scroll(&self.nav_scroll)
                             .children(tabs),
                     )
+                    // A tab hidden past either edge is otherwise invisible, so
+                    // a fade in the bar's own colour says the strip continues,
+                    // the way the kit's tab bar keeps a neighbouring tab in
+                    // sight; it sits over the strip rather than beside it, so
+                    // the tabs stay the scroller's own children.
+                    .when(hidden_left, |this| {
+                        this.child(
+                            div()
+                                .id(FADE_LEFT)
+                                .test_support()
+                                .absolute()
+                                .left_0()
+                                .top_0()
+                                .bottom_0()
+                                .w_6()
+                                .bg(linear_gradient(
+                                    90.,
+                                    linear_color_stop(background, 0.),
+                                    linear_color_stop(background.opacity(0.), 1.),
+                                )),
+                        )
+                    })
+                    .when(hidden_right, |this| {
+                        this.child(
+                            div()
+                                .id(FADE_RIGHT)
+                                .test_support()
+                                .absolute()
+                                .right_0()
+                                .top_0()
+                                .bottom_0()
+                                .w_6()
+                                .bg(linear_gradient(
+                                    90.,
+                                    linear_color_stop(background.opacity(0.), 0.),
+                                    linear_color_stop(background, 1.),
+                                )),
+                        )
+                    })
                     // Over the strip, not inside it, so a plain wheel's vertical
                     // lines scroll the tabs sideways the way the kit's tab bars
                     // do; tab indices stay the strip's own children.
