@@ -2,7 +2,6 @@
 
 use gpui_kit::base::Tabs as SurfaceTabs;
 use gpui_kit::component::ActiveTheme as _;
-use gpui_kit::component::ThemeStyled as _;
 use gpui_kit::component::scroll::ScrollableMask;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -19,6 +18,7 @@ use crate::paths::AppPaths;
 use crate::review_view::ReviewView;
 use crate::settings_view::SettingsView;
 use crate::store::StoreModel;
+use crate::tab::Tab;
 use crate::upload::UploadModel;
 use crate::upload_view::UploadView;
 use sync_core::connection::{ConnectionState, ServerProfile};
@@ -732,9 +732,6 @@ impl AppShell {
     fn switch(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let (background, border) = (theme.background, theme.border);
-        let (primary, primary_foreground) = (theme.primary, theme.primary_foreground);
-        let (foreground, muted_foreground) = (theme.foreground, theme.muted_foreground);
-        let (accent, radius) = (theme.accent, theme.radius);
         // The focus handles are claimed first: the tab loop below needs `cx` for
         // its listeners, and a tab's handle has to outlive that borrow.
         let focus: Vec<FocusHandle> = ViewMode::ALL
@@ -791,42 +788,18 @@ impl AppShell {
         let mut tabs = Vec::with_capacity(ViewMode::ALL.len());
         for (ix, (mode, focus)) in ViewMode::ALL.iter().zip(&focus).enumerate() {
             let mode = *mode;
-            let selected = mode == self.mode;
             tabs.push(
-                div()
-                    .id(mode.nav_id())
-                    .test_support()
-                    .role(Role::Tab)
-                    .aria_label(mode.label())
-                    // Both states are always reported, so a tab that is not the
-                    // surface on screen says so instead of saying nothing.
-                    .aria_selected(selected)
-                    .aria_position_in_set(ix + 1)
-                    .aria_size_of_set(ViewMode::ALL.len())
-                    .track_focus(focus)
-                    .on_click(cx.listener(move |this, _, _, cx| this.show(mode, cx)))
-                    .flex()
-                    .items_center()
-                    .px_3()
-                    .py_1()
-                    .rounded(radius)
-                    .text_sm()
-                    .text_color(if selected {
-                        primary_foreground
-                    } else {
-                        muted_foreground
-                    })
-                    .when(selected, |tab| {
-                        tab.bg(primary).font_weight(FontWeight::SEMIBOLD)
-                    })
-                    .when(!selected, |tab| {
-                        tab.hover(move |style| style.bg(accent).text_color(foreground))
-                    })
-                    .when(focus.is_focused(window), |tab| {
-                        tab.focus_ring_style(window, cx)
-                    })
-                    .child(mode.label())
-                    .into_any_element(),
+                Tab::new(
+                    mode.nav_id(),
+                    mode.label(),
+                    mode == self.mode,
+                    focus,
+                    ix + 1,
+                    ViewMode::ALL.len(),
+                )
+                .render(window, cx)
+                .on_click(cx.listener(move |this, _, _, cx| this.show(mode, cx)))
+                .into_any_element(),
             );
         }
 

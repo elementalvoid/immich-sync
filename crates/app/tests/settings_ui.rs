@@ -656,7 +656,7 @@ async fn keyboard_walks_every_page_and_every_control(cx: &mut TestAppContext) {
             assert_eq!(
                 window.find(PAGE_BUTTONS[page]).focused(),
                 Some(true),
-                "the keyboard reaches page {page}'s button"
+                "the keyboard reaches page {page}'s tab"
             );
             window.press("enter", cx);
             draw(window, cx);
@@ -2542,7 +2542,7 @@ const PAGE_STORAGE: usize = 5;
 /// The number of settings pages.
 const PAGE_COUNT: usize = 6;
 
-/// The page strip's buttons, in the order the surface lists them.
+/// The page strip's tabs, in the order the surface lists them.
 const PAGE_BUTTONS: [&str; PAGE_COUNT] = [
     "settings-page-connection",
     "settings-page-general",
@@ -2552,7 +2552,7 @@ const PAGE_BUTTONS: [&str; PAGE_COUNT] = [
     "settings-page-storage",
 ];
 
-/// The name each page button carries, which is the page's own name.
+/// The name each page tab carries, which is the page's own name.
 const PAGE_TITLES: [&str; PAGE_COUNT] = [
     "Connection",
     "General",
@@ -2828,12 +2828,12 @@ fn every_settings_row_is_named_and_explained_on_its_own_page(cx: &mut TestAppCon
 
     cx.update_window(window, |_, window, cx| {
         draw(window, cx);
-        // Each page's own button names it, and the kit's sidebar is not drawn:
+        // Each page's own tab names it, and the kit's sidebar is not drawn:
         // one page switch, not two (N3, S5).
         for (page, id) in PAGE_BUTTONS.iter().enumerate() {
             let button = window
                 .try_find(*id)
-                .unwrap_or_else(|| panic!("page {page} has no button"));
+                .unwrap_or_else(|| panic!("page {page} has no tab"));
             assert_eq!(
                 button.label(),
                 Some(PAGE_TITLES[page]),
@@ -2878,6 +2878,79 @@ fn every_settings_row_is_named_and_explained_on_its_own_page(cx: &mut TestAppCon
         }
     })
     .expect("walk the settings pages");
+}
+
+/// #78: the strip is a tab list, and every page reports whether it is the page
+/// on screen, so the selection reaches assistive technology and not only the
+/// eye. It is the word #75's surface switch above it uses, because these are
+/// the pages of one surface, not a set of toggles.
+#[gpui_kit::test]
+fn the_page_strip_reports_every_page_as_a_tab_and_the_selected_one(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let store = SettingsStore::open(paths.config_file.clone());
+    let window = open_settings(cx, store, paths, FakeAutostart::new());
+
+    cx.update_window(window, |_, window, cx| {
+        draw(window, cx);
+        for shown in 0..PAGE_COUNT {
+            open_page(window, shown, cx);
+            for (page, id) in PAGE_BUTTONS.iter().enumerate() {
+                let tab = window.find(*id);
+                assert_eq!(tab.role(), Some(Role::Tab), "{id} is announced as a tab");
+                assert_eq!(
+                    tab.label(),
+                    Some(PAGE_TITLES[page]),
+                    "{id} is announced by its page's name"
+                );
+                assert_eq!(
+                    tab.selected(),
+                    Some(page == shown),
+                    "{id} reports whether page {shown} is the page on screen"
+                );
+            }
+        }
+    })
+    .expect("read the page strip");
+}
+
+/// #78: the kit's settings group always draws its resize handle, even with a
+/// zero-width sidebar, and 0.8.1 has no switch to leave it out. The handle is
+/// therefore covered rather than left live under the pointer: the band paints
+/// nothing and, because the cover occludes, it never offers a resize cursor for
+/// a drag that resizes nothing.
+#[gpui_kit::test]
+fn the_dead_resize_handle_is_covered_instead_of_left_live(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let store = SettingsStore::open(paths.config_file.clone());
+    let window = open_settings(cx, store, paths, FakeAutostart::new());
+
+    cx.update_window(window, |_, window, cx| {
+        draw(window, cx);
+        let surface = window.find("settings-scroll").bounds();
+        let inside_page = surface.left() + px(16.);
+        let handle = window.find(("resizable-handle", 0usize));
+        let cover = window.find("settings-handle-cover");
+        assert!(
+            handle.bounds().left() < inside_page && handle.bounds().right() > inside_page,
+            "the kit's handle straddles the page's left edge: {:?}",
+            handle.bounds()
+        );
+        assert!(
+            cover.bounds().left() <= inside_page
+                && cover.bounds().right() >= handle.bounds().right()
+                && cover.bounds().size.height >= handle.bounds().size.height,
+            "the cover spans the handle's inside part: {:?} vs {:?}",
+            cover.bounds(),
+            handle.bounds()
+        );
+        assert!(
+            cover.bounds().right() < window.find("settings-server-url").bounds().left(),
+            "the cover stays in the page's padding, clear of the first control"
+        );
+    })
+    .expect("read the settings body");
 }
 
 /// #78: the search field is a named, keyboard-reachable control.
@@ -2991,9 +3064,10 @@ fn search_matches_the_help_sentence_and_an_empty_result_says_so(cx: &mut TestApp
 }
 
 /// #78: at the narrowest supported window, in both themes, every row of every
-/// page is reachable and keeps its control inside the surface.
+/// page is reachable and keeps its control inside its group.
 ///
-/// The extra 780x480 pass measures the tight band just above the component's
+/// 520×480 is the shell's minimum window (`shell::main_window_options`). The
+/// extra 780×480 pass measures the tight band just above the component's
 /// stacking breakpoint, where a long label word and a fixed-width field are
 /// closest to not fitting.
 #[gpui_kit::test]
@@ -3001,12 +3075,9 @@ fn every_page_lays_out_its_rows_at_the_narrowest_window_in_both_themes(cx: &mut 
     cx.update(gpui_kit::init);
     let temp = tempfile::tempdir().expect("create a temp dir");
     let paths = temporary_paths(temp.path());
-    // 720x480 is the shell's minimum window; 780x480 is the tight band just
-    // above the component's stacking breakpoint, where the label column and a
-    // fixed-width field are closest to not fitting.
     for (window_size, system) in [
-        ((720., 480.), theme::SystemTheme::Light),
-        ((720., 480.), theme::SystemTheme::Dark),
+        ((520., 480.), theme::SystemTheme::Light),
+        ((520., 480.), theme::SystemTheme::Dark),
         ((780., 480.), theme::SystemTheme::Light),
     ] {
         cx.update(|cx| theme::apply_system_theme(system, cx));
@@ -3016,6 +3087,19 @@ fn every_page_lays_out_its_rows_at_the_narrowest_window_in_both_themes(cx: &mut 
             tab_to(window, "nav-settings", cx);
             window.press("enter", cx);
             draw(window, cx);
+            // The page body's group is inset by the surface's own `p_4` and the
+            // list's `px_4`, so this is the edge every row and control stays
+            // inside.
+            let surface = window.find("settings-scroll").bounds();
+            let group_right = surface.right() - px(32.);
+            for id in PAGE_BUTTONS {
+                let tab = window.find(id);
+                assert!(
+                    tab.bounds().right() <= surface.right() - px(16.) + px(1.),
+                    "{window_size:?} {system:?}: {id} overflows the surface: {:?} vs {surface:?}",
+                    tab.bounds()
+                );
+            }
             for page in 0..PAGE_COUNT {
                 open_page(window, page, cx);
                 for pin in ROWS.iter().filter(|pin| pin.page == page) {
@@ -3028,8 +3112,8 @@ fn every_page_lays_out_its_rows_at_the_narrowest_window_in_both_themes(cx: &mut 
                     let surface = window.find("settings-scroll").bounds();
                     assert!(
                         row.bounds().left() >= surface.left() - px(1.)
-                            && row.bounds().right() <= surface.right() + px(1.),
-                        "{window_size:?} {system:?}: {} overflows the surface: {:?} vs {surface:?}",
+                            && row.bounds().right() <= group_right + px(1.),
+                        "{window_size:?} {system:?}: {} overflows its group: {:?} vs {surface:?}",
                         pin.id,
                         row.bounds()
                     );
@@ -3040,8 +3124,8 @@ fn every_page_lays_out_its_rows_at_the_narrowest_window_in_both_themes(cx: &mut 
                         pin.help_id
                     );
                     assert!(
-                        control.right() <= surface.right() + px(1.),
-                        "{window_size:?} {system:?}: {} clips its control: {control:?} vs {surface:?}",
+                        control.right() <= group_right + px(1.),
+                        "{window_size:?} {system:?}: {} past its group edge: {control:?} vs {group_right:?}",
                         pin.help_id
                     );
                     // A row wrapper that fits can still overflow its own text

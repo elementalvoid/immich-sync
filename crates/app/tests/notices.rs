@@ -2,8 +2,8 @@
 //!
 //! Three properties are read off a real dashboard window: a notice is announced
 //! once, its severity reaches the reader in words and not only through the
-//! accent colour, and a long quoted path wraps instead of clipping at the
-//! shell's smallest window.
+//! accent colour, and a long quoted path wraps instead of clipping at a
+//! window narrow enough to squeeze the card.
 
 mod common;
 
@@ -17,7 +17,8 @@ use gpui_kit::{
 use immich_sync::dashboard::Dashboard;
 use immich_sync::status::{DashboardModel, sample};
 
-/// The shell's smallest window, where a notice is widest relative to its card.
+/// A 720×480 window: the shell's smallest is 520×480 (#75), and at 720 the
+/// notice is still wide relative to its card.
 const NARROWEST: (f32, f32) = (720., 480.);
 
 /// A path long enough to wrap the card's notice onto several lines at 720.

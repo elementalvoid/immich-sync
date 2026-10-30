@@ -17,9 +17,9 @@ use crate::logging::LogLevel;
 use crate::notice::{Notice, Severity};
 use crate::paths::AppPaths;
 use crate::settings::{Settings, SettingsStore};
+use crate::tab::Tab;
 
 use gpui_kit::base::ObservedElement;
-use gpui_kit::base::Selectable as _;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState, NumberInput};
@@ -38,8 +38,8 @@ use sync_core::tags::{BackfillStatus, SYNC_TAG, TagStatus};
 /// one byte.
 pub const BYTES_PER_MEGABYTE: u64 = 1_000_000;
 
-/// One settings page: the element id of the button that opens it, its name, and
-/// the sentence under the name.
+/// One settings page: the element id of the tab that opens it, its name, and the
+/// sentence under the name.
 struct Page {
     id: &'static str,
     title: &'static str,
@@ -47,7 +47,7 @@ struct Page {
 }
 
 /// The pages, in the order the surface lists them. The page strip and the page
-/// a button opens read the same entry, so a name cannot drift from its button.
+/// a tab opens read the same entry, so a name cannot drift from its tab.
 const PAGES: [Page; 6] = [
     Page {
         id: "settings-page-connection",
@@ -888,24 +888,37 @@ impl SettingsView {
             )
     }
 
-    /// The page strip: one button per page, the same shape as the shell's own
-    /// view switch.
+    /// The page strip: one tab per page, the shell's own view switch and this
+    /// strip draw the same element (#75, #78).
     ///
     /// A kit sidebar entry has no focus handle and no key binding, so the strip
     /// is the only keyboard path between the pages (#78).
-    fn page_strip(&self, selected: usize, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn page_strip(
+        &self,
+        selected: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
         let mut strip = div().flex().flex_row().flex_wrap().items_center().gap_1();
         for (ix, page) in PAGES.iter().enumerate() {
-            let active = ix == selected;
-            let button = Button::new(page.id).label(page.title).selected(active);
-            // The page the surface shows is prominent; the others are quiet.
-            let button = if active {
-                button.primary()
-            } else {
-                button.ghost()
-            };
-            strip = strip
-                .child(button.on_click(cx.listener(move |this, _, _, cx| this.show_page(ix, cx))));
+            // The handles are claimed in the loop that needs `cx` for its
+            // listeners, so each one is read out before that borrow.
+            let focus = window
+                .use_keyed_state(page.id, cx, |_, cx| cx.focus_handle().tab_stop(true))
+                .read(cx)
+                .clone();
+            strip = strip.child(
+                Tab::new(
+                    page.id,
+                    page.title,
+                    ix == selected,
+                    &focus,
+                    ix + 1,
+                    PAGES.len(),
+                )
+                .render(window, cx)
+                .on_click(cx.listener(move |this, _, _, cx| this.show_page(ix, cx))),
+            );
         }
         strip
     }
@@ -1093,7 +1106,7 @@ impl SettingsView {
             }
         }));
         let method = self.auth_method;
-        Row::setting(
+        Row::stacked(
             "Credential",
             "A password for the account, or an API key from Immich.",
             move |_, _| {
@@ -1378,7 +1391,7 @@ impl SettingsView {
         let focus = input.read(cx).focus_handle(cx);
         let muted = cx.theme().muted_foreground;
         let unit = key.unit();
-        Some(Row::setting(key.label(), key.help(), move |_, _| {
+        Some(Row::stacked(key.label(), key.help(), move |_, _| {
             div()
                 .id(key.id())
                 .test_support()
@@ -1430,7 +1443,7 @@ impl Render for SettingsView {
             .iter()
             .position(|(index, _)| *index == shown)
             .unwrap_or(0);
-        let strip = self.page_strip(shown, cx);
+        let strip = self.page_strip(shown, window, cx);
         let body = if pages.is_empty() {
             div()
                 .flex_1()
@@ -1442,9 +1455,10 @@ impl Render for SettingsView {
                 .flex_1()
                 .min_h_0()
                 .w_full()
+                .relative()
                 // The component's sidebar is collapsed to nothing but still draws
-                // its drag handle, a hairline one pixel inside this box: the
-                // inset and the clip take it out of the surface.
+                // its resize handle, half of it inside this box; see
+                // `handle_cover`.
                 .pl(px(1.))
                 .overflow_hidden()
                 .child(RenderOnce::render(
@@ -1461,6 +1475,7 @@ impl Render for SettingsView {
                     window,
                     cx,
                 ))
+                .child(handle_cover(background))
                 .into_any_element()
         };
 
@@ -1613,6 +1628,27 @@ fn page(index: usize, groups: Vec<Option<SettingGroup>>) -> Option<SettingPage> 
             .description(page.description)
             .groups(groups),
     )
+}
+
+/// Covers the resize handle the kit's settings group draws with a zero-width
+/// sidebar.
+///
+/// `Settings` always builds its resizable group's handle, and 0.8.1 has no
+/// option to leave the sidebar or its handle out. Drawn over the band, the
+/// handle paints nothing, receives no pointer and never offers a resize cursor
+/// for a drag that resizes nothing. The cover sits in the page's own left
+/// padding, clear of every control.
+fn handle_cover(background: Hsla) -> impl IntoElement {
+    div()
+        .id("settings-handle-cover")
+        .test_support()
+        .occlude()
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .left_0()
+        .w(px(9.))
+        .bg(background)
 }
 
 /// One read-only storage row (R9).
