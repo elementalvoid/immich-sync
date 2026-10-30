@@ -17,6 +17,7 @@ use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_kit::*;
 
 use crate::dashboard::CardPalette;
+use crate::empty_state::EmptyState;
 use crate::logging::{self, LogLevel, TAIL_LINES};
 use crate::notice::{Notice, Severity};
 use crate::settings_view::{SettingsView, field_text, filling_section, section};
@@ -503,14 +504,21 @@ impl LogsView {
             );
         }
         if self.lines.is_empty() {
+            // #77: the tail's empty state, and the one step it can carry out
+            // from where the reader notices it is empty.
             body.push(
-                div()
-                    .id("logs-empty")
-                    .test_support()
-                    .text_xs()
-                    .text_color(palette.meta)
-                    .child("No log lines yet.")
-                    .into_any_element(),
+                EmptyState::new(
+                    "logs-empty",
+                    "No log lines yet.",
+                    "Lines appear as the client works.",
+                )
+                .action(
+                    Button::new("logs-empty-refresh")
+                        .label("Refresh")
+                        .accessibility_label("Refresh the log lines")
+                        .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx))),
+                )
+                .into_any_element(),
             );
         } else {
             let lines: Vec<AnyElement> = self

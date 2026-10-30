@@ -8,6 +8,7 @@ pub mod dashboard;
 pub mod debug_bundle;
 pub mod diagnostics;
 pub mod diagnostics_view;
+mod empty_state;
 pub mod engine;
 pub mod failed;
 pub mod failed_view;

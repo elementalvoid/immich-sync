@@ -24,6 +24,22 @@ use sync_core::failure::FailureClass;
 use sync_core::hash::Sha1;
 use sync_core::store::{AlbumScope, ItemRecord, ItemState, SourceFolder, StateStore};
 
+/// The sentence the empty list explains itself with (#77).
+const EMPTY_DESCRIPTION: &str = "A file the client gives up on appears here, with the reason.";
+
+/// How many observed elements announce `text`: as a name, as a value, or as the
+/// description a screen reader reads after the name.
+fn announced(window: &Window, text: &str) -> usize {
+    snapshots(window)
+        .into_iter()
+        .filter(|element| {
+            element.label() == Some(text)
+                || element.value() == Some(text)
+                || element.description() == Some(text)
+        })
+        .count()
+}
+
 /// The path layout the other app tests use, so the view gets a temp database.
 fn temporary_paths(dir: &Path) -> AppPaths {
     AppPaths {
@@ -506,10 +522,21 @@ async fn choosing_a_folder_narrows_the_list_its_summary_and_its_empty_state(
         );
         window.click("failed-folder-option-2", cx);
         window.render_frame(cx);
+        let empty = window.find("failed-empty");
         assert_eq!(
-            window.find("failed-empty").label(),
+            empty.label(),
             Some("No failed items in Videos"),
             "the empty state names the folder the filter shows"
+        );
+        assert_eq!(
+            empty.description(),
+            Some(EMPTY_DESCRIPTION),
+            "#77: the filtered state explains the list in the same words as before"
+        );
+        assert_eq!(
+            announced(window, "Nothing has failed"),
+            0,
+            "#77: an empty filtered list never claims the whole client is empty"
         );
         assert_eq!(
             window.find("failed-summary").label(),
@@ -534,6 +561,68 @@ async fn choosing_a_folder_narrows_the_list_its_summary_and_its_empty_state(
         );
     })
     .expect("read the filtered failed-items view");
+}
+
+#[gpui_kit::test]
+async fn the_empty_list_is_one_status_and_offers_nothing_to_retry(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    seed_folder(&paths, &temp.path().join("Camera Roll"), true);
+    let (window, _view) = open_failed_view(cx, &paths);
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let empty = window.find("failed-empty");
+        assert_eq!(
+            empty.label(),
+            Some("Nothing has failed"),
+            "#77: the unfiltered list states what has failed"
+        );
+        assert_eq!(
+            empty.description(),
+            Some(EMPTY_DESCRIPTION),
+            "#77: the explanation is announced after the title, not instead of it"
+        );
+        assert_eq!(
+            empty.role(),
+            Some(Role::Status),
+            "#77: the empty state is a status for assistive technology"
+        );
+        assert!(
+            empty.visible(),
+            "#77: the empty state is on screen: {empty:?}"
+        );
+        assert_eq!(
+            announced(window, "Nothing has failed"),
+            1,
+            "#77: the title is announced once: {}",
+            registered(window)
+        );
+        assert_eq!(
+            announced(window, EMPTY_DESCRIPTION),
+            1,
+            "#77: the explanation is announced once: {}",
+            registered(window)
+        );
+        assert!(
+            window
+                .try_find((ElementId::from("failed-empty"), "action"))
+                .is_none(),
+            "#77: with no row to retry the empty state offers no action"
+        );
+    })
+    .expect("read the empty failed-items view");
+}
+
+/// Every observed element that announces `text`, for a failure message.
+fn registered(window: &Window) -> String {
+    snapshots(window)
+        .iter()
+        .filter(|element| element.label().is_some() || element.value().is_some())
+        .map(|element| format!("{:?} {:?}", element.role(), element.path()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[gpui_kit::test]

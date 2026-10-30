@@ -13,9 +13,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use gpui_kit::base::TextSelection;
+use gpui_kit::base::test_support::snapshots;
 use gpui_kit::test::{ElementSnapshot, TestWindowExt as _};
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, Bounds, ClipboardItem, ElementId, Entity, Point,
+    AnyWindowHandle, App, AppContext as _, Bounds, ClipboardItem, ElementId, Entity, Point, Role,
     ScrollDelta, TestAppContext, Window, WindowBounds, WindowOptions, point, px, size,
 };
 use immich_sync::autostart::{Autostart, UnavailableAutostart};
@@ -66,6 +67,22 @@ fn window_options_at(width: f32, height: f32) -> WindowOptions {
         })),
         ..Default::default()
     }
+}
+
+/// The sentence the empty tail explains itself with (#77).
+const EMPTY_DESCRIPTION: &str = "Lines appear as the client works.";
+
+/// How many observed elements announce `text`: as a name, as a value, or as the
+/// description a screen reader reads after the name.
+fn announced(window: &Window, text: &str) -> usize {
+    snapshots(window)
+        .into_iter()
+        .filter(|element| {
+            element.label() == Some(text)
+                || element.value() == Some(text)
+                || element.description() == Some(text)
+        })
+        .count()
 }
 
 fn autostart() -> Rc<dyn Autostart> {
@@ -238,6 +255,99 @@ fn settle(cx: &mut TestAppContext, window: AnyWindowHandle) {
 fn tick_live(cx: &mut TestAppContext, window: AnyWindowHandle) {
     cx.executor().advance_clock(LIVE_TAIL_POLL);
     settle(cx, window);
+}
+
+#[gpui_kit::test]
+async fn an_empty_tail_is_one_status_inside_the_narrowest_window(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let store = SettingsStore::open(paths.config_file.clone());
+    // 520x480 is the shell's smallest window (#75).
+    let (window, _shell) = open_shell_at(cx, store, paths, (520., 480.));
+
+    show_logs(cx, window);
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let empty = window.find("logs-empty");
+        assert_eq!(
+            empty.label(),
+            Some("No log lines yet."),
+            "#77: the empty tail states what it shows"
+        );
+        assert_eq!(
+            empty.description(),
+            Some(EMPTY_DESCRIPTION),
+            "#77: the explanation is announced after the title, not instead of it"
+        );
+        assert_eq!(
+            empty.role(),
+            Some(Role::Status),
+            "#77: the empty tail is a status for assistive technology"
+        );
+        assert!(
+            empty.visible(),
+            "#77: the empty tail is on screen: {empty:?}"
+        );
+        assert_eq!(
+            announced(window, "No log lines yet."),
+            1,
+            "#77: the title is announced once"
+        );
+        assert_eq!(
+            announced(window, EMPTY_DESCRIPTION),
+            1,
+            "#77: the explanation is announced once"
+        );
+        // The narrowest window must not clip the state it is showing.
+        let size = window.viewport_size();
+        assert!(
+            empty.bounds().right() <= size.width && empty.bounds().bottom() <= size.height,
+            "#77: the empty tail stays inside {size:?}: {:?}",
+            empty.bounds()
+        );
+        assert!(
+            window
+                .try_find((ElementId::from("logs-empty"), "action"))
+                .is_some(),
+            "#77: the empty tail offers the one step it can honour"
+        );
+    })
+    .expect("read the empty logs view");
+}
+
+#[gpui_kit::test]
+async fn an_empty_tail_is_re_read_from_where_it_is_shown(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let store = SettingsStore::open(paths.config_file.clone());
+    let (window, _shell) = open_shell(cx, store, paths.clone());
+
+    show_logs(cx, window);
+    cx.update_window(window, |_, window, cx| {
+        assert!(window.find("logs-empty").visible(), "the tail starts empty");
+        assert_eq!(
+            window.find("logs-empty-refresh").label(),
+            Some("Refresh the log lines"),
+            "the empty tail's one action is named"
+        );
+        write_log(&paths, &["the first line ever written"]);
+        window.click("logs-empty-refresh", cx);
+    })
+    .expect("update the shell window");
+
+    settle(cx, window);
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(
+            window.find("logs-line-0").label(),
+            Some("the first line ever written"),
+            "the empty tail's action re-reads the file"
+        );
+        assert!(
+            window.try_find("logs-empty").is_none(),
+            "and the empty state clears with it"
+        );
+    })
+    .expect("update the shell window");
 }
 
 #[test]
