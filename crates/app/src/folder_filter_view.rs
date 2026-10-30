@@ -63,7 +63,7 @@ pub fn folder_filter_bar(
         .items_center()
         .gap_2()
         .child(
-            div().w(px(200.)).flex_shrink_0().child(
+            div().w_48().flex_shrink_0().child(
                 Select::new(&choices)
                     .id(format!("{prefix}-folder-filter"))
                     .accessibility_label("Folder filter")
@@ -227,7 +227,7 @@ struct FolderChoice {
     /// What the row and the trigger show: the folder's name, not its path.
     label: SharedString,
     /// The accessible name: the full path, because two source folders can share
-    /// a leaf name, and what the choice means when it is the current one.
+    /// a leaf name.
     accessible: SharedString,
 }
 
@@ -281,52 +281,55 @@ impl SearchableListDelegate for FolderChoices {
 
     /// The row the kit paints for each choice.
     ///
-    /// The kit's default row is text only, so the accessible name and the check
-    /// that marks the current choice are supplied here. The name says
-    /// "selected" as well as drawing the check, so the state is never colour
-    /// alone.
+    /// The kit's default row is text only, so the accessible name and the state
+    /// of the current choice are supplied here. `checked` is the committed
+    /// selection, so it is reported as `aria_selected` rather than written into
+    /// the name, and drawn as heavier weight on the label, so the state is never
+    /// colour alone.
     fn render_item(
         &self,
         ix: IndexPath,
         item: &Self::Item,
         checked: bool,
         _window: &mut Window,
-        cx: &mut App,
+        _cx: &mut App,
     ) -> Option<AnyElement> {
         let id = format!("{}-folder-option-{}", self.prefix, ix.row);
-        let accessible = if checked {
-            format!("{}, selected", item.accessible)
-        } else {
-            item.accessible.to_string()
-        };
         Some(
             div()
                 .id(id.clone())
                 .test_support()
                 .role(Role::ListBoxOption)
-                .aria_label(accessible)
+                .aria_label(item.accessible.clone())
+                .aria_selected(checked)
                 .flex()
                 .flex_row()
                 .items_center()
-                .justify_between()
                 .gap_2()
                 .w_full()
                 .min_w_0()
-                .child(div().min_w_0().truncate().child(item.label.clone()))
-                .when(checked, |this| {
-                    // A word, not the component family's checkmark: this
-                    // application installs no icon assets, so an icon would
-                    // draw nothing. The name says it too, for the same reason.
-                    this.child(
-                        div()
-                            .id(format!("{id}-selected"))
-                            .test_support()
-                            .flex_shrink_0()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("Selected"),
-                    )
-                })
+                .child(
+                    div()
+                        // The id carries the state, so a headless test can prove
+                        // the marker below is drawn as well as reported: weight
+                        // alone is not observable without pixels.
+                        .id(if checked {
+                            format!("{id}-selected")
+                        } else {
+                            format!("{id}-label")
+                        })
+                        .test_support()
+                        .min_w_0()
+                        .truncate()
+                        .when(checked, |label| {
+                            // The design guides' selected row: the item's own
+                            // surface carries the state. Weight needs no icon
+                            // assets, so it draws until #86 registers them; the
+                            // kit's checkmark can join it then.
+                            label.font_weight(FontWeight::SEMIBOLD)
+                        })
+                        .child(item.label.clone()),
+                )
                 .into_any_element(),
         )
     }

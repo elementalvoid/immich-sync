@@ -486,8 +486,18 @@ async fn the_failed_view_offers_every_source_folder_under_all_folders(cx: &mut T
         );
         assert_eq!(
             window.find("failed-folder-option-0").label(),
-            Some("Show items from all folders, selected"),
-            "#79: all folders is a choice of the list, and the current one says so"
+            Some("Show items from all folders"),
+            "#79: the name says what the choice does; its state is not part of it"
+        );
+        assert_eq!(
+            window.find("failed-folder-option-0").selected(),
+            Some(true),
+            "#79: the current choice reports itself as selected, so a screen reader gets the state"
+        );
+        assert_eq!(
+            window.find("failed-folder-option-1").selected(),
+            Some(false),
+            "#79: every option reports the state, so an unchecked one says it is unchecked"
         );
         assert!(
             window.try_find("failed-folder-option-0-selected").is_some(),
@@ -828,6 +838,61 @@ async fn the_view_opens_with_a_folder_already_selected(cx: &mut TestAppContext) 
         );
     })
     .expect("read the selected folder");
+}
+
+/// #79 S4: a folder that is no longer a source folder is no longer offered as a
+/// choice, and the filter that names it still filters instead of quietly
+/// listing everything.
+#[gpui_kit::test]
+async fn a_folder_that_is_no_longer_a_source_folder_still_filters(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    // `gone` was a source folder when the filter was chosen; it is not one now.
+    let gone = temp.path().join("Gone");
+    seed_folder(&paths, &photos, true);
+    failed_under(&paths, &photos.join("IMG_0001.jpg"));
+    failed_under(&paths, &gone.join("IMG_0002.jpg"));
+    let (window, view) = open_failed_view(cx, &paths);
+    wait_for_rows(cx, window, 2).await;
+
+    let selected = gone.display().to_string();
+    cx.update(|cx| {
+        view.update(cx, |view, cx| view.select_folder(selected.clone(), cx));
+    });
+    cx.update_window(window, |_, window, cx| window.render_frame(cx))
+        .expect("render the selected folder");
+
+    assert_eq!(
+        failed_count(cx, window),
+        1,
+        "the folder still narrows the list, so it does not list every item"
+    );
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("failed-folder-chip").label(),
+            Some("Showing Gone")
+        );
+        assert_eq!(
+            window.find("failed-folder-filter").value(),
+            Some("Gone"),
+            "#79: the control still names the folder the list is narrowed to"
+        );
+        window.within("failed-folder-filter").click("input", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("failed-folder-option-1").label(),
+            Some(format!("Show only {}", photos.display()).as_str()),
+            "the list holds only the folder that is still a source folder"
+        );
+        assert!(
+            window.try_find("failed-folder-option-2").is_none(),
+            "a folder that is no longer a source folder is not offered as a choice"
+        );
+    })
+    .expect("read the stale filter");
 }
 
 /// The rows the rendered view holds, counted from `window`'s element tree.
