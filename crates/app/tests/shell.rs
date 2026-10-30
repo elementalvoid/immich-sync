@@ -845,3 +845,68 @@ fn the_minimum_window_comes_from_the_surfaces_not_the_tab_row(cx: &mut TestAppCo
         .expect("lay out the surface at the minimum");
     }
 }
+
+/// #75: a surface switched from outside the switch — the environment-variable
+/// pin, About, a folder-detail link — shows its tab too. At a window narrower
+/// than the seven labels the strip has to scroll itself to it, or the switch
+/// would point at one surface while showing another.
+#[gpui_kit::test]
+fn a_surface_shown_from_outside_the_switch_brings_its_tab_into_sight(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let (window, shell) = open_shell_at(cx, &paths, (420., 600.));
+
+    // The last tab, the one that starts out of sight.
+    cx.update(|cx| shell.update(cx, |shell, cx| shell.show(ViewMode::Diagnostics, cx)));
+    cx.update_window(window, |_, window, cx| {
+        // The strip applies a scroll in the frame after its own layout, which
+        // is what a running window does on the next paint.
+        for _ in 0..3 {
+            window.render_frame(cx);
+        }
+        let strip = window.find(STRIP).bounds();
+        let tab = window.find("nav-diagnostics").bounds();
+        assert!(
+            f32::from(tab.origin.x) >= f32::from(strip.origin.x) - 0.5
+                && f32::from(tab.origin.x + tab.size.width)
+                    <= f32::from(strip.origin.x + strip.size.width) + 0.5,
+            "the strip scrolled to the surface it shows: {tab:?} in {strip:?}"
+        );
+    })
+    .expect("read the switch");
+}
+
+/// #75: narrowing the window re-clips the strip around what is left of it, so
+/// the surface on screen scrolls back into sight instead of vanishing off the
+/// strip's edge.
+#[gpui_kit::test]
+fn narrowing_the_window_keeps_the_shown_surface_on_the_strip(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    // Wide enough for all seven labels, so the tab starts in sight.
+    let (window, shell) = open_shell(cx, &paths);
+    cx.update(|cx| shell.update(cx, |shell, cx| shell.show(ViewMode::Diagnostics, cx)));
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.find("nav-diagnostics").visible(),
+            "the last tab starts in sight at 1200 px"
+        );
+    })
+    .expect("show the last surface");
+    cx.simulate_window_resize(window, size(px(420.), px(600.)));
+    cx.update_window(window, |_, window, cx| {
+        for _ in 0..3 {
+            window.render_frame(cx);
+        }
+        let strip = window.find(STRIP).bounds();
+        let tab = window.find("nav-diagnostics").bounds();
+        assert!(
+            f32::from(tab.origin.x) >= f32::from(strip.origin.x) - 0.5
+                && f32::from(tab.origin.x + tab.size.width)
+                    <= f32::from(strip.origin.x + strip.size.width) + 0.5,
+            "the strip scrolled the shown surface back into sight: {tab:?} in {strip:?}"
+        );
+    })
+    .expect("narrow the window");
+}

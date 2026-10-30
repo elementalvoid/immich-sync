@@ -499,9 +499,19 @@ pub struct AppShell {
     /// clipping its tabs, so the tab of the surface on screen has to be brought
     /// into sight at a narrow window (#75).
     nav_scroll: ScrollHandle,
-    /// The tab the switch last revealed. Compared against, so a frame that only
-    /// repaints does not undo the user's own scrolling.
-    revealed: Option<usize>,
+    /// The tab the switch still owes the user a look at, and how many frames it
+    /// has asked for. A reveal needs the strip's own layout, which arrives a
+    /// frame after the surface it follows.
+    reveal: Option<usize>,
+    reveal_tries: u8,
+    /// The tab that held the keyboard in the last frame, so a tab is only
+    /// scrolled to when the keyboard moves and not on every repaint, which
+    /// would undo the user's own scrolling.
+    focused_tab: Option<usize>,
+    /// The strip's width in the last frame. A resize re-clips it, and the
+    /// surface on screen must stay on it; a wheel does not, so the user's own
+    /// scrolling survives.
+    strip_width: Option<Pixels>,
     dashboard: Entity<Dashboard>,
     settings: Entity<SettingsView>,
     logs: Entity<LogsView>,
@@ -560,7 +570,10 @@ impl AppShell {
         let mut shell = Self {
             mode,
             nav_scroll: ScrollHandle::new(),
-            revealed: None,
+            reveal: None,
+            reveal_tries: 0,
+            focused_tab: None,
+            strip_width: None,
             dashboard,
             settings,
             logs,
@@ -572,9 +585,10 @@ impl AppShell {
             _connection_subscription: subscription,
             _dashboard_subscription: dashboard_subscription,
         };
-        // A pinned surface (#43) can be one of the last tabs, so the first frame
-        // already scrolls its tab into sight.
-        shell.reveal(shell.mode);
+        // A pinned surface (#43, #75) can be one of the last tabs, so the switch
+        // starts out owing it a look: at a narrow window its tab is past the
+        // strip's edge until the strip scrolls to it.
+        shell.want_tab(shell.mode);
         shell
     }
 
@@ -599,20 +613,34 @@ impl AppShell {
             // (R10.3).
             self.logs
                 .update(cx, |logs, cx| logs.set_visible(mode == ViewMode::Logs, cx));
-            self.reveal(mode);
+            self.want_tab(mode);
         }
         cx.notify();
     }
 
-    /// Scrolls the switch until `mode`'s tab is in sight.
+    /// Asks the switch to bring `mode`'s tab into sight.
     ///
     /// The strip scrolls rather than clips, so at a window too narrow for the
     /// seven labels the tab of the surface on screen could sit past the strip's
     /// edge; the tray, a pinned surface, and a folder-detail link all switch
-    /// without the pointer ever touching the switch (#75).
-    fn reveal(&mut self, mode: ViewMode) {
-        self.revealed = Some(mode.index());
-        self.nav_scroll.scroll_to_item(mode.index());
+    /// without the pointer ever touching the switch (#75). The scroll itself
+    /// waits for the strip's layout, which [`Self::switch`] applies.
+    fn want_tab(&mut self, mode: ViewMode) {
+        self.reveal = Some(mode.index());
+        self.reveal_tries = 0;
+    }
+
+    /// Whether the tab at `ix` lay wholly inside the strip in the last frame.
+    fn tab_in_sight(&self, ix: usize) -> bool {
+        let Some(tab) = self.nav_scroll.bounds_for_item(ix) else {
+            // The strip has not laid out yet, so nothing is known to be in
+            // sight.
+            return false;
+        };
+        let strip = self.nav_scroll.bounds();
+        let left = tab.origin.x + self.nav_scroll.offset().x;
+        let (strip_left, strip_right) = (strip.origin.x, strip.origin.x + strip.size.width);
+        left >= strip_left - px(0.5) && left + tab.size.width <= strip_right + px(0.5)
     }
 
     /// Opens a list view narrowed to one source folder (#41).
@@ -671,14 +699,41 @@ impl AppShell {
                     .clone()
             })
             .collect();
-        // A tab that holds the keyboard is scrolled into the strip. The strip
-        // clips what does not fit, and a clipped tab would clip its focus ring
-        // with it.
-        if let Some(ix) = focus.iter().position(|handle| handle.is_focused(window))
-            && self.revealed != Some(ix)
-        {
-            self.revealed = Some(ix);
-            self.nav_scroll.scroll_to_item(ix);
+        // The strip clips what does not fit, and a clipped tab clips its focus
+        // ring with it, so the tab the keyboard moved to is scrolled into sight.
+        let focused = focus.iter().position(|handle| handle.is_focused(window));
+        if focused != self.focused_tab {
+            self.focused_tab = focused;
+            if let Some(ix) = focused {
+                self.reveal = Some(ix);
+                self.reveal_tries = 0;
+            }
+        }
+        // A resize re-clips the strip around whatever the window now shows, so
+        // the tab of the surface on screen is brought back into sight.
+        let width = self.nav_scroll.bounds().size.width;
+        if self.strip_width != Some(width) {
+            self.strip_width = Some(width);
+            let shown = self.mode;
+            if !self.tab_in_sight(shown.index()) {
+                self.want_tab(shown);
+            }
+        }
+        // A scroll request is applied by the strip's own prepaint, and the strip
+        // does not know it overflows until it has laid out once, so the frame a
+        // surface changes in drops its request. Asking for the next frame is
+        // what turns the request into a scroll; the count stops a tab wider than
+        // the strip from asking forever.
+        if let Some(ix) = self.reveal {
+            if self.tab_in_sight(ix) || self.reveal_tries >= 3 {
+                self.reveal = None;
+                self.reveal_tries = 0;
+            } else {
+                self.nav_scroll.scroll_to_item(ix);
+                self.reveal_tries += 1;
+                let view = window.current_view();
+                window.on_next_frame(move |_, cx| cx.notify(view));
+            }
         }
 
         let mut tabs = Vec::with_capacity(ViewMode::ALL.len());
