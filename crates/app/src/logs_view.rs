@@ -7,6 +7,7 @@
 //! reads nothing.
 
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::Duration;
 
 use gpui_kit::base::{Disableable as _, SelectableText, TextSelection};
@@ -20,7 +21,8 @@ use crate::dashboard::CardPalette;
 use crate::empty_state::EmptyState;
 use crate::logging::{self, LogLevel, TAIL_LINES};
 use crate::notice::{Notice, Severity, copy_confirmation};
-use crate::settings_view::{SettingsView, field_text, filling_section, section};
+use crate::rows::{Row, mono_value_item, value_list};
+use crate::settings_view::{SettingsView, filling_section, section};
 
 /// How often the live tail re-reads the newest log file while the Logs surface
 /// is visible.
@@ -347,82 +349,60 @@ impl LogsView {
     }
 
     /// The log location and the refresh action.
-    fn location(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn location(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let palette = CardPalette::new(cx.theme());
-        let theme = cx.theme();
+        let mono = cx.theme().mono_font_family.clone();
         let current = self
             .current_file
             .clone()
             .unwrap_or_else(|| "No log file yet.".to_string());
-        let path_row = |id: &'static str,
-                        value_id: &'static str,
-                        label: &'static str,
-                        help: &'static str,
-                        value: String| {
-            div()
-                .id(id)
-                .test_support()
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .gap_6()
-                .min_h(rems(2.25))
-                .child(field_text(label, help, &palette))
-                .child(
-                    div().flex_1().min_w_0().text_right().child(
-                        // Wrapped, not truncated: the whole path stays visible.
-                        crate::a11y::named(Role::Label, value_id, value.clone(), None)
-                            .min_w_0()
-                            .font_family(theme.mono_font_family.clone())
-                            .text_xs()
-                            .text_color(palette.meta)
-                            .child(value),
+        let refresh = Rc::new(cx.listener(|this, _, window, cx| this.refresh(window, cx)));
+        // The two paths are read-only pairs, not label-and-control rows: the
+        // term column carries the label and the value column the path and its
+        // help, so the path wraps instead of truncating (#80's shape).
+        let paths = value_list(
+            "logs-path-values",
+            vec![
+                mono_value_item(
+                    "Log folder",
+                    Some("Resolved from the platform data directory."),
+                    "logs-path-directory-value",
+                    self.directory.display().to_string(),
+                    &palette,
+                    mono.clone(),
+                ),
+                mono_value_item(
+                    "Current file",
+                    Some(
+                        "Reads from the newest file. It follows the file while this surface is open.",
                     ),
-                )
-        };
+                    "logs-path-current-value",
+                    current,
+                    &palette,
+                    mono,
+                ),
+            ],
+        );
         section(
             "logs-location",
             "Log file",
             "Same directory as the state database. The file rotates and old files are pruned.",
             vec![
-                path_row(
-                    "logs-path-directory",
-                    "logs-path-directory-value",
-                    "Log folder",
-                    "Resolved from the platform data directory.",
-                    self.directory.display().to_string(),
-                )
-                .into_any_element(),
-                path_row(
-                    "logs-path-current",
-                    "logs-path-current-value",
-                    "Current file",
-                    "Reads from the newest file. It follows the file while this surface is open.",
-                    current,
-                )
-                .into_any_element(),
-                div()
-                    .id("logs-refresh-row")
-                    .test_support()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .gap_6()
-                    .min_h(rems(2.25))
-                    .child(field_text(
-                        "Refresh",
-                        "Re-reads the tail of the newest log file.",
-                        &palette,
-                    ))
-                    .child(
+                paths.into_any_element(),
+                Row::wrapped(
+                    "Refresh",
+                    "Re-reads the tail of the newest log file.",
+                    "logs-refresh-row",
+                    move |_, _| {
+                        let refresh = Rc::clone(&refresh);
                         Button::new("logs-refresh")
                             .label("Refresh")
                             .accessibility_label("Refresh the log lines")
-                            .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx))),
-                    )
-                    .into_any_element(),
+                            .on_click(move |event, window, cx| refresh(event, window, cx))
+                            .into_any_element()
+                    },
+                )
+                .render(window, cx),
             ],
             cx,
         )
@@ -472,26 +452,20 @@ impl LogsView {
     }
 
     /// The bounded tail of the newest log file.
-    fn lines_section(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme();
-        let palette = CardPalette::new(theme);
+    fn lines_section(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let palette = CardPalette::new(cx.theme());
+        let mono = cx.theme().mono_font_family.clone();
         let mut body: Vec<AnyElement> = Vec::with_capacity(3);
+        let copy_all = Rc::new(cx.listener(|this, _, _, cx| this.copy_all(cx)));
+        let nothing_to_copy = self.lines.is_empty();
+        let copies = self.copies;
         body.push(
-            div()
-                .id("logs-copy-row")
-                .test_support()
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .gap_6()
-                .min_h(rems(2.25))
-                .child(field_text(
-                    "Copy all",
-                    "Copies every line shown below, in order.",
-                    &palette,
-                ))
-                .child(
+            Row::wrapped(
+                "Copy all",
+                "Copies every line shown below, in order.",
+                "logs-copy-row",
+                move |_, _| {
+                    let copy_all = Rc::clone(&copy_all);
                     div()
                         .flex()
                         .flex_row()
@@ -500,16 +474,18 @@ impl LogsView {
                         // #82: the confirmation sits beside the control it
                         // belongs to, in the row, so it opens no surface and
                         // adds no row to the card's floor.
-                        .children(copy_confirmation("logs-copy-confirmation", self.copies))
+                        .children(copy_confirmation("logs-copy-confirmation", copies))
                         .child(
                             Button::new("logs-copy-all")
                                 .label("Copy all")
                                 .accessibility_label("Copy every displayed log line")
-                                .disabled(self.lines.is_empty())
-                                .on_click(cx.listener(|this, _, _, cx| this.copy_all(cx))),
-                        ),
-                )
-                .into_any_element(),
+                                .disabled(nothing_to_copy)
+                                .on_click(move |event, window, cx| copy_all(event, window, cx)),
+                        )
+                        .into_any_element()
+                },
+            )
+            .render(window, cx),
         );
         if let Some(problem) = &self.read_problem {
             body.push(
@@ -564,7 +540,7 @@ impl LogsView {
                     // tail must overflow and scroll instead (#38).
                     .flex_shrink_0()
                     .truncate()
-                    .font_family(theme.mono_font_family.clone())
+                    .font_family(mono.clone())
                     .text_xs()
                     .text_color(palette.text)
                     // One handle per line: a shared handle registers once
@@ -641,28 +617,22 @@ impl LogsView {
                 1 => "1 new line · Jump to latest".to_string(),
                 count => format!("{count} new lines · Jump to latest"),
             };
+            let resume = Rc::new(cx.listener(|this, _, _, cx| this.resume(cx)));
             body.push(
-                div()
-                    .id("logs-paused")
-                    .test_support()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .gap_6()
-                    .min_h(rems(2.25))
-                    .child(field_text(
-                        "Live tail paused",
-                        "New lines keep arriving; the tail stays where you left it.",
-                        &palette,
-                    ))
-                    .child(
+                Row::wrapped(
+                    "Live tail paused",
+                    "New lines keep arriving; the tail stays where you left it.",
+                    "logs-paused",
+                    move |_, _| {
+                        let resume = Rc::clone(&resume);
                         Button::new("logs-jump-latest")
                             .label(jump.clone())
-                            .accessibility_label(jump)
-                            .on_click(cx.listener(|this, _, _, cx| this.resume(cx))),
-                    )
-                    .into_any_element(),
+                            .accessibility_label(jump.clone())
+                            .on_click(move |event, window, cx| resume(event, window, cx))
+                            .into_any_element()
+                    },
+                )
+                .render(window, cx),
             );
         }
         // The read notice and the paused row each sit inside the card beside
@@ -704,9 +674,9 @@ impl Render for LogsView {
         let theme = cx.theme();
         let background = theme.background;
         let foreground = theme.foreground;
-        let location = self.location(cx);
+        let location = self.location(window, cx);
         let level = self.level_section(cx);
-        let lines = self.lines_section(cx);
+        let lines = self.lines_section(window, cx);
 
         div()
             .id("logs-view")
