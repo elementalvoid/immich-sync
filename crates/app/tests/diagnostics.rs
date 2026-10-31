@@ -553,6 +553,107 @@ async fn every_diagnostics_control_is_named_and_keyboard_reachable(cx: &mut Test
     .expect("update the shell window");
 }
 
+/// #87: "Show in folder" hands the archive's path to the file manager, names a
+/// refusal beside its control, and does not exist until an archive does.
+#[gpui_kit::test]
+async fn show_in_folder_hands_the_archive_over_and_names_a_refusal(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let (_runtime, server) = mock_server();
+    server.set_api_key(API_KEY);
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let connection = connection_model(cx, &server, AuthMethod::ApiKey);
+    let store = open_store(cx, &paths);
+    let (_engine, diagnostics) = open_models(cx, &paths, connection.clone(), store.clone());
+
+    let revealed: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let refuse = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (recorder, refusing) = (revealed.clone(), refuse.clone());
+    let window = cx.update(|cx| {
+        gpui_kit::init(cx);
+        let (window, _) = gpui_kit::open_window(window_options(), cx, |_, cx| {
+            cx.new(|cx| {
+                DiagnosticsView::with_revealer(
+                    diagnostics.clone(),
+                    Arc::new(move |path: &str| {
+                        recorder
+                            .lock()
+                            .expect("the recorder lock")
+                            .push(path.to_string());
+                        if refusing.load(std::sync::atomic::Ordering::SeqCst) {
+                            Err(std::io::Error::other("no file manager is installed"))
+                        } else {
+                            Ok(())
+                        }
+                    }),
+                    cx,
+                )
+            })
+        })
+        .expect("open the diagnostics window");
+        apply_system_theme(SystemTheme::Light, cx);
+        window
+    });
+
+    cx.update_window(window, |_, window, _| {
+        assert!(
+            window.try_find("diagnostics-bundle-reveal").is_none(),
+            "no archive yet, so there is no control to show it"
+        );
+    })
+    .expect("update the diagnostics window");
+
+    cx.update(|cx| diagnostics.update(cx, |model, cx| model.collect_bundle(cx)));
+    wait_until(cx, "the debug bundle", |cx| {
+        matches!(diagnostics.read(cx).bundle(), BundleState::Ready(_))
+    })
+    .await;
+    let report = match cx.read(|cx| diagnostics.read(cx).bundle().clone()) {
+        BundleState::Ready(report) => report,
+        other => panic!("the bundle is ready: {other:?}"),
+    };
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        tab_to(window, "diagnostics-bundle-reveal", cx);
+        assert_eq!(
+            window.find("diagnostics-bundle-reveal").label(),
+            Some("Show the debug bundle in the file manager"),
+            "the control is named"
+        );
+        window.click("diagnostics-bundle-reveal", cx);
+        assert!(
+            confirmations(window).is_empty(),
+            "showing the archive confirms nothing"
+        );
+    })
+    .expect("update the diagnostics window");
+    assert_eq!(
+        revealed.lock().expect("the recorder lock").as_slice(),
+        std::slice::from_ref(&report.path.display().to_string()),
+        "the control hands the archive's path to the file manager"
+    );
+
+    refuse.store(true, std::sync::atomic::Ordering::SeqCst);
+    cx.update_window(window, |_, window, cx| {
+        window.click("diagnostics-bundle-reveal", cx);
+    })
+    .expect("update the diagnostics window");
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let problem = window
+            .find("diagnostics-bundle-reveal-problem")
+            .label()
+            .expect("the refusal is shown beside the control")
+            .to_string();
+        assert!(
+            problem.contains("no file manager is installed"),
+            "the refusal names its reason: {problem}"
+        );
+    })
+    .expect("update the diagnostics window");
+}
+
 #[gpui_kit::test]
 async fn a_password_session_shows_the_account_permissions_without_a_key_read(
     cx: &mut TestAppContext,

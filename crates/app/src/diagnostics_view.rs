@@ -12,9 +12,11 @@ use gpui_kit::*;
 use crate::dashboard::CardPalette;
 use crate::debug_bundle::{LOG_BYTES, LOG_FILES};
 use crate::diagnostics::{BundleState, DiagnosticsModel, Permissions, format_bytes, format_rate};
+use crate::folder_panel::FolderOpener;
 use crate::notice::{Notice, Severity, copy_confirmation};
 use crate::settings_view::{field_text, section};
 use crate::version;
+use std::sync::Arc;
 use sync_core::store::SqliteInfo;
 
 /// The Diagnostics view.
@@ -25,14 +27,35 @@ pub struct DiagnosticsView {
     /// it has had since. Both are dropped once that path is no longer the last
     /// archive, so the confirmation never describes a stale copy (#82).
     copied: Option<(String, u32)>,
+    /// What "Show in folder" runs (#87): the file manager in the product, a
+    /// recorder in a test.
+    revealer: FolderOpener,
+    /// The archive path the last "Show in folder" could not open, and why. It
+    /// is shown only for that archive, so it never describes a newer one (#87).
+    reveal_problem: Option<(String, String)>,
 }
 
 impl DiagnosticsView {
     /// A view over the diagnostics model.
     pub fn new(model: Entity<DiagnosticsModel>, cx: &mut Context<Self>) -> Self {
+        Self::with_revealer(
+            model,
+            Arc::new(crate::folder_panel::reveal_in_file_manager),
+            cx,
+        )
+    }
+
+    /// A view whose "Show in folder" hands the archive to `revealer` instead of
+    /// the platform's file manager, so a test can record the path (#87).
+    pub fn with_revealer(
+        model: Entity<DiagnosticsModel>,
+        revealer: FolderOpener,
+        cx: &mut Context<Self>,
+    ) -> Self {
         cx.observe(&model, |this, model, cx| {
             // The confirmation names the path it copied, so it goes when the last
-            // archive is no longer that path (#82).
+            // archive is no longer that path (#82). A failure to show an archive
+            // goes the same way, for the same reason (#87).
             let current = match model.read(cx).bundle() {
                 BundleState::Ready(report) => Some(report.path.display().to_string()),
                 _ => None,
@@ -44,12 +67,21 @@ impl DiagnosticsView {
             if !still_copied {
                 this.copied = None;
             }
+            let still_refused = this
+                .reveal_problem
+                .as_ref()
+                .is_some_and(|(refused, _)| current.as_deref() == Some(refused.as_str()));
+            if !still_refused {
+                this.reveal_problem = None;
+            }
             cx.notify();
         })
         .detach();
         Self {
             model,
             copied: None,
+            revealer,
+            reveal_problem: None,
         }
     }
 
@@ -445,6 +477,46 @@ impl DiagnosticsView {
                         )
                         .into_any_element(),
                 );
+                rows.push(
+                    div()
+                        .id("diagnostics-bundle-reveal-row")
+                        .test_support()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .gap_6()
+                        .min_h(rems(2.25))
+                        .child(field_text(
+                            "Show in folder",
+                            "Opens the folder that holds the archive in your file manager, with \
+                             the archive selected where the platform allows it.",
+                            &palette,
+                        ))
+                        .child(
+                            Button::new("diagnostics-bundle-reveal")
+                                .label("Show in folder")
+                                .accessibility_label("Show the debug bundle in the file manager")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.reveal_bundle(cx);
+                                })),
+                        )
+                        .into_any_element(),
+                );
+                if let Some((_, problem)) = self
+                    .reveal_problem
+                    .as_ref()
+                    .filter(|(refused, _)| *refused == report.path.display().to_string())
+                {
+                    rows.push(
+                        Notice::new(
+                            "diagnostics-bundle-reveal-problem",
+                            Severity::Error,
+                            problem.clone(),
+                        )
+                        .into_any_element(),
+                    );
+                }
                 // A partial archive says what it could not hold, in the same
                 // words its README uses.
                 for (index, note) in report.notes.iter().enumerate() {
@@ -491,6 +563,28 @@ impl DiagnosticsView {
             Some((copied, presses)) if copied == path => (copied, presses + 1),
             _ => (path, 1),
         });
+        cx.notify();
+    }
+
+    /// Shows the last archive in the file manager (#87). It writes nothing to
+    /// the clipboard and confirms nothing: the file manager opening is the
+    /// feedback. A refusal is not feedback, so it is shown as an error beside
+    /// the control and logged.
+    fn reveal_bundle(&mut self, cx: &mut Context<Self>) {
+        let path = match self.model.read(cx).bundle() {
+            BundleState::Ready(report) => report.path.display().to_string(),
+            _ => return,
+        };
+        self.reveal_problem = match (self.revealer)(&path) {
+            Ok(()) => None,
+            Err(error) => {
+                tracing::warn!(%error, "could not show the debug bundle in the file manager");
+                Some((
+                    path,
+                    format!("The debug bundle could not be shown in the file manager: {error}"),
+                ))
+            }
+        };
         cx.notify();
     }
 
