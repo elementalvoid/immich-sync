@@ -15,9 +15,11 @@
 
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::IndexPath;
+use gpui_kit::component::Sizable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::searchable_list::{SearchableListDelegate, SearchableListItem};
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
+use gpui_kit::component::{Icon, IconName};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use sync_core::store::SourceFolder;
@@ -292,7 +294,7 @@ impl SearchableListDelegate for FolderChoices {
         item: &Self::Item,
         checked: bool,
         _window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) -> Option<AnyElement> {
         let id = format!("{}-folder-option-{}", self.prefix, ix.row);
         Some(
@@ -305,6 +307,7 @@ impl SearchableListDelegate for FolderChoices {
                 .flex()
                 .flex_row()
                 .items_center()
+                .justify_between()
                 .gap_2()
                 .w_full()
                 .min_w_0()
@@ -323,13 +326,27 @@ impl SearchableListDelegate for FolderChoices {
                         .truncate()
                         .when(checked, |label| {
                             // The design guides' selected row: the item's own
-                            // surface carries the state. Weight needs no icon
-                            // assets, so it draws until #86 registers them; the
-                            // kit's checkmark can join it then.
+                            // surface carries the state. Weight draws with no
+                            // icon assets; the check beside it needs them, and
+                            // since #86 registers the kit's bundle it draws too.
                             label.font_weight(FontWeight::SEMIBOLD)
                         })
                         .child(item.label.clone()),
                 )
+                .when(checked, |row| {
+                    // The kit's own row draws this check in a trailing slot, but
+                    // its adapter (`searchable_list/adapter.rs`, gpui-component
+                    // 0.8.1) only sets `checked` when the delegate leaves
+                    // `render_item` to the kit. This row is ours for the name
+                    // and `aria_selected`, so the mark is drawn here, at the
+                    // kit's own size and colour.
+                    row.child(
+                        Icon::new(IconName::Check)
+                            .xsmall()
+                            .flex_shrink_0()
+                            .text_color(cx.theme().foreground),
+                    )
+                })
                 .into_any_element(),
         )
     }

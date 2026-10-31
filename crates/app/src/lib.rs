@@ -118,10 +118,17 @@ fn run_client() -> anyhow::Result<()> {
     let (requests, incoming) = async_channel::unbounded();
     std::thread::spawn(move || instance::forward(listener, requests));
 
+    // Every kit glyph the shell draws (the select's caret, a checked option
+    // row, whatever an icon-only affordance uses) is an SVG loaded from an
+    // `AssetSource`, and an application with none leaves an icon's space blank.
+    // `gpui_kit::init` sets no source, so the default bundle is registered
+    // here, on the one `Application` the window, the tray and every capture run
+    // from (#86).
+    //
     // A Dock click with no window open reopens the main window. The callback
     // lives on the `Application`, not on `App`: gpui-pre fires it only from the
     // macOS delegate, and `show_window` handles both cases (issue #64).
-    let application = gpui_kit::application();
+    let application = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
     application.on_reopen(shell::show_window);
     application.run(move |cx| boot(cx, incoming));
     Ok(())
