@@ -2567,6 +2567,19 @@ const PAGE_TITLES: [&str; PAGE_COUNT] = [
     "Storage",
 ];
 
+/// The sentence each page panel carries as its accessible description, which the
+/// page header used to draw under the tab strip.
+const PAGE_DESCRIPTIONS: [&str; PAGE_COUNT] = [
+    "The server and the account this client uploads to.",
+    "How the client starts.",
+    "How much the client uses while it syncs.",
+    "How the client scans and retries.",
+    "Adds one tag to the assets this client uploads, so they can be found through Immich's tag \
+     search.",
+    "Read-only. The database stays on this computer; it never lives on a network share or in a \
+     cloud-sync folder.",
+];
+
 /// Every control that takes the keyboard, page by page. A read-only value, such
 /// as a resolved path, is not a control and holds no focus, so Storage has none.
 const PAGE_CONTROLS: [&[&str]; PAGE_COUNT] = [
@@ -2934,6 +2947,84 @@ fn the_page_strip_reports_every_page_as_a_tab_and_the_selected_one(cx: &mut Test
     .expect("read the page strip");
 }
 
+/// The tab strip names the page, so the page header draws nothing: no element but
+/// the tab shows the page's name, and the words the header used to draw are not
+/// lost — the page panel is a tab panel named by the page's title and described by
+/// its sentence, where a screen reader reads them.
+///
+/// A snapshot carries a role-bearing element's accessible name and description,
+/// never rendered text (a plain `div` reports no node at all), so the visible part
+/// of this claim is proved by the captures in
+/// `/data/home/projects/immich-sync-notes/settings-header-report.md`. What is
+/// pinned here is the tree: the name reaches assistive technology exactly twice
+/// (the tab that draws it, the panel it opened) and the sentence exactly once.
+#[gpui_kit::test]
+fn the_page_panel_carries_the_name_and_the_sentence_the_header_used_to_draw(
+    cx: &mut TestAppContext,
+) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let store = SettingsStore::open(paths.config_file.clone());
+    let window = open_settings(cx, store, paths, FakeAutostart::new());
+
+    cx.update_window(window, |_, window, cx| {
+        draw(window, cx);
+        for page in 0..PAGE_COUNT {
+            open_page(window, page, cx);
+            let panel = window.find("settings-page-panel");
+            assert_eq!(
+                panel.role(),
+                Some(Role::TabPanel),
+                "page {page}'s body is the panel its tab opens"
+            );
+            assert_eq!(
+                panel.label(),
+                Some(PAGE_TITLES[page]),
+                "page {page}'s panel is named by its page"
+            );
+            assert_eq!(
+                panel.description(),
+                Some(PAGE_DESCRIPTIONS[page]),
+                "page {page}'s panel is described by its page's sentence"
+            );
+
+            let carrying = |words: &'static str, description: bool| {
+                let mut ids: Vec<ElementId> = gpui_kit::base::test_support::snapshots(window)
+                    .into_iter()
+                    .filter(|element| {
+                        element.visible()
+                            && if description {
+                                element.description() == Some(words)
+                            } else {
+                                element.label() == Some(words)
+                            }
+                    })
+                    .map(|element| element.path().last().cloned().expect("an id"))
+                    .collect();
+                ids.sort_by_key(|id| format!("{id:?}"));
+                ids
+            };
+            let mut expected = vec![
+                ElementId::from(PAGE_BUTTONS[page]),
+                ElementId::from("settings-page-panel"),
+            ];
+            expected.sort_by_key(|id| format!("{id:?}"));
+            assert_eq!(
+                carrying(PAGE_TITLES[page], false),
+                expected,
+                "page {page}: the strip's tab draws the name and the panel carries it, \
+                 and nothing else names the page"
+            );
+            assert_eq!(
+                carrying(PAGE_DESCRIPTIONS[page], true),
+                vec![ElementId::from("settings-page-panel")],
+                "page {page}: the sentence lives on the panel alone"
+            );
+        }
+    })
+    .expect("walk the settings pages");
+}
+
 /// #78: the kit's settings group always draws its resize handle, even with a
 /// zero-width sidebar, and 0.8.1 has no switch to leave it out. The handle is
 /// therefore covered rather than left live under the pointer: the band paints
@@ -3194,7 +3285,7 @@ fn scroll_page_to(
             return row;
         }
         // The wheel goes to the page body, the surface's only scrollable part:
-        // above it sits the page header and below it the reachability line.
+        // above it sits the page strip and below it the reachability line.
         let surface = window.find("settings-scroll").bounds();
         let position = point(surface.center().x, surface.bottom() - px(44.));
         window.dispatch_event(
