@@ -35,10 +35,14 @@ rust-version = "1.92"
 
 [workspace.dependencies]
 # Pin the shell stack exactly. gpui-kit imposes an exact `gpui-pre`; a caret
-# range would let a patch release move it (ADR 0001).
+# range would let a patch release move it (ADR 0001). 0.8.1 is the release the
+# component tickets build on: its fixed focus, keyboard and accessibility
+# behaviour is what they need, and it pins gpui-pre 0.3.10. gpui-tray 0.1.4
+# still resolves onto that one snapshot through its `gpui-pre ^0.3.4` range, so
+# the graph holds a single `gpui-pre` and the tray needs no bump.
 anyhow = "1"
 async-channel = "=2.5.0"
-gpui-kit = "=0.7.2"
+gpui-kit = "=0.8.1"
 # Only the `gpui-kit` backend. The three gpui-tray backends are mutually
 # exclusive and `compile_error!` when more than one is enabled, so never build
 # the workspace with `--all-features`.

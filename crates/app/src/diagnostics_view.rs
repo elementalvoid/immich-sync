@@ -5,26 +5,84 @@
 use gpui_kit::base::Disableable as _;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::Button;
+use gpui_kit::component::description_list::{DescriptionItem, DescriptionList};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::dashboard::CardPalette;
 use crate::debug_bundle::{LOG_BYTES, LOG_FILES};
 use crate::diagnostics::{BundleState, DiagnosticsModel, Permissions, format_bytes, format_rate};
-use crate::settings_view::{field_text, notice, section};
+use crate::folder_panel::FolderOpener;
+use crate::notice::{Notice, Severity, copy_confirmation};
+use crate::settings_view::{field_text, section};
 use crate::version;
+use std::sync::Arc;
 use sync_core::store::SqliteInfo;
 
 /// The Diagnostics view.
 pub struct DiagnosticsView {
     /// The model owns every read; the view renders what it last produced.
     model: Entity<DiagnosticsModel>,
+    /// The archive path the last copy put on the clipboard, and how many presses
+    /// it has had since. Both are dropped once that path is no longer the last
+    /// archive, so the confirmation never describes a stale copy (#82).
+    copied: Option<(String, u32)>,
+    /// What "Show in folder" runs (#87): the file manager in the product, a
+    /// recorder in a test.
+    revealer: FolderOpener,
+    /// The archive path the last "Show in folder" could not open, and why. It
+    /// is shown only for that archive, so it never describes a newer one (#87).
+    reveal_problem: Option<(String, String)>,
 }
 
 impl DiagnosticsView {
     /// A view over the diagnostics model.
     pub fn new(model: Entity<DiagnosticsModel>, cx: &mut Context<Self>) -> Self {
-        cx.observe(&model, |_, _, cx| cx.notify()).detach();
-        Self { model }
+        Self::with_revealer(
+            model,
+            Arc::new(crate::folder_panel::reveal_in_file_manager),
+            cx,
+        )
+    }
+
+    /// A view whose "Show in folder" hands the archive to `revealer` instead of
+    /// the platform's file manager, so a test can record the path (#87).
+    pub fn with_revealer(
+        model: Entity<DiagnosticsModel>,
+        revealer: FolderOpener,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        cx.observe(&model, |this, model, cx| {
+            // The confirmation names the path it copied, so it goes when the last
+            // archive is no longer that path (#82). A failure to show an archive
+            // goes the same way, for the same reason (#87).
+            let current = match model.read(cx).bundle() {
+                BundleState::Ready(report) => Some(report.path.display().to_string()),
+                _ => None,
+            };
+            let still_copied = this
+                .copied
+                .as_ref()
+                .is_some_and(|(copied, _)| current.as_deref() == Some(copied.as_str()));
+            if !still_copied {
+                this.copied = None;
+            }
+            let still_refused = this
+                .reveal_problem
+                .as_ref()
+                .is_some_and(|(refused, _)| current.as_deref() == Some(refused.as_str()));
+            if !still_refused {
+                this.reveal_problem = None;
+            }
+            cx.notify();
+        })
+        .detach();
+        Self {
+            model,
+            copied: None,
+            revealer,
+            reveal_problem: None,
+        }
     }
 
     /// The page header.
@@ -43,39 +101,6 @@ impl DiagnosticsView {
             .child(div().text_sm().text_color(muted).child(
                 "What the client knows about the server and its own state. Refresh re-reads both.",
             ))
-    }
-
-    /// One labelled row: the name and help on the left, the value on the right.
-    fn value_row(
-        label: &'static str,
-        help: &'static str,
-        value_id: &'static str,
-        value: String,
-        palette: &CardPalette,
-    ) -> AnyElement {
-        div()
-            .id(ElementId::Name(format!("{value_id}-row").into()))
-            .test_support()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .gap_6()
-            .min_h(rems(2.25))
-            .child(field_text(label, help, palette))
-            .child(
-                div()
-                    .id(value_id)
-                    .test_support()
-                    .aria_label(value.clone())
-                    .min_w_0()
-                    .max_w(rems(36.))
-                    .text_right()
-                    .text_xs()
-                    .text_color(palette.meta)
-                    .child(value),
-            )
-            .into_any_element()
     }
 
     /// The server version, the granted permissions, and the refresh action.
@@ -100,39 +125,41 @@ impl DiagnosticsView {
             }
             Permissions::Unavailable(reason) => reason.clone(),
         };
-        let mut rows = Vec::with_capacity(5);
+        let items = vec![
+            value_item(
+                "Client version",
+                Some("The running binary: the package version and the short build revision."),
+                "diagnostics-client-version-value",
+                version::client_version().to_string(),
+                &palette,
+            ),
+            value_item(
+                "Server version",
+                Some("GET /server/about with this credential."),
+                "diagnostics-server-version-value",
+                version,
+                &palette,
+            ),
+            value_item(
+                "Permissions",
+                Some("An API key's granted permissions, read from GET /api-keys/me."),
+                "diagnostics-permissions-value",
+                permissions,
+                &palette,
+            ),
+        ];
+        let mut rows = Vec::with_capacity(3);
         if let Some(problem) = &server.problem {
             rows.push(
-                notice(
+                Notice::new(
                     "diagnostics-server-problem",
+                    Severity::Error,
                     problem.clone(),
-                    cx.theme().danger,
-                    &palette,
                 )
                 .into_any_element(),
             );
         }
-        rows.push(Self::value_row(
-            "Client version",
-            "The running binary: the package version and the short build revision.",
-            "diagnostics-client-version-value",
-            version::client_version().to_string(),
-            &palette,
-        ));
-        rows.push(Self::value_row(
-            "Server version",
-            "GET /server/about with this credential.",
-            "diagnostics-server-version-value",
-            version,
-            &palette,
-        ));
-        rows.push(Self::value_row(
-            "Permissions",
-            "An API key's granted permissions, read from GET /api-keys/me.",
-            "diagnostics-permissions-value",
-            permissions,
-            &palette,
-        ));
+        rows.push(value_list("diagnostics-server-values", items).into_any_element());
         rows.push(
             div()
                 .id("diagnostics-refresh-row")
@@ -180,59 +207,59 @@ impl DiagnosticsView {
         let mut rows = Vec::with_capacity(12);
         if let Some(problem) = &problem {
             rows.push(
-                notice(
+                Notice::new(
                     "diagnostics-state-problem",
+                    Severity::Error,
                     problem.clone(),
-                    cx.theme().danger,
-                    &palette,
                 )
                 .into_any_element(),
             );
         }
         if rebuilding {
             rows.push(
-                notice(
+                Notice::new(
                     "diagnostics-rebuilding",
-                    "Rebuilding the state database and rescanning the folders…".to_string(),
-                    cx.theme().info,
-                    &palette,
+                    Severity::Info,
+                    "Rebuilding the state database and rescanning the folders…",
                 )
                 .into_any_element(),
             );
         }
-        rows.push(Self::value_row(
+        let mut items = Vec::with_capacity(12);
+        items.push(value_item(
             "Database",
-            "The state database the client writes.",
+            Some("The state database the client writes."),
             "diagnostics-state-path-value",
             path,
             &palette,
         ));
-        match &info {
-            Some(info) => {
-                rows.push(Self::value_row(
-                    "Migration version",
-                    "PRAGMA user_version: the schema the client migrated to.",
-                    "diagnostics-sqlite-version-value",
-                    info.migration_version.to_string(),
-                    &palette,
-                ));
-                rows.push(Self::value_row(
-                    "Size",
-                    "The pages SQLite holds for this database.",
-                    "diagnostics-sqlite-size-value",
-                    format_bytes(info.size_bytes),
-                    &palette,
-                ));
-                rows.push(Self::value_row(
-                    "Integrity",
-                    "PRAGMA quick_check.",
-                    "diagnostics-integrity-value",
-                    info.integrity.clone(),
-                    &palette,
-                ));
-                rows.extend(table_rows(info, &palette));
-            }
-            None => rows.push(
+        if let Some(info) = &info {
+            items.push(value_item(
+                "Migration version",
+                Some("PRAGMA user_version: the schema the client migrated to."),
+                "diagnostics-sqlite-version-value",
+                info.migration_version.to_string(),
+                &palette,
+            ));
+            items.push(value_item(
+                "Size",
+                Some("The pages SQLite holds for this database."),
+                "diagnostics-sqlite-size-value",
+                format_bytes(info.size_bytes),
+                &palette,
+            ));
+            items.push(value_item(
+                "Integrity",
+                Some("PRAGMA quick_check."),
+                "diagnostics-integrity-value",
+                info.integrity.clone(),
+                &palette,
+            ));
+            items.extend(table_items(info, &palette));
+        }
+        rows.push(value_list("diagnostics-state-values", items).into_any_element());
+        if info.is_none() {
+            rows.push(
                 div()
                     .id("diagnostics-state-empty")
                     .test_support()
@@ -240,7 +267,7 @@ impl DiagnosticsView {
                     .text_color(palette.meta)
                     .child("The state database is opening.")
                     .into_any_element(),
-            ),
+            );
         }
         rows.push(
             div()
@@ -283,37 +310,33 @@ impl DiagnosticsView {
         let errors = self.model.read(cx).errors().to_vec();
         let rows: Vec<AnyElement> = if errors.is_empty() {
             vec![
-                div()
-                    .id("diagnostics-errors-empty")
-                    .test_support()
-                    .aria_label("No failure has been recorded.")
-                    .text_xs()
-                    .text_color(palette.meta)
-                    .child("No failure has been recorded.")
-                    .into_any_element(),
+                crate::a11y::named(
+                    Role::Label,
+                    "diagnostics-errors-empty",
+                    "No failure has been recorded.",
+                    None,
+                )
+                .text_xs()
+                .text_color(palette.meta)
+                .child("No failure has been recorded.")
+                .into_any_element(),
             ]
         } else {
-            errors
+            let items = errors
                 .iter()
                 .map(|error| {
-                    let text = match &error.message {
-                        Some(message) => format!("{}: {message}", error.class.as_str()),
-                        None => error.class.as_str().to_string(),
-                    };
-                    div()
-                        .id(ElementId::Name(
-                            format!("diagnostics-error-{}", error.class.as_str()).into(),
-                        ))
-                        .test_support()
-                        .aria_label(text.clone())
-                        .min_w_0()
-                        .w_full()
-                        .text_xs()
-                        .text_color(palette.text)
-                        .child(text)
-                        .into_any_element()
+                    // The term is the class and the value is the reason, so the
+                    // row does not name the class a second time (F1).
+                    value_item(
+                        error.class.as_str(),
+                        None,
+                        &format!("diagnostics-error-{}", error.class.as_str()),
+                        error.message.clone().unwrap_or_default(),
+                        &palette,
+                    )
                 })
-                .collect()
+                .collect();
+            vec![value_list("diagnostics-errors-values", items).into_any_element()]
         };
         section(
             "diagnostics-errors",
@@ -336,14 +359,12 @@ impl DiagnosticsView {
         let collecting = matches!(state, BundleState::Collecting);
         let mut rows: Vec<AnyElement> = Vec::with_capacity(6);
         rows.push(
-            notice(
+            Notice::new(
                 "diagnostics-bundle-privacy",
+                Severity::Info,
                 "The archive holds your folder paths, account email, server URL, and the log \
                  files. It never holds your password, an API key, or a session token: the log \
-                 files are already redacted. Review it before you attach it to a message."
-                    .to_string(),
-                theme.info,
-                &palette,
+                 files are already redacted. Review it before you attach it to a message.",
             )
             .into_any_element(),
         );
@@ -381,45 +402,27 @@ impl DiagnosticsView {
         match &state {
             BundleState::Idle => {}
             BundleState::Collecting => rows.push(
-                notice(
+                Notice::new(
                     "diagnostics-bundle-collecting",
-                    "Collecting the debug bundle…".to_string(),
-                    theme.info,
-                    &palette,
+                    Severity::Info,
+                    "Collecting the debug bundle…",
                 )
                 .into_any_element(),
             ),
             BundleState::Ready(report) => {
-                let path = report.path.display().to_string();
                 rows.push(
-                    div()
-                        .id("diagnostics-bundle-path-row")
-                        .test_support()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .justify_between()
-                        .gap_6()
-                        .min_h(rems(2.25))
-                        .child(field_text(
+                    value_list(
+                        "diagnostics-bundle-values",
+                        vec![mono_value_item(
                             "Archive",
-                            "Attach this file to your support message.",
+                            Some("Attach this file to your support message."),
+                            "diagnostics-bundle-path-value",
+                            report.path.display().to_string(),
                             &palette,
-                        ))
-                        .child(
-                            div()
-                                .id("diagnostics-bundle-path-value")
-                                .test_support()
-                                .aria_label(path.clone())
-                                .min_w_0()
-                                .max_w(rems(48.))
-                                .text_right()
-                                .font_family(theme.mono_font_family.clone())
-                                .text_xs()
-                                .text_color(palette.meta)
-                                .child(path.clone()),
-                        )
-                        .into_any_element(),
+                            theme.mono_font_family.clone(),
+                        )],
+                    )
+                    .into_any_element(),
                 );
                 rows.push(
                     div()
@@ -438,33 +441,100 @@ impl DiagnosticsView {
                             &palette,
                         ))
                         .child(
-                            Button::new("diagnostics-bundle-copy")
-                                .label("Copy path")
-                                .accessibility_label("Copy the debug bundle's path")
-                                .on_click(cx.listener(|this, _, _, cx| this.copy_bundle_path(cx))),
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_3()
+                                // #82: the confirmation sits beside the control
+                                // it belongs to, in the row, so it opens no
+                                // surface and adds no row above the control.
+                                .flex_shrink_0()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .justify_end()
+                                        // #82: its slot is reserved whether or not
+                                        // it is showing, so the confirmation
+                                        // cannot rewrap the help text and slide
+                                        // the button out from under the pointer.
+                                        .w(rems(6.))
+                                        .children(copy_confirmation(
+                                            "diagnostics-copy-confirmation",
+                                            self.presses(),
+                                        )),
+                                )
+                                .child(
+                                    Button::new("diagnostics-bundle-copy")
+                                        .label("Copy path")
+                                        .accessibility_label("Copy the debug bundle's path")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.copy_bundle_path(cx);
+                                        })),
+                                ),
                         )
                         .into_any_element(),
                 );
+                rows.push(
+                    div()
+                        .id("diagnostics-bundle-reveal-row")
+                        .test_support()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .gap_6()
+                        .min_h(rems(2.25))
+                        .child(field_text(
+                            "Show in folder",
+                            "Opens the folder that holds the archive in your file manager, with \
+                             the archive selected where the platform allows it.",
+                            &palette,
+                        ))
+                        .child(
+                            Button::new("diagnostics-bundle-reveal")
+                                .label("Show in folder")
+                                .accessibility_label("Show the debug bundle in the file manager")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.reveal_bundle(cx);
+                                })),
+                        )
+                        .into_any_element(),
+                );
+                if let Some((_, problem)) = self
+                    .reveal_problem
+                    .as_ref()
+                    .filter(|(refused, _)| *refused == report.path.display().to_string())
+                {
+                    rows.push(
+                        Notice::new(
+                            "diagnostics-bundle-reveal-problem",
+                            Severity::Error,
+                            problem.clone(),
+                        )
+                        .into_any_element(),
+                    );
+                }
                 // A partial archive says what it could not hold, in the same
                 // words its README uses.
                 for (index, note) in report.notes.iter().enumerate() {
                     rows.push(
-                        notice(
+                        Notice::new(
                             ElementId::Name(format!("diagnostics-bundle-note-{index}").into()),
+                            Severity::Warning,
                             note.clone(),
-                            theme.warning,
-                            &palette,
                         )
                         .into_any_element(),
                     );
                 }
             }
             BundleState::Failed(problem) => rows.push(
-                notice(
+                Notice::new(
                     "diagnostics-bundle-problem",
+                    Severity::Error,
                     problem.clone(),
-                    theme.danger,
-                    &palette,
                 )
                 .into_any_element(),
             ),
@@ -480,12 +550,47 @@ impl DiagnosticsView {
     }
 
     /// Puts the last archive's path on the clipboard.
+    ///
+    /// Only a ready archive can be copied: the control renders only for one, and
+    /// a press with nothing behind it confirms nothing (#82).
     fn copy_bundle_path(&mut self, cx: &mut Context<Self>) {
         let path = match self.model.read(cx).bundle() {
             BundleState::Ready(report) => report.path.display().to_string(),
             _ => return,
         };
-        cx.write_to_clipboard(ClipboardItem::new_string(path));
+        cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+        self.copied = Some(match self.copied.take() {
+            Some((copied, presses)) if copied == path => (copied, presses + 1),
+            _ => (path, 1),
+        });
+        cx.notify();
+    }
+
+    /// Shows the last archive in the file manager (#87). It writes nothing to
+    /// the clipboard and confirms nothing: the file manager opening is the
+    /// feedback. A refusal is not feedback, so it is shown as an error beside
+    /// the control and logged.
+    fn reveal_bundle(&mut self, cx: &mut Context<Self>) {
+        let path = match self.model.read(cx).bundle() {
+            BundleState::Ready(report) => report.path.display().to_string(),
+            _ => return,
+        };
+        self.reveal_problem = match (self.revealer)(&path) {
+            Ok(()) => None,
+            Err(error) => {
+                tracing::warn!(%error, "could not show the debug bundle in the file manager");
+                Some((
+                    path,
+                    format!("The debug bundle could not be shown in the file manager: {error}"),
+                ))
+            }
+        };
+        cx.notify();
+    }
+
+    /// How many times the archive now on the clipboard has been copied (#82).
+    fn presses(&self) -> u32 {
+        self.copied.as_ref().map_or(0, |(_, presses)| *presses)
     }
 
     /// The upload rate from the engine's meter, and the live progress.
@@ -498,67 +603,170 @@ impl DiagnosticsView {
             "{} uploaded, {} pending, {} failed",
             status.counts.uploaded, status.counts.pending, status.counts.failed
         );
+        let items = vec![
+            value_item(
+                "Upload rate",
+                Some("Measured between the last two status polls."),
+                "diagnostics-throughput-value",
+                rate,
+                &palette,
+            ),
+            value_item(
+                "Activity",
+                Some("What the engine is doing right now."),
+                "diagnostics-activity-value",
+                status.activity.label().to_string(),
+                &palette,
+            ),
+            value_item(
+                "Items",
+                Some("The counts across every folder."),
+                "diagnostics-counts-value",
+                counts,
+                &palette,
+            ),
+        ];
         section(
             "diagnostics-throughput",
             "Throughput",
             "Upload bytes per second, from the same meter the bandwidth limit uses.",
-            vec![
-                Self::value_row(
-                    "Upload rate",
-                    "Measured between the last two status polls.",
-                    "diagnostics-throughput-value",
-                    rate,
-                    &palette,
-                ),
-                Self::value_row(
-                    "Activity",
-                    "What the engine is doing right now.",
-                    "diagnostics-activity-value",
-                    status.activity.label().to_string(),
-                    &palette,
-                ),
-                Self::value_row(
-                    "Items",
-                    "The counts across every folder.",
-                    "diagnostics-counts-value",
-                    counts,
-                    &palette,
-                ),
-            ],
+            vec![value_list("diagnostics-throughput-values", items).into_any_element()],
             cx,
         )
     }
 }
 
-/// One row per tracked table, with its row count.
-fn table_rows(info: &SqliteInfo, palette: &CardPalette) -> Vec<AnyElement> {
-    info.tables
-        .iter()
-        .map(|count| {
-            let id = ElementId::Name(format!("diagnostics-table-{}", count.table).into());
-            div()
-                .id(id)
-                .test_support()
-                .aria_label(format!("{}: {}", count.table, count.rows))
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .gap_6()
-                .min_h(rems(1.75))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(palette.text)
-                        .child(count.table.clone()),
+/// The label column every value row shares, in rems: wide enough for the
+/// longest term, and fixed, so a long value wraps inside its own column instead
+/// of taking the term's width (#80).
+const LABEL_COLUMN_REMS: f32 = 12.;
+
+/// The most lines a value may take before it is cut (#80).
+///
+/// A value can be as long as a server or a filesystem makes it — a failure
+/// message is the raw error text — and an unclamped one grows its card by that
+/// many lines. The cut is visual only: the value's accessible name still carries
+/// the whole text.
+const VALUE_LINE_CLAMP: usize = 6;
+
+/// The description list a card's value rows share (#80).
+///
+/// `columns(1)` puts one row in each line. `bordered(false)` leaves the card's
+/// own surface and border to carry the box: the rows are a grid inside the
+/// card, not a second card inside the first. The kit's list is a `RenderOnce`
+/// with no role, so the wrapper is what gives the pairs their collection (F4).
+fn value_list(id: &'static str, items: Vec<DescriptionItem>) -> impl IntoElement {
+    div()
+        .id(id)
+        .test_support()
+        .role(Role::DescriptionList)
+        .child(
+            DescriptionList::new()
+                .columns(1)
+                .bordered(false)
+                .label_width(rems(LABEL_COLUMN_REMS))
+                .children(items),
+        )
+}
+
+/// One value row: the term in the label cell, and the value with its help
+/// sentence in the description cell.
+///
+/// The value names itself and the term beside it states the label, so a row
+/// reads its term once and has no name to compose (F1).
+fn value_item(
+    label: &str,
+    help: Option<&str>,
+    value_id: &str,
+    value: String,
+    palette: &CardPalette,
+) -> DescriptionItem {
+    value_item_with_font(label, help, value_id, value, palette, None)
+}
+
+/// The archive path's row: [`value_item`] with its value set in the mono font,
+/// as every other read-only path in the app is, so `l`/`1` and `O`/`0` stay
+/// apart (#80).
+fn mono_value_item(
+    label: &str,
+    help: Option<&str>,
+    value_id: &str,
+    value: String,
+    palette: &CardPalette,
+    mono: SharedString,
+) -> DescriptionItem {
+    value_item_with_font(label, help, value_id, value, palette, Some(mono))
+}
+
+/// The one row shape both constructors build, with `font` as the value's family
+/// when it is not the UI's (#80).
+fn value_item_with_font(
+    label: &str,
+    help: Option<&str>,
+    value_id: &str,
+    value: String,
+    palette: &CardPalette,
+    font: Option<SharedString>,
+) -> DescriptionItem {
+    DescriptionItem::new(
+        crate::a11y::named(
+            Role::Term,
+            ElementId::Name(format!("{value_id}-label").into()),
+            label,
+            None,
+        )
+        .min_w_0()
+        .text_sm()
+        .font_weight(FontWeight::MEDIUM)
+        .child(label.to_string())
+        .into_any_element(),
+    )
+    .value(
+        div()
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .min_w_0()
+            .child(
+                // The description-list value of the term above it, so the two
+                // reach the tree as a pair and not as flat text (#80).
+                crate::a11y::named(
+                    Role::Definition,
+                    ElementId::Name(value_id.into()),
+                    value.clone(),
+                    None,
                 )
-                .child(
+                .min_w_0()
+                .line_clamp(VALUE_LINE_CLAMP)
+                .text_xs()
+                .text_color(palette.text)
+                .when_some(font, |this, font| this.font_family(font))
+                .child(value),
+            )
+            .when_some(help, |this, help| {
+                this.child(
                     div()
                         .text_xs()
                         .text_color(palette.meta)
-                        .child(count.rows.to_string()),
+                        .child(help.to_string()),
                 )
-                .into_any_element()
+            })
+            .into_any_element(),
+    )
+}
+
+/// One row per tracked table, with its row count (#80).
+fn table_items(info: &SqliteInfo, palette: &CardPalette) -> Vec<DescriptionItem> {
+    info.tables
+        .iter()
+        .map(|count| {
+            value_item(
+                &count.table,
+                None,
+                &format!("diagnostics-table-{}", count.table),
+                count.rows.to_string(),
+                palette,
+            )
         })
         .collect()
 }

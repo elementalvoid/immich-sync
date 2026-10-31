@@ -17,8 +17,10 @@ use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_kit::*;
 
 use crate::dashboard::CardPalette;
+use crate::empty_state::EmptyState;
 use crate::logging::{self, LogLevel, TAIL_LINES};
-use crate::settings_view::{SettingsView, field_text, filling_section, notice, section};
+use crate::notice::{Notice, Severity, copy_confirmation};
+use crate::settings_view::{SettingsView, field_text, filling_section, section};
 
 /// How often the live tail re-reads the newest log file while the Logs surface
 /// is visible.
@@ -73,6 +75,11 @@ pub struct LogsView {
     /// What the read in flight does when it lands. A read latches this before
     /// its file read starts, and the apply re-reads the viewport for a poll.
     follow: Follow,
+    /// How many times Copy all has been pressed since the displayed tail last
+    /// changed. The confirmation is one node whose announcement names the press,
+    /// and it goes when the rows it copied are no longer the rows on screen
+    /// (#82).
+    copies: u32,
     /// The window the tail is painted in, where a selection is read from before
     /// a live replace would drop the rows under it. Set by every render.
     window: Option<AnyWindowHandle>,
@@ -121,6 +128,7 @@ impl LogsView {
             visible: false,
             read_generation: 0,
             follow: Follow::Always,
+            copies: 0,
             window: None,
         }
     }
@@ -267,6 +275,12 @@ impl LogsView {
             // file's name stays with the rows: it names the file they show.
             self.counted = tail;
         } else {
+            // The confirmation names the rows it copied, so it goes as soon as
+            // they are not the rows on screen. A poll that read the same tail
+            // leaves it alone, so the live tail cannot make it flicker (#82).
+            if self.lines != tail {
+                self.copies = 0;
+            }
             self.current_file = file;
             self.lines = tail.clone();
             self.counted = tail;
@@ -303,12 +317,15 @@ impl LogsView {
     ///
     /// The clipboard is written from the lines the view holds, so nothing that
     /// was not written to the log can reach it. Joining keeps blank lines,
-    /// which the selection layer's copy path drops.
+    /// which the selection layer's copy path drops. The confirmation is the
+    /// copy's own: a refused copy sets nothing and confirms nothing (#82).
     fn copy_all(&mut self, cx: &mut Context<Self>) {
         if self.lines.is_empty() {
             return;
         }
         cx.write_to_clipboard(ClipboardItem::new_string(self.lines.join("\n")));
+        self.copies += 1;
+        cx.notify();
     }
 
     /// The page header.
@@ -355,10 +372,7 @@ impl LogsView {
                 .child(
                     div().flex_1().min_w_0().text_right().child(
                         // Wrapped, not truncated: the whole path stays visible.
-                        div()
-                            .id(value_id)
-                            .test_support()
-                            .aria_label(value.clone())
+                        crate::a11y::named(Role::Label, value_id, value.clone(), None)
                             .min_w_0()
                             .font_family(theme.mono_font_family.clone())
                             .text_xs()
@@ -419,15 +433,9 @@ impl LogsView {
         let current = self.level(cx);
         let mut rows = Vec::with_capacity(LogLevel::ALL.len() + 1);
         if let Some(problem) = &self.save_problem {
-            let palette = CardPalette::new(cx.theme());
             rows.push(
-                notice(
-                    "logs-level-problem",
-                    problem.clone(),
-                    cx.theme().danger,
-                    &palette,
-                )
-                .into_any_element(),
+                Notice::new("logs-level-problem", Severity::Error, problem.clone())
+                    .into_any_element(),
             );
         }
         for level in LogLevel::ALL {
@@ -484,11 +492,22 @@ impl LogsView {
                     &palette,
                 ))
                 .child(
-                    Button::new("logs-copy-all")
-                        .label("Copy all")
-                        .accessibility_label("Copy every displayed log line")
-                        .disabled(self.lines.is_empty())
-                        .on_click(cx.listener(|this, _, _, cx| this.copy_all(cx))),
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_3()
+                        // #82: the confirmation sits beside the control it
+                        // belongs to, in the row, so it opens no surface and
+                        // adds no row to the card's floor.
+                        .children(copy_confirmation("logs-copy-confirmation", self.copies))
+                        .child(
+                            Button::new("logs-copy-all")
+                                .label("Copy all")
+                                .accessibility_label("Copy every displayed log line")
+                                .disabled(self.lines.is_empty())
+                                .on_click(cx.listener(|this, _, _, cx| this.copy_all(cx))),
+                        ),
                 )
                 .into_any_element(),
         );
@@ -499,24 +518,32 @@ impl LogsView {
                     // on a long path. Clamped to the two lines the floor's 4rem
                     // covers; the accessible label keeps the whole text (#54).
                     .line_clamp(2)
-                    .child(notice(
+                    .child(Notice::new(
                         "logs-problem",
+                        Severity::Error,
                         problem.clone(),
-                        theme.danger,
-                        &palette,
                     ))
                     .into_any_element(),
             );
         }
         if self.lines.is_empty() {
+            // #77: the tail's empty state, and the one step it can carry out
+            // from where the reader notices it is empty.
             body.push(
-                div()
-                    .id("logs-empty")
-                    .test_support()
-                    .text_xs()
-                    .text_color(palette.meta)
-                    .child("No log lines yet.")
-                    .into_any_element(),
+                EmptyState::new(
+                    "logs-empty",
+                    "No log lines yet.",
+                    "Lines appear as the client works.",
+                )
+                .action(
+                    Button::new("logs-empty-refresh")
+                        .label("Refresh")
+                        // Its own name: at an empty tail both refreshes are
+                        // on screen and must not sound alike.
+                        .accessibility_label("Refresh the log tail")
+                        .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx))),
+                )
+                .into_any_element(),
             );
         } else {
             let lines: Vec<AnyElement> = self
@@ -524,34 +551,36 @@ impl LogsView {
                 .iter()
                 .enumerate()
                 .map(|(index, line)| {
-                    div()
-                        .id(ElementId::Name(format!("logs-line-{index}").into()))
-                        .test_support()
-                        .aria_label(line.clone())
-                        .min_w_0()
-                        .w_full()
-                        // The tail box caps its height, so a shrinkable row is
-                        // squeezed into the cap and its glyphs are clipped: the
-                        // tail must overflow and scroll instead (#38).
-                        .flex_shrink_0()
-                        .truncate()
-                        .font_family(theme.mono_font_family.clone())
-                        .text_xs()
-                        .text_color(palette.text)
-                        // One handle per line: a shared handle registers once
-                        // and the last line painted would win (probe Q1).
-                        // A blank line selected by a drag is dropped from the
-                        // copied text: the selection layer drops whitespace-only
-                        // participants and the Root trims. That is vendored
-                        // gpui-base behaviour; Copy all keeps blank lines.
-                        .child(
-                            SelectableText::new(
-                                ElementId::Name(format!("logs-text-{index}").into()),
-                                line.clone(),
-                            )
-                            .document_order(index as u64),
+                    crate::a11y::named(
+                        Role::Label,
+                        ElementId::Name(format!("logs-line-{index}").into()),
+                        line.clone(),
+                        None,
+                    )
+                    .min_w_0()
+                    .w_full()
+                    // The tail box caps its height, so a shrinkable row is
+                    // squeezed into the cap and its glyphs are clipped: the
+                    // tail must overflow and scroll instead (#38).
+                    .flex_shrink_0()
+                    .truncate()
+                    .font_family(theme.mono_font_family.clone())
+                    .text_xs()
+                    .text_color(palette.text)
+                    // One handle per line: a shared handle registers once
+                    // and the last line painted would win (probe Q1).
+                    // A blank line selected by a drag is dropped from the
+                    // copied text: the selection layer drops whitespace-only
+                    // participants and the Root trims. That is vendored
+                    // gpui-base behaviour; Copy all keeps blank lines.
+                    .child(
+                        SelectableText::new(
+                            ElementId::Name(format!("logs-text-{index}").into()),
+                            line.clone(),
                         )
-                        .into_any_element()
+                        .document_order(index as u64),
+                    )
+                    .into_any_element()
                 })
                 .collect();
             let focus = self.lines_focus.clone();
@@ -578,7 +607,7 @@ impl LogsView {
                             // the delta to every scroll hitbox under the pointer,
                             // so without this any scrolling ancestor would move
                             // by the same delta (#54).
-                            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                            .on_scroll(|_, _, cx| cx.stop_propagation())
                             .flex()
                             .flex_col()
                             .gap_0p5()

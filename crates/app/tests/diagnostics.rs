@@ -8,7 +8,7 @@
 
 mod common;
 
-use common::mock_server;
+use common::{contrast, mock_server};
 
 use std::fs;
 use std::path::Path;
@@ -16,14 +16,16 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gpui_kit::test::TestWindowExt as _;
+use gpui_kit::base::test_support::snapshots;
+use gpui_kit::component::Theme;
+use gpui_kit::test::{ElementSnapshot, TestWindowExt as _};
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, Bounds, ElementId, Entity, Point, Role, TestAppContext,
-    Window, WindowBounds, WindowOptions, px, size,
+    AnyWindowHandle, App, AppContext as _, Bounds, ClipboardItem, ElementId, Entity, Point, Role,
+    TestAppContext, Window, WindowBounds, WindowOptions, px, size,
 };
 use immich_sync::autostart::{Autostart, UnavailableAutostart};
 use immich_sync::connection::ConnectionModel;
-use immich_sync::dashboard::Dashboard;
+use immich_sync::dashboard::{CardPalette, Dashboard};
 use immich_sync::debug_bundle::BUNDLE_PREFIX;
 use immich_sync::diagnostics::{BundleState, DiagnosticsModel, Permissions};
 use immich_sync::diagnostics_view::DiagnosticsView;
@@ -34,6 +36,7 @@ use immich_sync::settings::SettingsStore;
 use immich_sync::settings_view::SettingsView;
 use immich_sync::shell::{self, AppShell, ViewMode};
 use immich_sync::store::StoreModel;
+use immich_sync::theme::{SystemTheme, apply_system_theme};
 use immich_sync::upload::UploadModel;
 use immich_sync::upload_view::UploadView;
 use immich_sync::{status, theme};
@@ -47,6 +50,31 @@ use sync_core::store::{
 };
 
 const API_KEY: &str = "api-key-abc123";
+/// The word a copy confirmation shows (#82). The same word on every surface.
+const COPIED: &str = "Copied";
+
+/// The one identity a copy confirmation keeps across presses (#82).
+const CONFIRMATION: &str = "diagnostics-copy-confirmation";
+
+/// The visible confirmations that say a copy happened (#82). One id, whatever
+/// the press count says inside it.
+fn confirmations(window: &Window) -> Vec<ElementSnapshot> {
+    snapshots(window)
+        .into_iter()
+        .filter(|element| {
+            element.visible() && confirmation_id(element) == ElementId::from(CONFIRMATION)
+        })
+        .collect()
+}
+
+/// The id of one observed confirmation, which is its accessibility identity.
+fn confirmation_id(confirmation: &ElementSnapshot) -> ElementId {
+    confirmation
+        .path()
+        .last()
+        .cloned()
+        .expect("the confirmation registers its own id")
+}
 /// The schema stands at the twelfth migration (#47 added the album title on top
 /// of the folder times #43 and the tag backfill #46).
 const DB_MIGRATION_VERSION: i64 = 12;
@@ -282,6 +310,45 @@ fn show_diagnostics(window: &mut Window, cx: &mut App) {
     window.press("enter", cx);
 }
 
+/// Scrolls the diagnostics view until the element with `id` is on screen.
+///
+/// #82: at the shell's smallest window the debug bundle card sits below the
+/// fold, and a control is clicked only once it is really visible.
+fn scroll_diagnostics_into_view(window: &mut Window, cx: &mut App, id: impl Into<ElementId>) {
+    use gpui_kit::{ScrollDelta, point, px};
+
+    let id = id.into();
+    window.render_frame(cx);
+    for _ in 0..60 {
+        if window
+            .try_find(id.clone())
+            .is_some_and(|target| target.visible())
+        {
+            return;
+        }
+        window.scroll(
+            "diagnostics-view",
+            ScrollDelta::Pixels(point(px(0.), px(-120.))),
+            cx,
+        );
+    }
+    panic!("{id:?} never became visible on diagnostics");
+}
+
+/// Scrolls the diagnostics view back to the top, so the next row is found by
+/// scrolling down to it rather than left behind above the viewport.
+fn scroll_diagnostics_to_top(window: &mut Window, cx: &mut App) {
+    use gpui_kit::{ScrollDelta, point, px};
+
+    window.render_frame(cx);
+    window.scroll(
+        "diagnostics-view",
+        ScrollDelta::Pixels(point(px(0.), px(4000.))),
+        cx,
+    );
+    window.render_frame(cx);
+}
+
 /// Adds one source folder straight to the store, before the engine exists.
 fn seed_folder(store: &Entity<StoreModel>, cx: &mut App, path: &Path) {
     store
@@ -406,7 +473,7 @@ async fn the_view_shows_the_sqlite_state_the_server_and_the_permissions(cx: &mut
             );
             assert_eq!(
                 window.find("diagnostics-table-sync_item").label(),
-                Some("sync_item: 0"),
+                Some("0"),
                 "every tracked table is counted"
             );
             assert_eq!(
@@ -418,6 +485,11 @@ async fn the_view_shows_the_sqlite_state_the_server_and_the_permissions(cx: &mut
                 window.find("diagnostics-errors-empty").label(),
                 Some("No failure has been recorded."),
                 "with no recorded failure the section says so"
+            );
+            assert_eq!(
+                window.find("diagnostics-errors-empty").role(),
+                Some(Role::Label),
+                "the empty section is a label node, so its sentence is read (B1)"
             );
         })
         .expect("update the shell window");
@@ -467,8 +539,119 @@ async fn every_diagnostics_control_is_named_and_keyboard_reachable(cx: &mut Test
         ] {
             tab_to(window, id, cx);
         }
+        // #82: with no archive yet there is nothing to copy, so the refusal is
+        // the control's absence rather than a confirmation of nothing.
+        assert!(
+            window.try_find("diagnostics-bundle-copy").is_none(),
+            "no archive yet, so there is no copy control"
+        );
+        assert!(
+            confirmations(window).is_empty(),
+            "no archive yet, so nothing confirms a copy"
+        );
     })
     .expect("update the shell window");
+}
+
+/// #87: "Show in folder" hands the archive's path to the file manager, names a
+/// refusal beside its control, and does not exist until an archive does.
+#[gpui_kit::test]
+async fn show_in_folder_hands_the_archive_over_and_names_a_refusal(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let (_runtime, server) = mock_server();
+    server.set_api_key(API_KEY);
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let connection = connection_model(cx, &server, AuthMethod::ApiKey);
+    let store = open_store(cx, &paths);
+    let (_engine, diagnostics) = open_models(cx, &paths, connection.clone(), store.clone());
+
+    let revealed: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let refuse = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (recorder, refusing) = (revealed.clone(), refuse.clone());
+    let window = cx.update(|cx| {
+        gpui_kit::init(cx);
+        let (window, _) = gpui_kit::open_window(window_options(), cx, |_, cx| {
+            cx.new(|cx| {
+                DiagnosticsView::with_revealer(
+                    diagnostics.clone(),
+                    Arc::new(move |path: &str| {
+                        recorder
+                            .lock()
+                            .expect("the recorder lock")
+                            .push(path.to_string());
+                        if refusing.load(std::sync::atomic::Ordering::SeqCst) {
+                            Err(std::io::Error::other("no file manager is installed"))
+                        } else {
+                            Ok(())
+                        }
+                    }),
+                    cx,
+                )
+            })
+        })
+        .expect("open the diagnostics window");
+        apply_system_theme(SystemTheme::Light, cx);
+        window
+    });
+
+    cx.update_window(window, |_, window, _| {
+        assert!(
+            window.try_find("diagnostics-bundle-reveal").is_none(),
+            "no archive yet, so there is no control to show it"
+        );
+    })
+    .expect("update the diagnostics window");
+
+    cx.update(|cx| diagnostics.update(cx, |model, cx| model.collect_bundle(cx)));
+    wait_until(cx, "the debug bundle", |cx| {
+        matches!(diagnostics.read(cx).bundle(), BundleState::Ready(_))
+    })
+    .await;
+    let report = match cx.read(|cx| diagnostics.read(cx).bundle().clone()) {
+        BundleState::Ready(report) => report,
+        other => panic!("the bundle is ready: {other:?}"),
+    };
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        tab_to(window, "diagnostics-bundle-reveal", cx);
+        assert_eq!(
+            window.find("diagnostics-bundle-reveal").label(),
+            Some("Show the debug bundle in the file manager"),
+            "the control is named"
+        );
+        window.click("diagnostics-bundle-reveal", cx);
+        assert!(
+            confirmations(window).is_empty(),
+            "showing the archive confirms nothing"
+        );
+    })
+    .expect("update the diagnostics window");
+    assert_eq!(
+        revealed.lock().expect("the recorder lock").as_slice(),
+        std::slice::from_ref(&report.path.display().to_string()),
+        "the control hands the archive's path to the file manager"
+    );
+
+    refuse.store(true, std::sync::atomic::Ordering::SeqCst);
+    cx.update_window(window, |_, window, cx| {
+        window.click("diagnostics-bundle-reveal", cx);
+    })
+    .expect("update the diagnostics window");
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let problem = window
+            .find("diagnostics-bundle-reveal-problem")
+            .label()
+            .expect("the refusal is shown beside the control")
+            .to_string();
+        assert!(
+            problem.contains("no file manager is installed"),
+            "the refusal names its reason: {problem}"
+        );
+    })
+    .expect("update the diagnostics window");
 }
 
 #[gpui_kit::test]
@@ -1072,7 +1255,33 @@ async fn the_bundle_action_saves_an_archive_shows_its_path_and_copies_it(cx: &mu
             Some(report.path.display().to_string().as_str()),
             "the view shows the archive's full path"
         );
-        window.click("diagnostics-bundle-copy", cx);
+        assert!(
+            confirmations(window).is_empty(),
+            "nothing has been copied yet, so nothing confirms"
+        );
+        // #82: the shell's smallest window is where the copy row has the least
+        // width to spare, so a confirmation that took space would rewrap the
+        // help text and move the control under the pointer that pressed it.
+        window.resize(size(px(520.), px(480.)));
+        window.bounds_changed(cx);
+        scroll_diagnostics_into_view(window, cx, "diagnostics-bundle-copy");
+    })
+    .expect("update the shell window");
+    let (button_before, row_before) = cx
+        .update_window(window, |_, window, _| {
+            (
+                window.find("diagnostics-bundle-copy").bounds(),
+                window.find("diagnostics-bundle-copy-row").bounds(),
+            )
+        })
+        .expect("update the shell window");
+    assert!(
+        row_before.size.width < px(520.),
+        "the row is laid out at the narrow window: {row_before:?}"
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        window.click("diagnostics-bundle-copy", cx)
     })
     .expect("update the shell window");
     let copied = cx
@@ -1083,6 +1292,111 @@ async fn the_bundle_action_saves_an_archive_shows_its_path_and_copies_it(cx: &mu
         report.path.display().to_string(),
         "the copy control puts the archive's path on the clipboard"
     );
+    cx.update_window(window, |_, window, _| {
+        let confirmations = confirmations(window);
+        assert_eq!(
+            confirmations.len(),
+            1,
+            "one confirmation says the copy happened: {confirmations:?}"
+        );
+        assert_eq!(
+            confirmations[0].role(),
+            Some(Role::Status),
+            "a copy that worked is a status, not an alert"
+        );
+        assert_eq!(
+            confirmations[0].label(),
+            Some(COPIED),
+            "the first press says what happened: {confirmations:?}"
+        );
+        assert_eq!(
+            confirmations[0].value(),
+            Some(COPIED),
+            "macOS announces a live node by value: {confirmations:?}"
+        );
+        assert!(
+            confirmations[0]
+                .path()
+                .contains(&ElementId::from("diagnostics-bundle-copy-row")),
+            "the confirmation sits in the row of the control that copied: {:?}",
+            confirmations[0].path()
+        );
+        assert_eq!(
+            (
+                window.find("diagnostics-bundle-copy").bounds(),
+                window.find("diagnostics-bundle-copy-row").bounds(),
+            ),
+            (button_before, row_before),
+            "the confirmation takes its reserved slot: nothing moves under the pointer"
+        );
+    })
+    .expect("update the shell window");
+
+    // #82: a second press must confirm again instead of staying silent. One
+    // node, one id, and the press count in the announcement: every adapter
+    // announces a changed name or value, none announces a replaced node.
+    cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string("SENTINEL".into())));
+    cx.update_window(window, |_, window, cx| {
+        window.click("diagnostics-bundle-copy", cx)
+    })
+    .expect("update the shell window");
+    let copied = cx
+        .update(|cx| cx.read_from_clipboard().and_then(|item| item.text()))
+        .unwrap_or_default();
+    assert_eq!(
+        copied,
+        report.path.display().to_string(),
+        "the second press copies the archive's path again"
+    );
+    cx.update_window(window, |_, window, _| {
+        let confirmations = confirmations(window);
+        assert_eq!(
+            confirmations.len(),
+            1,
+            "the second press replaces the confirmation instead of stacking one: {confirmations:?}"
+        );
+        assert_eq!(
+            confirmation_id(&confirmations[0]),
+            ElementId::from(CONFIRMATION),
+            "the confirmation keeps one stable identity across presses"
+        );
+        assert_eq!(
+            confirmations[0].role(),
+            Some(Role::Status),
+            "a repeat is still a status"
+        );
+        assert_eq!(
+            (confirmations[0].label(), confirmations[0].value()),
+            (Some("Copied 2 times"), Some("Copied 2 times")),
+            "the repeat is announced: a name change for Windows and AT-SPI, a value change for macOS"
+        );
+    })
+    .expect("update the shell window");
+
+    // #82: the confirmation describes the archive it copied, so a new archive
+    // takes it away instead of leaving a claim about the old path.
+    cx.update(|cx| diagnostics.update(cx, |model, cx| model.collect_bundle(cx)));
+    wait_until(cx, "the second debug bundle", |cx| {
+        matches!(diagnostics.read(cx).bundle(), BundleState::Ready(_))
+    })
+    .await;
+    let second = match cx.read(|cx| diagnostics.read(cx).bundle().clone()) {
+        BundleState::Ready(report) => report,
+        other => panic!("the second bundle is ready: {other:?}"),
+    };
+    assert_ne!(
+        second.path, report.path,
+        "a second collection in the same second is named apart"
+    );
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find(CONFIRMATION).is_none(),
+            "a copy of the previous archive is not confirmed beside a new one: {:?}",
+            window.try_find(CONFIRMATION)
+        );
+    })
+    .expect("update the shell window");
 
     let (entries, bytes) = read_archive(&report.path);
     for required in [
@@ -1280,4 +1594,398 @@ async fn an_unreachable_server_makes_a_partial_bundle_with_a_note(cx: &mut TestA
         }
     })
     .expect("update the shell window");
+}
+
+/// Seeds one failed attempt with a message, so the last-error card has a row.
+fn seed_failure(store: &Entity<StoreModel>, cx: &mut App, message: &str) {
+    let store = store.read(cx);
+    let store = store.store().expect("the store is open");
+    let mut failed = bundle_item("/photos/one.cr3", ItemState::FailedPermanent);
+    failed.error_class = Some(FailureClass::UnsupportedFormat);
+    failed.error_message = Some(message.to_string());
+    store.record(&failed).expect("write the failed item");
+    store
+        .record_attempt(&AttemptRecord {
+            path: failed.path.clone(),
+            started_ns: 10,
+            outcome: AttemptOutcome::Failed,
+            error_class: Some(FailureClass::UnsupportedFormat),
+        })
+        .expect("record the attempt");
+}
+
+/// #80: the description-list rows keep every value's element id and accessible
+/// name. The literals are the ones the hand-written rows showed, copied from
+/// the pre-migration source, not read back from the view: a row that loses its
+/// id, its name, or its value fails here.
+#[gpui_kit::test]
+async fn every_value_row_keeps_its_element_id_and_accessible_name(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let (_runtime, server) = mock_server();
+    server.set_api_key(API_KEY);
+    server.set_api_key_permissions(&["asset.upload", "server.about"]);
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let connection = connection_model(cx, &server, AuthMethod::ApiKey);
+    let (window, store, _engine, diagnostics) = open_shell(
+        cx,
+        SettingsStore::open(paths.config_file.clone()),
+        paths.clone(),
+        connection.clone(),
+    );
+    wait_until(cx, "the store", |cx| store.read(cx).store().is_some()).await;
+    let message = "the server answered 415";
+    cx.update(|cx| seed_failure(&store, cx, message));
+    cx.update(|cx| diagnostics.update(cx, |model, cx| model.refresh(cx)));
+    sign_in(cx, &connection, &server, AuthMethod::ApiKey, API_KEY);
+    wait_until(cx, "the server probe", |cx| {
+        diagnostics.read(cx).server().version.is_some()
+    })
+    .await;
+    wait_until(cx, "the sqlite read", |cx| {
+        diagnostics.read(cx).info().is_some()
+    })
+    .await;
+    wait_until(cx, "the last error per class", |cx| {
+        !diagnostics.read(cx).errors().is_empty()
+    })
+    .await;
+
+    let rows: Vec<(&str, String)> = vec![
+        (
+            "diagnostics-client-version-value",
+            concat!(
+                env!("CARGO_PKG_VERSION"),
+                " (",
+                env!("IMMICH_SYNC_GIT_REVISION"),
+                ")"
+            )
+            .to_string(),
+        ),
+        ("diagnostics-server-version-value", "v3.3.1".to_string()),
+        (
+            "diagnostics-permissions-value",
+            "Mock API Key: asset.upload, server.about".to_string(),
+        ),
+        (
+            "diagnostics-state-path-value",
+            paths.state_db.display().to_string(),
+        ),
+        (
+            "diagnostics-sqlite-version-value",
+            DB_MIGRATION_VERSION.to_string(),
+        ),
+        ("diagnostics-integrity-value", "ok".to_string()),
+        // The seeded failed item is the one row `sync_item` holds. Both it and
+        // the error row name their value only: the term beside it states the
+        // label, so a row reads its term once (F1).
+        ("diagnostics-table-sync_item", "1".to_string()),
+        ("diagnostics-throughput-value", "0 B/s".to_string()),
+        ("diagnostics-error-unsupported_format", message.to_string()),
+    ];
+    for system in [theme::SystemTheme::Light, theme::SystemTheme::Dark] {
+        cx.update(|cx| theme::apply_system_theme(system, cx));
+        cx.update_window(window, |_, window, cx| {
+            show_diagnostics(window, cx);
+            for (id, name) in &rows {
+                let row = window
+                    .try_find(*id)
+                    .unwrap_or_else(|| panic!("{id} is no longer shown in {system:?}"));
+                assert!(row.visible(), "{id} is visible in {system:?}");
+                assert_eq!(
+                    row.label(),
+                    Some(name.as_str()),
+                    "{id} keeps its accessible name in {system:?}"
+                );
+                // #80: the term is announced as a term, and the value as the
+                // description-list value beside it — both named, so both reach
+                // the tree (B1).
+                let term = window
+                    .try_find(ElementId::Name(format!("{id}-label").into()))
+                    .unwrap_or_else(|| panic!("{id} has no label in {system:?}"));
+                assert_eq!(
+                    term.role(),
+                    Some(Role::Term),
+                    "{id} is announced as its term in {system:?}"
+                );
+                assert!(term.label().is_some(), "{id} names its term in {system:?}");
+                assert_eq!(
+                    window.find(*id).role(),
+                    Some(Role::Definition),
+                    "{id} is announced as its term's value in {system:?}"
+                );
+            }
+            // F4: the pairs sit in one description list per card, so a screen
+            // reader walks them as a collection and not as flat text.
+            for id in [
+                "diagnostics-server-values",
+                "diagnostics-state-values",
+                "diagnostics-throughput-values",
+                "diagnostics-errors-values",
+            ] {
+                assert_eq!(
+                    window.find(id).role(),
+                    Some(Role::DescriptionList),
+                    "{id} groups its term and definition pairs in {system:?}"
+                );
+            }
+            // The rows whose value the run itself decides: each one still says
+            // what it said before the migration, and none may be blank.
+            let activity = window
+                .find("diagnostics-activity-value")
+                .label()
+                .expect("the activity is shown")
+                .to_string();
+            assert!(
+                ["Idle", "Syncing", "Paused", "Needs attention"].contains(&activity.as_str()),
+                "the activity is one of its four labels: {activity}"
+            );
+            let counts = window
+                .find("diagnostics-counts-value")
+                .label()
+                .expect("the counts are shown")
+                .to_string();
+            let parts: Vec<&str> = counts.split(", ").collect();
+            assert_eq!(parts.len(), 3, "three counts, in one sentence: {counts}");
+            for (part, word) in parts.iter().zip(["uploaded", "pending", "failed"]) {
+                assert!(
+                    part.ends_with(&format!(" {word}"))
+                        && part
+                            .trim_end_matches(&format!(" {word}"))
+                            .parse::<u64>()
+                            .is_ok(),
+                    "the counts keep their wording: {counts}"
+                );
+            }
+            assert!(
+                window
+                    .find("diagnostics-sqlite-size-value")
+                    .label()
+                    .is_some_and(|size| !size.is_empty()),
+                "the database size is still shown"
+            );
+        })
+        .expect("update the shell window");
+    }
+}
+
+/// The most lines a value may take before it is cut. A copy of the view's
+/// clamp, deliberately not imported, so raising it fails here (#80).
+const VALUE_LINE_CLAMP: f32 = 6.;
+
+/// #80: a value long enough to fill the card is cut at a fixed number of lines,
+/// and the whole text stays in the row's accessible name.
+///
+/// `UploadFailure::message` is the raw error text, so a 2000-character server
+/// answer reaches this row. Unclamped it wraps to about 45 lines in the
+/// description column at 520 px and makes the errors card one tall row; the cut
+/// is visual only, so the name still carries every character.
+#[gpui_kit::test]
+async fn a_very_long_value_is_cut_at_the_clamp_and_keeps_its_whole_name(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let (_runtime, server) = mock_server();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let connection = connection_model(cx, &server, AuthMethod::ApiKey);
+    let (window, store, _engine, diagnostics) = open_shell(
+        cx,
+        SettingsStore::open(paths.config_file.clone()),
+        paths.clone(),
+        connection.clone(),
+    );
+    wait_until(cx, "the store", |cx| store.read(cx).store().is_some()).await;
+    let message: String = "the server answered 415 "
+        .repeat(84)
+        .chars()
+        .take(2000)
+        .collect();
+    assert_eq!(message.chars().count(), 2000, "the message is the long one");
+    cx.update(|cx| seed_failure(&store, cx, &message));
+    cx.update(|cx| diagnostics.update(cx, |model, cx| model.refresh(cx)));
+    wait_until(cx, "the last error per class", |cx| {
+        !diagnostics.read(cx).errors().is_empty()
+    })
+    .await;
+
+    cx.update_window(window, |_, window, cx| {
+        show_diagnostics(window, cx);
+        window.resize(size(px(520.), px(480.)));
+        window.bounds_changed(cx);
+        window.render_frame(cx);
+    })
+    .expect("update the shell window");
+
+    let name = &message;
+    for system in [theme::SystemTheme::Light, theme::SystemTheme::Dark] {
+        cx.update(|cx| theme::apply_system_theme(system, cx));
+        cx.update_window(window, |_, window, cx| {
+            show_diagnostics(window, cx);
+            let one_line = f32::from(
+                window
+                    .find("diagnostics-throughput-value")
+                    .bounds()
+                    .size
+                    .height,
+            );
+            assert!(
+                one_line > 0.,
+                "a one-line value has a height to measure against"
+            );
+            scroll_diagnostics_into_view(window, cx, "diagnostics-error-unsupported_format");
+            let value = window.find("diagnostics-error-unsupported_format");
+            let lines = f32::from(value.bounds().size.height) / one_line;
+            assert!(
+                (lines - VALUE_LINE_CLAMP).abs() <= 1.,
+                "{system:?}: the 2000-character value takes {lines:.1} lines, the clamp's \
+                 {VALUE_LINE_CLAMP}"
+            );
+            // The cut is visual: every character is still in the name, and the
+            // name is on a node with a role, so it reaches the tree (#80, B1).
+            assert_eq!(
+                value.role(),
+                Some(Role::Definition),
+                "{system:?}: the value is the term's value, so its name is read"
+            );
+            assert_eq!(
+                value.label(),
+                Some(name.as_str()),
+                "{system:?}: the whole 2000-character value stays announced"
+            );
+        })
+        .expect("update the shell window");
+    }
+}
+
+/// The label column every value row shares, in rems: wide enough for the
+/// longest term and fixed, so a long value can never take its width.
+const LABEL_COLUMN_REMS: f32 = 12.;
+
+/// #80: a long value wraps inside its own column and never narrows the label,
+/// at the shell's smallest window and in both themes.
+///
+/// The deep temp directory makes the state database's path longer than the
+/// description column at 520 px, and the failure message does the same in the
+/// errors card, so both rows have to wrap instead of pushing the label aside.
+#[gpui_kit::test]
+async fn a_long_value_wraps_and_never_narrows_the_label_at_the_narrowest_window(
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let (_runtime, server) = mock_server();
+    server.set_api_key(API_KEY);
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let deep = temp
+        .path()
+        .join("a-deep-directory-name-long-enough-to-wrap-the-database-path")
+        .join("and-a-second-segment-for-good-measure");
+    fs::create_dir_all(&deep).expect("create the deep directory");
+    let paths = temporary_paths(&deep);
+    let connection = connection_model(cx, &server, AuthMethod::ApiKey);
+    let (window, store, _engine, diagnostics) = open_shell(
+        cx,
+        SettingsStore::open(paths.config_file.clone()),
+        paths.clone(),
+        connection.clone(),
+    );
+    wait_until(cx, "the store", |cx| store.read(cx).store().is_some()).await;
+    let message = "the server answered 415 with a long explanation that cannot fit on one line \
+                   of the description column";
+    cx.update(|cx| seed_failure(&store, cx, message));
+    cx.update(|cx| diagnostics.update(cx, |model, cx| model.refresh(cx)));
+    wait_until(cx, "the last error per class", |cx| {
+        !diagnostics.read(cx).errors().is_empty()
+    })
+    .await;
+
+    cx.update_window(window, |_, window, cx| {
+        show_diagnostics(window, cx);
+        window.resize(size(px(520.), px(480.)));
+        window.bounds_changed(cx);
+        window.render_frame(cx);
+    })
+    .expect("update the shell window");
+
+    for system in [theme::SystemTheme::Light, theme::SystemTheme::Dark] {
+        cx.update(|cx| theme::apply_system_theme(system, cx));
+        cx.update_window(window, |_, window, cx| {
+            show_diagnostics(window, cx);
+            let label_width = f32::from(window.rem_size()) * LABEL_COLUMN_REMS;
+            let one_line = f32::from(
+                window
+                    .find("diagnostics-throughput-value")
+                    .bounds()
+                    .size
+                    .height,
+            );
+            assert!(
+                one_line > 0.,
+                "a one-line value has a height to measure against"
+            );
+            scroll_diagnostics_to_top(window, cx);
+            for (card_id, value_id) in [
+                ("diagnostics-state", "diagnostics-state-path-value"),
+                ("diagnostics-errors", "diagnostics-error-unsupported_format"),
+            ] {
+                scroll_diagnostics_into_view(window, cx, value_id);
+                let card = window.find(card_id).bounds();
+                let label = window
+                    .try_find(ElementId::Name(format!("{value_id}-label").into()))
+                    .unwrap_or_else(|| panic!("{value_id} has no label box in {system:?}"))
+                    .bounds();
+                let value = window.find(value_id).bounds();
+                assert!(
+                    (f32::from(label.size.width) - label_width).abs() <= 1.,
+                    "{system:?}: {value_id} keeps its label column ({label_width} px): {label:?}"
+                );
+                assert!(
+                    label.origin.x >= card.origin.x + px(12.) - px(1.)
+                        && label.origin.x + label.size.width <= card.origin.x + card.size.width,
+                    "{system:?}: the {value_id} label sits inside its card: {label:?} in {card:?}"
+                );
+                assert!(
+                    value.origin.x >= label.origin.x + label.size.width - px(1.),
+                    "{system:?}: the {value_id} value starts after the label, not over it: \
+                     {value:?} vs {label:?}"
+                );
+                assert!(
+                    value.origin.x + value.size.width <= card.origin.x + card.size.width,
+                    "{system:?}: the {value_id} value stays inside its card: {value:?} in {card:?}"
+                );
+                assert!(
+                    f32::from(value.size.height) >= one_line * 1.5,
+                    "{system:?}: the long {value_id} wraps instead of being clipped to one \
+                     line: {value:?} vs a {one_line} px line"
+                );
+            }
+        })
+        .expect("update the shell window");
+    }
+}
+
+/// #80: the value rows read on the card surface in both themes.
+///
+/// The terms take the kit's description-list label ink and the values keep the
+/// card's own two inks, so the three pairs are measured against the card
+/// surface the rows are drawn on.
+#[gpui_kit::test]
+fn the_label_and_value_ink_reads_on_the_card_in_both_themes(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    for system in [SystemTheme::Light, SystemTheme::Dark] {
+        cx.update(|cx| apply_system_theme(system, cx));
+        cx.read(|cx| {
+            let theme = Theme::global(cx);
+            let palette = CardPalette::new(theme);
+            for (what, ink) in [
+                ("the term", theme.description_list_label_foreground),
+                ("the value", palette.text),
+                ("the help", palette.meta),
+            ] {
+                let ratio = contrast(ink, palette.surface);
+                assert!(
+                    ratio >= 4.5,
+                    "{system:?}: {what} on the card surface is {ratio:.2}:1, below 4.5:1"
+                );
+            }
+        });
+    }
 }

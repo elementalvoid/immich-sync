@@ -13,9 +13,11 @@ use gpui_kit::*;
 use sync_core::paths::PathCase;
 
 use crate::dashboard::CardPalette;
+use crate::empty_state::EmptyState;
 use crate::engine::EngineModel;
 use crate::folder_filter::FolderFilter;
 use crate::folder_filter_view::folder_filter_bar;
+use crate::notice::{Notice, Severity};
 use crate::review::{ReviewRow, rows, summary};
 
 /// The deletion review surface.
@@ -77,8 +79,6 @@ impl Render for ReviewView {
         let palette = CardPalette::new(cx.theme());
         let radius = cx.theme().radius_lg;
         let border = cx.theme().border;
-        let danger = cx.theme().danger;
-        let warning = cx.theme().warning;
         let background = cx.theme().background;
         let foreground = cx.theme().foreground;
         let muted = cx.theme().muted_foreground;
@@ -89,18 +89,17 @@ impl Render for ReviewView {
         items.retain(|item| filter.keeps(&item.path, &folders, case));
         let rows = rows(&items);
         let problem = self.engine.read(cx).review_problem().map(str::to_string);
-        // R5.3, #41: the empty state names the folder the filter shows.
+        // R5.3, #41: the empty state names the folder the filter shows, and only
+        // the list it stands in for (#77).
         let empty = self
             .filter
             .read(cx)
             .empty_heading("No missing files", "Every tracked file is present");
         // #41 review: an empty filtered list must not be summarised as if the
-        // whole client were empty, so the summary says what the list says.
-        let summary = if rows.is_empty() && self.filter.read(cx).is_active() {
-            empty.clone()
-        } else {
-            summary(&items)
-        };
+        // whole client were empty, so the summary only states a count. An empty
+        // list is stated once, by the empty state below it (#76's "announced
+        // once" rule, #77).
+        let summary = (!rows.is_empty()).then(|| summary(&items));
 
         div()
             .id("review-view")
@@ -131,16 +130,7 @@ impl Render for ReviewView {
                     )),
             )
             .when_some(problem, |this, problem| {
-                this.child(
-                    div()
-                        .id("review-problem")
-                        .test_support()
-                        .role(Role::Status)
-                        .aria_label(problem.clone())
-                        .text_sm()
-                        .text_color(danger)
-                        .child(problem),
-                )
+                this.child(Notice::new("review-problem", Severity::Error, problem))
             })
             .child(folder_filter_bar(
                 "review",
@@ -149,16 +139,18 @@ impl Render for ReviewView {
                 window,
                 cx,
             ))
-            .child(
-                div()
-                    .id("review-summary")
-                    .test_support()
-                    .role(Role::Status)
-                    .aria_label(summary.clone())
-                    .text_sm()
-                    .text_color(muted)
-                    .child(summary),
-            )
+            .when_some(summary, |this, summary| {
+                this.child(
+                    div()
+                        .id("review-summary")
+                        .test_support()
+                        .role(Role::Status)
+                        .aria_label(summary.clone())
+                        .text_sm()
+                        .text_color(muted)
+                        .child(summary),
+                )
+            })
             .child(
                 div()
                     .id("review-list")
@@ -169,11 +161,18 @@ impl Render for ReviewView {
                     .flex_col()
                     .gap_3()
                     .when(rows.is_empty(), |this| {
-                        this.child(empty_card("review-empty", &empty, &palette, radius, border))
+                        this.child(EmptyState::new(
+                            "review-empty",
+                            empty,
+                            "A file that disappears from a source folder appears here, and the \
+                             server copy waits for your choice.",
+                        ))
                     })
-                    .children(rows.iter().enumerate().map(|(index, row)| {
-                        row_card(row, index, &palette, radius, border, warning, cx)
-                    })),
+                    .children(
+                        rows.iter()
+                            .enumerate()
+                            .map(|(index, row)| row_card(row, index, &palette, radius, border, cx)),
+                    ),
             )
     }
 }
@@ -185,7 +184,6 @@ fn row_card(
     palette: &CardPalette,
     radius: Pixels,
     border: Hsla,
-    warning: Hsla,
     cx: &mut Context<ReviewView>,
 ) -> impl IntoElement + use<> {
     let keep_path = row.path.clone();
@@ -227,13 +225,14 @@ fn row_card(
                         .child(row.path.clone()),
                 )
                 .child(
-                    div()
-                        .border_l_2()
-                        .border_color(warning)
-                        .pl_2()
-                        .text_xs()
-                        .text_color(palette.text)
-                        .child("Missing on this computer · the server copy is untouched"),
+                    // The row's accessible name states the row and its
+                    // reassurance, so the strip names nothing itself (#76).
+                    Notice::new(
+                        format!("review-row-notice-{index}"),
+                        Severity::Warning,
+                        "Missing on this computer · the server copy is untouched",
+                    )
+                    .quiet(),
                 ),
         )
         .child(
@@ -260,42 +259,5 @@ fn row_card(
                             this.trash(trash_path.clone(), cx);
                         })),
                 ),
-        )
-}
-
-/// The empty state: the view is a normal place to be, not a broken one.
-fn empty_card(
-    id: &'static str,
-    heading: &str,
-    palette: &CardPalette,
-    radius: Pixels,
-    border: Hsla,
-) -> impl IntoElement + use<> {
-    let heading = heading.to_string();
-    div()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .p_4()
-        .w_full()
-        .rounded(radius)
-        .bg(palette.surface)
-        .border_1()
-        .border_color(border)
-        .child(
-            div()
-                .id(id)
-                .test_support()
-                .role(Role::Status)
-                .aria_label(heading.clone())
-                .text_base()
-                .font_weight(FontWeight::MEDIUM)
-                .child(heading),
-        )
-        .child(
-            div()
-                .text_xs()
-                .text_color(palette.meta)
-                .child("A file that disappears from a source folder appears here, and the server copy waits for your choice."),
         )
 }

@@ -15,8 +15,7 @@ use std::time::Duration;
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
     AnyWindowHandle, App, AppContext as _, Bounds, ElementId, Entity, InputEvent as _, Point,
-    ScrollDelta, ScrollWheelEvent, TestAppContext, Window, WindowBounds, WindowOptions, point, px,
-    size,
+    ScrollDelta, ScrollEvent, TestAppContext, Window, WindowBounds, WindowOptions, point, px, size,
 };
 use immich_sync::autostart::{Autostart, UnavailableAutostart};
 use immich_sync::connection::{ConnectionModel, profile_from_settings};
@@ -217,8 +216,11 @@ fn surface_probe(mode: ViewMode) -> (ElementId, ElementId, bool) {
             ("folder-details", SEEDED_FOLDERS - 1).into(),
             true,
         ),
+        // #78: the settings surface is six pages, so its last element is on
+        // the last page. The page body scrolls, not the surface, so the wheel
+        // is aimed at the first row of that page.
         ViewMode::Settings => (
-            "settings-scroll".into(),
+            "settings-path-config".into(),
             "settings-path-state-value".into(),
             true,
         ),
@@ -277,7 +279,7 @@ fn scroll_until_visible(
         }
         let position = visible_center(window, container);
         window.dispatch_event(
-            ScrollWheelEvent {
+            ScrollEvent {
                 position,
                 delta: ScrollDelta::Lines(point(0., lines)),
                 ..Default::default()
@@ -334,6 +336,15 @@ async fn every_long_surface_reaches_its_last_element_at_a_short_height(cx: &mut 
     ] {
         let (container, target, must_scroll) = surface_probe(mode);
         shell.update(cx, |shell, cx| shell.show(mode, cx));
+        if mode == ViewMode::Settings {
+            // The storage locations are on the settings surface's last page.
+            cx.update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                window.render_frame(cx);
+                window.click("settings-page-storage", cx);
+            })
+            .expect("open the settings surface's last page");
+        }
         wait_for_element(cx, window, target.clone()).await;
         cx.update_window(window, |_, window, cx| {
             window.render_frame(cx);
@@ -401,7 +412,7 @@ async fn the_log_tail_scrolls_inside_its_own_container(cx: &mut TestAppContext) 
             - f32::from(window.find("logs-lines").bounds().origin.y);
         let box_bounds = window.find("logs-lines").bounds();
         window.dispatch_event(
-            ScrollWheelEvent {
+            ScrollEvent {
                 position: point(box_bounds.center().x, box_bounds.origin.y + px(20.)),
                 delta: ScrollDelta::Lines(point(0., 4.)),
                 ..Default::default()

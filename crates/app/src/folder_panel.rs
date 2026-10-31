@@ -2,10 +2,12 @@
 //! (#40) and opened as its live detail (#43).
 //!
 //! One panel serves both: the draft is the setup dialog, and the detail is the
-//! same card in live mode. The title, the path block, the three settings
-//! controls, the modal host, the focus trap, and Escape are shared, so the two
-//! modes cannot drift apart. The dashboard owns which panel is open: it creates
-//! one when the add field, Browse, a card, or its Details control asks for it.
+//! same body in live mode. The title, the path block, and the three settings
+//! controls are shared, so the two modes cannot drift apart. The dashboard owns
+//! which panel is open: it creates one when the add field, Browse, a card, or
+//! its Details control asks for it, and opens it through the window's dialog
+//! layer (#81), which owns the backdrop, the focus trap, Escape, the outside
+//! press and the focus return to that opener.
 //!
 //! In detail mode the panel reads the folder's live status from the engine on
 //! every engine notification, so counts, state, progress, the last error, and
@@ -17,7 +19,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use gpui_kit::base::Disableable as _;
-use gpui_kit::base::FocusTrapElement as _;
 use gpui_kit::base::SelectableText;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::Theme;
@@ -38,7 +39,7 @@ use crate::dashboard::{CardPalette, state_tag};
 use crate::diagnostics::format_bytes;
 use crate::engine::EngineModel;
 use crate::folder_controls::{SettingsControls, SettingsIds, SettingsValues};
-use crate::settings_view::notice;
+use crate::notice::{Notice, Severity};
 use crate::shell::ViewMode;
 use crate::status::{ActivityState, StatusCard, folder_name};
 use crate::times;
@@ -83,9 +84,41 @@ pub(crate) fn file_manager_command() -> &'static str {
 ///
 /// Returns the platform's error when the file manager cannot be started.
 pub fn open_in_file_manager(path: &str) -> std::io::Result<()> {
-    let mut child = std::process::Command::new(file_manager_command())
-        .arg(path)
-        .spawn()?;
+    spawn_reaped(std::process::Command::new(file_manager_command()).arg(path))
+}
+
+/// The program and arguments that show `path` in the platform's file manager
+/// (#87).
+///
+/// Windows and macOS select the file itself. Linux has no launcher that selects
+/// a file, so it opens the folder that holds it.
+#[must_use]
+pub(crate) fn reveal_command(path: &str) -> (&'static str, Vec<String>) {
+    if cfg!(windows) {
+        ("explorer", vec![format!("/select,{path}")])
+    } else if cfg!(target_os = "macos") {
+        ("open", vec!["-R".to_string(), path.to_string()])
+    } else {
+        let folder = Path::new(path).parent().unwrap_or(Path::new(path));
+        ("xdg-open", vec![folder.display().to_string()])
+    }
+}
+
+/// Shows `path` in the platform's file manager with the file selected where the
+/// platform allows it (#87). Same reaping rule as [`open_in_file_manager`].
+///
+/// # Errors
+///
+/// Returns the platform's error when the file manager cannot be started.
+pub fn reveal_in_file_manager(path: &str) -> std::io::Result<()> {
+    let (program, args) = reveal_command(path);
+    spawn_reaped(std::process::Command::new(program).args(args))
+}
+
+/// Starts `command` and reaps the child on a thread of its own, so the caller
+/// never waits for a file manager the user may keep open.
+fn spawn_reaped(command: &mut std::process::Command) -> std::io::Result<()> {
+    let mut child = command.spawn()?;
     std::thread::spawn(move || {
         let _ = child.wait();
     });
@@ -226,6 +259,10 @@ fn subscribe_title(
 pub struct FolderPanel {
     engine: Entity<EngineModel>,
     mode: FolderPanelMode,
+    /// The panel's own focus handle (#81). It is not a trap: the layer supplies
+    /// the trap. It is where the keyboard lands when the panel opens, so Tab
+    /// descends into the panel's controls.
+    focus: FocusHandle,
     /// The draft: the path plus the three settings. In detail mode the path is
     /// the folder's identity and the settings are the live values, so one
     /// renderer serves both.
@@ -272,7 +309,6 @@ pub struct FolderPanel {
     /// The folder's uploaded count and recursion setting the loaded rows were
     /// read at, so the next status poll that changes either reloads them.
     assets_read_at: Option<(u32, bool)>,
-    focus: FocusHandle,
     _subscription: Subscription,
     _title_subscription: Subscription,
 }
@@ -290,7 +326,6 @@ impl FolderPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let focus = cx.focus_handle();
         let subscription = cx.observe(&engine, |this, engine, cx| this.engine_changed(&engine, cx));
         let path = path.trim().to_string();
         let title_input = title_field(&path, None, window, cx);
@@ -298,6 +333,7 @@ impl FolderPanel {
         Self {
             engine,
             mode: FolderPanelMode::Draft,
+            focus: cx.focus_handle(),
             draft: SourceFolder {
                 path,
                 recursive: true,
@@ -321,7 +357,6 @@ impl FolderPanel {
             assets_problem: None,
             assets_loading: false,
             assets_read_at: None,
-            focus,
             _subscription: subscription,
             _title_subscription: title_subscription,
         }
@@ -341,7 +376,6 @@ impl FolderPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let focus = cx.focus_handle();
         let subscription = cx.observe(&engine, |this, engine, cx| this.engine_changed(&engine, cx));
         let card = folder_card(&engine, &path, cx);
         let server_url = engine.read(cx).server_url(cx);
@@ -361,6 +395,7 @@ impl FolderPanel {
         let mut panel = Self {
             engine,
             mode: FolderPanelMode::Detail,
+            focus: cx.focus_handle(),
             draft,
             problem: None,
             pending: None,
@@ -378,7 +413,6 @@ impl FolderPanel {
             assets_problem: None,
             assets_loading: false,
             assets_read_at: None,
-            focus,
             _subscription: subscription,
             _title_subscription: title_subscription,
         };
@@ -558,7 +592,7 @@ impl FolderPanel {
     ///
     /// One request at a time: a second Add while the first is in flight is
     /// ignored, so a slow store cannot write the folder twice.
-    fn add(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn add(&mut self, cx: &mut Context<Self>) {
         if self.mode != FolderPanelMode::Draft || self.pending.is_some() {
             return;
         }
@@ -568,11 +602,6 @@ impl FolderPanel {
         let engine = self.engine.clone();
         let request = engine.update(cx, |engine, cx| engine.add_folder_settings(draft, cx));
         self.pending = Some(request);
-        // Cancel is disabled while the request runs, and a disabled control
-        // drops focus to the window root, which would stop the modal host
-        // receiving Escape. Keep the host focused so the dialog stays
-        // cancellable from the keyboard.
-        window.focus(&self.focus, cx);
         // A failed worker reports synchronously, before `pending` was set;
         // read the result back so that failure cannot be missed.
         self.engine_changed(&engine, cx);
@@ -758,18 +787,13 @@ impl FolderPanel {
     }
 
     /// Escape, the backdrop, and the close control, each respecting what may
-    /// still be in flight.
-    fn dismiss(&mut self, cx: &mut Context<Self>) {
+    /// still be in flight. The dialog layer turns Escape and an outside press
+    /// into this dismissal, so the panel has one close path (#81).
+    pub(crate) fn dismiss(&mut self, cx: &mut Context<Self>) {
         match self.mode {
             FolderPanelMode::Draft => self.cancel(cx),
             FolderPanelMode::Detail => cx.emit(FolderPanelEvent::Closed),
         }
-    }
-
-    /// Escape inside the dialog (#43). While the confirmation alert is up,
-    /// focus is in that layer and its own Escape closes only the alert (#73).
-    fn escape(&mut self, cx: &mut Context<Self>) {
-        self.dismiss(cx);
     }
 
     /// Cancels the draft. While an Add is in flight this is a no-op: its result
@@ -788,6 +812,30 @@ impl FolderPanel {
             FolderPanelMode::Draft => "Folder setup",
             FolderPanelMode::Detail => "Folder detail",
         }
+    }
+
+    /// The width this mode's dialog takes (#40, #81): the detail carries more
+    /// than the setup, so it gets the wider surface.
+    #[must_use]
+    pub fn dialog_width(&self) -> Rems {
+        match self.mode {
+            FolderPanelMode::Draft => rems(30.),
+            FolderPanelMode::Detail => rems(34.),
+        }
+    }
+
+    /// The folder this panel is about: the draft's path, and in detail mode the
+    /// tracked folder's identity (#43).
+    #[must_use]
+    pub fn folder_path(&self) -> &str {
+        &self.draft.path
+    }
+
+    /// The handle the layer opens with focus on (#81), so Tab starts inside the
+    /// panel before the user reaches any control.
+    #[must_use]
+    pub(crate) fn focus_handle(&self) -> FocusHandle {
+        self.focus.clone()
     }
 
     /// The visible heading the setup dialog gives the panel; the detail's
@@ -812,23 +860,25 @@ impl FolderPanel {
         };
         let muted = cx.theme().muted_foreground;
         let selectable = self.mode == FolderPanelMode::Detail;
-        div()
-            .id("folder-panel-path")
-            .test_support()
-            .aria_label(format!("Folder path: {shown}"))
-            .min_w_0()
-            .w_full()
-            .text_sm()
-            .text_color(muted)
-            .when(!selectable, |this| this.truncate())
-            // The detail shows the path whole: a long one wraps instead of
-            // being cut, and it can be selected and copied.
-            .when(selectable, |this| {
-                this.child(
-                    SelectableText::new("folder-panel-path-text", shown.clone()).document_order(0),
-                )
-            })
-            .when(!selectable, |this| this.child(shown))
+        crate::a11y::named(
+            Role::Label,
+            "folder-panel-path",
+            format!("Folder path: {shown}"),
+            None,
+        )
+        .min_w_0()
+        .w_full()
+        .text_sm()
+        .text_color(muted)
+        .when(!selectable, |this| this.truncate())
+        // The detail shows the path whole: a long one wraps instead of
+        // being cut, and it can be selected and copied.
+        .when(selectable, |this| {
+            this.child(
+                SelectableText::new("folder-panel-path-text", shown.clone()).document_order(0),
+            )
+        })
+        .when(!selectable, |this| this.child(shown))
     }
 
     /// The album title field (#47): the user's own name for this folder's
@@ -842,24 +892,29 @@ impl FolderPanel {
         let detail = self.mode == FolderPanelMode::Detail;
         let name = self.folder_name();
         let focus = self.title_input.read(cx).focus_handle(cx);
-        let row = div()
-            .id("folder-panel-title")
-            .test_support()
-            .track_focus(&focus)
-            .aria_label(format!("Album title for {name}"))
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child("Album title"),
-            )
-            .child(div().flex_1().min_w_0().child(
-                Input::new(&self.title_input).aria_label(format!("Album title for {name}")),
-            ));
+        let row = crate::a11y::named(
+            Role::Group,
+            "folder-panel-title",
+            format!("Album title for {name}"),
+            None,
+        )
+        .track_focus(&focus)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .child(
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child("Album title"),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(Input::new(&self.title_input).aria_label(format!("Album title for {name}"))),
+        );
         row.when(detail, |this| {
             this.child(
                 Button::new("folder-panel-title-save")
@@ -945,17 +1000,12 @@ impl FolderPanel {
                     // silence; the control stays enabled so focus does not move.
                     .label(if pending { "Adding…" } else { "Add" })
                     .accessibility_label("Add the folder")
-                    .on_click(cx.listener(|this, _, window, cx| this.add(window, cx))),
+                    .on_click(cx.listener(|this, _, _, cx| this.add(cx))),
             )
     }
 
     /// The setup dialog's body: title, path, settings, and the Add footer.
-    fn draft_body(
-        &self,
-        palette: &CardPalette,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn draft_body(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         div()
             .flex()
             .flex_col()
@@ -972,11 +1022,10 @@ impl FolderPanel {
             .child(self.album_title_field(theme, cx))
             .child(self.settings(cx))
             .when_some(self.problem.clone(), |this, problem| {
-                this.child(notice(
+                this.child(Notice::new(
                     "folder-panel-problem",
+                    Severity::Error,
                     problem,
-                    theme.danger,
-                    palette,
                 ))
             })
             .child(self.draft_actions(cx))
@@ -1039,11 +1088,11 @@ impl FolderPanel {
         let percent = format!("{}%", (progress.clamp(0.0, 1.0) * 100.0).round() as u32);
 
         // #43: while the Remove confirmation shows, the normal body dims. The
-        // opacity sits on this inner wrapper, never on the whole body, so the
-        // answer is never dimmed with the panel (#73 moved the answer into its
-        // own window-level layer). Opacity is not one of the things the test
-        // harness observes, so no test pins this; the flag is pinned by the
-        // alert opening and closing.
+        // opacity sits on the scrolling wrapper and the footer, never on the
+        // whole body, so the answer is never dimmed with the panel (#73 moved
+        // the answer into its own window-level layer). Opacity is not one of the
+        // things the test harness observes, so no test pins this; the flag is
+        // pinned by the alert opening and closing.
         let inner = div()
             .id("folder-detail-body-dim")
             .test_support()
@@ -1051,6 +1100,12 @@ impl FolderPanel {
             .flex_col()
             .gap_3()
             .w_full()
+            // #81: the region that scrolls when the detail is taller than the
+            // dialog, so every row keeps its own height: nothing is squeezed to
+            // make it fit, and the footer below it never moves.
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
             .when(self.confirming, |this| this.opacity(0.4))
             .child(
                 div()
@@ -1060,13 +1115,15 @@ impl FolderPanel {
                     .justify_between()
                     .gap_3()
                     .child(
-                        div()
-                            .id("folder-detail-title")
-                            .test_support()
-                            .aria_label(title.clone())
-                            .text_lg()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(title.clone()),
+                        crate::a11y::named(
+                            Role::Heading,
+                            "folder-detail-title",
+                            title.clone(),
+                            None,
+                        )
+                        .text_lg()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(title.clone()),
                     )
                     .child(
                         Button::new("folder-detail-close")
@@ -1084,16 +1141,18 @@ impl FolderPanel {
                     .items_center()
                     .gap_3()
                     .child(
-                        div()
-                            .id("folder-detail-state")
-                            .test_support()
-                            .aria_label(activity.label().to_string())
-                            .child(state_tag(
-                                activity,
-                                activity.label().to_string(),
-                                palette,
-                                theme,
-                            )),
+                        crate::a11y::named(
+                            Role::Label,
+                            "folder-detail-state",
+                            activity.label().to_string(),
+                            None,
+                        )
+                        .child(state_tag(
+                            activity,
+                            activity.label().to_string(),
+                            palette,
+                            theme,
+                        )),
                     )
                     .child(
                         Progress::new("folder-detail-progress")
@@ -1102,39 +1161,39 @@ impl FolderPanel {
                             .accessibility_label(format!("{title} progress")),
                     )
                     .child(
-                        div()
-                            .id("folder-detail-percent")
-                            .test_support()
-                            .aria_label(percent.clone())
-                            .text_sm()
-                            .text_color(muted)
-                            .child(percent),
+                        crate::a11y::named(
+                            Role::Label,
+                            "folder-detail-percent",
+                            percent.clone(),
+                            None,
+                        )
+                        .text_sm()
+                        .text_color(muted)
+                        .child(percent),
                     ),
             )
             .child(
-                div()
-                    .id("folder-detail-counts")
-                    .test_support()
-                    .aria_label(counts.clone())
+                crate::a11y::named(Role::Label, "folder-detail-counts", counts.clone(), None)
                     .text_sm()
                     .text_color(muted)
                     .child(counts),
             )
             .child(
-                div()
-                    .id("folder-detail-activity")
-                    .test_support()
-                    .aria_label(activity_line.clone())
-                    .text_sm()
-                    .text_color(muted)
-                    .child(activity_line),
+                crate::a11y::named(
+                    Role::Label,
+                    "folder-detail-activity",
+                    activity_line.clone(),
+                    None,
+                )
+                .text_sm()
+                .text_color(muted)
+                .child(activity_line),
             )
             .when(!available, |this| {
-                this.child(notice(
+                this.child(Notice::new(
                     "folder-detail-unavailable",
+                    Severity::Warning,
                     format!("Folder unavailable: {path}"),
-                    theme.warning,
-                    palette,
                 ))
             })
             .child(self.album_title_field(theme, cx))
@@ -1145,49 +1204,62 @@ impl FolderPanel {
                 |this, rename| {
                     // #47: the field keeps the desired title, and this says why
                     // the server does not hold it yet.
-                    this.child(notice(
+                    this.child(Notice::new(
                         "folder-detail-album-rename",
+                        Severity::Warning,
                         format!("Album title pending: {}.", rename.reason()),
-                        theme.warning,
-                        palette,
                     ))
                 },
             )
             .child(self.settings(cx))
             .when_some(last_error, |this, error| {
-                this.child(
-                    div()
-                        .id("folder-detail-error")
-                        .test_support()
-                        .role(Role::Alert)
-                        .aria_label(format!("Last error: {error}"))
-                        .border_l_2()
-                        .border_color(theme.danger)
-                        .pl_2()
-                        .text_sm()
-                        .text_color(theme.foreground)
-                        .child(error),
-                )
+                this.child(Notice::new(
+                    "folder-detail-error",
+                    Severity::Error,
+                    format!("Last error: {error}"),
+                ))
             })
             .child(
-                div()
-                    .id("folder-detail-upload")
-                    .test_support()
-                    .aria_label(upload_line.clone())
-                    .text_sm()
-                    .text_color(muted)
-                    .child(upload_line),
+                crate::a11y::named(
+                    Role::Label,
+                    "folder-detail-upload",
+                    upload_line.clone(),
+                    None,
+                )
+                .text_sm()
+                .text_color(muted)
+                .child(upload_line),
             )
             .child(
-                div()
-                    .id("folder-detail-scan")
-                    .test_support()
-                    .aria_label(scan_line.clone())
+                crate::a11y::named(Role::Label, "folder-detail-scan", scan_line.clone(), None)
                     .text_sm()
                     .text_color(muted)
                     .child(scan_line),
             )
-            .child(self.assets_section(palette, theme, cx))
+            .child(self.assets_section(palette, theme, cx));
+
+        // #81: the list's Load more and the row that acts on the whole folder
+        // sit in a footer that never scrolls, so neither is behind a wheel at
+        // any window height. The body above keeps the wheel, and the list keeps
+        // its own.
+        let footer = div()
+            .id("folder-detail-footer")
+            .test_support()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .w_full()
+            .flex_shrink_0()
+            .when(self.confirming, |this| this.opacity(0.4))
+            .when(self.assets_more, |this| {
+                this.child(
+                    Button::new("folder-assets-more")
+                        .secondary()
+                        .label("Load more")
+                        .accessibility_label(format!("Load the next {ASSET_PAGE} uploaded assets"))
+                        .on_click(cx.listener(|this, _, _, cx| this.load_more_assets(cx))),
+                )
+            })
             .child(
                 div()
                     .flex()
@@ -1256,18 +1328,22 @@ impl FolderPanel {
             .flex_col()
             .gap_3()
             .w_full()
+            // #81: the body fills the surface the layer sized and splits it: the
+            // content above scrolls, the footer below never does (#43).
+            .flex_1()
+            .min_h_0()
             .child(inner)
             // The problem notice is the dialog's answer, not body content: it
             // stays outside the dimmed wrapper, so a refused Remove is readable
             // while the confirmation is up.
             .when_some(self.problem.clone(), |this, problem| {
-                this.child(notice(
+                this.child(Notice::new(
                     "folder-panel-problem",
+                    Severity::Error,
                     problem,
-                    theme.danger,
-                    palette,
                 ))
             })
+            .child(footer)
             .into_any_element()
     }
 
@@ -1289,7 +1365,7 @@ impl FolderPanel {
             .text_color(palette.text)
             .child("Uploaded assets");
         let state = if let Some(problem) = self.assets_problem.clone() {
-            notice("folder-assets-problem", problem, theme.danger, palette).into_any_element()
+            Notice::new("folder-assets-problem", Severity::Error, problem).into_any_element()
         } else if self.assets.is_empty() {
             let (id, text) = if self.assets_loading {
                 ("folder-assets-loading", "Reading the folder's assets…")
@@ -1299,17 +1375,17 @@ impl FolderPanel {
                     "No uploaded assets in this folder yet.",
                 )
             };
-            div()
-                .id(id)
-                .test_support()
-                .aria_label(text)
+            crate::a11y::named(Role::Label, id, text, None)
                 .text_xs()
                 .text_color(palette.meta)
                 .child(text)
                 .into_any_element()
         } else {
-            // The list scrolls inside the dialog, so a folder with hundreds of
-            // assets does not push Load more or the actions out of reach.
+            // #44: the list scrolls inside the dialog, so a folder with hundreds
+            // of assets does not push the controls out of reach. #81: it keeps
+            // #44's designed height (five rows), so the data view is not
+            // squeezed to buy room for them; when the detail is taller than the
+            // surface, the body above the footer is what scrolls.
             let mut rows = div()
                 .id("folder-assets-list")
                 .test_support()
@@ -1333,15 +1409,6 @@ impl FolderPanel {
             .w_full()
             .child(heading)
             .child(state)
-            .when(self.assets_more, |this| {
-                this.child(
-                    Button::new("folder-assets-more")
-                        .secondary()
-                        .label("Load more")
-                        .accessibility_label(format!("Load the next {ASSET_PAGE} uploaded assets"))
-                        .on_click(cx.listener(|this, _, _, cx| this.load_more_assets(cx))),
-                )
-            })
     }
 
     /// One uploaded asset: its name, size, upload time, and Immich link (#44).
@@ -1363,10 +1430,7 @@ impl FolderPanel {
         // Two lines: the file's name gets the row's width, and the metadata
         // shares the second line with the link. One line squeezed the name to
         // an ellipsis, which is the one thing the row is for.
-        div()
-            .id(("folder-asset", index))
-            .test_support()
-            .aria_label(described)
+        crate::a11y::named(Role::Group, ("folder-asset", index), described, None)
             .flex()
             .flex_col()
             .gap_1()
@@ -1411,62 +1475,6 @@ impl FolderPanel {
             )
             .into_any_element()
     }
-
-    /// The modal host: centered over a backdrop, focus trapped, Escape cancels.
-    ///
-    /// The backdrop is the host's sibling rather than an ancestor of the card,
-    /// so a click on the dialog never reaches it (#43).
-    fn modal(&self, card: AnyElement, window: &Window, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().clone();
-        let focus = self.focus.clone();
-        let viewport = window.viewport_size();
-        let backdrop = div()
-            .id("folder-panel-backdrop")
-            .test_support()
-            .absolute()
-            .top_0()
-            .left_0()
-            .w(viewport.width)
-            .h(viewport.height)
-            .bg(theme.background.opacity(0.75))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.dismiss(cx);
-                    cx.stop_propagation();
-                }),
-            );
-        deferred(
-            anchored().position(point(px(0.), px(0.))).child(
-                div()
-                    .id("folder-panel-host")
-                    .test_support()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .w(viewport.width)
-                    .h(viewport.height)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .track_focus(&focus)
-                    .focus_trap("folder-panel-trap", &focus)
-                    // The host swallows pointer and wheel events, so the
-                    // dashboard behind the modal stays inert.
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                        if event.keystroke.key == "escape" {
-                            this.escape(cx);
-                        }
-                    }))
-                    .child(backdrop)
-                    .child(card),
-            ),
-        )
-        .with_priority(10)
-        .into_any_element()
-    }
 }
 
 /// The live card the engine's status holds for `path`, when it holds one.
@@ -1483,52 +1491,34 @@ fn folder_card(
         .find(|card| card.path.as_deref() == Some(path))
 }
 
-impl Focusable for FolderPanel {
-    fn focus_handle(&self, _: &App) -> FocusHandle {
-        self.focus.clone()
-    }
-}
-
 impl Render for FolderPanel {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The theme is copied before the controls borrow the context mutably.
         let theme = cx.theme().clone();
         let palette = CardPalette::new(&theme);
-        let viewport = window.viewport_size();
-        // The detail carries more than the setup, so it gets the wider card; a
-        // short window scrolls the body instead of clipping its last control.
-        let width = match self.mode {
-            FolderPanelMode::Draft => rems(30.),
-            FolderPanelMode::Detail => rems(34.),
-        };
         let body = match self.mode {
-            FolderPanelMode::Draft => self.draft_body(&palette, &theme, cx),
+            FolderPanelMode::Draft => self.draft_body(&theme, cx),
             FolderPanelMode::Detail => self.detail_body(&palette, &theme, cx),
         };
-        let card = div()
+        // The window's dialog layer supplies the surface, the backdrop, the
+        // focus trap, Escape and the sizing (#81); the panel is the body it
+        // hosts. Escape is bound for the whole window, so it reaches the layer
+        // from anywhere the trap puts the keyboard, the panel's own root
+        // included: the panel declares no key context of its own.
+        div()
             .id("folder-panel")
             .test_support()
             .role(Role::Dialog)
             .aria_label(self.aria_label())
+            .track_focus(&self.focus)
+            .tab_stop(false)
             .flex()
             .flex_col()
-            .gap_3()
-            .w(width)
-            .max_h(viewport.height - px(96.))
-            .overflow_y_scroll()
-            .p_5()
-            .rounded(theme.radius_lg)
-            .bg(theme.popover)
+            .w_full()
+            .h_full()
+            .min_h_0()
             .text_color(theme.foreground)
-            .border_1()
-            .border_color(theme.border)
-            // The card is a mouse barrier above the backdrop: a press inside
-            // the dialog never reaches the backdrop that dismisses it, and it
-            // is what lets the path's text selection see the drag (#43).
-            .block_mouse_except_scroll()
             .child(body)
-            .into_any_element();
-        self.modal(card, window, cx)
     }
 }
 
@@ -1563,6 +1553,26 @@ mod tests {
         };
 
         assert_eq!(super::file_manager_command(), expected);
+    }
+
+    /// #87: "Show in folder" selects the archive where the platform can, and
+    /// opens the containing folder where it cannot. The macOS and Windows arms
+    /// are the ones only their CI jobs run.
+    #[test]
+    fn reveal_selects_the_archive_or_opens_its_folder_per_platform() {
+        let archive = "/exports/immich-sync-debug.zip";
+        let (program, args) = super::reveal_command(archive);
+
+        if cfg!(windows) {
+            assert_eq!(program, "explorer");
+            assert_eq!(args, vec![format!("/select,{archive}")]);
+        } else if cfg!(target_os = "macos") {
+            assert_eq!(program, "open");
+            assert_eq!(args, vec!["-R".to_string(), archive.to_string()]);
+        } else {
+            assert_eq!(program, "xdg-open");
+            assert_eq!(args, vec!["/exports".to_string()]);
+        }
     }
 
     #[test]
@@ -2130,8 +2140,8 @@ mod tests {
         // Add starts a request and this test drops its answer, as a panicking
         // worker drops it. Both happen in one update, so the real answer cannot
         // land in between.
-        cx.update_window(window, |_, window, cx| {
-            panel.update(cx, |panel, cx| panel.add(window, cx));
+        cx.update_window(window, |_, _, cx| {
+            panel.update(cx, |panel, cx| panel.add(cx));
             let request = panel.read(cx).pending.expect("Add waits for its answer");
             engine.update(cx, |engine, cx| engine.folder_add_lost(request, cx));
         })

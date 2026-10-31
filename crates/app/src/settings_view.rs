@@ -1,10 +1,11 @@
 //! The settings surface (SPEC R7, R8.5, R9): General, Limits, Sync, and the
 //! read-only Storage locations.
 //!
-//! Every control is keyboard reachable: `Switch` activates with Enter or Space,
-//! `NumberInput` edits with the keyboard and steps with Up and Down, and both
-//! draw the kit's focus ring. Each row also observes its control's focus handle
-//! so a test can assert reachability.
+//! Every control is keyboard reachable: the page strip puts all six pages in
+//! the Tab order, `Switch` activates with Enter or Space, `NumberInput` edits
+//! with the keyboard and steps with Up and Down, and both draw the kit's focus
+//! ring. Each row also observes its control's focus handle so a test can assert
+//! reachability.
 
 use std::rc::Rc;
 
@@ -13,15 +14,19 @@ use crate::connection::{ConnectionModel, apply_profile, profile_from_settings};
 use crate::dashboard::CardPalette;
 use crate::engine::EngineModel;
 use crate::logging::LogLevel;
+use crate::notice::{Notice, Severity};
 use crate::paths::AppPaths;
 use crate::settings::{Settings, SettingsStore};
+use crate::tab::Tab;
 
 use gpui_kit::base::ObservedElement;
 use gpui_kit::component::ActiveTheme as _;
-use gpui_kit::component::Theme;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState, NumberInput};
 use gpui_kit::component::radio::Radio;
+use gpui_kit::component::setting::{
+    SelectIndex, SettingField, SettingGroup, SettingItem, SettingPage, Settings as SettingsPages,
+};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::*;
 use sync_core::connection::{AuthMethod, ConnectionState, ServerProfile, SignIn};
@@ -32,6 +37,60 @@ use sync_core::tags::{BackfillStatus, SYNC_TAG, TagStatus};
 /// per second (SPEC R7.1); the UI shows MB/s with up to six decimals, which is
 /// one byte.
 pub const BYTES_PER_MEGABYTE: u64 = 1_000_000;
+
+/// One settings page: the element id of the tab that opens it, its name, and the
+/// sentence under the name.
+struct Page {
+    id: &'static str,
+    title: &'static str,
+    description: &'static str,
+}
+
+/// The pages, in the order the surface lists them. The page strip and the page
+/// a tab opens read the same entry, so a name cannot drift from its tab.
+const PAGES: [Page; 6] = [
+    Page {
+        id: "settings-page-connection",
+        title: "Connection",
+        description: "The server and the account this client uploads to.",
+    },
+    Page {
+        id: "settings-page-general",
+        title: "General",
+        description: "How the client starts.",
+    },
+    Page {
+        id: "settings-page-limits",
+        title: "Limits",
+        description: "How much the client uses while it syncs.",
+    },
+    Page {
+        id: "settings-page-sync",
+        title: "Sync",
+        description: "How the client scans and retries.",
+    },
+    Page {
+        id: "settings-page-tagging",
+        title: "Tagging",
+        description: "Adds one tag to the assets this client uploads, so they can be found through \
+                      Immich's tag search.",
+    },
+    Page {
+        id: "settings-page-storage",
+        title: "Storage",
+        description: "Read-only. The database stays on this computer; it never lives on a network \
+                      share or in a cloud-sync folder.",
+    },
+];
+
+/// The index of each page in `PAGES`, so a page builder names the page it builds
+/// instead of repeating its title.
+const PAGE_CONNECTION: usize = 0;
+const PAGE_GENERAL: usize = 1;
+const PAGE_LIMITS: usize = 2;
+const PAGE_SYNC: usize = 3;
+const PAGE_TAGGING: usize = 4;
+const PAGE_STORAGE: usize = 5;
 
 /// One numeric setting the view edits, its text, and its bounds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -232,6 +291,11 @@ pub struct SettingsView {
     autostart: Rc<dyn Autostart>,
     /// The connection state shared with the dashboard (R8.1).
     connection: Entity<ConnectionModel>,
+    /// The search field over the pages' rows (#78).
+    search: Entity<InputState>,
+    /// The page the strip shows (#78). The component is keyed on the page this
+    /// selects, so re-keying is what moves it.
+    page: usize,
     server_url_input: Entity<InputState>,
     email_input: Entity<InputState>,
     secret_input: Entity<InputState>,
@@ -281,7 +345,7 @@ impl SettingsView {
     ) -> Self {
         let initial = store.settings().clone();
         let mut fields = Vec::with_capacity(FieldKey::ALL.len());
-        let mut subscriptions = Vec::with_capacity(FieldKey::ALL.len() + 1);
+        let mut subscriptions = Vec::with_capacity(FieldKey::ALL.len() + 2);
         for key in FieldKey::ALL {
             let input = cx.new(|cx| {
                 InputState::new(window, cx)
@@ -331,6 +395,19 @@ impl SettingsView {
                 }
             },
         ));
+        // #78: the surface filters its own rows from this field's value, the
+        // way the kit's own settings search does: the value is read when the
+        // surface renders, not kept as a second copy that an event can miss.
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search settings"));
+        // Every text replacement emits `Change`, a paste included, and a paste
+        // comes with no keystroke for a key listener to catch (S1).
+        subscriptions.push(
+            cx.subscribe_in(&search, window, |_, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            }),
+        );
         // The profile is persisted only once the model reaches connected, so
         // a refused sign-in leaves the saved profile and credential in step.
         subscriptions.push(cx.observe(&connection, |this, _, cx| {
@@ -342,6 +419,8 @@ impl SettingsView {
             paths,
             autostart,
             connection,
+            search,
+            page: 0,
             server_url_input,
             email_input,
             secret_input,
@@ -762,66 +841,160 @@ impl SettingsView {
         cx.notify();
     }
 
-    /// The page header.
-    fn header(cx: &App) -> impl IntoElement + use<> {
+    /// The surface header: what the surface is, and the search over its rows.
+    fn header(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let muted = cx.theme().muted_foreground;
+        let focus = self.search.read(cx).focus_handle(cx);
         div()
             .flex()
-            .flex_col()
-            .gap_0p5()
+            .flex_row()
+            .justify_between()
+            .items_start()
+            .gap_6()
             .child(
                 div()
-                    .text_2xl()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("Settings"),
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    // The field beside this is a fixed width, so the copy has to
+                    // wrap in what the minimum window leaves rather than push
+                    // the field past the edge (#75's minimum-window test).
+                    .min_w_0()
+                    .child(
+                        div()
+                            .text_2xl()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Settings"),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(muted)
+                            .child("Defaults for the sync client. Changes save immediately."),
+                    ),
             )
             .child(
+                // #78: the surface owns the query, because it also owns the
+                // result when nothing matches. The component still owns the
+                // pages, the groups, the rows, and the sidebar; its own search
+                // field is dropped by `hidden()`.
                 div()
-                    .text_sm()
-                    .text_color(muted)
-                    .child("Defaults for the sync client. Changes save immediately."),
+                    .id("settings-search")
+                    .test_support()
+                    .track_focus(&focus)
+                    .w_64()
+                    .flex_none()
+                    .child(Input::new(&self.search).aria_label("Search settings")),
             )
     }
 
+    /// The page strip: one tab per page, the shell's own view switch and this
+    /// strip draw the same element and the same `Role::TabList` root (#75, #78).
+    ///
+    /// A kit sidebar entry has no focus handle and no key binding, so the strip
+    /// is the only keyboard path between the pages (#78). The root is a plain
+    /// `div` with the list role rather than the kit's `Tabs` only because
+    /// `Tabs` is a `RenderOnce` and so cannot be observed by the snapshots; the
+    /// role and the tab children are the same as the shell's strip.
+    fn page_strip(
+        &self,
+        selected: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let mut strip =
+            crate::a11y::named(Role::TabList, "settings-page-tabs", "Settings pages", None)
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .items_center()
+                .gap_1();
+        for (ix, page) in PAGES.iter().enumerate() {
+            // The handles are claimed in the loop that needs `cx` for its
+            // listeners, so each one is read out before that borrow.
+            let focus = window
+                .use_keyed_state(page.id, cx, |_, cx| cx.focus_handle().tab_stop(true))
+                .read(cx)
+                .clone();
+            strip = strip.child(
+                Tab::new(
+                    page.id,
+                    page.title,
+                    ix == selected,
+                    &focus,
+                    ix + 1,
+                    PAGES.len(),
+                )
+                .render(window, cx)
+                .on_click(cx.listener(move |this, _, _, cx| this.show_page(ix, cx))),
+            );
+        }
+        strip
+    }
+
+    /// Opens one page from the strip.
+    fn show_page(&mut self, page: usize, cx: &mut Context<Self>) {
+        self.page = page;
+        cx.notify();
+    }
+
     /// The problem notices, when the file failed to load or an action failed.
-    fn notices(&self, cx: &App) -> Vec<AnyElement> {
-        let theme = cx.theme();
-        let palette = CardPalette::new(theme);
+    fn notices(&self) -> Vec<AnyElement> {
         let mut notices = Vec::new();
         if let Some(problem) = self.store.problem() {
             notices.push(
-                notice(
-                    "settings-problem",
-                    problem.to_string(),
-                    theme.warning,
-                    &palette,
-                )
-                .into_any_element(),
+                Notice::new("settings-problem", Severity::Warning, problem.to_string())
+                    .into_any_element(),
             );
         } else if let Some(problem) = &self.environment_problem {
             notices.push(
-                notice("settings-problem", problem.clone(), theme.warning, &palette)
+                Notice::new("settings-problem", Severity::Warning, problem.clone())
                     .into_any_element(),
             );
         }
         if let Some(error) = &self.action_error {
             notices.push(
-                notice(
-                    "settings-action-error",
-                    error.clone(),
-                    theme.danger,
-                    &palette,
-                )
-                .into_any_element(),
+                Notice::new("settings-action-error", Severity::Error, error.clone())
+                    .into_any_element(),
             );
         }
         notices
     }
 
-    /// The Connection section: server, account, credential, and sign-in
+    /// What the surface shows when no row matches the search, so an empty
+    /// result says so instead of leaving an empty pane.
+    fn no_matches(query: &str) -> impl IntoElement + use<> {
+        Notice::new(
+            "settings-search-empty",
+            Severity::Info,
+            format!("No setting matches \"{}\".", query.trim()),
+        )
+    }
+
+    /// Every page that survives the search query, with the index it has in the
+    /// unfiltered set.
+    ///
+    /// A page keeps the rows whose title or help sentence contain the query,
+    /// and a page or group left without one is dropped.
+    fn pages(&self, query: &str, cx: &mut Context<Self>) -> Vec<(usize, SettingPage)> {
+        let query = query.trim().to_lowercase();
+        [
+            self.connection_page(&query, cx),
+            self.general_page(&query, cx),
+            self.limits_page(&query, cx),
+            self.sync_page(&query, cx),
+            self.tagging_page(&query, cx),
+            self.storage_page(&query, cx),
+        ]
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, page)| page.map(|page| (index, page)))
+        .collect()
+    }
+
+    /// The Connection page: the server, the account, and the sign-in form
     /// (R1.1 to R1.6).
-    fn connection(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let palette = CardPalette::new(cx.theme());
+    fn connection_page(&self, query: &str, cx: &mut Context<Self>) -> Option<SettingPage> {
         let (state, form_error) = {
             let model = self.connection.read(cx);
             (
@@ -833,570 +1006,476 @@ impl SettingsView {
             &state,
             ConnectionState::NeedsAttention(attention) if attention.needs_api_key()
         );
-        // The accents are read before the row builders borrow `cx` mutably.
-        let (state_accent, hint_accent, error_accent) = {
-            let theme = cx.theme();
-            (connection_accent(&state, theme), theme.info, theme.danger)
-        };
+        let state_severity = connection_severity(&state);
 
-        let mut rows = vec![
-            self.text_row(
+        let server = vec![
+            Self::text_row(
+                &self.server_url_input,
                 "settings-server-url",
                 "Server URL",
                 "For example https://immich.example.com. Certificate verification stays on.",
-                &self.server_url_input,
                 cx,
             ),
-            self.text_row(
+            Self::text_row(
+                &self.email_input,
                 "settings-email",
                 "Email address",
                 "The Immich account this client uploads as.",
-                &self.email_input,
                 cx,
             ),
-            self.method_row(cx),
-            self.secret_row(cx),
-            div()
-                .id("settings-sign-in-row")
-                .test_support()
-                .flex()
-                .flex_row()
-                .justify_end()
-                .child(
-                    Button::new("settings-sign-in")
-                        .primary()
-                        .label("Sign in")
-                        .accessibility_label("Sign in")
-                        .on_click(cx.listener(|this, _, window, cx| this.sign_in(window, cx))),
-                )
-                .into_any_element(),
         ];
 
-        rows.push(
-            notice(
-                "settings-connection-state",
-                state.message(),
-                state_accent,
-                &palette,
-            )
-            .into_any_element(),
-        );
+        let sign_in_click = Rc::new(cx.listener(|this, _, window, cx| this.sign_in(window, cx)));
+        let mut sign_in = vec![
+            self.method_row(cx),
+            self.secret_row(cx),
+            note(move |_, _| {
+                let click = Rc::clone(&sign_in_click);
+                div()
+                    .id("settings-sign-in-row")
+                    .test_support()
+                    .flex()
+                    .flex_row()
+                    .justify_end()
+                    .child(
+                        Button::new("settings-sign-in")
+                            .primary()
+                            .label("Sign in")
+                            .accessibility_label("Sign in")
+                            .on_click(move |event, window, cx| click(event, window, cx)),
+                    )
+                    .into_any_element()
+            }),
+            note(move |_, _| {
+                Notice::new("settings-connection-state", state_severity, state.message())
+                    .into_any_element()
+            }),
+        ];
         if needs_api_key {
-            rows.push(
-                notice(
+            sign_in.push(note(|_, _| {
+                Notice::new(
                     "settings-connection-hint",
+                    Severity::Info,
                     "Switch the credential to API key and paste a key from Immich (Account \
-                     settings, then API keys)."
-                        .to_string(),
-                    hint_accent,
-                    &palette,
+                     settings, then API keys).",
                 )
-                .into_any_element(),
-            );
+                .into_any_element()
+            }));
         }
         if let Some(error) = form_error {
-            rows.push(
-                notice("settings-connection-error", error, error_accent, &palette)
-                    .into_any_element(),
-            );
+            sign_in.push(note(move |_, _| {
+                Notice::new("settings-connection-error", Severity::Error, error.clone())
+                    .into_any_element()
+            }));
         }
 
-        section(
-            "settings-connection",
-            "Connection",
-            "The server and the account this client uploads to.",
-            rows,
-            cx,
+        page(
+            PAGE_CONNECTION,
+            vec![
+                group(Some("Server"), server, query),
+                group(Some("Sign in"), sign_in, query),
+            ],
         )
     }
 
-    /// One connection text input row.
+    /// One text input row (R1.1).
     fn text_row(
-        &self,
-        id: &'static str,
-        label: &'static str,
-        help: &'static str,
         input: &Entity<InputState>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let palette = CardPalette::new(cx.theme());
+        id: &'static str,
+        title: &'static str,
+        help: &'static str,
+        cx: &App,
+    ) -> Row {
+        let input = input.clone();
         let focus = input.read(cx).focus_handle(cx);
-        div()
-            .id(id)
-            .test_support()
-            .track_focus(&focus)
-            .aria_label(label)
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .gap_6()
-            .min_h(rems(2.25))
-            .child(field_text(label, help, &palette))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .child(Input::new(input).aria_label(label)),
-            )
-            .into_any_element()
+        Row::stacked(title, help, move |_, _| {
+            crate::a11y::named(Role::Group, id, title, Some(help.into()))
+                .track_focus(&focus)
+                .min_w_0()
+                .w_full()
+                .child(Input::new(&input).aria_label(title))
+                .into_any_element()
+        })
     }
 
     /// The credential kind: password or API key (R1.1, R1.5).
-    fn method_row(&self, cx: &mut Context<Self>) -> AnyElement {
-        let palette = CardPalette::new(cx.theme());
-        div()
-            .id("settings-auth-method")
-            .test_support()
-            .aria_label("Credential")
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .gap_6()
-            .min_h(rems(2.25))
-            .child(field_text(
-                "Credential",
-                "A password for the account, or an API key from Immich.",
-                &palette,
-            ))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_4()
-                    .child(
-                        Radio::new("settings-auth-password")
-                            .label("Password")
-                            .accessibility_label("Sign in with a password")
-                            .checked(self.auth_method == AuthMethod::Password)
-                            .on_change(cx.listener(|this, checked, window, cx| {
-                                if *checked {
-                                    this.set_auth_method(AuthMethod::Password, window, cx);
-                                }
-                            })),
-                    )
-                    .child(
-                        Radio::new("settings-auth-apikey")
-                            .label("API key")
-                            .accessibility_label("Sign in with an API key")
-                            .checked(self.auth_method == AuthMethod::ApiKey)
-                            .on_change(cx.listener(|this, checked, window, cx| {
-                                if *checked {
-                                    this.set_auth_method(AuthMethod::ApiKey, window, cx);
-                                }
-                            })),
-                    ),
-            )
-            .into_any_element()
+    fn method_row(&self, cx: &mut Context<Self>) -> Row {
+        let password = Rc::new(cx.listener(|this, checked: &bool, window, cx| {
+            if *checked {
+                this.set_auth_method(AuthMethod::Password, window, cx);
+            }
+        }));
+        let api_key = Rc::new(cx.listener(|this, checked: &bool, window, cx| {
+            if *checked {
+                this.set_auth_method(AuthMethod::ApiKey, window, cx);
+            }
+        }));
+        let method = self.auth_method;
+        Row::stacked(
+            "Credential",
+            "A password for the account, or an API key from Immich.",
+            move |_, _| {
+                let password = Rc::clone(&password);
+                let api_key = Rc::clone(&api_key);
+                // A named group around the two radios: the row's title and help
+                // sentence ride here, beside the controls that name themselves.
+                crate::a11y::named(
+                    Role::Group,
+                    "settings-auth-method",
+                    "Credential",
+                    Some("A password for the account, or an API key from Immich.".into()),
+                )
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_4()
+                .child(
+                    Radio::new("settings-auth-password")
+                        .label("Password")
+                        .accessibility_label("Sign in with a password")
+                        .checked(method == AuthMethod::Password)
+                        .on_change(move |checked, window, cx| password(checked, window, cx)),
+                )
+                .child(
+                    Radio::new("settings-auth-apikey")
+                        .label("API key")
+                        .accessibility_label("Sign in with an API key")
+                        .checked(method == AuthMethod::ApiKey)
+                        .on_change(move |checked, window, cx| api_key(checked, window, cx)),
+                )
+                .into_any_element()
+            },
+        )
     }
 
     /// The password or API key input. The value is masked and never saved to
     /// the settings file (R1.2).
-    fn secret_row(&self, cx: &mut Context<Self>) -> AnyElement {
-        let palette = CardPalette::new(cx.theme());
-        let label = match self.auth_method {
-            AuthMethod::Password => "Password",
-            AuthMethod::ApiKey => "API key",
-        };
-        let focus = self.secret_input.read(cx).focus_handle(cx);
-        div()
-            .id("settings-secret")
-            .test_support()
-            .track_focus(&focus)
-            .aria_label(label)
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .gap_6()
-            .min_h(rems(2.25))
-            .child(field_text(
-                label,
-                "Stored in the OS credential store, never in the settings file.",
-                &palette,
-            ))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .child(Input::new(&self.secret_input).aria_label(label)),
-            )
-            .into_any_element()
+    fn secret_row(&self, cx: &mut Context<Self>) -> Row {
+        let label = secret_placeholder_for(self.auth_method);
+        Self::text_row(
+            &self.secret_input,
+            "settings-secret",
+            label,
+            "Stored in the OS credential store, never in the settings file.",
+            cx,
+        )
     }
 
-    /// The General section: autostart.
-    fn general(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let palette = CardPalette::new(cx.theme());
+    /// The General page: how the client starts.
+    fn general_page(&self, query: &str, cx: &mut Context<Self>) -> Option<SettingPage> {
         // The switch shows the user's newest intent, so a queued or in-flight
         // write is reflected before it lands (N2).
         let enabled = self.intended_settings().autostart;
-        let mut rows = vec![
-            div()
-                .id("settings-autostart-row")
-                .test_support()
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .gap_6()
-                .min_h(rems(2.25))
-                .child(field_text(
-                    "Autostart at login",
-                    "Start Immich Sync when you log in. Off by default.",
-                    &palette,
-                ))
-                .child(
-                    Switch::new("settings-autostart")
-                        .checked(enabled)
-                        .accessibility_label("Start Immich Sync at login")
-                        .on_change(cx.listener(|this, enabled, _, cx| {
-                            this.toggle_autostart(*enabled, cx);
-                        })),
-                )
-                .into_any_element(),
-        ];
+        let toggle = Rc::new(cx.listener(|this, enabled: &bool, _, cx| {
+            this.toggle_autostart(*enabled, cx);
+        }));
+        let mut rows = vec![Row::wrapped(
+            "Autostart at login",
+            "Start Immich Sync when you log in. Off by default.",
+            "settings-autostart-row",
+            move |_, _| {
+                let toggle = Rc::clone(&toggle);
+                Switch::new("settings-autostart")
+                    .checked(enabled)
+                    .accessibility_label("Start Immich Sync at login")
+                    .on_change(move |enabled, window, cx| toggle(enabled, window, cx))
+                    .into_any_element()
+            },
+        )];
         // macOS registers the item and leaves the last step to the user; the
         // setting stays on. The backend supplies the text, and the view caches
         // it, so no platform detail or OS call lives on the render path.
         if let Some(hint) = self.approval_hint {
-            rows.push(
-                div()
-                    .id("settings-autostart-approval")
-                    .test_support()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .gap_6()
-                    .min_h(rems(2.25))
-                    .child(field_text("Approval needed", hint, &palette))
-                    .child(
-                        Button::new("settings-autostart-approve")
-                            .label("Open Login Items")
-                            .accessibility_label("Open Login Items settings")
-                            .on_click(cx.listener(|this, _, _, _| {
-                                this.autostart.open_approval_settings();
-                            })),
-                    )
-                    .into_any_element(),
-            );
+            let open = Rc::new(cx.listener(|this, _, _, _| {
+                this.autostart.open_approval_settings();
+            }));
+            rows.push(Row::wrapped(
+                "Approval needed",
+                hint,
+                "settings-autostart-approval",
+                move |_, _| {
+                    let open = Rc::clone(&open);
+                    Button::new("settings-autostart-approve")
+                        .label("Open Login Items")
+                        .accessibility_label("Open Login Items settings")
+                        .on_click(move |event, window, cx| open(event, window, cx))
+                        .into_any_element()
+                },
+            ));
         }
-        section(
-            "settings-general",
-            "General",
-            "How the client starts.",
-            rows,
-            cx,
+        page(PAGE_GENERAL, vec![group(None, rows, query)])
+    }
+
+    /// The Limits page: bandwidth and concurrency (SPEC R7).
+    fn limits_page(&self, query: &str, cx: &App) -> Option<SettingPage> {
+        page(
+            PAGE_LIMITS,
+            vec![group(
+                None,
+                [FieldKey::Bandwidth, FieldKey::Concurrency]
+                    .into_iter()
+                    .filter_map(|key| self.numeric_row(key, cx))
+                    .collect(),
+                query,
+            )],
         )
     }
 
-    /// The Limits section: bandwidth and concurrency (SPEC R7).
-    fn limits(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let rows = self.numeric_rows(&[FieldKey::Bandwidth, FieldKey::Concurrency], cx);
-        section(
-            "settings-limits",
-            "Limits",
-            "How much the client uses while it syncs.",
-            rows,
-            cx,
+    /// The Sync page: scan interval and attempt cap (SPEC R2.3, R6.1).
+    fn sync_page(&self, query: &str, cx: &App) -> Option<SettingPage> {
+        page(
+            PAGE_SYNC,
+            vec![group(
+                None,
+                [FieldKey::ScanInterval, FieldKey::AttemptCap]
+                    .into_iter()
+                    .filter_map(|key| self.numeric_row(key, cx))
+                    .collect(),
+                query,
+            )],
         )
     }
 
-    /// The Sync section: scan interval and attempt cap (SPEC R2.3, R6.1).
-    fn sync(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let rows = self.numeric_rows(&[FieldKey::ScanInterval, FieldKey::AttemptCap], cx);
-        section(
-            "settings-sync",
-            "Sync",
-            "How the client scans and retries.",
-            rows,
-            cx,
-        )
-    }
-
-    /// The Tagging section: the one sync tag, its switch, and where Immich
-    /// shows it (SPEC R3.7).
-    fn tagging(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    /// The Tagging page: the one sync tag, its switch, and where Immich shows
+    /// it (SPEC R3.7).
+    fn tagging_page(&self, query: &str, cx: &mut Context<Self>) -> Option<SettingPage> {
         let theme = cx.theme();
-        let palette = CardPalette::new(theme);
+        let mono = theme.mono_font_family.clone();
+        let muted = theme.muted_foreground;
         // The switch shows the user's newest intent, so a queued or in-flight
         // write is reflected before it lands (N2).
         let settings = self.intended_settings();
         let enabled = settings.tag_uploaded_assets;
         let link = sync_tag_url(&settings.server_url);
-        // R3.7: the engine ran the one permission probe; this section only
+        // R3.7: the engine ran the one permission probe; this page only
         // reports what it found, so opening Settings costs no request.
         let problem = self.tag.enabled.then(|| self.tag.problem.clone()).flatten();
+
+        let toggle = Rc::new(cx.listener(|this, enabled: &bool, _, cx| {
+            this.toggle_tag_uploads(*enabled, cx);
+        }));
         let mut rows = vec![
-            div()
-                .id("settings-tag-upload-row")
-                .test_support()
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .gap_6()
-                .min_h(rems(2.25))
-                .child(field_text(
-                    "Tag uploaded assets",
-                    "Adds the tag to every asset the client uploads. On by default.",
-                    &palette,
-                ))
-                .child(
+            Row::wrapped(
+                "Tag uploaded assets",
+                "Adds the tag to every asset the client uploads. On by default.",
+                "settings-tag-upload-row",
+                move |_, _| {
+                    let toggle = Rc::clone(&toggle);
                     Switch::new("settings-tag-upload")
                         .checked(enabled)
                         .accessibility_label("Tag uploaded assets with immich-sync")
-                        .on_change(cx.listener(|this, enabled, _, cx| {
-                            this.toggle_tag_uploads(*enabled, cx);
-                        })),
-                )
-                .into_any_element(),
-            div()
-                .id("settings-tag-name-row")
-                .test_support()
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .gap_6()
-                .min_h(rems(2.25))
-                .child(field_text(
-                    "Tag",
-                    "Fixed. The client always uses this name.",
-                    &palette,
-                ))
-                .child(
-                    div()
-                        .id("settings-tag-name")
-                        .test_support()
-                        .aria_label(SYNC_TAG)
-                        .font_family(theme.mono_font_family.clone())
+                        .on_change(move |enabled, window, cx| toggle(enabled, window, cx))
+                        .into_any_element()
+                },
+            ),
+            Row::wrapped(
+                "Tag",
+                "Fixed. The client always uses this name.",
+                "settings-tag-name-row",
+                move |_, _| {
+                    crate::a11y::named(Role::Label, "settings-tag-name", SYNC_TAG, None)
+                        .font_family(mono.clone())
                         .text_sm()
-                        .child(SYNC_TAG),
-                )
-                .into_any_element(),
-            div()
-                .id("settings-tag-prerequisite")
-                .test_support()
-                .text_xs()
-                .text_color(palette.meta)
-                .child(
-                    "Immich hides tags until you enable Tags in your Immich preferences \
-                     (Account Settings, then Features).",
-                )
-                .into_any_element(),
+                        .child(SYNC_TAG)
+                        .into_any_element()
+                },
+            ),
+            note(move |_, _| {
+                div()
+                    .id("settings-tag-prerequisite")
+                    .test_support()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(
+                        "Immich hides tags until you enable Tags in your Immich preferences \
+                         (Account Settings, then Features).",
+                    )
+                    .into_any_element()
+            }),
         ];
         if let Some(url) = link {
-            rows.push(
-                div()
-                    .id("settings-tag-link-row")
-                    .test_support()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .gap_6()
-                    .min_h(rems(2.25))
-                    .child(field_text(
-                        "View in Immich",
-                        "Opens the tag's page in your browser.",
-                        &palette,
-                    ))
-                    .child(
-                        Button::new("settings-tag-link")
-                            .label("View in Immich")
-                            .accessibility_label("Open the sync tag's page in Immich")
-                            .on_click(cx.listener(move |_, _, _, cx| cx.open_url(&url))),
-                    )
-                    .into_any_element(),
-            );
+            rows.push(Row::wrapped(
+                "View in Immich",
+                "Opens the tag's page in your browser.",
+                "settings-tag-link-row",
+                move |_, _| {
+                    let url = url.clone();
+                    Button::new("settings-tag-link")
+                        .label("View in Immich")
+                        .accessibility_label("Open the sync tag's page in Immich")
+                        .on_click(move |_, _, cx| cx.open_url(&url))
+                        .into_any_element()
+                },
+            ));
         }
         if let Some(problem) = problem {
-            rows.push(
-                notice(
+            rows.push(note(move |_, _| {
+                Notice::new(
                     "settings-tag-problem",
+                    Severity::Warning,
                     format!("The sync tag is not being applied: {problem}"),
-                    theme.warning,
-                    &palette,
                 )
-                .into_any_element(),
-            );
+                .into_any_element()
+            }));
         }
         // R3.7: the backfill's progress arrives on the engine's status poll, so
-        // the section has no timer of its own; the counts only change when a
-        // batch lands.
+        // the page has no timer of its own; the counts only change when a batch
+        // lands.
         if let Some(progress) = backfill_text(&self.tag.backfill, enabled) {
-            rows.push(
-                div()
-                    .id("settings-tag-backfill")
-                    .test_support()
-                    .aria_label(progress.clone())
+            rows.push(note(move |_, _| {
+                crate::a11y::named(Role::Label, "settings-tag-backfill", progress.clone(), None)
                     .text_xs()
-                    .text_color(palette.meta)
-                    .child(progress)
-                    .into_any_element(),
-            );
+                    .text_color(muted)
+                    .child(progress.clone())
+                    .into_any_element()
+            }));
         }
         if enabled && self.engine.is_some() {
-            rows.push(
-                div()
-                    .id("settings-tag-now-row")
-                    .test_support()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .gap_6()
-                    .min_h(rems(2.25))
-                    .child(field_text(
-                        "Tag existing assets now",
-                        "Tags every asset the client has uploaded, including the ones that were \
-                         uploaded before the switch was on.",
-                        &palette,
-                    ))
-                    .child(
-                        Button::new("settings-tag-now")
-                            .label("Tag existing assets now")
-                            .accessibility_label("Tag every existing asset with immich-sync")
-                            .on_click(cx.listener(|this, _, _, cx| this.tag_existing_assets(cx))),
-                    )
-                    .into_any_element(),
-            );
+            let tag_now = Rc::new(cx.listener(|this, _, _, cx| this.tag_existing_assets(cx)));
+            rows.push(Row::wrapped(
+                "Tag existing assets now",
+                "Tags every asset the client has uploaded, including the ones that were \
+                 uploaded before the switch was on.",
+                "settings-tag-now-row",
+                move |_, _| {
+                    let tag_now = Rc::clone(&tag_now);
+                    Button::new("settings-tag-now")
+                        .label("Tag existing assets now")
+                        .accessibility_label("Tag every existing asset with immich-sync")
+                        .on_click(move |event, window, cx| tag_now(event, window, cx))
+                        .into_any_element()
+                },
+            ));
         }
-        section(
-            "settings-tagging",
-            "Tagging",
-            "Adds one tag to the assets this client uploads, so they can be found through Immich's tag search.",
-            rows,
-            cx,
+        page(PAGE_TAGGING, vec![group(None, rows, query)])
+    }
+
+    /// The Storage page: the resolved locations, read-only (SPEC R9).
+    fn storage_page(&self, query: &str, cx: &App) -> Option<SettingPage> {
+        let theme = cx.theme();
+        let mono = theme.mono_font_family.clone();
+        let muted = theme.muted_foreground;
+        page(
+            PAGE_STORAGE,
+            vec![group(
+                None,
+                vec![
+                    storage_row(
+                        "settings-path-config",
+                        "settings-path-config-value",
+                        "Settings file",
+                        self.paths.config_file.display().to_string(),
+                        mono.clone(),
+                        muted,
+                    ),
+                    storage_row(
+                        "settings-path-state",
+                        "settings-path-state-value",
+                        "State database",
+                        self.paths.state_db.display().to_string(),
+                        mono,
+                        muted,
+                    ),
+                ],
+                query,
+            )],
         )
     }
 
-    /// The Storage section: the resolved locations, read-only (SPEC R9).
-    fn storage(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let palette = CardPalette::new(cx.theme());
-        let theme = cx.theme();
-        let row = |id: &'static str,
-                   value_id: &'static str,
-                   label: &'static str,
-                   path: &std::path::Path| {
-            div()
-                .id(id)
-                .test_support()
+    /// One numeric row: the field, its unit, and its focus handle.
+    fn numeric_row(&self, key: FieldKey, cx: &App) -> Option<Row> {
+        let input = self
+            .fields
+            .iter()
+            .find(|field| field.key == key)?
+            .input
+            .clone();
+        let focus = input.read(cx).focus_handle(cx);
+        let muted = cx.theme().muted_foreground;
+        let unit = key.unit();
+        Some(Row::stacked(key.label(), key.help(), move |_, _| {
+            crate::a11y::named(Role::Group, key.id(), key.label(), Some(key.help().into()))
+                .track_focus(&focus)
                 .flex()
                 .flex_row()
                 .items_center()
-                .justify_between()
-                .gap_6()
-                .min_h(rems(2.25))
-                .child(field_text(label, "Resolved from the platform.", &palette))
+                .gap_3()
                 .child(
-                    div().flex_1().min_w_0().text_right().child(
-                        // The text node itself must shrink, or the path draws
-                        // past the card with no ellipsis.
-                        div()
-                            .id(value_id)
-                            .test_support()
-                            .min_w_0()
-                            .truncate()
-                            .font_family(theme.mono_font_family.clone())
-                            .text_xs()
-                            .text_color(palette.meta)
-                            .child(path.display().to_string()),
-                    ),
+                    // The component's root is `flex_1`, so the fixed width
+                    // belongs on a non-growing wrapper.
+                    div().w_32().flex_none().child(NumberInput::new(&input)),
                 )
-        };
-        section(
-            "settings-storage",
-            "Storage",
-            "Read-only. The database stays on this computer; it never lives on a network share or in a cloud-sync folder.",
-            vec![
-                row(
-                    "settings-path-config",
-                    "settings-path-config-value",
-                    "Settings file",
-                    &self.paths.config_file,
-                )
-                .into_any_element(),
-                row(
-                    "settings-path-state",
-                    "settings-path-state-value",
-                    "State database",
-                    &self.paths.state_db,
-                )
-                .into_any_element(),
-            ],
-            cx,
-        )
-    }
-
-    /// One row per key, with its input and focus observation.
-    fn numeric_rows(&self, keys: &[FieldKey], cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let palette = CardPalette::new(cx.theme());
-        let muted = cx.theme().muted_foreground;
-        keys.iter()
-            .filter_map(|key| {
-                let field = self.fields.iter().find(|field| field.key == *key)?;
-                let focus = field.input.read(cx).focus_handle(cx);
-                Some(
+                .child(
                     div()
-                        .id(key.id())
-                        .test_support()
-                        .track_focus(&focus)
-                        .aria_label(key.label())
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .justify_between()
-                        .gap_6()
-                        .min_h(rems(2.25))
-                        .child(field_text(key.label(), key.help(), &palette))
-                        .child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap_3()
-                                .child(
-                                    // The component's root is `flex_1`, so the
-                                    // fixed width belongs on a non-growing
-                                    // wrapper.
-                                    div()
-                                        .w_32()
-                                        .flex_none()
-                                        .child(NumberInput::new(&field.input)),
-                                )
-                                .child(
-                                    div()
-                                        .w_16()
-                                        .flex_none()
-                                        .text_xs()
-                                        .text_color(muted)
-                                        .child(key.unit()),
-                                ),
-                        )
-                        .into_any_element(),
+                        .w_16()
+                        .flex_none()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(unit),
                 )
-            })
-            .collect()
+                .into_any_element()
+        }))
     }
 }
 
 impl Render for SettingsView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let palette = CardPalette::new(theme);
         let background = theme.background;
         let foreground = theme.foreground;
-        let notices = self.notices(cx);
-        let connection = self.connection(cx);
-        let general = self.general(cx);
-        let limits = self.limits(cx);
-        let sync = self.sync(cx);
-        let tagging = self.tagging(cx);
-        let storage = self.storage(cx);
+        let muted = theme.muted_foreground;
+        let notices = self.notices();
+        let header = self.header(cx);
+        let query = self.search.read(cx).value().to_string();
+        let pages = self.pages(&query, cx);
+        // The page the surface shows: the one the strip picked while the query
+        // leaves it a row, otherwise the first page the query landed on.
+        let shown = if pages.iter().any(|(index, _)| *index == self.page) {
+            self.page
+        } else {
+            pages.first().map_or(self.page, |(index, _)| *index)
+        };
+        // The component keys its selection on its own id, so the page it shows is
+        // seeded and re-keyed from here (S5).
+        let selected = pages
+            .iter()
+            .position(|(index, _)| *index == shown)
+            .unwrap_or(0);
+        let strip = self.page_strip(shown, window, cx);
+        let body = if pages.is_empty() {
+            div()
+                .flex_1()
+                .min_h_0()
+                .child(Self::no_matches(&query))
+                .into_any_element()
+        } else {
+            div()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .relative()
+                // The component's sidebar is collapsed to nothing but still draws
+                // its resize handle, half of it inside this box; see
+                // `handle_cover`.
+                .pl(px(1.))
+                .overflow_hidden()
+                .child(RenderOnce::render(
+                    SettingsPages::new(("settings-pages", selected))
+                        .pages(pages.into_iter().map(|(_, page)| page))
+                        .default_selected_index(SelectIndex {
+                            page_ix: selected,
+                            group_ix: None,
+                        })
+                        .sidebar_width(px(0.))
+                        .sidebar_size_range(px(0.)..px(0.))
+                        .sidebar_style(&hidden())
+                        .header_style(&hidden()),
+                    window,
+                    cx,
+                ))
+                .child(handle_cover(background))
+                .into_any_element()
+        };
 
         div()
             .id("settings-scroll")
@@ -1406,26 +1485,210 @@ impl Render for SettingsView {
             .size_full()
             .bg(background)
             .text_color(foreground)
-            .overflow_y_scroll()
             .p_4()
             .gap_2()
-            .child(Self::header(cx))
+            .child(header)
             .children(notices)
-            .child(connection)
-            .child(general)
-            .child(limits)
-            .child(sync)
-            .child(tagging)
-            .child(storage)
+            .child(strip)
+            .child(body)
             .child(
                 div()
                     .text_xs()
-                    .text_color(palette.meta)
+                    .text_color(muted)
                     .child("Every control is reachable with the Tab key."),
             )
     }
 }
 
+/// One row of the settings surface: the words the search compares, and the item
+/// the kit lays out.
+///
+/// The id, name and help attributes stay on the wrapper each row builder creates
+/// around its control, because that wrapper is also what tracks the control's
+/// focus handle: `text_row` and `numeric_row` forward the kit input's handle, and
+/// a `Switch` or `Button` names itself. A row cannot own that wrapper without
+/// also owning a handle it does not have (S4).
+struct Row {
+    /// The row's title, which names its control.
+    title: &'static str,
+    /// The help sentence under the title.
+    help: &'static str,
+    /// The setting item the kit renders.
+    item: SettingItem,
+}
+
+impl Row {
+    /// A row whose control is the element the row itself names.
+    fn setting(
+        title: &'static str,
+        help: &'static str,
+        control: impl Fn(&mut Window, &mut App) -> AnyElement + 'static,
+    ) -> Self {
+        let field = SettingField::<SharedString>::render(move |_, window, cx| control(window, cx));
+        Self {
+            title,
+            help,
+            item: SettingItem::new(title, field).description(help),
+        }
+    }
+
+    /// A row whose field is as wide as the page: the label and help sit above
+    /// it at every window size.
+    ///
+    /// A long label word and a fixed-width field do not fit side by side on a
+    /// page just wider than the component's stacking breakpoint, and the kit's
+    /// field slot sizes to its content, so the field would draw past the page.
+    fn stacked(
+        title: &'static str,
+        help: &'static str,
+        control: impl Fn(&mut Window, &mut App) -> AnyElement + 'static,
+    ) -> Self {
+        let field = SettingField::<SharedString>::render(move |_, window, cx| control(window, cx));
+        Self {
+            title,
+            help,
+            item: SettingItem::new(title, field)
+                .description(help)
+                .layout(Axis::Vertical),
+        }
+    }
+
+    /// A row whose control is its own widget: the row around it states the
+    /// help sentence, because the widget names itself.
+    fn wrapped(
+        title: &'static str,
+        help: &'static str,
+        row_id: &'static str,
+        control: impl Fn(&mut Window, &mut App) -> AnyElement + 'static,
+    ) -> Self {
+        Self::setting(title, help, move |window, cx| {
+            crate::a11y::named(Role::Group, row_id, title, Some(help.into()))
+                .child(control(window, cx))
+                .into_any_element()
+        })
+    }
+
+    /// Whether the row's own words contain `query`, which is already lower case.
+    fn matches(&self, query: &str) -> bool {
+        query.is_empty()
+            || self.title.to_lowercase().contains(query)
+            || self.help.to_lowercase().contains(query)
+    }
+
+    /// Whether the row carries no words of its own: a notice, a button, a line
+    /// of copy. It follows the group it sits in and never keeps one.
+    fn is_note(&self) -> bool {
+        self.title.is_empty()
+    }
+}
+
+/// A row that is not a setting: a notice, a button, or a line of copy.
+fn note(build: impl Fn(&mut Window, &mut App) -> AnyElement + 'static) -> Row {
+    Row {
+        title: "",
+        help: "",
+        item: SettingItem::render(move |_, window, cx| build(window, cx)),
+    }
+}
+
+/// One group of rows, kept only when a row of its own matches `query`.
+fn group(title: Option<&'static str>, rows: Vec<Row>, query: &str) -> Option<SettingGroup> {
+    let keep: Vec<bool> = rows.iter().map(|row| row.matches(query)).collect();
+    if !keep.iter().any(|kept| *kept) {
+        return None;
+    }
+    let mut group = SettingGroup::new();
+    if let Some(title) = title {
+        group = group.title(title);
+    }
+    Some(
+        group.items(
+            rows.into_iter()
+                .zip(keep)
+                .filter(|(row, kept)| *kept || row.is_note())
+                .map(|(row, _)| row.item),
+        ),
+    )
+}
+
+/// One page, kept only when a group of it survives the search.
+fn page(index: usize, groups: Vec<Option<SettingGroup>>) -> Option<SettingPage> {
+    let groups: Vec<SettingGroup> = groups.into_iter().flatten().collect();
+    if groups.is_empty() {
+        return None;
+    }
+    let page = &PAGES[index];
+    Some(
+        SettingPage::new(page.title)
+            .description(page.description)
+            .groups(groups),
+    )
+}
+
+/// Covers the resize handle the kit's settings group draws with a zero-width
+/// sidebar.
+///
+/// `Settings` always builds its resizable group's handle, and 0.8.1 has no
+/// option to leave the sidebar or its handle out. Drawn over the band, the
+/// handle paints nothing, receives no pointer and never offers a resize cursor
+/// for a drag that resizes nothing. The cover sits in the page's own left
+/// padding, clear of every control.
+fn handle_cover(background: Hsla) -> impl IntoElement {
+    div()
+        .id("settings-handle-cover")
+        .test_support()
+        .occlude()
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .left_0()
+        .w(px(9.))
+        .bg(background)
+}
+
+/// One read-only storage row (R9).
+fn storage_row(
+    id: &'static str,
+    value_id: &'static str,
+    title: &'static str,
+    path: String,
+    mono: SharedString,
+    muted: Hsla,
+) -> Row {
+    const HELP: &str = "Resolved from the platform.";
+    Row::stacked(title, HELP, move |_, _| {
+        crate::a11y::named(Role::Group, id, title, Some(HELP.into()))
+            .min_w_0()
+            .w_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_end()
+            .child(
+                div().flex_1().min_w_0().text_right().child(
+                    // The text node itself must shrink, or the path draws past
+                    // the row with no ellipsis.
+                    crate::a11y::named(Role::Label, value_id, path.clone(), None)
+                        .min_w_0()
+                        .truncate()
+                        .font_family(mono.clone())
+                        .text_xs()
+                        .text_color(muted)
+                        .child(path.clone()),
+                ),
+            )
+            .into_any_element()
+    })
+}
+
+/// A style that leaves an element out of the layout: the kit's own page sidebar
+/// duplicates the strip and its search field duplicates the surface's.
+fn hidden() -> StyleRefinement {
+    StyleRefinement {
+        display: Some(Display::None),
+        ..StyleRefinement::default()
+    }
+}
 /// The placeholder the secret field shows for one credential kind.
 ///
 /// The field follows the radio, so the empty password field does not advertise
@@ -1438,17 +1701,27 @@ fn secret_placeholder_for(method: AuthMethod) -> &'static str {
 }
 
 /// The accent that marks one connection state on the settings notice.
-fn connection_accent(state: &ConnectionState, theme: &Theme) -> Hsla {
+fn connection_severity(state: &ConnectionState) -> Severity {
     match state {
-        ConnectionState::Connected => theme.success,
-        ConnectionState::NeedsAttention(_) => theme.danger,
-        ConnectionState::Connecting => theme.info,
-        ConnectionState::NotConfigured => theme.muted_foreground,
+        ConnectionState::Connected => Severity::Success,
+        ConnectionState::NeedsAttention(_) => Severity::Error,
+        ConnectionState::Connecting => Severity::Info,
+        ConnectionState::NotConfigured => Severity::Info,
     }
 }
 
 /// One labelled field row: the name and help on the left, the control on the
 /// right.
+///
+/// This and the card helpers below stay for the diagnostics and logs surfaces,
+/// which still borrow them; #78 took the settings surface off them.
+///
+/// What is left calls it for a label and its help sentence *beside a control*,
+/// not for a label-and-value pair: `diagnostics_view` ×4 (Refresh, Rebuild,
+/// Collect, Copy path) and `logs_view` ×4 (Refresh, Copy all, Live tail paused,
+/// and the log path row). #80 moved every diagnostics value row to a kit
+/// `DescriptionList` instead, so the helper is not dead — those rows would each
+/// need a kit `SettingItem` to retire it, and no ticket in this spec owns them.
 pub(crate) fn field_text(label: &str, help: &str, palette: &CardPalette) -> impl IntoElement {
     div()
         .flex()
@@ -1591,28 +1864,6 @@ pub fn sync_tag_url(server_url: &str) -> Option<String> {
         "{}/tags?path={SYNC_TAG}",
         crate::asset_link::web_root(server_url)?
     ))
-}
-
-/// A notice with a colored edge, named by `id`. The accessible name carries
-/// the message, so the visible copy is not announced a second time.
-pub(crate) fn notice(
-    id: impl Into<ElementId>,
-    text: String,
-    accent: Hsla,
-    palette: &CardPalette,
-) -> impl IntoElement {
-    div()
-        .id(id)
-        .test_support()
-        .role(Role::Alert)
-        .aria_label(text.clone())
-        .border_l_2()
-        .border_color(accent)
-        .pl_2()
-        .py_1()
-        .text_xs()
-        .text_color(palette.text)
-        .child(Text::new_inaccessible(text.into()))
 }
 
 #[cfg(test)]

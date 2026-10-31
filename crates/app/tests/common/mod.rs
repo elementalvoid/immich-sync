@@ -21,6 +21,27 @@ pub fn mock_server() -> (tokio::runtime::Runtime, MockImmich) {
     (runtime, server)
 }
 
+/// The WCAG 2.1 contrast ratio, 1.0 (identical) to 21.0.
+///
+/// The headless harness cannot read pixels, so a surface's ink and its
+/// background are measured as theme tokens.
+#[allow(dead_code)]
+pub fn contrast(a: gpui_kit::Hsla, b: gpui_kit::Hsla) -> f32 {
+    let linear = |channel: f32| {
+        if channel <= 0.04045 {
+            channel / 12.92
+        } else {
+            ((channel + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let luminance = |color: gpui_kit::Hsla| {
+        let rgb = color.to_rgb();
+        0.2126 * linear(rgb.r) + 0.7152 * linear(rgb.g) + 0.0722 * linear(rgb.b)
+    };
+    let (a, b) = (luminance(a), luminance(b));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
 /// Scrolls the dashboard until the element with `id` is on screen.
 ///
 /// #56: the global card carries the reconciliation scan line, so on a short

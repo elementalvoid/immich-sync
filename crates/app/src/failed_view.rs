@@ -13,10 +13,12 @@ use gpui_kit::*;
 use sync_core::paths::PathCase;
 
 use crate::dashboard::CardPalette;
+use crate::empty_state::EmptyState;
 use crate::engine::EngineModel;
 use crate::failed::{FailedRow, rows, summary};
 use crate::folder_filter::FolderFilter;
 use crate::folder_filter_view::folder_filter_bar;
+use crate::notice::{Notice, Severity};
 
 /// The failed-items surface.
 pub struct FailedView {
@@ -71,7 +73,6 @@ impl Render for FailedView {
         let palette = CardPalette::new(cx.theme());
         let radius = cx.theme().radius_lg;
         let border = cx.theme().border;
-        let danger = cx.theme().danger;
         let background = cx.theme().background;
         let foreground = cx.theme().foreground;
         let muted = cx.theme().muted_foreground;
@@ -82,18 +83,17 @@ impl Render for FailedView {
         items.retain(|item| filter.keeps(&item.path, &folders, case));
         let rows = rows(&items);
         let problem = self.engine.read(cx).problem().map(str::to_string);
-        // R6.5, #41: the empty state names the folder the filter shows.
+        // R6.5, #41: the empty state names the folder the filter shows, and only
+        // the list it stands in for (#77).
         let empty = self
             .filter
             .read(cx)
             .empty_heading("No failed items", "Nothing has failed");
         // #41 review: an empty filtered list must not be summarised as if the
-        // whole client were empty, so the summary says what the list says.
-        let summary = if rows.is_empty() && self.filter.read(cx).is_active() {
-            empty.clone()
-        } else {
-            summary(&items)
-        };
+        // whole client were empty, so the summary only states a count. An empty
+        // list is stated once, by the empty state below it (#76's "announced
+        // once" rule, #77).
+        let summary = (!rows.is_empty()).then(|| summary(&items));
 
         div()
             .id("failed-view")
@@ -123,7 +123,7 @@ impl Render for FailedView {
                     )),
             )
             .when_some(problem, |this, problem| {
-                this.child(div().text_sm().text_color(danger).child(problem))
+                this.child(Notice::new("failed-problem", Severity::Error, problem))
             })
             .child(folder_filter_bar(
                 "failed",
@@ -132,16 +132,18 @@ impl Render for FailedView {
                 window,
                 cx,
             ))
-            .child(
-                div()
-                    .id("failed-summary")
-                    .test_support()
-                    .role(Role::Status)
-                    .aria_label(summary.clone())
-                    .text_sm()
-                    .text_color(muted)
-                    .child(summary),
-            )
+            .when_some(summary, |this, summary| {
+                this.child(
+                    div()
+                        .id("failed-summary")
+                        .test_support()
+                        .role(Role::Status)
+                        .aria_label(summary.clone())
+                        .text_sm()
+                        .text_color(muted)
+                        .child(summary),
+                )
+            })
             .child(
                 div()
                     .id("failed-list")
@@ -152,11 +154,17 @@ impl Render for FailedView {
                     .flex_col()
                     .gap_3()
                     .when(rows.is_empty(), |this| {
-                        this.child(empty_card("failed-empty", &empty, &palette, radius, border))
+                        this.child(EmptyState::new(
+                            "failed-empty",
+                            empty,
+                            "A file the client gives up on appears here, with the reason.",
+                        ))
                     })
-                    .children(rows.iter().enumerate().map(|(index, row)| {
-                        row_card(row, index, &palette, radius, border, danger, cx)
-                    })),
+                    .children(
+                        rows.iter()
+                            .enumerate()
+                            .map(|(index, row)| row_card(row, index, &palette, radius, border, cx)),
+                    ),
             )
     }
 }
@@ -168,7 +176,6 @@ fn row_card(
     palette: &CardPalette,
     radius: Pixels,
     border: Hsla,
-    danger: Hsla,
     cx: &mut Context<FailedView>,
 ) -> impl IntoElement + use<> {
     let path = row.path.clone();
@@ -208,14 +215,15 @@ fn row_card(
                         .text_color(palette.meta)
                         .child(row.path.clone()),
                 )
+                // The row's accessible name already states the class and the
+                // error, so the strip names nothing itself (#76).
                 .child(
-                    div()
-                        .border_l_2()
-                        .border_color(danger)
-                        .pl_2()
-                        .text_xs()
-                        .text_color(palette.text)
-                        .child(format!("{} — {}", row.class, row.error)),
+                    Notice::new(
+                        format!("failed-row-notice-{index}"),
+                        Severity::Error,
+                        format!("{} — {}", row.class, row.error),
+                    )
+                    .quiet(),
                 )
                 .child(
                     div()
@@ -230,42 +238,5 @@ fn row_card(
                 .label("Retry")
                 .accessibility_label(row.retry_label.clone())
                 .on_click(cx.listener(move |this, _, _, cx| this.retry(path.clone(), cx))),
-        )
-}
-
-/// The empty state: the view is a normal place to be, not a broken one.
-fn empty_card(
-    id: &'static str,
-    heading: &str,
-    palette: &CardPalette,
-    radius: Pixels,
-    border: Hsla,
-) -> impl IntoElement + use<> {
-    let heading = heading.to_string();
-    div()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .p_4()
-        .w_full()
-        .rounded(radius)
-        .bg(palette.surface)
-        .border_1()
-        .border_color(border)
-        .child(
-            div()
-                .id(id)
-                .test_support()
-                .role(Role::Status)
-                .aria_label(heading.clone())
-                .text_base()
-                .font_weight(FontWeight::MEDIUM)
-                .child(heading),
-        )
-        .child(
-            div()
-                .text_xs()
-                .text_color(palette.meta)
-                .child("A file the client gives up on appears here, with the reason."),
         )
 }

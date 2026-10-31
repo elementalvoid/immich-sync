@@ -13,9 +13,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use gpui_kit::base::TextSelection;
+use gpui_kit::base::test_support::snapshots;
 use gpui_kit::test::{ElementSnapshot, TestWindowExt as _};
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, Bounds, ClipboardItem, ElementId, Entity, Point,
+    AnyWindowHandle, App, AppContext as _, Bounds, ClipboardItem, ElementId, Entity, Point, Role,
     ScrollDelta, TestAppContext, Window, WindowBounds, WindowOptions, point, px, size,
 };
 use immich_sync::autostart::{Autostart, UnavailableAutostart};
@@ -66,6 +67,60 @@ fn window_options_at(width: f32, height: f32) -> WindowOptions {
         })),
         ..Default::default()
     }
+}
+
+/// The sentence the empty tail explains itself with (#77).
+const EMPTY_DESCRIPTION: &str = "Lines appear as the client works.";
+
+/// The word a copy confirmation shows (#82). The same word on every surface.
+const COPIED: &str = "Copied";
+
+/// The one identity a copy confirmation keeps across presses (#82).
+const CONFIRMATION: &str = "logs-copy-confirmation";
+
+/// The visible confirmations that say a copy happened (#82). One id, whatever
+/// the press count says inside it.
+fn confirmations(window: &Window) -> Vec<ElementSnapshot> {
+    snapshots(window)
+        .into_iter()
+        .filter(|element| {
+            element.visible() && confirmation_id(element) == ElementId::from(CONFIRMATION)
+        })
+        .collect()
+}
+
+/// The id of one observed confirmation, which is its accessibility identity.
+fn confirmation_id(confirmation: &ElementSnapshot) -> ElementId {
+    confirmation
+        .path()
+        .last()
+        .cloned()
+        .expect("the confirmation registers its own id")
+}
+
+/// The empty tail's one action, named for where it sits (#77).
+const EMPTY_ACTION_LABEL: &str = "Refresh the log tail";
+
+/// How many observed elements announce `text`: as a name, as a value, or as the
+/// description a screen reader reads after the name.
+fn announced(window: &Window, text: &str) -> usize {
+    snapshots(window)
+        .into_iter()
+        .filter(|element| {
+            element.label() == Some(text)
+                || element.value() == Some(text)
+                || element.description() == Some(text)
+        })
+        .count()
+}
+
+/// The accessible name of every control in the view, in tree order.
+fn control_names(window: &Window) -> Vec<String> {
+    snapshots(window)
+        .into_iter()
+        .filter(|element| element.role() == Some(Role::Button))
+        .filter_map(|element| element.label().map(str::to_owned))
+        .collect()
 }
 
 fn autostart() -> Rc<dyn Autostart> {
@@ -240,6 +295,99 @@ fn tick_live(cx: &mut TestAppContext, window: AnyWindowHandle) {
     settle(cx, window);
 }
 
+#[gpui_kit::test]
+async fn an_empty_tail_is_one_status_inside_the_narrowest_window(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let store = SettingsStore::open(paths.config_file.clone());
+    // 520x480 is the shell's smallest window (#75).
+    let (window, _shell) = open_shell_at(cx, store, paths, (520., 480.));
+
+    show_logs(cx, window);
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let empty = window.find("logs-empty");
+        assert_eq!(
+            empty.label(),
+            Some("No log lines yet."),
+            "#77: the empty tail states what it shows"
+        );
+        assert_eq!(
+            empty.description(),
+            Some(EMPTY_DESCRIPTION),
+            "#77: the explanation is announced after the title, not instead of it"
+        );
+        assert_eq!(
+            empty.role(),
+            Some(Role::Status),
+            "#77: the empty tail is a status for assistive technology"
+        );
+        assert!(
+            empty.visible(),
+            "#77: the empty tail is on screen: {empty:?}"
+        );
+        assert_eq!(
+            announced(window, "No log lines yet."),
+            1,
+            "#77: the title is announced once"
+        );
+        assert_eq!(
+            announced(window, EMPTY_DESCRIPTION),
+            1,
+            "#77: the explanation is announced once"
+        );
+        // The narrowest window must not clip the state it is showing.
+        let size = window.viewport_size();
+        assert!(
+            empty.bounds().right() <= size.width && empty.bounds().bottom() <= size.height,
+            "#77: the empty tail stays inside {size:?}: {:?}",
+            empty.bounds()
+        );
+        assert!(
+            window
+                .try_find((ElementId::from("logs-empty"), "action"))
+                .is_some(),
+            "#77: the empty tail offers the one step it can honour"
+        );
+    })
+    .expect("read the empty logs view");
+}
+
+#[gpui_kit::test]
+async fn an_empty_tail_is_re_read_from_where_it_is_shown(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let store = SettingsStore::open(paths.config_file.clone());
+    let (window, _shell) = open_shell(cx, store, paths.clone());
+
+    show_logs(cx, window);
+    cx.update_window(window, |_, window, cx| {
+        assert!(window.find("logs-empty").visible(), "the tail starts empty");
+        assert_eq!(
+            window.find("logs-empty-refresh").label(),
+            Some(EMPTY_ACTION_LABEL),
+            "the empty tail's one action is named"
+        );
+        write_log(&paths, &["the first line ever written"]);
+        window.click("logs-empty-refresh", cx);
+    })
+    .expect("update the shell window");
+
+    settle(cx, window);
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(
+            window.find("logs-line-0").label(),
+            Some("the first line ever written"),
+            "the empty tail's action re-reads the file"
+        );
+        assert!(
+            window.try_find("logs-empty").is_none(),
+            "and the empty state clears with it"
+        );
+    })
+    .expect("update the shell window");
+}
+
 #[test]
 fn the_screenshot_view_override_names_a_surface() {
     assert_eq!(shell::view_for_name("dashboard"), Some(ViewMode::Dashboard));
@@ -271,7 +419,7 @@ async fn the_logs_entry_shows_the_location_and_the_recent_lines(cx: &mut TestApp
     cx.update_window(window, |_, window, _| {
         assert!(window.find("logs-view").visible(), "the Logs view is shown");
         assert!(
-            window.try_find("settings-general").is_none(),
+            window.try_find("settings-scroll").is_none(),
             "the settings are not rendered"
         );
         assert!(
@@ -546,12 +694,40 @@ async fn ten_refreshes_keep_every_row_at_full_height(cx: &mut TestAppContext) {
 async fn every_logs_control_is_named_and_keyboard_reachable(cx: &mut TestAppContext) {
     let temp = tempfile::tempdir().expect("create a temp dir");
     let paths = temporary_paths(temp.path());
-    // One line, so Copy all is enabled and therefore a tab stop.
-    write_log(&paths, &["a stable line"]);
     let store = SettingsStore::open(paths.config_file.clone());
-    let (window, _shell) = open_shell(cx, store, paths);
+    let (window, _shell) = open_shell(cx, store, paths.clone());
 
     show_logs(cx, window);
+    // The empty tail is the one state that shows both refreshes at once, so it
+    // is where two controls could end up sharing one name (#77).
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("logs-empty-refresh").label(),
+            Some(EMPTY_ACTION_LABEL),
+            "the empty tail's action is named for where it sits"
+        );
+        let names = control_names(window);
+        let mut unique = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            names.len(),
+            "two controls share an accessible name: {names:?}"
+        );
+        tab_to(window, "logs-empty-refresh", cx);
+        // Walk the tab order below from its start again.
+        window.blur(cx);
+    })
+    .expect("update the shell window");
+
+    // One line, so Copy all is enabled and therefore a tab stop.
+    write_log(&paths, &["a stable line"]);
+    cx.update_window(window, |_, window, cx| window.click("logs-refresh", cx))
+        .expect("update the shell window");
+    settle(cx, window);
+
     cx.update_window(window, |_, window, cx| {
         for (id, label) in [
             ("nav-logs", "Logs"),
@@ -855,6 +1031,169 @@ async fn copy_all_with_an_empty_tail_copies_nothing_and_does_not_panic(cx: &mut 
         .update(|cx| cx.read_from_clipboard().and_then(|item| item.text()))
         .unwrap_or_default();
     assert_eq!(copied, "SENTINEL", "the clipboard is untouched");
+    // #82: a refused copy is still a refusal, not a confirmation.
+    cx.update_window(window, |_, window, _| {
+        assert!(
+            confirmations(window).is_empty(),
+            "the empty tail's copy is disabled and shows no confirmation"
+        );
+    })
+    .expect("update the shell window");
+}
+
+/// #82: a copy confirms where the control is, the confirmation reaches assistive
+/// technology, and a second press confirms again instead of staying silent.
+#[gpui_kit::test]
+async fn copy_all_confirms_each_press_and_keeps_the_copied_bytes(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    // The blank line is the part of the payload the selection copy path drops.
+    write_log(&paths, &["alpha first line", "", "charlie third line"]);
+    let store = SettingsStore::open(paths.config_file.clone());
+    let (window, _shell) = open_shell(cx, store, paths);
+
+    cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string("SENTINEL".into())));
+    show_logs(cx, window);
+    cx.update_window(window, |_, window, _| {
+        assert!(
+            confirmations(window).is_empty(),
+            "nothing has been copied yet, so nothing confirms"
+        );
+    })
+    .expect("update the shell window");
+
+    cx.update_window(window, |_, window, cx| window.click("logs-copy-all", cx))
+        .expect("update the shell window");
+    let copied = cx
+        .update(|cx| cx.read_from_clipboard().and_then(|item| item.text()))
+        .unwrap_or_default();
+    assert_eq!(
+        copied, "alpha first line\n\ncharlie third line",
+        "the confirmation changed nothing about the copied bytes, blank line included"
+    );
+    cx.update_window(window, |_, window, _| {
+        let confirmations = confirmations(window);
+        assert_eq!(
+            confirmations.len(),
+            1,
+            "one confirmation says the copy happened: {confirmations:?}"
+        );
+        assert_eq!(
+            confirmation_id(&confirmations[0]),
+            ElementId::from(CONFIRMATION),
+            "the confirmation owns the one stable id from the first press on"
+        );
+        assert_eq!(
+            confirmations[0].role(),
+            Some(Role::Status),
+            "a copy that worked is a status, not an alert"
+        );
+        assert_eq!(
+            confirmations[0].label(),
+            Some(COPIED),
+            "the first press says what happened: {confirmations:?}"
+        );
+        assert_eq!(
+            confirmations[0].value(),
+            Some(COPIED),
+            "macOS announces a live node by value: {confirmations:?}"
+        );
+        assert!(
+            confirmations[0]
+                .path()
+                .contains(&ElementId::from("logs-copy-row")),
+            "the confirmation sits in the row of the control that copied: {:?}",
+            confirmations[0].path()
+        );
+    })
+    .expect("update the shell window");
+
+    // A second press must confirm again: the clipboard is written again and the
+    // announcement names the press, on the node whose identity never changes.
+    cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string("SENTINEL".into())));
+    cx.update_window(window, |_, window, cx| window.click("logs-copy-all", cx))
+        .expect("update the shell window");
+    let copied = cx
+        .update(|cx| cx.read_from_clipboard().and_then(|item| item.text()))
+        .unwrap_or_default();
+    assert_eq!(
+        copied, "alpha first line\n\ncharlie third line",
+        "the second press copies again"
+    );
+    cx.update_window(window, |_, window, _| {
+        let confirmations = confirmations(window);
+        assert_eq!(
+            confirmations.len(),
+            1,
+            "the second press replaces the confirmation instead of stacking one: {confirmations:?}"
+        );
+        assert_eq!(
+            confirmation_id(&confirmations[0]),
+            ElementId::from(CONFIRMATION),
+            "the confirmation keeps one stable identity across presses"
+        );
+        assert_eq!(
+            confirmations[0].role(),
+            Some(Role::Status),
+            "a repeat is still a status"
+        );
+        assert_eq!(
+            (confirmations[0].label(), confirmations[0].value()),
+            (Some("Copied 2 times"), Some("Copied 2 times")),
+            "the repeat is announced: a name change for Windows and AT-SPI, a value change for macOS"
+        );
+    })
+    .expect("update the shell window");
+}
+
+/// #82: the confirmation describes the rows it copied, so a poll that read the
+/// same tail leaves it alone and a tail that changed takes it away.
+#[gpui_kit::test]
+async fn the_confirmation_holds_still_until_the_tail_it_copied_changes(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let log = write_log(&paths, &["alpha first line", "charlie third line"]);
+    let store = SettingsStore::open(paths.config_file.clone());
+    let (window, _shell) = open_shell(cx, store, paths);
+
+    show_logs(cx, window);
+    cx.update_window(window, |_, window, cx| window.click("logs-copy-all", cx))
+        .expect("update the shell window");
+    // A poll that read the same bytes says nothing new, so the confirmation
+    // neither goes away nor counts a press: the live tail cannot make it
+    // flicker once a second.
+    tick_live(cx, window);
+    cx.update_window(window, |_, window, _| {
+        let confirmations = confirmations(window);
+        assert_eq!(confirmations.len(), 1, "the unchanged tail keeps it");
+        assert_eq!(
+            confirmations[0].label(),
+            Some(COPIED),
+            "an unchanged poll is not another copy: {confirmations:?}"
+        );
+    })
+    .expect("update the shell window");
+
+    // Appending a line changes the rows, so the copied text is no longer what
+    // the control would copy.
+    fs::write(
+        &log,
+        "alpha first line\ncharlie third line\na line nobody copied\n",
+    )
+    .expect("append a line to the log file");
+    tick_live(cx, window);
+    cx.update_window(window, |_, window, _| {
+        assert!(
+            window.try_find("logs-line-2").is_some(),
+            "the poll replaced the rows with the new tail"
+        );
+        assert!(
+            window.try_find(CONFIRMATION).is_none(),
+            "the confirmation does not outlive the rows it copied: {:?}",
+            window.try_find(CONFIRMATION)
+        );
+    })
+    .expect("update the shell window");
 }
 
 #[gpui_kit::test]
@@ -1638,8 +1977,9 @@ async fn a_short_window_keeps_the_tail_on_screen_and_scrolls_the_cards_above_it(
 /// enough for the paused row plus the tail's own minimum (#54).
 #[gpui_kit::test]
 async fn a_paused_tail_keeps_the_jump_control_inside_a_short_window(cx: &mut TestAppContext) {
-    // 900x600 is the window the review measured, and 720x480 is the shell's
-    // minimum: the narrowest window wraps the paused row's labels the most.
+    // 900x600 is the window the review measured, and 720x480 is a window at the
+    // shell's minimum height: the narrowest window wraps the paused row's
+    // labels the most.
     for window_size in [(900., 600.), (720., 480.)] {
         let temp = tempfile::tempdir().expect("create a temp dir");
         let paths = temporary_paths(temp.path());
@@ -1699,8 +2039,9 @@ async fn a_paused_tail_keeps_the_jump_control_inside_a_short_window(cx: &mut Tes
 async fn a_failed_tail_read_keeps_its_notice_and_paused_row_inside_the_card(
     cx: &mut TestAppContext,
 ) {
-    // 900x600 is the window the review measured, and 720x480 is the shell's
-    // minimum: the narrowest window wraps the notice and the paused row most.
+    // 900x600 is the window the review measured, and 720x480 is a window at the
+    // shell's minimum height: the narrowest window wraps the notice and the
+    // paused row most.
     for window_size in [(900., 600.), (720., 480.)] {
         // A long prefix stands in for a long data directory, and it is long
         // enough that the unclamped notice wraps to four lines at both sizes,
