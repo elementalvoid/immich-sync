@@ -15,17 +15,16 @@
 
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::IndexPath;
-use gpui_kit::component::Sizable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::searchable_list::{SearchableListDelegate, SearchableListItem};
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
-use gpui_kit::component::{Icon, IconName};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use sync_core::store::SourceFolder;
 
 use crate::dashboard::CardPalette;
 use crate::folder_filter::{ALL_FOLDERS, FolderFilter};
+use crate::rows::select_option;
 use crate::status::folder_name;
 
 /// The filter row for one list view.
@@ -281,13 +280,9 @@ impl SearchableListDelegate for FolderChoices {
             .map(IndexPath::new)
     }
 
-    /// The row the kit paints for each choice.
-    ///
-    /// The kit's default row is text only, so the accessible name and the state
-    /// of the current choice are supplied here. `checked` is the committed
-    /// selection, so it is reported as `aria_selected` rather than written into
-    /// the name, and drawn as heavier weight on the label, so the state is never
-    /// colour alone.
+    /// The row the kit paints for each choice: [`select_option`] with the
+    /// folder's own row id and its accessible name (the full path, because two
+    /// source folders can share a leaf name).
     fn render_item(
         &self,
         ix: IndexPath,
@@ -297,60 +292,7 @@ impl SearchableListDelegate for FolderChoices {
         cx: &mut App,
     ) -> Option<AnyElement> {
         let id = format!("{}-folder-option-{}", self.prefix, ix.row);
-        Some(
-            div()
-                .id(id.clone())
-                .test_support()
-                .role(Role::ListBoxOption)
-                .aria_label(item.accessible.clone())
-                .aria_selected(checked)
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .gap_2()
-                .w_full()
-                .min_w_0()
-                .child(
-                    div()
-                        // The id carries the state, so a headless test can prove
-                        // the marker below is drawn as well as reported: weight
-                        // alone is not observable without pixels.
-                        .id(if checked {
-                            format!("{id}-selected")
-                        } else {
-                            format!("{id}-label")
-                        })
-                        .test_support()
-                        .min_w_0()
-                        .truncate()
-                        .when(checked, |label| {
-                            // The design guides' selected row: the item's own
-                            // surface carries the state. Weight draws with no
-                            // icon assets; the check beside it needs them, and
-                            // since #86 registers the kit's bundle it draws too.
-                            label.font_weight(FontWeight::SEMIBOLD)
-                        })
-                        .child(item.label.clone()),
-                )
-                .when(checked, |row| {
-                    // The kit's own row draws this check in a trailing slot, but
-                    // its adapter (`searchable_list/adapter.rs`, gpui-component
-                    // 0.8.1) only sets `checked` when the delegate leaves
-                    // `render_item` to the kit. This row is ours for the name
-                    // and `aria_selected`, so the mark is drawn here, at the
-                    // kit's own size and colour. The kit's hidden slot still
-                    // reserves its width (`item.rs`), so this one sits ~16 px
-                    // inboard of the row's trailing edge, not flush with it.
-                    row.child(
-                        Icon::new(IconName::Check)
-                            .xsmall()
-                            .flex_shrink_0()
-                            .text_color(cx.theme().foreground),
-                    )
-                })
-                .into_any_element(),
-        )
+        Some(select_option(&id, &item.accessible, checked, cx))
     }
 }
 

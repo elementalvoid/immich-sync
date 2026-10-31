@@ -1657,12 +1657,12 @@ pub(crate) fn filling_section_with_action(
     id: &'static str,
     title: &'static str,
     description: &'static str,
-    action: Option<AnyElement>,
+    action: AnyElement,
     rows: Vec<AnyElement>,
     floor_rem: f32,
     cx: &App,
 ) -> AnyElement {
-    card(id, title, description, action, rows, cx)
+    card(id, title, description, Some(action), rows, cx)
         .flex_1()
         .min_h(rems(floor_rem))
         .into_any_element()

@@ -13,13 +13,10 @@ use std::time::Duration;
 use gpui_kit::base::{Disableable as _, SelectableText, TextSelection};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::IndexPath;
-use gpui_kit::component::Sizable as _;
 use gpui_kit::component::button::Button;
 use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_kit::component::searchable_list::{SearchableListDelegate, SearchableListItem};
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
-use gpui_kit::component::{Icon, IconName};
-use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::a11y;
@@ -27,7 +24,7 @@ use crate::dashboard::CardPalette;
 use crate::empty_state::EmptyState;
 use crate::logging::{self, LogLevel, TAIL_LINES};
 use crate::notice::{Notice, Severity, copy_confirmation};
-use crate::rows::{Row, mono_value_item, value_list};
+use crate::rows::{Row, mono_value_item, select_option, value_list};
 use crate::settings_view::{SettingsView, filling_section_with_action, section};
 
 /// How often the live tail re-reads the newest log file while the Logs surface
@@ -665,7 +662,7 @@ impl LogsView {
             "logs-lines-section",
             "Recent lines",
             "The newest file's last lines. They follow the file while this surface is open.",
-            Some(self.copy_all_action(cx)),
+            self.copy_all_action(cx),
             body,
             floor_rem,
             cx,
@@ -764,12 +761,9 @@ impl SearchableListDelegate for LevelChoices {
             .map(IndexPath::new)
     }
 
-    /// The row the kit paints for each level.
-    ///
-    /// The kit's default row is text only, so the current level's state is
-    /// supplied here: the committed choice reports `aria_selected`, and is
-    /// drawn as heavier weight plus the kit's check, so the state is never
-    /// colour alone — the shape #79 settled on the folder filter.
+    /// The row the kit paints for each level: [`select_option`], with the
+    /// level's own id, so the option a state change lands on is named after the
+    /// setting it holds.
     fn render_item(
         &self,
         _ix: IndexPath,
@@ -778,55 +772,7 @@ impl SearchableListDelegate for LevelChoices {
         _window: &mut Window,
         cx: &mut App,
     ) -> Option<AnyElement> {
-        // The level's own id, so the option a state change lands on is named
-        // after the setting it holds.
-        let id = item.id();
-        Some(
-            div()
-                .id(id)
-                .test_support()
-                .role(Role::ListBoxOption)
-                .aria_label(item.label())
-                .aria_selected(checked)
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .gap_2()
-                .w_full()
-                .min_w_0()
-                .child(
-                    div()
-                        // The id carries the state, so a headless test can prove
-                        // the marker below is drawn as well as reported: weight
-                        // alone is not observable without pixels.
-                        .id(if checked {
-                            format!("{id}-selected")
-                        } else {
-                            format!("{id}-label")
-                        })
-                        .test_support()
-                        .min_w_0()
-                        .truncate()
-                        .when(checked, |label| label.font_weight(FontWeight::SEMIBOLD))
-                        .child(item.label()),
-                )
-                .when(checked, |row| {
-                    // The kit's own row draws this check in a trailing slot, but
-                    // its adapter (`searchable_list/adapter.rs`, gpui-component
-                    // 0.8.1) only sets `checked` when the delegate leaves
-                    // `render_item` to the kit. This row is ours for
-                    // `aria_selected`, so the mark is drawn here, at the kit's
-                    // own size and colour.
-                    row.child(
-                        Icon::new(IconName::Check)
-                            .xsmall()
-                            .flex_shrink_0()
-                            .text_color(cx.theme().foreground),
-                    )
-                })
-                .into_any_element(),
-        )
+        Some(select_option(item.id(), item.label(), checked, cx))
     }
 }
 

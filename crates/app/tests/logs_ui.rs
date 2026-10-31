@@ -453,7 +453,7 @@ async fn the_logs_entry_shows_the_location_and_the_recent_lines(cx: &mut TestApp
 /// sentence — Refresh and Copy all announce no help any more, because each now
 /// shares a row instead of spending one.
 #[gpui_kit::test]
-async fn every_migrated_row_keeps_its_name_and_help(cx: &mut TestAppContext) {
+async fn every_migrated_row_keeps_its_name_and_its_help_when_it_has_one(cx: &mut TestAppContext) {
     let temp = tempfile::tempdir().expect("create a temp dir");
     let paths = temporary_paths(temp.path());
     // A tail long enough that scrolling up leaves its end, which is what draws
@@ -2676,8 +2676,8 @@ async fn the_tail_scrollbar_follows_the_scroll_handle_it_was_given(cx: &mut Test
 
 /// The default window is the one in `shell.rs`: 900x650. This change is meant
 /// to buy the tail rows, so the page must not lose any of them, and the count is
-/// pinned here: at HEAD before this change the same page showed 6 lines, and it
-/// shows 8 now.
+/// pinned here at the measured 8: at HEAD before this change the same page
+/// showed 6 lines, and it shows 8 now.
 ///
 /// The ticket target was 20-25. It is not reachable at 900x650, and this test
 /// records the arithmetic rather than claiming the target: a line is 21px, so 20
@@ -2689,10 +2689,10 @@ async fn the_tail_scrollbar_follows_the_scroll_handle_it_was_given(cx: &mut Test
 /// backlog, not this change, is what keeps the tail at 8. See
 /// `/data/home/projects/immich-sync-notes/logs-layout-report.md`.
 ///
-/// The assertion is 7, not the 8 measured here: one row of slack for a platform
-/// whose text metrics are taller (macOS), where the same 168.5px tail would hold
-/// one row fewer. A regression to the six lines this change started from still
-/// fails it.
+/// The pin is the Linux measurement, and a platform whose text metrics are
+/// taller (macOS) has not been measured: that caveat is a known limit in the
+/// report, not slack here. Losing a row fails this test. The maintainer decided
+/// the tail grows with the window and the floor stays as it is.
 #[gpui_kit::test]
 async fn the_default_window_shows_more_of_the_tail_than_it_did(cx: &mut TestAppContext) {
     let temp = tempfile::tempdir().expect("create a temp dir");
@@ -2713,7 +2713,7 @@ async fn the_default_window_shows_more_of_the_tail_than_it_did(cx: &mut TestAppC
             })
             .collect();
         assert!(
-            visible.len() >= 7,
+            visible.len() >= 8,
             "the default 900x650 window showed 6 lines before this change and 8 after it, \
              and shows {} now: {visible:?}",
             visible.len()
