@@ -2,10 +2,14 @@
 //!
 //! Two kit shapes cover every row in the app:
 //!
-//! - [`Row`] — a label, the help sentence under it, and a control. It builds the
-//!   kit's `SettingItem`, so a settings row and a Logs or Diagnostics control
-//!   row are the same row; the settings surface groups and searches it through
-//!   [`Row::item`], and a card renders it through [`Row::render`].
+//! - [`Row`] — a label, the help sentence under it, and a control. It is one
+//!   contract with two renderings: the settings surface groups, searches and
+//!   hands it to the kit through [`Row::item`], and the kit draws it, while a
+//!   Logs or Diagnostics card draws it itself through [`Row::render`]. The
+//!   words, the id, the name and the help are the same on both; the frame is
+//!   not, and the column rules differ where the kit has no rule for a card
+//!   (the 60% label cap, the 480 px stacking breakpoint, the field wrapper —
+//!   ADR 0001, "rows.rs mirrors `SettingItem`").
 //! - [`value_list`] with [`value_item`] — a term and a read-only value with its
 //!   help, for a row whose second column is a fact rather than a control (#80).
 //!
@@ -129,7 +133,8 @@ impl Row {
     /// `pub(super)` (`setting/item.rs:252`), so a card cannot hand it one. This
     /// draws the item's own layout instead — the label and help column, the
     /// `gap_3` row, the control in the field column — from the same row, so the
-    /// two renderings cannot disagree about anything but the frame.
+    /// two renderings cannot disagree about the words, the ids or the layout
+    /// choice.
     pub(crate) fn render(&self, window: &mut Window, cx: &mut App) -> AnyElement {
         let control = (self.control)(window, cx);
         if self.is_note() {

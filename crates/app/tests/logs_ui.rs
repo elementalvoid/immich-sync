@@ -6,6 +6,8 @@
 //! properties; the colour tokens themselves are covered by the WCAG test in
 //! `tests/dashboard.rs`.
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -440,6 +442,47 @@ async fn the_logs_entry_shows_the_location_and_the_recent_lines(cx: &mut TestApp
             window.find("logs-line-1").label(),
             Some("second line"),
             "the latest line is shown"
+        );
+    })
+    .expect("update the shell window");
+}
+
+/// #89: the five rows this card migrated onto the row contract still announce
+/// the words they announced before it. The two log paths name the path; the
+/// three control rows name their title and announce their help sentence.
+#[gpui_kit::test]
+async fn every_migrated_row_keeps_its_name_and_help(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    // A tail long enough that scrolling up leaves its end, which is what draws
+    // the paused row (#54).
+    write_lines(&paths, &long_tail(60));
+    let store = SettingsStore::open(paths.config_file.clone());
+    let (window, _shell) = open_shell(cx, store, paths.clone());
+
+    show_logs(cx, window);
+    // Wheel up, away from the end: the next read notices and pauses the tail,
+    // so the paused row exists for the table below (#54).
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.scroll(
+            "logs-lines",
+            ScrollDelta::Pixels(point(px(0.), px(240.))),
+            cx,
+        );
+    })
+    .expect("update the shell window");
+    tick_live(cx, window);
+
+    cx.update_window(window, |_, window, _| {
+        assert!(
+            window.try_find("logs-paused").is_some(),
+            "the tail paused, so the paused row is drawn"
+        );
+        common::assert_migrated_rows(
+            window,
+            &common::migrated_rows(&paths.log_directory().display().to_string()),
+            "logs",
         );
     })
     .expect("update the shell window");
