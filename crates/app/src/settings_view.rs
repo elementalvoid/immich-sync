@@ -1268,7 +1268,8 @@ impl SettingsView {
         let mut rows = vec![
             Row::wrapped(
                 "Tag uploaded assets",
-                "Adds the tag to every asset the client uploads. On by default.",
+                "Adds the tag to every asset the client uploads, so they can be found with \
+                 Immich's tag search. On by default.",
                 "settings-tag-upload-row",
                 move |_, _| {
                     let toggle = Rc::clone(&toggle);
@@ -1597,7 +1598,10 @@ fn storage_row(
     mono: SharedString,
     muted: Hsla,
 ) -> Row {
-    const HELP: &str = "Resolved from the platform.";
+    // The panel's description carried the warning only for a screen reader; the
+    // sighted user is the one who could put the database on a network share.
+    const HELP: &str =
+        "Read-only. Resolved from the platform; never on a network share or a cloud-sync folder.";
     Row::stacked(title, HELP, move |_, _| {
         crate::a11y::named(Role::Group, id, title, Some(HELP.into()))
             .min_w_0()
@@ -1641,8 +1645,16 @@ fn hidden() -> StyleRefinement {
 /// for the one thing it still draws — the page's Reset All button, at its
 /// top-right — but the kit still shapes its title as a line of text, empty or
 /// not, which measured 26 px left over on this pin. The zero line height closes
-/// that last line; the button draws no text of its own (it is the kit's `Undo2`
-/// icon at `small`), so it keeps its own size if a page ever has a resettable row.
+/// that last line.
+///
+/// The kit's Reset All survives it because the button is not sized by the
+/// inherited line box: an icon-only `small` button takes `size_6()`
+/// (`gpui-component-0.8.1/src/button/button.rs:689`) and sets its own
+/// `line_height(relative(1.25))` (`:763`), so it cannot collapse.
+///
+/// shortcut: every child inherits this zero line height, so a *labelled* control
+/// added to this header would draw 0 px tall, invisible. A page that puts words
+/// here must give the line height back (drop `.line_height(rems(0.))`).
 fn flat_header() -> StyleRefinement {
     StyleRefinement::default()
         .p_0()

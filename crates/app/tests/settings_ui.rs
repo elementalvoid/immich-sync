@@ -2702,7 +2702,8 @@ const ROWS: &[RowPin] = &[
         "settings-tag-upload",
         "Tag uploaded assets with immich-sync",
         "settings-tag-upload-row",
-        "Adds the tag to every asset the client uploads. On by default.",
+        "Adds the tag to every asset the client uploads, so they can be found with \
+         Immich's tag search. On by default.",
     ),
     control_row(
         PAGE_TAGGING,
@@ -2715,13 +2716,15 @@ const ROWS: &[RowPin] = &[
         PAGE_STORAGE,
         "settings-path-config",
         "Settings file",
-        "Resolved from the platform.",
+        "Read-only. Resolved from the platform; never on a network share or a \
+         cloud-sync folder.",
     ),
     row(
         PAGE_STORAGE,
         "settings-path-state",
         "State database",
-        "Resolved from the platform.",
+        "Read-only. Resolved from the platform; never on a network share or a \
+         cloud-sync folder.",
     ),
 ];
 
@@ -2956,8 +2959,10 @@ fn the_page_strip_reports_every_page_as_a_tab_and_the_selected_one(cx: &mut Test
 /// never rendered text (a plain `div` reports no node at all), so the visible part
 /// of this claim is proved by the captures in
 /// `/data/home/projects/immich-sync-notes/settings-header-report.md`. What is
-/// pinned here is the tree: the name reaches assistive technology exactly twice
-/// (the tab that draws it, the panel it opened) and the sentence exactly once.
+/// pinned here is the tree — the name reaches assistive technology exactly twice
+/// (the tab that draws it, the panel it opened) and the sentence exactly once —
+/// and, below, the height the header cost, measured from the strip to the first
+/// row so a page title that comes back fails here.
 #[gpui_kit::test]
 fn the_page_panel_carries_the_name_and_the_sentence_the_header_used_to_draw(
     cx: &mut TestAppContext,
@@ -3021,6 +3026,19 @@ fn the_page_panel_carries_the_name_and_the_sentence_the_header_used_to_draw(
                 "page {page}: the sentence lives on the panel alone"
             );
         }
+
+        // The 91 px of header is invisible in the tree above, so pin the height
+        // it cost. The first row's top sits 114.5 px below the strip's box (the
+        // group header and the row in between); re-adding the kit's header
+        // measured 173.5 px, so 150 px separates the two cases.
+        open_page(window, 0, cx);
+        let strip = window.find("settings-page-tabs").bounds();
+        let first = window.find("settings-server-url").bounds();
+        let gap = first.origin.y - strip.bottom();
+        assert!(
+            gap < px(150.),
+            "the page header draws no height again: {gap:?} between the strip and the first row"
+        );
     })
     .expect("walk the settings pages");
 }

@@ -55,7 +55,7 @@ fn temporary_paths(dir: &Path) -> AppPaths {
 /// A window short enough that no long surface fits in one screen.
 ///
 /// It was 420 high until the settings pages stopped repeating the tab strip's
-/// name in a page header: that header cost 65 px on every page, and without it
+/// name in a page header: that header cost 91 px on every page, and without it
 /// the Storage page fits in 420, so the Settings probe below would prove no
 /// scrolling. 330 keeps every surface longer than the window.
 fn window_options() -> WindowOptions {
