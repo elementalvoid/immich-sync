@@ -125,6 +125,13 @@ fn run_client() -> anyhow::Result<()> {
     // here, on the one `Application` the window, the tray and every capture run
     // from (#86).
     //
+    // Tests and capture harnesses go through `gpui_kit::init` instead, which
+    // sets no source, and the gap cannot be closed from here: `TestAppContext`
+    // builds its `App` with `()` as the source (gpui-pre 0.3.10), `with_assets`
+    // is `Application`-only, and `ElementSnapshot` has no svg field. A test
+    // therefore renders no icon and can assert none, so icon use is only ever
+    // proven by a capture.
+    //
     // A Dock click with no window open reopens the main window. The callback
     // lives on the `Application`, not on `App`: gpui-pre fires it only from the
     // macOS delegate, and `show_window` handles both cases (issue #64).

@@ -339,7 +339,9 @@ impl SearchableListDelegate for FolderChoices {
                     // 0.8.1) only sets `checked` when the delegate leaves
                     // `render_item` to the kit. This row is ours for the name
                     // and `aria_selected`, so the mark is drawn here, at the
-                    // kit's own size and colour.
+                    // kit's own size and colour. The kit's hidden slot still
+                    // reserves its width (`item.rs`), so this one sits ~16 px
+                    // inboard of the row's trailing edge, not flush with it.
                     row.child(
                         Icon::new(IconName::Check)
                             .xsmall()
