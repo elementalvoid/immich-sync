@@ -8,7 +8,7 @@
 
 mod common;
 
-use common::{contrast, mock_server};
+use common::{contrast, mock_server, press_reaches};
 
 use std::fs;
 use std::path::Path;
@@ -310,25 +310,6 @@ fn show_diagnostics(window: &mut Window, cx: &mut App) {
     window.press("enter", cx);
 }
 
-/// Whether a press at the element's centre would reach it.
-///
-/// `visible()` is only a non-empty clipped intersection — `gpui-base`
-/// `test_support.rs` sets it from `clipped.size > 0` — while
-/// `TestWindowExt::click` presses `bounds.center()` and the window hit-tests a
-/// hitbox only inside its content mask (`gpui-pre` `window.rs`, `hit_test`
-/// intersects `hitbox.bounds` with `hitbox.content_mask.bounds`). An element
-/// hanging over the fold by half its height therefore reports visible and takes
-/// no press: on Windows the taller migrated row left the copy control exactly
-/// there and the clipboard stayed empty (#89). So the centre the harness will
-/// press must be inside the box the scroller actually shows.
-fn press_reaches(window: &Window, target: &ElementSnapshot) -> bool {
-    let shown = window
-        .find("diagnostics-view")
-        .bounds()
-        .intersect(&Bounds::new(Point::default(), window.viewport_size()));
-    target.visible() && shown.contains(&target.bounds().center())
-}
-
 /// Scrolls the diagnostics view until the element with `id` can be pressed.
 ///
 /// #82: at the shell's smallest window the debug bundle card sits below the
@@ -341,7 +322,7 @@ fn scroll_diagnostics_into_view(window: &mut Window, cx: &mut App, id: impl Into
     for _ in 0..60 {
         if window
             .try_find(id.clone())
-            .is_some_and(|target| press_reaches(window, &target))
+            .is_some_and(|target| press_reaches(window, "diagnostics-view", &target))
         {
             return;
         }

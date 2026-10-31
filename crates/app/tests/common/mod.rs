@@ -5,7 +5,8 @@
 //! already enable, and each binary uses a part of it. The per-item
 //! `dead_code` allows say which parts that binary left out.
 
-use gpui_kit::{App, ElementId, Window};
+use gpui_kit::test::ElementSnapshot;
+use gpui_kit::{App, Bounds, ElementId, Point, Window};
 use mock_immich::MockImmich;
 
 /// Starts the offline Immich double on its own runtime: a GPUI test runs on
@@ -42,11 +43,35 @@ pub fn contrast(a: gpui_kit::Hsla, b: gpui_kit::Hsla) -> f32 {
     (a.max(b) + 0.05) / (a.min(b) + 0.05)
 }
 
-/// Scrolls the dashboard until the element with `id` is on screen.
+/// Whether a press at the element's centre would reach it.
+///
+/// `visible()` is only a non-empty clipped intersection — `gpui-base`
+/// `test_support.rs:471-479` sets it from `clipped.size > 0` — while
+/// `TestWindowExt::click` presses `bounds.center()` (`gpui-kit` `test.rs:146-171`)
+/// and the window hit-tests a hitbox only inside its content mask (`gpui-pre`
+/// `window.rs:1173-1178` intersects `hitbox.bounds` with
+/// `hitbox.content_mask.bounds`). An element hanging over the fold by half its
+/// height therefore reports visible and takes no press: on Windows the taller
+/// migrated row left the diagnostics copy control exactly there and the
+/// clipboard stayed empty (#89). So the centre the harness will press must be
+/// inside the box the scroller actually shows, which is `scroll_id`'s bounds
+/// clipped to the viewport.
+#[allow(dead_code)]
+pub fn press_reaches(window: &Window, scroll_id: &'static str, target: &ElementSnapshot) -> bool {
+    use gpui_kit::test::TestWindowExt as _;
+
+    let shown = window
+        .find(scroll_id)
+        .bounds()
+        .intersect(&Bounds::new(Point::default(), window.viewport_size()));
+    target.visible() && shown.contains(&target.bounds().center())
+}
+
+/// Scrolls the dashboard until the element with `id` can be pressed.
 ///
 /// #56: the global card carries the reconciliation scan line, so on a short
-/// window a card's footer sits below the fold; a control is clicked only after
-/// it is really visible.
+/// window a card's footer sits below the fold; a control is clicked only once
+/// the pointer can land on it.
 #[allow(dead_code)]
 pub fn scroll_dashboard_into_view(window: &mut Window, cx: &mut App, id: impl Into<ElementId>) {
     use gpui_kit::test::TestWindowExt as _;
@@ -57,7 +82,7 @@ pub fn scroll_dashboard_into_view(window: &mut Window, cx: &mut App, id: impl In
     for _ in 0..60 {
         if window
             .try_find(id.clone())
-            .is_some_and(|target| target.visible())
+            .is_some_and(|target| press_reaches(window, "dashboard-scroll", &target))
         {
             return;
         }
@@ -67,7 +92,17 @@ pub fn scroll_dashboard_into_view(window: &mut Window, cx: &mut App, id: impl In
             cx,
         );
     }
-    panic!("{id:?} never became visible on the dashboard");
+    // The geometry, so the next failure says where the row ended up instead of
+    // pressing blind.
+    let target = window.try_find(id.clone());
+    panic!(
+        "{id:?} never reached the point the pointer presses: bounds {:?}, centre {:?}, \
+         scroll box {:?}, viewport {:?}",
+        target.as_ref().map(ElementSnapshot::bounds),
+        target.as_ref().map(|target| target.bounds().center()),
+        window.find("dashboard-scroll").bounds(),
+        window.viewport_size(),
+    );
 }
 
 /// Waits for an alert dialog's entrance to settle before pressing it.
