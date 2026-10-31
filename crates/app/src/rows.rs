@@ -12,9 +12,12 @@
 //!   ADR 0001, "rows.rs mirrors `SettingItem`").
 //! - [`value_list`] with [`value_item`] — a term and a read-only value with its
 //!   help, for a row whose second column is a fact rather than a control (#80).
+//! - [`select_option`] — one row of a kit select's popup, for the two selects
+//!   the app draws itself (#79, #89).
 //!
-//! Both live here because three views render them. A view that imported them
-//! from `settings_view` was importing another view's chrome.
+//! They live here because three views render the card rows, and both selects
+//! render the option row. A view that imported them from `settings_view` was
+//! importing another view's chrome.
 //!
 //! The words are `SharedString` rather than `&'static str`: a settings row is a
 //! fixed sentence, but a row that quotes the log directory or the bundle's path
@@ -27,9 +30,11 @@
 use std::rc::Rc;
 
 use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::Sizable as _;
 use gpui_kit::component::description_list::{DescriptionItem, DescriptionList};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::setting::{SettingField, SettingItem};
+use gpui_kit::component::{Icon, IconName};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -225,6 +230,72 @@ pub(crate) fn value_list(id: &'static str, items: Vec<DescriptionItem>) -> impl 
                 .label_width(rems(LABEL_COLUMN_REMS))
                 .children(items),
         )
+}
+
+/// The row a select paints for one choice (#79), shared by the folder filter
+/// and the Logs level select (#89).
+///
+/// The kit's default row is text only, so the accessible name and the state of
+/// the current choice are supplied here: `checked` is the committed selection,
+/// so it is reported as `aria_selected` rather than written into the name, and
+/// drawn as heavier weight plus the kit's check, so the state is never colour
+/// alone. `id` names the row — the folder filter's per-prefix row id, or the
+/// level's own id — and the label's wrapper carries `{id}-selected` or
+/// `{id}-label`, so a headless test can prove the marker is drawn as well as
+/// reported.
+pub(crate) fn select_option(id: &str, label: &str, checked: bool, cx: &mut App) -> AnyElement {
+    let label = label.to_string();
+    div()
+        .id(id.to_string())
+        .test_support()
+        .role(Role::ListBoxOption)
+        .aria_label(label.clone())
+        .aria_selected(checked)
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .w_full()
+        .min_w_0()
+        .child(
+            div()
+                // The id carries the state, so a headless test can prove the
+                // marker below is drawn as well as reported: weight alone is
+                // not observable without pixels.
+                .id(if checked {
+                    format!("{id}-selected")
+                } else {
+                    format!("{id}-label")
+                })
+                .test_support()
+                .min_w_0()
+                .truncate()
+                .when(checked, |label| {
+                    // The design guides' selected row: the item's own surface
+                    // carries the state. Weight draws with no icon assets; the
+                    // check beside it needs them, and since #86 registers the
+                    // kit's bundle it draws too.
+                    label.font_weight(FontWeight::SEMIBOLD)
+                })
+                .child(label.clone()),
+        )
+        .when(checked, |row| {
+            // The kit's own row draws this check in a trailing slot, but its
+            // adapter (`searchable_list/adapter.rs`, gpui-component 0.8.1) only
+            // sets `checked` when the delegate leaves `render_item` to the kit.
+            // This row is ours for the name and `aria_selected`, so the mark is
+            // drawn here, at the kit's own size and colour. The kit's hidden
+            // slot still reserves its width (`item.rs`), so this one sits ~16 px
+            // inboard of the row's trailing edge, not flush with it.
+            row.child(
+                Icon::new(IconName::Check)
+                    .xsmall()
+                    .flex_shrink_0()
+                    .text_color(cx.theme().foreground),
+            )
+        })
+        .into_any_element()
 }
 
 /// One value row: the term in the label cell, and the value with its help

@@ -101,7 +101,7 @@ impl LogLevel {
         }
     }
 
-    /// The element id of the Logs view's control for this level.
+    /// The element id of the Logs view's option for this level.
     #[must_use]
     pub fn id(self) -> &'static str {
         match self {
