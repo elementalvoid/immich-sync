@@ -29,6 +29,7 @@ use gpui_kit::component::setting::{
     SelectIndex, SettingGroup, SettingPage, Settings as SettingsPages,
 };
 use gpui_kit::component::switch::Switch;
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use sync_core::connection::{AuthMethod, ConnectionState, ServerProfile, SignIn};
 use sync_core::credential::Secret;
@@ -1635,7 +1636,7 @@ pub(crate) fn section(
     rows: Vec<AnyElement>,
     cx: &App,
 ) -> AnyElement {
-    card(id, title, description, rows, cx).into_any_element()
+    card(id, title, description, None, rows, cx).into_any_element()
 }
 
 /// One card of related settings that takes the page height the cards above it
@@ -1646,15 +1647,22 @@ pub(crate) fn section(
 /// content height, so `floor_rem` must leave the body its own minimum on top of
 /// the rows the card always shows. It is a parameter because the rows change
 /// with the view's state: the Logs tail adds a paused row below the lines.
-pub(crate) fn filling_section(
+///
+/// `action` is one control at the right end of the card's header, for an action
+/// that belongs to the card's title rather than to a row of its own (the Logs
+/// tail's Copy all, which saves the tail a row). It sits beside the title, not
+/// the description: the title is the line it acts on, and the description keeps
+/// the card's full width under it.
+pub(crate) fn filling_section_with_action(
     id: &'static str,
     title: &'static str,
     description: &'static str,
+    action: Option<AnyElement>,
     rows: Vec<AnyElement>,
     floor_rem: f32,
     cx: &App,
 ) -> AnyElement {
-    card(id, title, description, rows, cx)
+    card(id, title, description, action, rows, cx)
         .flex_1()
         .min_h(rems(floor_rem))
         .into_any_element()
@@ -1664,6 +1672,7 @@ fn card(
     id: &'static str,
     title: &'static str,
     description: &'static str,
+    action: Option<AnyElement>,
     rows: Vec<AnyElement>,
     cx: &App,
 ) -> ObservedElement<Stateful<Div>> {
@@ -1689,9 +1698,22 @@ fn card(
                 .gap_0p5()
                 .child(
                     div()
-                        .text_base()
-                        .font_weight(FontWeight::MEDIUM)
-                        .child(title),
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_base()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(title),
+                        )
+                        .when_some(action, |this, action| {
+                            this.child(div().flex_shrink_0().child(action))
+                        }),
                 )
                 .child(div().text_xs().text_color(palette.meta).child(description)),
         )

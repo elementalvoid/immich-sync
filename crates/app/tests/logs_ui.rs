@@ -449,7 +449,9 @@ async fn the_logs_entry_shows_the_location_and_the_recent_lines(cx: &mut TestApp
 
 /// #89: the five rows this card migrated onto the row contract still announce
 /// the words they announced before it. The two log paths name the path; the
-/// three control rows name their title and announce their help sentence.
+/// three control rows name their title, and the paused row keeps its help
+/// sentence — Refresh and Copy all announce no help any more, because each now
+/// shares a row instead of spending one.
 #[gpui_kit::test]
 async fn every_migrated_row_keeps_its_name_and_help(cx: &mut TestAppContext) {
     let temp = tempfile::tempdir().expect("create a temp dir");
@@ -775,23 +777,25 @@ async fn every_logs_control_is_named_and_keyboard_reachable(cx: &mut TestAppCont
         for (id, label) in [
             ("nav-logs", "Logs"),
             ("logs-refresh", "Refresh the log lines"),
-            ("logs-level-trace", "Log level: Trace"),
-            ("logs-level-debug", "Log level: Debug"),
-            ("logs-level-info", "Log level: Info"),
-            ("logs-level-warn", "Log level: Warn"),
-            ("logs-level-error", "Log level: Error"),
+            // One tab stop for the level now, not five: the kit's select names
+            // itself and reports the level as its value (#79's control).
+            ("logs-level-select", "Log level"),
             ("logs-copy-all", "Copy every displayed log line"),
         ] {
             assert_eq!(window.find(id).label(), Some(label), "{id} is named");
         }
+        assert_eq!(
+            window.find("logs-level-select").value(),
+            Some("Info"),
+            "the select's value is the level the settings hold"
+        );
 
         for id in [
             "nav-dashboard",
             "nav-settings",
             "nav-logs",
+            "logs-level-select",
             "logs-refresh",
-            "logs-level-trace",
-            "logs-level-error",
             "logs-copy-all",
         ] {
             tab_to(window, id, cx);
@@ -809,8 +813,15 @@ async fn choosing_a_level_persists_it_in_the_settings_file(cx: &mut TestAppConte
     let (window, _shell) = open_shell(cx, store, paths.clone());
 
     show_logs(cx, window);
-    cx.update_window(window, |_, window, cx| window.click("logs-level-debug", cx))
-        .expect("update the shell window");
+    cx.update_window(window, |_, window, cx| {
+        // The level is the kit's select now: open it, then choose the option.
+        window.within("logs-level-select").click("input", cx);
+        window.render_frame(cx);
+        window.click("logs-level-debug", cx);
+    })
+    .expect("update the shell window");
+    // The kit commits the selection after the click handler returns.
+    cx.run_until_parked();
 
     // The level write runs on the background executor (N2), so the test waits
     // for it to land instead of reading the file in the same tick.
@@ -830,6 +841,205 @@ async fn choosing_a_level_persists_it_in_the_settings_file(cx: &mut TestAppConte
         LogLevel::Debug,
         "the chosen level is stored in the settings file"
     );
+}
+
+/// #79's control, on the level: one named combo box instead of five radio rows,
+/// with the state on each option rather than a "selected" word in the control's
+/// name, and the whole choice reachable from the keyboard.
+#[gpui_kit::test]
+async fn the_log_level_is_one_named_select_that_the_keyboard_can_work(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    write_log(&paths, &["a stable line"]);
+    let store = SettingsStore::open(paths.config_file.clone());
+    let (window, _shell) = open_shell(cx, store, paths.clone());
+
+    show_logs(cx, window);
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let trigger = window.find("logs-level-select");
+        assert_eq!(
+            trigger.role(),
+            Some(Role::ComboBox),
+            "the level is the kit's select, which a screen reader can place"
+        );
+        assert_eq!(
+            trigger.label(),
+            Some("Log level"),
+            "the control's own name does not change with the level"
+        );
+        assert_eq!(
+            trigger.value(),
+            Some("Info"),
+            "the current level is the control's value"
+        );
+        assert_eq!(trigger.expanded(), Some(false));
+
+        // Enter opens the options on the committed level, and both the state and
+        // a mark that is not colour say which one it is.
+        tab_to(window, "logs-level-select", cx);
+        window.press("enter", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("logs-level-select").expanded(),
+            Some(true),
+            "Enter on the control opens its options"
+        );
+        for (id, label, selected) in [
+            ("logs-level-trace", "Trace", false),
+            ("logs-level-debug", "Debug", false),
+            ("logs-level-info", "Info", true),
+            ("logs-level-warn", "Warn", false),
+            ("logs-level-error", "Error", false),
+        ] {
+            let option = window.find(id);
+            assert_eq!(
+                option.role(),
+                Some(Role::ListBoxOption),
+                "{id} is an option"
+            );
+            assert_eq!(
+                option.label(),
+                Some(label),
+                "{id} is named by its level, not by its state"
+            );
+            assert_eq!(
+                option.selected(),
+                Some(selected),
+                "{id} reports whether it is the current level"
+            );
+        }
+        assert!(
+            window.try_find("logs-level-info-selected").is_some(),
+            "the current level carries a marker of its own, so the state is not colour alone"
+        );
+        assert!(
+            window.try_find("logs-level-debug-selected").is_none(),
+            "only the current level is marked"
+        );
+
+        // Escape dismisses the options the way the kit's overlay contract says,
+        // and the choice and the focus stay put.
+        window.press("escape", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("logs-level-select").expanded(),
+            Some(false),
+            "Escape closes the options"
+        );
+        assert_eq!(
+            window.find("logs-level-select").focused(),
+            Some(true),
+            "Escape leaves the keyboard focus on the control"
+        );
+        assert_eq!(
+            window.find("logs-level-select").value(),
+            Some("Info"),
+            "dismissing without choosing keeps the level"
+        );
+
+        // Away from Info is Warn: Down moves the cursor and Enter commits it.
+        window.press("enter", cx);
+        window.render_frame(cx);
+        window.press("down", cx);
+        window.press("enter", cx);
+        window.render_frame(cx);
+    })
+    .expect("work the level control from the keyboard");
+
+    // The choice applies immediately: the view reports it, and it is saved.
+    let mut observed = LogLevel::Info;
+    for _ in 0..600 {
+        observed = SettingsStore::open(paths.config_file.clone())
+            .settings()
+            .log_level;
+        if observed == LogLevel::Warn {
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        observed,
+        LogLevel::Warn,
+        "the level chosen from the keyboard is applied and stored"
+    );
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("logs-level-select").value(),
+            Some("Warn"),
+            "the control shows the level it committed"
+        );
+    })
+    .expect("read the committed level");
+}
+
+/// The level control and Refresh share one row of the Log level card, and Copy
+/// all sits in the Recent lines header: the three actions the page reclaimed
+/// rows for.
+#[gpui_kit::test]
+async fn the_level_refresh_and_copy_actions_cost_no_rows_of_their_own(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    write_lines(&paths, &long_tail(60));
+    let store = SettingsStore::open(paths.config_file.clone());
+    let (window, _shell) = open_shell(cx, store, paths);
+
+    show_logs(cx, window);
+    cx.update_window(window, |_, window, _| {
+        let level_card = window_rect(window, "logs-level");
+        let location_card = window_rect(window, "logs-location");
+        let select = window.find("logs-level-select").bounds();
+        let refresh = window.find("logs-refresh").bounds();
+
+        // One row: the two controls sit on the same line of the level card.
+        let (select_middle, refresh_middle) = (
+            f32::from(select.origin.y + select.size.height / 2.),
+            f32::from(refresh.origin.y + refresh.size.height / 2.),
+        );
+        assert!(
+            (select_middle - refresh_middle).abs() <= 4.,
+            "the level control is centred at y={select_middle} and Refresh at y={refresh_middle}, \
+             so they are not on one row"
+        );
+        assert!(
+            refresh.origin.x >= select.origin.x + select.size.width,
+            "Refresh sits at the right end of the row, after the level control: {select:?} {refresh:?}"
+        );
+        // The row is the level card's, not the file card's.
+        for (id, bounds) in [("logs-level-select", select), ("logs-refresh", refresh)] {
+            assert!(
+                f32::from(bounds.origin.y) >= level_card.1
+                    && f32::from(bounds.origin.y + bounds.size.height)
+                        <= level_card.1 + level_card.3,
+                "{id} at {bounds:?} is inside the level card at {level_card:?}"
+            );
+        }
+        assert!(
+            f32::from(refresh.origin.y) >= location_card.1 + location_card.3,
+            "the file card no longer holds a Refresh row: {location_card:?} {refresh:?}"
+        );
+
+        // Copy all is in the Recent lines header: inside the card and above the
+        // first line it copies.
+        let pane = window_rect(window, "logs-lines-section");
+        let copy = window.find("logs-copy-all").bounds();
+        let tail = window_rect(window, "logs-lines");
+        let (copy_top, copy_bottom) = (
+            f32::from(copy.origin.y),
+            f32::from(copy.origin.y + copy.size.height),
+        );
+        assert!(
+            copy_top >= pane.1 && copy_bottom <= tail.1,
+            "Copy all at {copy:?} sits in the card's header, between {pane:?} and {tail:?}"
+        );
+        assert!(
+            f32::from(copy.origin.x + copy.size.width) >= pane.0 + pane.2 - CARD_PADDING - 2.,
+            "Copy all is right-aligned in the header: {copy:?} in {pane:?}"
+        );
+    })
+    .expect("measure the reclaimed rows");
 }
 
 #[gpui_kit::test]
@@ -1061,6 +1271,19 @@ async fn copy_all_with_an_empty_tail_copies_nothing_and_does_not_panic(cx: &mut 
             window.find("logs-copy-all").label(),
             Some("Copy every displayed log line"),
             "the control is there and named"
+        );
+        // It is in the card's header, disabled, and it costs no row: the empty
+        // state below it starts under the header.
+        let copy = window.find("logs-copy-all").bounds();
+        let pane = window_rect(window, "logs-lines-section");
+        let empty = window.find("logs-empty").bounds();
+        assert!(
+            f32::from(copy.origin.y + copy.size.height) <= f32::from(empty.origin.y),
+            "Copy all at {copy:?} sits in the header, above the empty state at {empty:?}"
+        );
+        assert!(
+            f32::from(copy.origin.x + copy.size.width) >= pane.0 + pane.2 - CARD_PADDING - 2.,
+            "Copy all is right-aligned in the header: {copy:?} in {pane:?}"
         );
         // The control is built disabled, but a disabled `Button`'s state is not
         // observable here: GPUI has no aria-disabled setter for stateful
@@ -2449,4 +2672,58 @@ async fn the_tail_scrollbar_follows_the_scroll_handle_it_was_given(cx: &mut Test
         );
     })
     .expect("update the shell window");
+}
+
+/// The default window is the one in `shell.rs`: 900x650. This change is meant
+/// to buy the tail rows, so the page must not lose any of them, and the count is
+/// pinned here: at HEAD before this change the same page showed 6 lines, and it
+/// shows 8 now.
+///
+/// The ticket target was 20-25. It is not reachable at 900x650, and this test
+/// records the arithmetic rather than claiming the target: a line is 21px, so 20
+/// lines need a 420px tail, which needs a 507px Recent lines card; the page has
+/// 570px for that card plus the eight pixels and the cards strip above it, which
+/// would leave the strip 55px — the page header and nothing else, with the Log
+/// file and Log level cards behind the strip's scroll. The reclaimed rows are
+/// real (the strip's own overflow falls from 284px to 54px); the strip's
+/// backlog, not this change, is what keeps the tail at 8. See
+/// `/data/home/projects/immich-sync-notes/logs-layout-report.md`.
+///
+/// The assertion is 7, not the 8 measured here: one row of slack for a platform
+/// whose text metrics are taller (macOS), where the same 168.5px tail would hold
+/// one row fewer. A regression to the six lines this change started from still
+/// fails it.
+#[gpui_kit::test]
+async fn the_default_window_shows_more_of_the_tail_than_it_did(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let lines = long_tail(200);
+    write_lines(&paths, &lines);
+    let store = SettingsStore::open(paths.config_file.clone());
+    // 900x650 is the window `shell.rs` opens by default.
+    let (window, _shell) = open_shell_at(cx, store, paths, (900., 650.));
+    show_logs(cx, window);
+
+    cx.update_window(window, |_, window, _| {
+        let visible: Vec<usize> = (0..lines.len())
+            .filter(|index| {
+                window
+                    .try_find(ElementId::Name(format!("logs-line-{index}").into()))
+                    .is_some_and(|row| row.visible())
+            })
+            .collect();
+        assert!(
+            visible.len() >= 7,
+            "the default 900x650 window showed 6 lines before this change and 8 after it, \
+             and shows {} now: {visible:?}",
+            visible.len()
+        );
+        // The rows it does show are the newest ones, whole and in order.
+        assert_eq!(
+            visible,
+            (lines.len() - visible.len()..lines.len()).collect::<Vec<_>>(),
+            "the visible rows are the tail's newest, contiguous, in order"
+        );
+    })
+    .expect("measure the default window");
 }
