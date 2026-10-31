@@ -28,6 +28,7 @@ pub mod path_picker;
 pub mod paths;
 pub mod review;
 pub mod review_view;
+mod rows;
 pub mod settings;
 pub mod settings_view;
 pub mod shell;

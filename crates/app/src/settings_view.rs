@@ -16,6 +16,7 @@ use crate::engine::EngineModel;
 use crate::logging::LogLevel;
 use crate::notice::{Notice, Severity};
 use crate::paths::AppPaths;
+use crate::rows::{Row, note};
 use crate::settings::{Settings, SettingsStore};
 use crate::tab::Tab;
 
@@ -25,7 +26,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState, NumberInput};
 use gpui_kit::component::radio::Radio;
 use gpui_kit::component::setting::{
-    SelectIndex, SettingField, SettingGroup, SettingItem, SettingPage, Settings as SettingsPages,
+    SelectIndex, SettingGroup, SettingPage, Settings as SettingsPages,
 };
 use gpui_kit::component::switch::Switch;
 use gpui_kit::*;
@@ -1500,100 +1501,16 @@ impl Render for SettingsView {
     }
 }
 
-/// One row of the settings surface: the words the search compares, and the item
-/// the kit lays out.
-///
-/// The id, name and help attributes stay on the wrapper each row builder creates
-/// around its control, because that wrapper is also what tracks the control's
-/// focus handle: `text_row` and `numeric_row` forward the kit input's handle, and
-/// a `Switch` or `Button` names itself. A row cannot own that wrapper without
-/// also owning a handle it does not have (S4).
-struct Row {
-    /// The row's title, which names its control.
-    title: &'static str,
-    /// The help sentence under the title.
-    help: &'static str,
-    /// The setting item the kit renders.
-    item: SettingItem,
-}
-
-impl Row {
-    /// A row whose control is the element the row itself names.
-    fn setting(
-        title: &'static str,
-        help: &'static str,
-        control: impl Fn(&mut Window, &mut App) -> AnyElement + 'static,
-    ) -> Self {
-        let field = SettingField::<SharedString>::render(move |_, window, cx| control(window, cx));
-        Self {
-            title,
-            help,
-            item: SettingItem::new(title, field).description(help),
-        }
-    }
-
-    /// A row whose field is as wide as the page: the label and help sit above
-    /// it at every window size.
-    ///
-    /// A long label word and a fixed-width field do not fit side by side on a
-    /// page just wider than the component's stacking breakpoint, and the kit's
-    /// field slot sizes to its content, so the field would draw past the page.
-    fn stacked(
-        title: &'static str,
-        help: &'static str,
-        control: impl Fn(&mut Window, &mut App) -> AnyElement + 'static,
-    ) -> Self {
-        let field = SettingField::<SharedString>::render(move |_, window, cx| control(window, cx));
-        Self {
-            title,
-            help,
-            item: SettingItem::new(title, field)
-                .description(help)
-                .layout(Axis::Vertical),
-        }
-    }
-
-    /// A row whose control is its own widget: the row around it states the
-    /// help sentence, because the widget names itself.
-    fn wrapped(
-        title: &'static str,
-        help: &'static str,
-        row_id: &'static str,
-        control: impl Fn(&mut Window, &mut App) -> AnyElement + 'static,
-    ) -> Self {
-        Self::setting(title, help, move |window, cx| {
-            crate::a11y::named(Role::Group, row_id, title, Some(help.into()))
-                .child(control(window, cx))
-                .into_any_element()
-        })
-    }
-
-    /// Whether the row's own words contain `query`, which is already lower case.
-    fn matches(&self, query: &str) -> bool {
-        query.is_empty()
-            || self.title.to_lowercase().contains(query)
-            || self.help.to_lowercase().contains(query)
-    }
-
-    /// Whether the row carries no words of its own: a notice, a button, a line
-    /// of copy. It follows the group it sits in and never keeps one.
-    fn is_note(&self) -> bool {
-        self.title.is_empty()
-    }
-}
-
-/// A row that is not a setting: a notice, a button, or a line of copy.
-fn note(build: impl Fn(&mut Window, &mut App) -> AnyElement + 'static) -> Row {
-    Row {
-        title: "",
-        help: "",
-        item: SettingItem::render(move |_, window, cx| build(window, cx)),
-    }
+/// Whether the row's own words contain `query`, which is already lower case.
+fn matches(row: &Row, query: &str) -> bool {
+    query.is_empty()
+        || row.title.to_lowercase().contains(query)
+        || row.help.to_lowercase().contains(query)
 }
 
 /// One group of rows, kept only when a row of its own matches `query`.
 fn group(title: Option<&'static str>, rows: Vec<Row>, query: &str) -> Option<SettingGroup> {
-    let keep: Vec<bool> = rows.iter().map(|row| row.matches(query)).collect();
+    let keep: Vec<bool> = rows.iter().map(|row| matches(row, query)).collect();
     if !keep.iter().any(|kept| *kept) {
         return None;
     }
@@ -1606,7 +1523,7 @@ fn group(title: Option<&'static str>, rows: Vec<Row>, query: &str) -> Option<Set
             rows.into_iter()
                 .zip(keep)
                 .filter(|(row, kept)| *kept || row.is_note())
-                .map(|(row, _)| row.item),
+                .map(|(row, _)| row.item()),
         ),
     )
 }
@@ -1708,38 +1625,6 @@ fn connection_severity(state: &ConnectionState) -> Severity {
         ConnectionState::Connecting => Severity::Info,
         ConnectionState::NotConfigured => Severity::Info,
     }
-}
-
-/// One labelled field row: the name and help on the left, the control on the
-/// right.
-///
-/// This and the card helpers below stay for the diagnostics and logs surfaces,
-/// which still borrow them; #78 took the settings surface off them.
-///
-/// What is left calls it for a label and its help sentence *beside a control*,
-/// not for a label-and-value pair: `diagnostics_view` ×4 (Refresh, Rebuild,
-/// Collect, Copy path) and `logs_view` ×4 (Refresh, Copy all, Live tail paused,
-/// and the log path row). #80 moved every diagnostics value row to a kit
-/// `DescriptionList` instead, so the helper is not dead — those rows would each
-/// need a kit `SettingItem` to retire it, and no ticket in this spec owns them.
-pub(crate) fn field_text(label: &str, help: &str, palette: &CardPalette) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_col()
-        .gap_0p5()
-        .min_w_0()
-        .child(
-            div()
-                .text_sm()
-                .font_weight(FontWeight::MEDIUM)
-                .child(label.to_string()),
-        )
-        .child(
-            div()
-                .text_xs()
-                .text_color(palette.meta)
-                .child(help.to_string()),
-        )
 }
 
 /// One card of related settings.
