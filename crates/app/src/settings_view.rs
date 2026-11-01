@@ -41,7 +41,12 @@ use sync_core::tags::{BackfillStatus, SYNC_TAG, TagStatus};
 pub const BYTES_PER_MEGABYTE: u64 = 1_000_000;
 
 /// One settings page: the element id of the tab that opens it, its name, and the
-/// sentence under the name.
+/// sentence that explains it.
+///
+/// The name is the tab's visible label and the page panel's accessible name; the
+/// sentence is the panel's accessible description. Neither is drawn under the
+/// tab strip: the strip already names the page, and repeating it there cost 91 px
+/// on every page.
 struct Page {
     id: &'static str,
     title: &'static str,
@@ -87,6 +92,10 @@ const PAGES: [Page; 6] = [
 
 /// The index of each page in `PAGES`, so a page builder names the page it builds
 /// instead of repeating its title.
+///
+/// The index no longer reaches the kit's page (the tab strip and the panel carry
+/// the page's words), so it is documentation of the order: `pages` builds the
+/// pages in `PAGES` order, and that order is what an index means.
 const PAGE_CONNECTION: usize = 0;
 const PAGE_GENERAL: usize = 1;
 const PAGE_LIMITS: usize = 2;
@@ -1259,7 +1268,8 @@ impl SettingsView {
         let mut rows = vec![
             Row::wrapped(
                 "Tag uploaded assets",
-                "Adds the tag to every asset the client uploads. On by default.",
+                "Adds the tag to every asset the client uploads, so they can be found with \
+                 Immich's tag search. On by default.",
                 "settings-tag-upload-row",
                 move |_, _| {
                     let toggle = Rc::clone(&toggle);
@@ -1451,32 +1461,42 @@ impl Render for SettingsView {
                 .child(Self::no_matches(&query))
                 .into_any_element()
         } else {
-            div()
-                .flex_1()
-                .min_h_0()
-                .w_full()
-                .relative()
-                // The component's sidebar is collapsed to nothing but still draws
-                // its resize handle, half of it inside this box; see
-                // `handle_cover`.
-                .pl(px(1.))
-                .overflow_hidden()
-                .child(RenderOnce::render(
-                    SettingsPages::new(("settings-pages", selected))
-                        .pages(pages.into_iter().map(|(_, page)| page))
-                        .default_selected_index(SelectIndex {
-                            page_ix: selected,
-                            group_ix: None,
-                        })
-                        .sidebar_width(px(0.))
-                        .sidebar_size_range(px(0.)..px(0.))
-                        .sidebar_style(&hidden())
-                        .header_style(&hidden()),
-                    window,
-                    cx,
-                ))
-                .child(handle_cover(background))
-                .into_any_element()
+            // The page is a tab panel, and the tab strip is the only thing that
+            // draws its name. The name and the sentence the header used to draw
+            // ride on the panel, where a screen reader reads them as the name and
+            // the description of the page the tab opened (B1).
+            let shown_page = &PAGES[shown];
+            crate::a11y::named(
+                Role::TabPanel,
+                "settings-page-panel",
+                shown_page.title,
+                Some(shown_page.description.into()),
+            )
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .relative()
+            // The component's sidebar is collapsed to nothing but still draws
+            // its resize handle, half of it inside this box; see
+            // `handle_cover`.
+            .pl(px(1.))
+            .overflow_hidden()
+            .child(RenderOnce::render(
+                SettingsPages::new(("settings-pages", selected))
+                    .pages(pages.into_iter().map(|(_, page)| page))
+                    .default_selected_index(SelectIndex {
+                        page_ix: selected,
+                        group_ix: None,
+                    })
+                    .sidebar_width(px(0.))
+                    .sidebar_size_range(px(0.)..px(0.))
+                    .sidebar_style(&hidden())
+                    .header_style(&hidden()),
+                window,
+                cx,
+            ))
+            .child(handle_cover(background))
+            .into_any_element()
         };
 
         div()
@@ -1530,15 +1550,20 @@ fn group(title: Option<&'static str>, rows: Vec<Row>, query: &str) -> Option<Set
 }
 
 /// One page, kept only when a group of it survives the search.
-fn page(index: usize, groups: Vec<Option<SettingGroup>>) -> Option<SettingPage> {
+fn page(_index: usize, groups: Vec<Option<SettingGroup>>) -> Option<SettingPage> {
     let groups: Vec<SettingGroup> = groups.into_iter().flatten().collect();
     if groups.is_empty() {
         return None;
     }
-    let page = &PAGES[index];
+    // The tab strip already names the page and the panel carries that name and
+    // the page's sentence for assistive technology, so the kit's own page header
+    // holds no words. The header stays: the kit draws the page's Reset All button
+    // inside it (`gpui-component-0.8.1/src/setting/page.rs:166-220`), and
+    // `flat_header` takes its box away, so it costs height only when that button
+    // appears.
     Some(
-        SettingPage::new(page.title)
-            .description(page.description)
+        SettingPage::new("")
+            .header_style(&flat_header())
             .groups(groups),
     )
 }
@@ -1573,7 +1598,10 @@ fn storage_row(
     mono: SharedString,
     muted: Hsla,
 ) -> Row {
-    const HELP: &str = "Resolved from the platform.";
+    // The panel's description carried the warning only for a screen reader; the
+    // sighted user is the one who could put the database on a network share.
+    const HELP: &str =
+        "Read-only. Resolved from the platform; never on a network share or a cloud-sync folder.";
     Row::stacked(title, HELP, move |_, _| {
         crate::a11y::named(Role::Group, id, title, Some(HELP.into()))
             .min_w_0()
@@ -1607,6 +1635,34 @@ fn hidden() -> StyleRefinement {
         ..StyleRefinement::default()
     }
 }
+
+/// A style that takes the kit page header's box away, for a header that holds no
+/// words.
+///
+/// The kit's page header is a `v_flex` with `p_4`, `gap_3` and a bottom rule
+/// (`gpui-component-0.8.1/src/setting/page.rs:186-190`), which is the height the
+/// tab strip makes redundant. Zeroing those three leaves the header on the page
+/// for the one thing it still draws — the page's Reset All button, at its
+/// top-right — but the kit still shapes its title as a line of text, empty or
+/// not, which measured 26 px left over on this pin. The zero line height closes
+/// that last line.
+///
+/// The kit's Reset All survives it because the button is not sized by the
+/// inherited line box: an icon-only `small` button takes `size_6()`
+/// (`gpui-component-0.8.1/src/button/button.rs:689`) and sets its own
+/// `line_height(relative(1.25))` (`:763`), so it cannot collapse.
+///
+/// shortcut: every child inherits this zero line height, so a *labelled* control
+/// added to this header would draw 0 px tall, invisible. A page that puts words
+/// here must give the line height back (drop `.line_height(rems(0.))`).
+fn flat_header() -> StyleRefinement {
+    StyleRefinement::default()
+        .p_0()
+        .gap_0()
+        .border_0()
+        .line_height(rems(0.))
+}
+
 /// The placeholder the secret field shows for one credential kind.
 ///
 /// The field follows the radio, so the empty password field does not advertise
@@ -1775,8 +1831,38 @@ pub fn sync_tag_url(server_url: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{backfill_text, group_digits, sync_tag_url};
+    use super::{backfill_text, flat_header, group_digits, sync_tag_url};
+    use gpui_kit::{Edges, Refineable as _, Size, Style, StyleRefinement, Styled as _, rems};
     use sync_core::tags::BackfillStatus;
+
+    /// The kit's page header is `p_4`, `gap_3` and a bottom rule
+    /// (`gpui-component-0.8.1/src/setting/page.rs:186-190`), and it shapes its
+    /// title as a line of text even when the title is empty — measured at 26 px
+    /// on this pin. A header that holds no words must cost none of that, or every
+    /// page pays twice for the name the tab strip already draws.
+    #[test]
+    fn the_page_header_box_costs_no_height() {
+        let mut header = StyleRefinement::default().p_4().gap_3().border_b_1();
+        header.refine(&flat_header());
+        let mut resolved = Style::default();
+        resolved.refine(&header);
+        assert_eq!(
+            resolved.padding,
+            Edges::default(),
+            "the header kept its p_4"
+        );
+        assert_eq!(resolved.gap, Size::default(), "the header kept its gap_3");
+        assert_eq!(
+            resolved.border_widths,
+            Edges::default(),
+            "the header kept its bottom rule"
+        );
+        assert_eq!(
+            resolved.text.line_height,
+            Some(rems(0.).into()),
+            "the header kept a line box for its empty title"
+        );
+    }
 
     /// R3.7: the Tagging section says where the backfill stands: working, at
     /// rest, or finished, with the counts grouped.
