@@ -148,18 +148,11 @@ pub fn migrated_rows(directory: &str) -> Vec<MigratedRow> {
         // the value names the path and no description is announced (#80).
         row("logs", "logs-path-directory-value", directory, None::<&str>),
         row("logs", "logs-path-current-value", &current, None::<&str>),
-        row(
-            "logs",
-            "logs-refresh-row",
-            "Refresh",
-            Some("Re-reads the tail of the newest log file."),
-        ),
-        row(
-            "logs",
-            "logs-copy-row",
-            "Copy all",
-            Some("Copies every line shown below, in order."),
-        ),
+        // Refresh and Copy all keep their row ids and names, and announce no
+        // help sentence now: each shares a row (the level control's, the Recent
+        // lines header) rather than spending a label-and-help row of its own.
+        row("logs", "logs-refresh-row", "Refresh", None::<&str>),
+        row("logs", "logs-copy-row", "Copy all", None::<&str>),
         row(
             "logs",
             "logs-paused",

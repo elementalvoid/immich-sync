@@ -12,17 +12,20 @@ use std::time::Duration;
 
 use gpui_kit::base::{Disableable as _, SelectableText, TextSelection};
 use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::IndexPath;
 use gpui_kit::component::button::Button;
-use gpui_kit::component::radio::Radio;
 use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
+use gpui_kit::component::searchable_list::{SearchableListDelegate, SearchableListItem};
+use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::*;
 
+use crate::a11y;
 use crate::dashboard::CardPalette;
 use crate::empty_state::EmptyState;
 use crate::logging::{self, LogLevel, TAIL_LINES};
 use crate::notice::{Notice, Severity, copy_confirmation};
-use crate::rows::{Row, mono_value_item, value_list};
-use crate::settings_view::{SettingsView, filling_section, section};
+use crate::rows::{Row, mono_value_item, select_option, value_list};
+use crate::settings_view::{SettingsView, filling_section_with_action, section};
 
 /// How often the live tail re-reads the newest log file while the Logs surface
 /// is visible.
@@ -348,15 +351,14 @@ impl LogsView {
             ))
     }
 
-    /// The log location and the refresh action.
-    fn location(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    /// The log location.
+    fn location(&self, cx: &mut Context<Self>) -> AnyElement {
         let palette = CardPalette::new(cx.theme());
         let mono = cx.theme().mono_font_family.clone();
         let current = self
             .current_file
             .clone()
             .unwrap_or_else(|| "No log file yet.".to_string());
-        let refresh = Rc::new(cx.listener(|this, _, window, cx| this.refresh(window, cx)));
         // The two paths are read-only pairs, not label-and-control rows: the
         // term column carries the label and the value column the path and its
         // help, so the path wraps instead of truncating (#80's shape).
@@ -383,65 +385,65 @@ impl LogsView {
                 ),
             ],
         );
+        // Refresh is not a row of this card: it shares the level control's row
+        // below, which is one row fewer between the header and the tail.
         section(
             "logs-location",
             "Log file",
             "Same directory as the state database. The file rotates and old files are pruned.",
-            vec![
-                paths.into_any_element(),
-                Row::wrapped(
-                    "Refresh",
-                    "Re-reads the tail of the newest log file.",
-                    "logs-refresh-row",
-                    move |_, _| {
-                        let refresh = Rc::clone(&refresh);
-                        Button::new("logs-refresh")
-                            .label("Refresh")
-                            .accessibility_label("Refresh the log lines")
-                            .on_click(move |event, window, cx| refresh(event, window, cx))
-                            .into_any_element()
-                    },
-                )
-                .render(window, cx),
-            ],
+            vec![paths.into_any_element()],
             cx,
         )
     }
 
-    /// The level control. The change applies immediately and persists.
-    fn level_section(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// The level control and the Refresh action, on one row: the level control
+    /// on the left and Refresh at the row's right end.
+    ///
+    /// The change applies immediately and persists.
+    fn level_section(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let current = self.level(cx);
-        let mut rows = Vec::with_capacity(LogLevel::ALL.len() + 1);
+        let select = self.level_select(current, window, cx);
+        let choices = select.read(cx).choices.clone();
+        let refresh = Rc::new(cx.listener(|this, _, window, cx| this.refresh(window, cx)));
+        let mut rows = Vec::with_capacity(2);
         if let Some(problem) = &self.save_problem {
             rows.push(
                 Notice::new("logs-level-problem", Severity::Error, problem.clone())
                     .into_any_element(),
             );
         }
-        for level in LogLevel::ALL {
-            let id = level.id();
-            rows.push(
-                div()
-                    .id(ElementId::Name(format!("{}-row", level.id()).into()))
-                    .test_support()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .min_h(rems(2.25))
-                    .child(
-                        Radio::new(id)
-                            .label(level.label())
-                            .accessibility_label(format!("Log level: {}", level.label()))
-                            .checked(level == current)
-                            .on_change(cx.listener(move |this, checked, _, cx| {
-                                if *checked {
-                                    this.set_level(level, cx);
-                                }
-                            })),
-                    )
-                    .into_any_element(),
-            );
-        }
+        rows.push(
+            div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .w_full()
+                .child(
+                    div().w_48().flex_shrink_0().child(
+                        Select::new(&choices)
+                            .id("logs-level-select")
+                            .accessibility_label("Log level")
+                            .placeholder(current.label()),
+                    ),
+                )
+                // #89's row id and name stay on the control's group, so the
+                // migrated-row table still finds what it pins. The help
+                // sentence is gone: Refresh says what it does.
+                .child(
+                    a11y::named(Role::Group, "logs-refresh-row", "Refresh", None)
+                        .flex_shrink_0()
+                        .child(
+                            Button::new("logs-refresh")
+                                .label("Refresh")
+                                .accessibility_label("Refresh the log lines")
+                                .on_click(move |event, window, cx| refresh(event, window, cx)),
+                        ),
+                )
+                .into_any_element(),
+        );
         section(
             "logs-level",
             "Log level",
@@ -451,42 +453,57 @@ impl LogsView {
         )
     }
 
+    /// The level select, kept in step with the level the settings hold.
+    ///
+    /// Keyed element state, the shape #79 gave the folder filter: the settings
+    /// stay the owner of the choice, and every way of changing it (a chosen
+    /// option, a save that failed) is pushed into the control on the next frame.
+    fn level_select(
+        &self,
+        current: LogLevel,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<LevelSelect> {
+        let view = cx.entity().downgrade();
+        let binding = window.use_keyed_state(
+            ElementId::Name("logs-level-select-state".into()),
+            cx,
+            move |window, cx| {
+                let choices = LevelChoices;
+                let chosen = choices.index_of(current);
+                let state = cx.new(|cx| SelectState::new(choices, chosen, window, cx));
+                let confirmed = cx.subscribe(
+                    &state,
+                    move |this: &mut LevelSelect,
+                          _: Entity<SelectState<LevelChoices>>,
+                          event: &SelectEvent<LevelChoices>,
+                          cx| {
+                        let SelectEvent::Confirm(value) = event;
+                        let Some(level) = value else {
+                            // The kit's own clear button, which this control does
+                            // not show: a log always has a level.
+                            return;
+                        };
+                        this.chosen = *level;
+                        _ = view.update(cx, |view, cx| view.set_level(*level, cx));
+                    },
+                );
+                LevelSelect {
+                    choices: state,
+                    chosen: current,
+                    _confirmed: confirmed,
+                }
+            },
+        );
+        binding.update(cx, |this, cx| this.sync(current, window, cx));
+        binding
+    }
+
     /// The bounded tail of the newest log file.
     fn lines_section(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let palette = CardPalette::new(cx.theme());
         let mono = cx.theme().mono_font_family.clone();
         let mut body: Vec<AnyElement> = Vec::with_capacity(3);
-        let copy_all = Rc::new(cx.listener(|this, _, _, cx| this.copy_all(cx)));
-        let nothing_to_copy = self.lines.is_empty();
-        let copies = self.copies;
-        body.push(
-            Row::wrapped(
-                "Copy all",
-                "Copies every line shown below, in order.",
-                "logs-copy-row",
-                move |_, _| {
-                    let copy_all = Rc::clone(&copy_all);
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_3()
-                        // #82: the confirmation sits beside the control it
-                        // belongs to, in the row, so it opens no surface and
-                        // adds no row to the card's floor.
-                        .children(copy_confirmation("logs-copy-confirmation", copies))
-                        .child(
-                            Button::new("logs-copy-all")
-                                .label("Copy all")
-                                .accessibility_label("Copy every displayed log line")
-                                .disabled(nothing_to_copy)
-                                .on_click(move |event, window, cx| copy_all(event, window, cx)),
-                        )
-                        .into_any_element()
-                },
-            )
-            .render(window, cx),
-        );
         if let Some(problem) = &self.read_problem {
             body.push(
                 div()
@@ -641,14 +658,133 @@ impl LogsView {
         let floor_rem = 16.
             + if self.read_problem.is_some() { 4. } else { 0. }
             + if self.paused { 4. } else { 0. };
-        filling_section(
+        filling_section_with_action(
             "logs-lines-section",
             "Recent lines",
             "The newest file's last lines. They follow the file while this surface is open.",
+            self.copy_all_action(cx),
             body,
             floor_rem,
             cx,
         )
+    }
+
+    /// Copy all, at the right end of the Recent lines header.
+    ///
+    /// It costs no row of its own, and #82's confirmation still sits beside the
+    /// control it belongs to: the header is wide enough for both at the shell's
+    /// 520px minimum (the button and the confirmation take ~180px of it).
+    fn copy_all_action(&self, cx: &mut Context<Self>) -> AnyElement {
+        let copy_all = Rc::new(cx.listener(|this, _, _, cx| this.copy_all(cx)));
+        let nothing_to_copy = self.lines.is_empty();
+        let copies = self.copies;
+        // #89's row id and name stay on the control's group, so the
+        // migrated-row table still finds what it pins. The help sentence is
+        // gone: Copy all says what it does.
+        a11y::named(Role::Group, "logs-copy-row", "Copy all", None)
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_3()
+            .children(copy_confirmation("logs-copy-confirmation", copies))
+            .child(
+                Button::new("logs-copy-all")
+                    .label("Copy all")
+                    .accessibility_label("Copy every displayed log line")
+                    .disabled(nothing_to_copy)
+                    .on_click(move |event, window, cx| copy_all(event, window, cx)),
+            )
+            .into_any_element()
+    }
+}
+
+/// One level select's state: the kit state and the level it last read from the
+/// settings.
+///
+/// Keyed element state, so the view does not own the control's state and the
+/// control survives a re-render the way a widget's does.
+struct LevelSelect {
+    choices: Entity<SelectState<LevelChoices>>,
+    /// The level the control last showed, so a frame that changed nothing does
+    /// not push a value back into the kit state (a setter notifies, so doing
+    /// it every frame schedules a frame every frame).
+    chosen: LogLevel,
+    _confirmed: Subscription,
+}
+
+impl LevelSelect {
+    /// Pushes the level the settings hold into the control when it differs.
+    fn sync(&mut self, current: LogLevel, window: &mut Window, cx: &mut Context<Self>) {
+        if self.chosen != current {
+            self.chosen = current;
+            let value = current;
+            self.choices.update(cx, |state, cx| {
+                state.set_selected_value(&value, window, cx);
+            });
+        }
+    }
+}
+
+/// The level select's items: the five levels, in the order the control shows
+/// them.
+struct LevelChoices;
+
+impl LevelChoices {
+    /// The row that holds `level`, so the control opens on the current choice.
+    fn index_of(&self, level: LogLevel) -> Option<IndexPath> {
+        LogLevel::ALL
+            .iter()
+            .position(|held| *held == level)
+            .map(IndexPath::new)
+    }
+}
+
+impl SearchableListDelegate for LevelChoices {
+    type Item = LogLevel;
+
+    fn items_count(&self, section: usize) -> usize {
+        if section == 0 { LogLevel::ALL.len() } else { 0 }
+    }
+
+    fn item(&self, ix: IndexPath) -> Option<&Self::Item> {
+        LogLevel::ALL.get(ix.row)
+    }
+
+    fn position<V>(&self, value: &V) -> Option<IndexPath>
+    where
+        Self::Item: SearchableListItem<Value = V>,
+        V: PartialEq,
+    {
+        LogLevel::ALL
+            .iter()
+            .position(|level| level.value() == value)
+            .map(IndexPath::new)
+    }
+
+    /// The row the kit paints for each level: [`select_option`], with the
+    /// level's own id, so the option a state change lands on is named after the
+    /// setting it holds.
+    fn render_item(
+        &self,
+        _ix: IndexPath,
+        item: &Self::Item,
+        checked: bool,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> Option<AnyElement> {
+        Some(select_option(item.id(), item.label(), checked, cx))
+    }
+}
+
+impl SearchableListItem for LogLevel {
+    type Value = Self;
+
+    fn title(&self) -> SharedString {
+        self.label().into()
+    }
+
+    fn value(&self) -> &Self::Value {
+        self
     }
 }
 
@@ -674,8 +810,8 @@ impl Render for LogsView {
         let theme = cx.theme();
         let background = theme.background;
         let foreground = theme.foreground;
-        let location = self.location(window, cx);
-        let level = self.level_section(cx);
+        let location = self.location(cx);
+        let level = self.level_section(window, cx);
         let lines = self.lines_section(window, cx);
 
         div()
