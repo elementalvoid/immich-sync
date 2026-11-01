@@ -553,6 +553,51 @@ async fn every_diagnostics_control_is_named_and_keyboard_reachable(cx: &mut Test
     .expect("update the shell window");
 }
 
+/// #89: the five rows this card migrated onto the row contract still announce
+/// the words they announced before it. Three exist at once; #82's two bundle
+/// rows need an archive, so the table is read after one is collected.
+#[gpui_kit::test]
+async fn every_migrated_row_keeps_its_name_and_help(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let (_runtime, server) = mock_server();
+    server.set_api_key(API_KEY);
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let connection = connection_model(cx, &server, AuthMethod::ApiKey);
+    let (window, store, _engine, diagnostics) = open_shell(
+        cx,
+        SettingsStore::open(paths.config_file.clone()),
+        paths.clone(),
+        connection.clone(),
+    );
+    wait_until(cx, "the store", |cx| store.read(cx).store().is_some()).await;
+    sign_in(cx, &connection, &server, AuthMethod::ApiKey, API_KEY);
+    wait_until(cx, "the server probe", |cx| {
+        diagnostics.read(cx).server().version.is_some()
+    })
+    .await;
+
+    cx.update_window(window, |_, window, cx| {
+        show_diagnostics(window, cx);
+        window.click("diagnostics-bundle-collect", cx);
+    })
+    .expect("update the shell window");
+    wait_until(cx, "the debug bundle", |cx| {
+        matches!(diagnostics.read(cx).bundle(), BundleState::Ready(_))
+    })
+    .await;
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        common::assert_migrated_rows(
+            window,
+            &common::migrated_rows(&paths.log_directory().display().to_string()),
+            "diagnostics",
+        );
+    })
+    .expect("update the shell window");
+}
+
 /// #87: "Show in folder" hands the archive's path to the file manager, names a
 /// refusal beside its control, and does not exist until an archive does.
 #[gpui_kit::test]

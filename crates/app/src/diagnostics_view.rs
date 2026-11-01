@@ -5,8 +5,7 @@
 use gpui_kit::base::Disableable as _;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::Button;
-use gpui_kit::component::description_list::{DescriptionItem, DescriptionList};
-use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::component::description_list::DescriptionItem;
 use gpui_kit::*;
 
 use crate::dashboard::CardPalette;
@@ -14,8 +13,10 @@ use crate::debug_bundle::{LOG_BYTES, LOG_FILES};
 use crate::diagnostics::{BundleState, DiagnosticsModel, Permissions, format_bytes, format_rate};
 use crate::folder_panel::FolderOpener;
 use crate::notice::{Notice, Severity, copy_confirmation};
-use crate::settings_view::{field_text, section};
+use crate::rows::{Row, mono_value_item, value_item, value_list};
+use crate::settings_view::section;
 use crate::version;
+use std::rc::Rc;
 use std::sync::Arc;
 use sync_core::store::SqliteInfo;
 
@@ -104,7 +105,7 @@ impl DiagnosticsView {
     }
 
     /// The server version, the granted permissions, and the refresh action.
-    fn server_section(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn server_section(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let palette = CardPalette::new(cx.theme());
         let server = self.model.read(cx).server().clone();
         let version = server
@@ -160,30 +161,24 @@ impl DiagnosticsView {
             );
         }
         rows.push(value_list("diagnostics-server-values", items).into_any_element());
+        let refresh = Rc::new(cx.listener(|this, _, _, cx| {
+            this.model.update(cx, |model, cx| model.refresh(cx));
+        }));
         rows.push(
-            div()
-                .id("diagnostics-refresh-row")
-                .test_support()
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .gap_6()
-                .min_h(rems(2.25))
-                .child(field_text(
-                    "Refresh",
-                    "Re-reads the state database and re-checks the server.",
-                    &palette,
-                ))
-                .child(
+            Row::wrapped(
+                "Refresh",
+                "Re-reads the state database and re-checks the server.",
+                "diagnostics-refresh-row",
+                move |_, _| {
+                    let refresh = Rc::clone(&refresh);
                     Button::new("diagnostics-refresh")
                         .label("Refresh")
                         .accessibility_label("Re-check the server and the state database")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.model.update(cx, |model, cx| model.refresh(cx));
-                        })),
-                )
-                .into_any_element(),
+                        .on_click(move |event, window, cx| refresh(event, window, cx))
+                        .into_any_element()
+                },
+            )
+            .render(window, cx),
         );
         section(
             "diagnostics-server",
@@ -196,7 +191,7 @@ impl DiagnosticsView {
 
     /// The database path, the migration version, the size, the table counts,
     /// the integrity check, and the rebuild action.
-    fn state_section(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn state_section(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let palette = CardPalette::new(cx.theme());
         let model = self.model.read(cx);
         let path = model.db_path(cx).display().to_string();
@@ -269,31 +264,25 @@ impl DiagnosticsView {
                     .into_any_element(),
             );
         }
+        let rebuild = Rc::new(cx.listener(|this, _, _, cx| {
+            this.model.update(cx, |model, cx| model.rebuild(cx));
+        }));
         rows.push(
-            div()
-                .id("diagnostics-rebuild-row")
-                .test_support()
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .gap_6()
-                .min_h(rems(2.25))
-                .child(field_text(
-                    "Rebuild",
-                    "Starts the state over and rescans every folder. The server is re-checked.",
-                    &palette,
-                ))
-                .child(
+            Row::wrapped(
+                "Rebuild",
+                "Starts the state over and rescans every folder. The server is re-checked.",
+                "diagnostics-rebuild-row",
+                move |_, _| {
+                    let rebuild = Rc::clone(&rebuild);
                     Button::new("diagnostics-rebuild")
                         .label("Rebuild")
                         .accessibility_label("Rebuild the state database and rescan the folders")
                         .disabled(rebuilding)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.model.update(cx, |model, cx| model.rebuild(cx));
-                        })),
-                )
-                .into_any_element(),
+                        .on_click(move |event, window, cx| rebuild(event, window, cx))
+                        .into_any_element()
+                },
+            )
+            .render(window, cx),
         );
         section(
             "diagnostics-state",
@@ -351,9 +340,9 @@ impl DiagnosticsView {
     ///
     /// The privacy note stays visible whether or not a bundle exists: it is
     /// the one thing a user needs to read before attaching the archive.
-    fn bundle_section(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme();
-        let palette = CardPalette::new(theme);
+    fn bundle_section(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let palette = CardPalette::new(cx.theme());
+        let mono = cx.theme().mono_font_family.clone();
         let state = self.model.read(cx).bundle().clone();
         let directory = self.model.read(cx).bundle_directory().display().to_string();
         let collecting = matches!(state, BundleState::Collecting);
@@ -368,36 +357,30 @@ impl DiagnosticsView {
             )
             .into_any_element(),
         );
+        let collect = Rc::new(cx.listener(|this, _, _, cx| {
+            this.model.update(cx, |model, cx| model.collect_bundle(cx));
+        }));
         rows.push(
-            div()
-                .id("diagnostics-bundle-collect-row")
-                .test_support()
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .gap_6()
-                .min_h(rems(2.25))
-                .child(field_text(
-                    "Collect",
-                    &format!(
-                        "Writes one .zip into {directory}: the newest {LOG_FILES} log files, \
-                         {} each at most, plus the versions, database, configuration, sizing, and \
-                         runtime sections.",
-                        format_bytes(LOG_BYTES)
-                    ),
-                    &palette,
-                ))
-                .child(
+            Row::wrapped(
+                "Collect",
+                format!(
+                    "Writes one .zip into {directory}: the newest {LOG_FILES} log files, \
+                     {} each at most, plus the versions, database, configuration, sizing, and \
+                     runtime sections.",
+                    format_bytes(LOG_BYTES)
+                ),
+                "diagnostics-bundle-collect-row",
+                move |_, _| {
+                    let collect = Rc::clone(&collect);
                     Button::new("diagnostics-bundle-collect")
                         .label("Collect bundle")
                         .accessibility_label("Collect the debug bundle into one archive")
                         .disabled(collecting)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.model.update(cx, |model, cx| model.collect_bundle(cx));
-                        })),
-                )
-                .into_any_element(),
+                        .on_click(move |event, window, cx| collect(event, window, cx))
+                        .into_any_element()
+                },
+            )
+            .render(window, cx),
         );
         match &state {
             BundleState::Idle => {}
@@ -419,28 +402,23 @@ impl DiagnosticsView {
                             "diagnostics-bundle-path-value",
                             report.path.display().to_string(),
                             &palette,
-                            theme.mono_font_family.clone(),
+                            mono.clone(),
                         )],
                     )
                     .into_any_element(),
                 );
+                let copy_path = Rc::new(cx.listener(|this, _, _, cx| {
+                    this.copy_bundle_path(cx);
+                }));
+                let presses = self.presses();
                 rows.push(
-                    div()
-                        .id("diagnostics-bundle-copy-row")
-                        .test_support()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .justify_between()
-                        .gap_6()
-                        .min_h(rems(2.25))
-                        .child(field_text(
-                            "Copy path",
-                            "Puts the archive's full path on the clipboard, so it can be pasted \
-                             into a message or a file manager.",
-                            &palette,
-                        ))
-                        .child(
+                    Row::wrapped(
+                        "Copy path",
+                        "Puts the archive's full path on the clipboard, so it can be pasted \
+                         into a message or a file manager.",
+                        "diagnostics-bundle-copy-row",
+                        move |_, _| {
+                            let copy_path = Rc::clone(&copy_path);
                             div()
                                 .flex()
                                 .flex_row()
@@ -463,45 +441,41 @@ impl DiagnosticsView {
                                         .w(rems(6.))
                                         .children(copy_confirmation(
                                             "diagnostics-copy-confirmation",
-                                            self.presses(),
+                                            presses,
                                         )),
                                 )
                                 .child(
                                     Button::new("diagnostics-bundle-copy")
                                         .label("Copy path")
                                         .accessibility_label("Copy the debug bundle's path")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.copy_bundle_path(cx);
-                                        })),
-                                ),
-                        )
-                        .into_any_element(),
+                                        .on_click(move |event, window, cx| {
+                                            copy_path(event, window, cx)
+                                        }),
+                                )
+                                .into_any_element()
+                        },
+                    )
+                    .render(window, cx),
                 );
+                let reveal = Rc::new(cx.listener(|this, _, _, cx| {
+                    this.reveal_bundle(cx);
+                }));
                 rows.push(
-                    div()
-                        .id("diagnostics-bundle-reveal-row")
-                        .test_support()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .justify_between()
-                        .gap_6()
-                        .min_h(rems(2.25))
-                        .child(field_text(
-                            "Show in folder",
-                            "Opens the folder that holds the archive in your file manager, with \
-                             the archive selected where the platform allows it.",
-                            &palette,
-                        ))
-                        .child(
+                    Row::wrapped(
+                        "Show in folder",
+                        "Opens the folder that holds the archive in your file manager, with \
+                         the archive selected where the platform allows it.",
+                        "diagnostics-bundle-reveal-row",
+                        move |_, _| {
+                            let reveal = Rc::clone(&reveal);
                             Button::new("diagnostics-bundle-reveal")
                                 .label("Show in folder")
                                 .accessibility_label("Show the debug bundle in the file manager")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.reveal_bundle(cx);
-                                })),
-                        )
-                        .into_any_element(),
+                                .on_click(move |event, window, cx| reveal(event, window, cx))
+                                .into_any_element()
+                        },
+                    )
+                    .render(window, cx),
                 );
                 if let Some((_, problem)) = self
                     .reveal_problem
@@ -636,125 +610,6 @@ impl DiagnosticsView {
     }
 }
 
-/// The label column every value row shares, in rems: wide enough for the
-/// longest term, and fixed, so a long value wraps inside its own column instead
-/// of taking the term's width (#80).
-const LABEL_COLUMN_REMS: f32 = 12.;
-
-/// The most lines a value may take before it is cut (#80).
-///
-/// A value can be as long as a server or a filesystem makes it — a failure
-/// message is the raw error text — and an unclamped one grows its card by that
-/// many lines. The cut is visual only: the value's accessible name still carries
-/// the whole text.
-const VALUE_LINE_CLAMP: usize = 6;
-
-/// The description list a card's value rows share (#80).
-///
-/// `columns(1)` puts one row in each line. `bordered(false)` leaves the card's
-/// own surface and border to carry the box: the rows are a grid inside the
-/// card, not a second card inside the first. The kit's list is a `RenderOnce`
-/// with no role, so the wrapper is what gives the pairs their collection (F4).
-fn value_list(id: &'static str, items: Vec<DescriptionItem>) -> impl IntoElement {
-    div()
-        .id(id)
-        .test_support()
-        .role(Role::DescriptionList)
-        .child(
-            DescriptionList::new()
-                .columns(1)
-                .bordered(false)
-                .label_width(rems(LABEL_COLUMN_REMS))
-                .children(items),
-        )
-}
-
-/// One value row: the term in the label cell, and the value with its help
-/// sentence in the description cell.
-///
-/// The value names itself and the term beside it states the label, so a row
-/// reads its term once and has no name to compose (F1).
-fn value_item(
-    label: &str,
-    help: Option<&str>,
-    value_id: &str,
-    value: String,
-    palette: &CardPalette,
-) -> DescriptionItem {
-    value_item_with_font(label, help, value_id, value, palette, None)
-}
-
-/// The archive path's row: [`value_item`] with its value set in the mono font,
-/// as every other read-only path in the app is, so `l`/`1` and `O`/`0` stay
-/// apart (#80).
-fn mono_value_item(
-    label: &str,
-    help: Option<&str>,
-    value_id: &str,
-    value: String,
-    palette: &CardPalette,
-    mono: SharedString,
-) -> DescriptionItem {
-    value_item_with_font(label, help, value_id, value, palette, Some(mono))
-}
-
-/// The one row shape both constructors build, with `font` as the value's family
-/// when it is not the UI's (#80).
-fn value_item_with_font(
-    label: &str,
-    help: Option<&str>,
-    value_id: &str,
-    value: String,
-    palette: &CardPalette,
-    font: Option<SharedString>,
-) -> DescriptionItem {
-    DescriptionItem::new(
-        crate::a11y::named(
-            Role::Term,
-            ElementId::Name(format!("{value_id}-label").into()),
-            label,
-            None,
-        )
-        .min_w_0()
-        .text_sm()
-        .font_weight(FontWeight::MEDIUM)
-        .child(label.to_string())
-        .into_any_element(),
-    )
-    .value(
-        div()
-            .flex()
-            .flex_col()
-            .gap_0p5()
-            .min_w_0()
-            .child(
-                // The description-list value of the term above it, so the two
-                // reach the tree as a pair and not as flat text (#80).
-                crate::a11y::named(
-                    Role::Definition,
-                    ElementId::Name(value_id.into()),
-                    value.clone(),
-                    None,
-                )
-                .min_w_0()
-                .line_clamp(VALUE_LINE_CLAMP)
-                .text_xs()
-                .text_color(palette.text)
-                .when_some(font, |this, font| this.font_family(font))
-                .child(value),
-            )
-            .when_some(help, |this, help| {
-                this.child(
-                    div()
-                        .text_xs()
-                        .text_color(palette.meta)
-                        .child(help.to_string()),
-                )
-            })
-            .into_any_element(),
-    )
-}
-
 /// One row per tracked table, with its row count (#80).
 fn table_items(info: &SqliteInfo, palette: &CardPalette) -> Vec<DescriptionItem> {
     info.tables
@@ -772,15 +627,15 @@ fn table_items(info: &SqliteInfo, palette: &CardPalette) -> Vec<DescriptionItem>
 }
 
 impl Render for DiagnosticsView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let background = theme.background;
         let foreground = theme.foreground;
-        let server = self.server_section(cx);
-        let state = self.state_section(cx);
+        let server = self.server_section(window, cx);
+        let state = self.state_section(window, cx);
         let errors = self.errors_section(cx);
         let throughput = self.throughput_section(cx);
-        let bundle = self.bundle_section(cx);
+        let bundle = self.bundle_section(window, cx);
 
         div()
             .id("diagnostics-view")
