@@ -8,7 +8,7 @@
 
 mod common;
 
-use common::{contrast, mock_server};
+use common::{contrast, mock_server, press_reaches};
 
 use std::fs;
 use std::path::Path;
@@ -310,10 +310,10 @@ fn show_diagnostics(window: &mut Window, cx: &mut App) {
     window.press("enter", cx);
 }
 
-/// Scrolls the diagnostics view until the element with `id` is on screen.
+/// Scrolls the diagnostics view until the element with `id` can be pressed.
 ///
 /// #82: at the shell's smallest window the debug bundle card sits below the
-/// fold, and a control is clicked only once it is really visible.
+/// fold, and a control is pressed only once the pointer can land on it.
 fn scroll_diagnostics_into_view(window: &mut Window, cx: &mut App, id: impl Into<ElementId>) {
     use gpui_kit::{ScrollDelta, point, px};
 
@@ -322,7 +322,7 @@ fn scroll_diagnostics_into_view(window: &mut Window, cx: &mut App, id: impl Into
     for _ in 0..60 {
         if window
             .try_find(id.clone())
-            .is_some_and(|target| target.visible())
+            .is_some_and(|target| press_reaches(window, "diagnostics-view", &target))
         {
             return;
         }
@@ -332,7 +332,17 @@ fn scroll_diagnostics_into_view(window: &mut Window, cx: &mut App, id: impl Into
             cx,
         );
     }
-    panic!("{id:?} never became visible on diagnostics");
+    // The geometry, so the next failure says where the row ended up instead of
+    // pressing blind and reporting an empty clipboard.
+    let target = window.try_find(id.clone());
+    panic!(
+        "{id:?} never reached the point the pointer presses: bounds {:?}, centre {:?}, \
+         scroll box {:?}, viewport {:?}",
+        target.as_ref().map(ElementSnapshot::bounds),
+        target.as_ref().map(|target| target.bounds().center()),
+        window.find("diagnostics-view").bounds(),
+        window.viewport_size(),
+    );
 }
 
 /// Scrolls the diagnostics view back to the top, so the next row is found by
