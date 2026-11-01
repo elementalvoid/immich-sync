@@ -69,6 +69,12 @@ not the content. A test-side scroll or a hidden row is the symptom, not the fix.
 PasswordInput`) to make a bump pass is how a silent regression ships. Assert the new expectation
 per site, and say in the commit why the release forced it.
 
+**A capture is the only proof of a glyph.** Tests and capture harnesses build through
+`gpui_kit::init`, which registers no asset source, and the gap cannot be closed from the test
+side: `TestAppContext` hardcodes `()` as the source (gpui-pre 0.3.10), `with_assets` is
+`Application`-only, and `ElementSnapshot` has no svg field. A test renders no icon and cannot
+assert one, so an icon's presence and theme colour are shown by a capture, never by a green suite.
+
 **Make claims the artefacts support.** "Both themes render it" needs a capture path; "three runs
 are byte-identical" needs hashes. A report that overstates is worse than no report, because the
 next agent builds on it.
