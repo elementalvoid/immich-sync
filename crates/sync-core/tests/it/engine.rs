@@ -4,7 +4,7 @@
 //! Every test drives the real pipeline: a real directory, the real watcher and
 //! scan, the real state store, and the mock server's request counters.
 
-mod common;
+use super::common;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

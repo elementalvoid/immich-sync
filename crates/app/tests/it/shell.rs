@@ -4,7 +4,7 @@
 //! cannot observe, so those are checked by the probe and the GUI smoke job.
 //! The state-to-tooltip mapping is pure, so it is tested here.
 
-mod common;
+use super::common;
 
 use std::path::Path;
 use std::sync::Arc;

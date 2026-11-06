@@ -5,7 +5,7 @@
 //! the whole dashboard. The rendered-view test opens a real headless window and
 //! reads native accessibility properties and layout bounds.
 
-mod common;
+use super::common;
 
 use std::collections::BTreeSet;
 

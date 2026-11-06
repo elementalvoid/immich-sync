@@ -6,7 +6,7 @@ keeps following the window's system appearance (`follow_system_theme`), which
 the shell calls when it opens the main window.
 
 The mapping and the apply step are covered by headless tests in
-`crates/app/tests/dashboard.rs`; the appearance observer itself is shell
+`crates/app/tests/it/dashboard.rs`; the appearance observer itself is shell
 wiring.
 
 ## Screenshots

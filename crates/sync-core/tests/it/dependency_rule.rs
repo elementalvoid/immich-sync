@@ -7,7 +7,7 @@ const SHELL_NAMES: [&str; 2] = ["gpui", "immich_sync"];
 
 #[test]
 fn sync_core_does_not_depend_on_the_shell() {
-    let manifest = include_str!("../Cargo.toml");
+    let manifest = include_str!("../../Cargo.toml");
     let dependencies = manifest
         .lines()
         .filter(|line| !line.trim_start().starts_with('#'));
@@ -25,7 +25,7 @@ fn immich_client_does_not_depend_on_the_shell() {
     // The engine reaches the shell through sync-core's dependencies. The HTTP
     // client is on that path, so a GPUI dependency here would leak the shell
     // into the engine just the same.
-    let manifest = include_str!("../../immich-client/Cargo.toml");
+    let manifest = include_str!("../../../immich-client/Cargo.toml");
     let dependencies = manifest
         .lines()
         .filter(|line| !line.trim_start().starts_with('#'));

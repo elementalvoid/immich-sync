@@ -5,7 +5,7 @@
 //! a number of requests on the wire. The double's upload delay is what keeps a
 //! request in flight long enough to be sampled.
 
-mod common;
+use super::common;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

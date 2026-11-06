@@ -5,7 +5,7 @@
 //! title is one stored value; the tests assert where it lands, not how the
 //! mapper holds it on the way.
 
-mod common;
+use super::common;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

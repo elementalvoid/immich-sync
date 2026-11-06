@@ -3,7 +3,7 @@
 //! Real timing against the offline double, because the criteria are a rate and
 //! a number of simultaneous uploads.
 
-mod common;
+use super::common;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

@@ -11,7 +11,7 @@
 //! echoes the submitted password in its error body, so a server-supplied
 //! message cannot slip a secret into the log either.
 
-mod common;
+use super::common;
 
 use common::mock_server;
 

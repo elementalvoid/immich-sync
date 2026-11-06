@@ -5,7 +5,7 @@
 //! state database, the real engine model, and the view's own click and keyboard
 //! handling.
 
-mod common;
+use super::common;
 
 use std::path::Path;
 use std::sync::Arc;

@@ -3,7 +3,7 @@
 //! The view is driven through its real controls: the path field, the button,
 //! and the result notice the window renders.
 
-mod common;
+use super::common;
 
 use common::mock_server;
 

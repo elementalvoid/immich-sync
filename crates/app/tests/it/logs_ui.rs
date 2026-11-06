@@ -6,7 +6,7 @@
 //! properties; the colour tokens themselves are covered by the WCAG test in
 //! `tests/dashboard.rs`.
 
-mod common;
+use super::common;
 
 use std::fs;
 use std::path::{Path, PathBuf};

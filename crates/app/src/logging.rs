@@ -7,7 +7,7 @@
 //!
 //! Redaction is a property of the recorded types: `Secret` and `SessionToken`
 //! redact their `Debug` output, and no event formats `Secret::expose`.
-//! `crates/app/tests/log_redaction.rs` greps the real file after real sign-ins
+//! `crates/app/tests/it/log_redaction.rs` greps the real file after real sign-ins
 //! to prove it.
 
 use std::fs;
@@ -120,7 +120,7 @@ impl LogLevel {
 /// exercise the pruning the appender runs when it opens the directory.
 /// `tracing-appender` reads its own clock, so the prune that runs at a timed
 /// rollover uses the same code path but cannot be triggered deterministically;
-/// see `crates/app/tests/logging.rs`.
+/// see `crates/app/tests/it/logging.rs`.
 #[derive(Clone, Debug)]
 pub struct LogPolicy {
     /// When a new log file starts.
