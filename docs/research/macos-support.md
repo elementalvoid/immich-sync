@@ -405,7 +405,7 @@ Current runners (2026-10-26): **`macos-26`** is arm64, **`macos-26-intel`** is I
 Recommended shape:
 
 - **Per-push CI:** one `macos-26` (arm64) job: `cargo clippy --workspace --all-targets
-  -- -D warnings` and `cargo test --workspace`. Add the Metal toolchain step first:
+  -- -D warnings` and `cargo nextest run --workspace`. Add the Metal toolchain step first:
   `xcrun metal --version || (xcodebuild -runFirstLaunch && xcodebuild -downloadComponent
   MetalToolchain)`. Do not add an Intel test job for v1; the code is platform-neutral
   and the Intel runner is on a clock.

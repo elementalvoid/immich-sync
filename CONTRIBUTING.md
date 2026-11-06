@@ -65,13 +65,21 @@ all three; the Windows and macOS jobs run clippy and the tests:
 ```sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo nextest run --workspace
 ```
+
+`cargo nextest` (`cargo install --locked cargo-nextest`; CI pins 0.9.150) runs
+test *binaries* concurrently instead of one at a time. That was where the gate's
+wall clock went: `cargo test --workspace` took 2m51 on the maintainer's box, and
+60s of it was one real-time bandwidth binary running alone. nextest takes it to
+about 60s. Each crate still has one test binary: `crates/*/tests/it/main.rs`
+holds the old per-file tests as modules, so a filter is
+`cargo nextest run -p immich-sync -E 'test(ui)'` rather than `--test logs_ui`.
 
 Plus a headless Linux smoke that launches the real binary under Xvfb with
 lavapipe and proves the captured frame is not blank. UI changes should keep the
-headless GPUI tests green; `cargo test -p immich-sync --test dashboard`,
-`--test logs_ui`, and the other `tests/*_ui.rs` files cover the surfaces.
+headless GPUI tests green; the `*_ui` modules under `crates/app/tests/it/` cover
+the surfaces.
 
 `--all-features` is invalid here: the three `gpui-tray` backends are mutually
 exclusive.
@@ -81,11 +89,17 @@ Some tests are wall-clock budgets rather than progress-bounded waits:
 tests in `engine.rs`,
 `a_server_that_stops_answering_produces_backoff_not_a_hot_loop`, the pacing
 test in `limits.rs`, and the port race in `connection.rs`. In
-`crates/app/tests/engine_model.rs`,
+`crates/app/tests/it/engine_model.rs`,
 `a_click_on_a_running_engine_starts_a_scan` is one too: it hashes a 64 MiB
 fixture so the scan outlives the 250 ms status poll that carries the scan flag,
 and `EngineModel`'s surface has no deterministic barrier. They can starve under
 heavy parallel load; run one alone before treating a failure as a regression.
+
+Concurrency makes the ones that read the clock twice flaky, so a timing test
+reads it once: `BandwidthLimit`'s unit tests pass one `Instant` to `set_idle_at`,
+`debit_at` and `wait_for_at` instead of letting a descheduled thread refill the
+bucket between two `Instant::now()` calls (nextest's parallelism is what exposed
+that). Do the same for a new timing assertion rather than widening its bounds.
 
 ## Where the design lives
 
@@ -100,7 +114,7 @@ heavy parallel load; run one alone before treating a failure as a regression.
 ## Screenshots
 
 The dashboard image in the README is a real frame from the app, seeded with
-`crates/app/tests/screenshot_seed.rs`. Give the capture its own XDG directories
+`crates/app/tests/it/screenshot_seed.rs`. Give the capture its own XDG directories
 so it cannot touch your real state:
 
 ```sh
@@ -110,7 +124,7 @@ mkdir -p "$XDG_CONFIG_HOME" "$XDG_DATA_HOME/immich-sync"
 
 IMMICH_SYNC_CAPTURE_DB="$XDG_DATA_HOME/immich-sync/state.db" \
 IMMICH_SYNC_CAPTURE_ROOT="$XDG_DATA_HOME/capture" \
-cargo test -p immich-sync --test screenshot_seed -- --ignored
+cargo nextest run -p immich-sync -E 'test(screenshot_seed)' --run-ignored all
 ```
 
 Then launch the binary with the same environment under Xvfb, with lavapipe for
