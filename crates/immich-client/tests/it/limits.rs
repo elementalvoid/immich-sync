@@ -16,6 +16,12 @@ const ONE_MEGABYTE_PER_SECOND: u64 = 1_000_000;
 /// the pace is what the clock measures, and under axum's 2 MB body limit in
 /// the double.
 const FILE_BYTES: usize = 1_572_864;
+/// The window these tests run the guard on. Production gets the 30 s window
+/// (`client.rs` asserts that); the knowledge under test is *that* the stall
+/// guard fires a window after the last byte moved, and half a minute of wall
+/// clock per test is not what measures it.
+const WINDOW: Duration = Duration::from_millis(200);
+
 /// A checksum for the request header. The double stores the checksum it
 /// computes from the body, so this one only has to be well-formed.
 const CHECKSUM: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -45,6 +51,12 @@ async fn client(server: &MockImmich) -> (ImmichClient, SessionToken) {
         .expect("the mock accepts these credentials")
         .access_token;
     (client, token)
+}
+
+/// The same logged-in client, on the short window.
+async fn short_window_client(server: &MockImmich) -> (ImmichClient, SessionToken) {
+    let (client, token) = client(server).await;
+    (client.with_window(WINDOW), token)
 }
 
 fn upload_request<'a>(path: &'a std::path::Path, limit: &BandwidthLimit) -> AssetUpload<'a> {
@@ -144,12 +156,12 @@ async fn a_server_that_stops_answering_fails_the_upload_within_the_stall_budget(
     // accepted the upload and stopped talking is exactly this. Nothing is in
     // flight on the socket by then, so the only bound left is the client's.
     server.fail(Operation::Upload, Fault::Slow(Duration::from_secs(300)));
-    let (client, token) = client(&server).await;
+    let (client, token) = short_window_client(&server).await;
     let (_directory, path) = fixture(FILE_BYTES);
-    // 1.5 MiB at 200 kB/s is 7.9 s of streaming, so the deadline this replaces
-    // - three times the bytes' own time plus the client window - was 53 s, and
-    // nothing on the wire would have ended the upload inside 30 s.
-    let limit = BandwidthLimit::new(200_000);
+    // A limit is in force, so the body streams rather than leaving in one
+    // burst, and it costs several windows to do it: the guard must not fire
+    // while the bytes keep moving, only once the server stops talking.
+    let limit = BandwidthLimit::new(4_000_000);
 
     let started = Instant::now();
     let error = client
@@ -159,9 +171,13 @@ async fn a_server_that_stops_answering_fails_the_upload_within_the_stall_budget(
     let elapsed = started.elapsed();
 
     assert!(matches!(error, ClientError::Stalled), "{error:?}");
+    // The body's own paced time, then one window with the server silent. A
+    // deadline derived from the limit would have ended it before the body was
+    // out; the guard must let the whole body through and then call the stall.
+    let streaming = Duration::from_secs_f64(FILE_BYTES as f64 / 4_000_000.0);
     assert!(
-        elapsed <= Duration::from_secs(60),
-        "a stalled upload took {elapsed:?}; the bound has to be the stall budget"
+        elapsed >= streaming && elapsed <= streaming + WINDOW + Duration::from_millis(150),
+        "a stalled upload took {elapsed:?}: {streaming:?} of streaming plus a {WINDOW:?} window"
     );
 }
 
@@ -169,7 +185,7 @@ async fn a_server_that_stops_answering_fails_the_upload_within_the_stall_budget(
 async fn an_unlimited_upload_still_gives_up_at_the_client_wide_window() {
     let server = MockImmich::start().await;
     server.fail(Operation::Upload, Fault::Slow(Duration::from_secs(300)));
-    let (client, token) = client(&server).await;
+    let (client, token) = short_window_client(&server).await;
     let (_directory, path) = fixture(FILE_BYTES);
     let limit = BandwidthLimit::new(0);
 
@@ -182,9 +198,9 @@ async fn an_unlimited_upload_still_gives_up_at_the_client_wide_window() {
 
     assert!(matches!(error, ClientError::Stalled), "{error:?}");
     // An unlimited upload carries no total deadline any more, but it must not
-    // wait any longer than the 30 s window every request has always had.
+    // wait any longer than the window every request has always had.
     assert!(
-        elapsed >= Duration::from_secs(29) && elapsed <= Duration::from_secs(45),
+        elapsed >= WINDOW && elapsed <= WINDOW + Duration::from_millis(100),
         "an unlimited upload to a stalled server failed after {elapsed:?}"
     );
 }
@@ -247,7 +263,9 @@ async fn server_that_stops_reading() -> StoppedReading {
 #[tokio::test]
 async fn a_server_that_stops_reading_mid_body_fails_the_upload_within_the_stall_budget() {
     let server = server_that_stops_reading().await;
-    let client = ImmichClient::new(&server.url).expect("a loopback URL is valid");
+    let client = ImmichClient::new(&server.url)
+        .expect("a loopback URL is valid")
+        .with_window(WINDOW);
     let (_directory, path) = fixture(BACKPRESSURE_BYTES);
     // Unlimited, so the only thing that can stop the body is the socket.
     let limit = BandwidthLimit::new(0);
@@ -263,8 +281,8 @@ async fn a_server_that_stops_reading_mid_body_fails_the_upload_within_the_stall_
     // The guard can only notice at the end of a window, so it needs at least
     // one and at most two of them: it saw bytes still moving in the first.
     assert!(
-        elapsed >= Duration::from_secs(29) && elapsed <= Duration::from_secs(65),
-        "an upload blocked mid-body gave up after {elapsed:?}"
+        elapsed >= WINDOW && elapsed <= WINDOW * 2 + Duration::from_millis(100),
+        "an upload blocked mid-body gave up after {elapsed:?}, on a {WINDOW:?} window"
     );
     // The client could not get the whole body out, so it was blocked with
     // bytes still to send when the guard gave up - a server that stopped
@@ -287,12 +305,12 @@ async fn a_server_that_stops_reading_mid_body_fails_the_upload_within_the_stall_
 #[tokio::test]
 async fn lowering_the_limit_mid_upload_does_not_abort_a_healthy_upload() {
     let server = MockImmich::start().await;
-    let (client, token) = client(&server).await;
+    let (client, token) = short_window_client(&server).await;
     let (_directory, path) = fixture(FILE_BYTES);
     // The engine starts unlimited, so the request is built with no limit in
-    // force and used to carry the client's 30 s total deadline. At 20 kB/s
-    // the rest of the file needs well over a minute of streaming, which that
-    // deadline cut short however well the server was behaving.
+    // force and used to carry the client's total deadline. At 200 kB/s the
+    // rest of the file streams for many times the window, which a total
+    // deadline would cut short however well the server was behaving.
     let limit = BandwidthLimit::new(0);
 
     let started = Instant::now();
@@ -308,7 +326,7 @@ async fn lowering_the_limit_mid_upload_does_not_abort_a_healthy_upload() {
     while server.upload_requests() == 0 {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    limit.set(20_000);
+    limit.set(200_000);
 
     let response = upload
         .await
@@ -326,7 +344,7 @@ async fn lowering_the_limit_mid_upload_does_not_abort_a_healthy_upload() {
     // the limit landed is the machine's business, and the proof is that the
     // upload finishes at all rather than dying on a deadline nobody re-read.
     assert!(
-        elapsed <= Duration::from_secs(150),
+        elapsed <= Duration::from_secs(30),
         "a slow but progressing upload took {elapsed:?}"
     );
 }

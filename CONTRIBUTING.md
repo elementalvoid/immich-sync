@@ -101,6 +101,23 @@ reads it once: `BandwidthLimit`'s unit tests pass one `Instant` to `set_idle_at`
 bucket between two `Instant::now()` calls (nextest's parallelism is what exposed
 that). Do the same for a new timing assertion rather than widening its bounds.
 
+A test that proves a *window* fires must not pay that window in wall clock.
+Shrink it on the client instead of on the clock:
+`ImmichClient::with_window(Duration::from_millis(200))` runs the real guard over
+a real socket, and `limits.rs` then asserts the arithmetic it actually wants
+(one window after the last byte moved, at most two for a body blocked
+mid-flight). The production value is asserted once, by
+`the_production_window_is_the_specified_thirty_seconds`; a test that re-measures
+30 s is measuring the constant, not the guard. Do not reach for
+`tokio::time::pause()` to do this: auto-advance cannot tell a parked runtime
+waiting on a socket from one waiting on a timer, so a real round-trip races the
+next deadline and fails as `TimedOut` (tried; the login handshake failed).
+
+Some tests stay on the real clock because the wire is the subject: the pacing
+tests in `limits.rs` cost `bytes / rate` and are irreducible, and the scan and
+100-file tests in `sync-core` cost real hashing, uploads and fsyncs. Shrink
+those with a smaller fixture, never with a fake clock.
+
 ## Where the design lives
 
 | What | Where |

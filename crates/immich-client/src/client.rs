@@ -24,27 +24,13 @@ use crate::model::{
 /// answer with an HTML page; the client keeps a short, useful prefix.
 const MESSAGE_LIMIT: usize = 200;
 
-/// A request that has not finished within this window is unreachable.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// The window [`send`] enforces. Production always gets [`REQUEST_TIMEOUT`];
-/// only a unit test can shrink it, so the stalled-server test does not spend
-/// half a minute on the wall clock.
-fn request_timeout() -> Duration {
-    #[cfg(test)]
-    {
-        let millis = TEST_TIMEOUT_MILLIS.load(std::sync::atomic::Ordering::Relaxed);
-        if millis > 0 {
-            return Duration::from_millis(millis);
-        }
-    }
-    REQUEST_TIMEOUT
-}
-
-/// The test seam [`request_timeout`] reads. It exists only in the unit-test
-/// build and defaults to zero, which means [`REQUEST_TIMEOUT`].
-#[cfg(test)]
-static TEST_TIMEOUT_MILLIS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The window a request has to finish, and the budget an upload may hand the
+/// server no byte before it is called stalled.
+///
+/// A test shrinks it on the client it builds ([`ImmichClient::with_window`]),
+/// so a stall is measured in milliseconds instead of half a minute of wall
+/// clock, and the value a production client gets is asserted here.
+const REQUEST_WINDOW: Duration = Duration::from_secs(30);
 
 /// How long an upload may hand the server no byte before it is called stalled.
 ///
@@ -57,56 +43,6 @@ static TEST_TIMEOUT_MILLIS: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 /// A window that sees bytes move is renewed whole, so the stall is called at
 /// the last byte the server took plus this budget: at most twice it, never at
 /// one window from the start of the gap.
-const STALL_BUDGET: Duration = REQUEST_TIMEOUT;
-
-/// Sends a request under the ordinary window.
-///
-/// An upload does not come through here: a total deadline cannot tell a slow
-/// upload from a stalled server, and one derived from the limit in force when
-/// the request was built aborts a healthy upload the moment the limit changes.
-async fn send(request: RequestBuilder) -> Result<Response, ClientError> {
-    request
-        .timeout(request_timeout())
-        .send()
-        .await
-        .map_err(ClientError::Unreachable)
-}
-
-/// Sends an upload, failing it when the body has made no progress for
-/// [`STALL_BUDGET`].
-///
-/// The upload carries no total deadline: the client's 30 s would cut off any
-/// throttled upload larger than `limit x 30 s`, and a deadline scaled by the
-/// limit in force when the request was built grows without bound for a large
-/// file at a slow one (R7.1). Progress is watched instead, so the bound holds
-/// whatever the limit does while the request is on the wire. A window that saw
-/// bytes is renewed in full, so the call comes at the last byte moved plus
-/// [`STALL_BUDGET`] - at most twice that budget.
-async fn send_upload(
-    request: RequestBuilder,
-    progress: &Progress,
-) -> Result<Response, ClientError> {
-    let mut send = Box::pin(request.send());
-    // The last byte that had moved when this window opened.
-    let mut waited = progress.stamp();
-    loop {
-        if let Ok(response) =
-            tokio::time::timeout(STALL_BUDGET.saturating_sub(progress.idle()), &mut send).await
-        {
-            return response.map_err(ClientError::Unreachable);
-        }
-        // The window closed with nothing moving, and a timer that fires a
-        // fraction late must not count as progress on its own: the server
-        // stopped reading.
-        let moved = progress.stamp();
-        if moved == waited {
-            return Err(ClientError::Stalled);
-        }
-        // Bytes did move: the request is healthy and waits out a full window.
-        waited = moved;
-    }
-}
-
 /// A typed client for the Immich Stable operations the client uses.
 ///
 /// The client is cheap to clone and holds no credential. The session owns the
@@ -115,6 +51,8 @@ async fn send_upload(
 pub struct ImmichClient {
     http: Client,
     base: Url,
+    /// [`REQUEST_WINDOW`], unless a test shrank it.
+    window: Duration,
 }
 
 /// The login request body. It does not derive `Debug`, so a password cannot
@@ -189,11 +127,60 @@ fn quota_exceeded(message: &str) -> bool {
 }
 
 impl ImmichClient {
+    /// Sends a request under the ordinary window.
+    ///
+    /// An upload does not come through here: a total deadline cannot tell a slow
+    /// upload from a stalled server, and one derived from the limit in force when
+    /// the request was built aborts a healthy upload the moment the limit changes.
+    async fn send(&self, request: RequestBuilder) -> Result<Response, ClientError> {
+        request
+            .timeout(self.window)
+            .send()
+            .await
+            .map_err(ClientError::Unreachable)
+    }
+
+    /// Sends an upload, failing it when the body has made no progress for
+    /// [`REQUEST_WINDOW`].
+    ///
+    /// The upload carries no total deadline: the client's 30 s would cut off any
+    /// throttled upload larger than `limit x 30 s`, and a deadline scaled by the
+    /// limit in force when the request was built grows without bound for a large
+    /// file at a slow one (R7.1). Progress is watched instead, so the bound holds
+    /// whatever the limit does while the request is on the wire. A window that saw
+    /// bytes is renewed in full, so the call comes at the last byte moved plus
+    /// [`REQUEST_WINDOW`] - at most twice that budget.
+    async fn send_upload(
+        &self,
+        request: RequestBuilder,
+        progress: &Progress,
+    ) -> Result<Response, ClientError> {
+        let mut send = Box::pin(request.send());
+        // The last byte that had moved when this window opened.
+        let mut waited = progress.stamp();
+        loop {
+            if let Ok(response) =
+                tokio::time::timeout(self.window.saturating_sub(progress.idle()), &mut send).await
+            {
+                return response.map_err(ClientError::Unreachable);
+            }
+            // The window closed with nothing moving, and a timer that fires a
+            // fraction late must not count as progress on its own: the server
+            // stopped reading.
+            let moved = progress.stamp();
+            if moved == waited {
+                return Err(ClientError::Stalled);
+            }
+            // Bytes did move: the request is healthy and waits out a full window.
+            waited = moved;
+        }
+    }
+
     /// Builds a client for one server. TLS verification stays on (N3).
     ///
-    /// The client carries no deadline of its own: [`send`] puts the ordinary
-    /// window on every request but an upload, and an upload is bounded by the
-    /// stall guard instead.
+    /// The client carries no deadline of its own: [`Self::send`] puts the
+    /// ordinary window on every request but an upload, and an upload is
+    /// bounded by the stall guard instead.
     ///
     /// # Errors
     ///
@@ -237,7 +224,24 @@ impl ImmichClient {
             base.set_path(&path);
         }
         let http = Client::builder().build().map_err(ClientError::HttpClient)?;
-        Ok(Self { http, base })
+        Ok(Self {
+            http,
+            base,
+            window: REQUEST_WINDOW,
+        })
+    }
+
+    /// The same client with a different [`REQUEST_WINDOW`].
+    ///
+    /// Every real-timing test used to pay the production window on the wall
+    /// clock: half a minute for a stall, twice that for a body blocked
+    /// mid-flight. Shrinking the window at the client keeps the test on a real
+    /// socket with the real guard, and the value a production client gets is
+    /// asserted in [`tests::the_production_window_is_the_specified_thirty_seconds`].
+    #[must_use]
+    pub fn with_window(mut self, window: Duration) -> Self {
+        self.window = window;
+        self
     }
 
     /// Logs in with an email address and password (R1.3).
@@ -248,12 +252,13 @@ impl ImmichClient {
     /// [`ClientError::PasswordLoginDisabled`] when the server has password
     /// login turned off (R1.6), and the transport and protocol variants.
     pub async fn login(&self, email: &str, password: &str) -> Result<LoginResponse, ClientError> {
-        let response = send(
-            self.http
-                .post(self.endpoint("auth/login"))
-                .json(&LoginRequest { email, password }),
-        )
-        .await?;
+        let response = self
+            .send(
+                self.http
+                    .post(self.endpoint("auth/login"))
+                    .json(&LoginRequest { email, password }),
+            )
+            .await?;
         let result = self.read_login(response).await;
         log_outcome("login", &result);
         result
@@ -266,12 +271,13 @@ impl ImmichClient {
     /// [`ClientError::InvalidToken`] when the server refuses the token, plus the
     /// transport and protocol variants.
     pub async fn validate_token(&self, token: &SessionToken) -> Result<(), ClientError> {
-        let response = send(
-            self.http
-                .post(self.endpoint("auth/validateToken"))
-                .bearer_auth(token.expose()),
-        )
-        .await?;
+        let response = self
+            .send(
+                self.http
+                    .post(self.endpoint("auth/validateToken"))
+                    .bearer_auth(token.expose()),
+            )
+            .await?;
         let result = self
             .read_auth_status(response, ClientError::InvalidToken)
             .await;
@@ -286,12 +292,13 @@ impl ImmichClient {
     /// [`ClientError::InvalidApiKey`] when the server refuses the key, plus the
     /// transport and protocol variants.
     pub async fn validate_api_key(&self, key: &str) -> Result<(), ClientError> {
-        let response = send(
-            self.http
-                .post(self.endpoint("auth/validateToken"))
-                .header("x-api-key", key),
-        )
-        .await?;
+        let response = self
+            .send(
+                self.http
+                    .post(self.endpoint("auth/validateToken"))
+                    .header("x-api-key", key),
+            )
+            .await?;
         let result = self
             .read_auth_status(response, ClientError::InvalidApiKey)
             .await;
@@ -311,8 +318,9 @@ impl ImmichClient {
     /// Returns the typed refusal classes (R6.3) and the transport and protocol
     /// variants.
     pub async fn about(&self, auth: Auth<'_>) -> Result<ServerAbout, ClientError> {
-        let response =
-            send(self.authorize(self.http.get(self.endpoint("server/about")), auth)).await?;
+        let response = self
+            .send(self.authorize(self.http.get(self.endpoint("server/about")), auth))
+            .await?;
         let status = response.status();
         let result = if status.is_success() {
             response
@@ -340,8 +348,9 @@ impl ImmichClient {
     /// other typed refusal classes (R6.3), and the transport and protocol
     /// variants.
     pub async fn api_key_permissions(&self, auth: Auth<'_>) -> Result<ApiKeyInfo, ClientError> {
-        let response =
-            send(self.authorize(self.http.get(self.endpoint("api-keys/me")), auth)).await?;
+        let response = self
+            .send(self.authorize(self.http.get(self.endpoint("api-keys/me")), auth))
+            .await?;
         let status = response.status();
         let result = if status.is_success() {
             response
@@ -369,14 +378,15 @@ impl ImmichClient {
         auth: Auth<'_>,
         items: &[BulkCheckItem],
     ) -> Result<Vec<BulkCheckResult>, ClientError> {
-        let response = send(
-            self.authorize(
-                self.http.post(self.endpoint("assets/bulk-upload-check")),
-                auth,
+        let response = self
+            .send(
+                self.authorize(
+                    self.http.post(self.endpoint("assets/bulk-upload-check")),
+                    auth,
+                )
+                .json(&BulkCheckRequest { assets: items }),
             )
-            .json(&BulkCheckRequest { assets: items }),
-        )
-        .await?;
+            .await?;
         let result = self.read_bulk_check(response).await;
         log_outcome("bulk-upload-check", &result);
         result
@@ -456,13 +466,14 @@ impl ImmichClient {
         if let Some(video_id) = upload.live_photo_video_id {
             form = form.text("livePhotoVideoId", video_id.to_string());
         }
-        let sent = send_upload(
-            self.authorize(self.http.post(self.endpoint("assets")), auth)
-                .header("x-immich-checksum", upload.checksum)
-                .multipart(form),
-            &progress,
-        )
-        .await;
+        let sent = self
+            .send_upload(
+                self.authorize(self.http.post(self.endpoint("assets")), auth)
+                    .header("x-immich-checksum", upload.checksum)
+                    .multipart(form),
+                &progress,
+            )
+            .await;
         let result = match sent {
             Ok(response) => self.read_upload(response).await,
             Err(lost) => {
@@ -527,14 +538,15 @@ impl ImmichClient {
         name: &str,
         asset_ids: &[String],
     ) -> Result<Album, ClientError> {
-        let response = send(
-            self.authorize(self.http.post(self.endpoint("albums")), auth)
-                .json(&CreateAlbumRequest {
-                    album_name: name,
-                    asset_ids,
-                }),
-        )
-        .await?;
+        let response = self
+            .send(
+                self.authorize(self.http.post(self.endpoint("albums")), auth)
+                    .json(&CreateAlbumRequest {
+                        album_name: name,
+                        asset_ids,
+                    }),
+            )
+            .await?;
         let result = self.read_album(response).await;
         log_outcome("create-album", &result);
         result
@@ -558,15 +570,16 @@ impl ImmichClient {
         album_id: &str,
         name: &str,
     ) -> Result<Album, ClientError> {
-        let response = send(
-            self.authorize(
-                self.http
-                    .patch(self.endpoint(&format!("albums/{album_id}"))),
-                auth,
+        let response = self
+            .send(
+                self.authorize(
+                    self.http
+                        .patch(self.endpoint(&format!("albums/{album_id}"))),
+                    auth,
+                )
+                .json(&UpdateAlbumRequest { album_name: name }),
             )
-            .json(&UpdateAlbumRequest { album_name: name }),
-        )
-        .await?;
+            .await?;
         let result = self.read_album(response).await;
         log_outcome("rename-album", &result);
         result
@@ -591,15 +604,16 @@ impl ImmichClient {
         album_id: &str,
         asset_ids: &[String],
     ) -> Result<(), ClientError> {
-        let response = send(
-            self.authorize(
-                self.http
-                    .put(self.endpoint(&format!("albums/{album_id}/assets"))),
-                auth,
+        let response = self
+            .send(
+                self.authorize(
+                    self.http
+                        .put(self.endpoint(&format!("albums/{album_id}/assets"))),
+                    auth,
+                )
+                .json(&AlbumAssetsRequest { ids: asset_ids }),
             )
-            .json(&AlbumAssetsRequest { ids: asset_ids }),
-        )
-        .await?;
+            .await?;
         let result = self.read_accepted(response).await;
         log_outcome("add-album-assets", &result);
         result
@@ -620,11 +634,12 @@ impl ImmichClient {
         auth: Auth<'_>,
         asset_id: &str,
     ) -> Result<AssetInfo, ClientError> {
-        let response = send(self.authorize(
-            self.http.get(self.endpoint(&format!("assets/{asset_id}"))),
-            auth,
-        ))
-        .await?;
+        let response = self
+            .send(self.authorize(
+                self.http.get(self.endpoint(&format!("assets/{asset_id}"))),
+                auth,
+            ))
+            .await?;
         let result = self.read_asset_info(response).await;
         log_outcome("asset-info", &result);
         result
@@ -651,19 +666,20 @@ impl ImmichClient {
         target_id: &str,
         stack: bool,
     ) -> Result<(), ClientError> {
-        let response = send(
-            self.authorize(self.http.put(self.endpoint("assets/copy")), auth)
-                .json(&AssetCopyRequest {
-                    source_id,
-                    target_id,
-                    albums: true,
-                    shared_links: true,
-                    favorite: true,
-                    sidecar: true,
-                    stack,
-                }),
-        )
-        .await?;
+        let response = self
+            .send(
+                self.authorize(self.http.put(self.endpoint("assets/copy")), auth)
+                    .json(&AssetCopyRequest {
+                        source_id,
+                        target_id,
+                        albums: true,
+                        shared_links: true,
+                        favorite: true,
+                        sidecar: true,
+                        stack,
+                    }),
+            )
+            .await?;
         let result = self.read_accepted(response).await;
         log_outcome("copy-asset", &result);
         result
@@ -685,11 +701,12 @@ impl ImmichClient {
         auth: Auth<'_>,
         asset_ids: &[String],
     ) -> Result<String, ClientError> {
-        let response = send(
-            self.authorize(self.http.post(self.endpoint("stacks")), auth)
-                .json(&CreateStackRequest { asset_ids }),
-        )
-        .await?;
+        let response = self
+            .send(
+                self.authorize(self.http.post(self.endpoint("stacks")), auth)
+                    .json(&CreateStackRequest { asset_ids }),
+            )
+            .await?;
         let result = self.read_stack(response).await;
         log_outcome("create-stack", &result);
         result
@@ -709,11 +726,12 @@ impl ImmichClient {
     /// not carry the tag that was asked for, and the transport variants.
     pub async fn upsert_tag(&self, auth: Auth<'_>, name: &str) -> Result<String, ClientError> {
         let names = [name.to_string()];
-        let response = send(
-            self.authorize(self.http.put(self.endpoint("tags")), auth)
-                .json(&TagUpsertRequest { tags: &names }),
-        )
-        .await?;
+        let response = self
+            .send(
+                self.authorize(self.http.put(self.endpoint("tags")), auth)
+                    .json(&TagUpsertRequest { tags: &names }),
+            )
+            .await?;
         let result = self.read_tag(response, name).await;
         log_outcome("upsert-tag", &result);
         result
@@ -733,11 +751,12 @@ impl ImmichClient {
         tag_ids: &[String],
         asset_ids: &[String],
     ) -> Result<(), ClientError> {
-        let response = send(
-            self.authorize(self.http.put(self.endpoint("tags/assets")), auth)
-                .json(&BulkTagRequest { tag_ids, asset_ids }),
-        )
-        .await?;
+        let response = self
+            .send(
+                self.authorize(self.http.put(self.endpoint("tags/assets")), auth)
+                    .json(&BulkTagRequest { tag_ids, asset_ids }),
+            )
+            .await?;
         let result = self.read_accepted(response).await;
         log_outcome("bulk-tag-assets", &result);
         result
@@ -760,14 +779,15 @@ impl ImmichClient {
         auth: Auth<'_>,
         asset_ids: &[String],
     ) -> Result<(), ClientError> {
-        let response = send(
-            self.authorize(self.http.delete(self.endpoint("assets")), auth)
-                .json(&AssetBulkDeleteRequest {
-                    ids: asset_ids,
-                    force: false,
-                }),
-        )
-        .await?;
+        let response = self
+            .send(
+                self.authorize(self.http.delete(self.endpoint("assets")), auth)
+                    .json(&AssetBulkDeleteRequest {
+                        ids: asset_ids,
+                        force: false,
+                    }),
+            )
+            .await?;
         let result = self.read_accepted(response).await;
         log_outcome("trash-assets", &result);
         result
@@ -792,11 +812,12 @@ impl ImmichClient {
         auth: Auth<'_>,
         asset_ids: &[String],
     ) -> Result<(), ClientError> {
-        let response = send(
-            self.authorize(self.http.post(self.endpoint("trash/restore/assets")), auth)
-                .json(&BulkIdsRequest { ids: asset_ids }),
-        )
-        .await?;
+        let response = self
+            .send(
+                self.authorize(self.http.post(self.endpoint("trash/restore/assets")), auth)
+                    .json(&BulkIdsRequest { ids: asset_ids }),
+            )
+            .await?;
         let result = self.read_accepted(response).await;
         log_outcome("restore-assets", &result);
         result
@@ -1099,6 +1120,16 @@ mod tests {
         assert_eq!(iso8601(SystemTime::UNIX_EPOCH), "1970-01-01T00:00:00.000Z");
     }
 
+    /// The window the stall guard and the request deadline use, and the value
+    /// the real-time tests shrink. It is the SPEC's half-minute; a test that
+    /// shrinks it measures the guard, not this number.
+    #[test]
+    fn the_production_window_is_the_specified_thirty_seconds() {
+        assert_eq!(REQUEST_WINDOW, Duration::from_secs(30));
+        let client = ImmichClient::new("http://127.0.0.1:2283").expect("a valid URL");
+        assert_eq!(client.window, REQUEST_WINDOW);
+    }
+
     #[test]
     fn only_immichs_quota_message_is_a_quota_refusal() {
         assert!(quota_exceeded("Quota has been exceeded!"));
@@ -1112,15 +1143,15 @@ mod tests {
             mock_immich::Operation::CreateAlbum,
             mock_immich::Fault::Slow(Duration::from_secs(30)),
         );
-        TEST_TIMEOUT_MILLIS.store(200, std::sync::atomic::Ordering::Relaxed);
-        let client = ImmichClient::new(server.base_url()).expect("a valid URL");
+        let client = ImmichClient::new(server.base_url())
+            .expect("a valid URL")
+            .with_window(Duration::from_millis(200));
 
         let error = client
             .create_album(Auth::ApiKey("test-key"), "album", &[])
             .await
             .expect_err("a server that accepts and never answers must fail the call");
 
-        TEST_TIMEOUT_MILLIS.store(0, std::sync::atomic::Ordering::Relaxed);
         assert!(
             matches!(&error, ClientError::Unreachable(inner) if inner.is_timeout()),
             "the ordinary request window must end the call, got {error:?}"
