@@ -175,12 +175,19 @@ impl BandwidthLimit {
     /// Charges `bytes` to the budget. The debt may go negative; the next
     /// refill repays it, which is what keeps the long-run rate honest.
     fn debit(&self, bytes: u64) {
+        self.debit_at(bytes, Instant::now());
+    }
+
+    /// [`Self::debit`] at `now`. The test seam: a thread descheduled between
+    /// two wall-clock reads would otherwise refill the bucket behind the
+    /// assertion's back.
+    fn debit_at(&self, bytes: u64, now: Instant) {
         let rate = self.bytes_per_second();
         if rate == 0 || bytes == 0 {
             return;
         }
         let mut bucket = self.bucket.lock().unwrap_or_else(PoisonError::into_inner);
-        bucket.refill(rate);
+        bucket.refill_at(rate, now);
         bucket.tokens -= bytes as f64;
     }
 
@@ -188,10 +195,33 @@ impl BandwidthLimit {
     /// a known instant instead of from the wall clock.
     #[cfg(test)]
     fn set_idle(&self, elapsed: Duration) {
+        self.set_idle_at(elapsed, Instant::now());
+    }
+
+    /// [`Self::set_idle`] at `now`; paired with [`Self::wait_for_at`] so a test
+    /// takes one reading of the clock and cannot be raced by the refill.
+    #[cfg(test)]
+    fn set_idle_at(&self, elapsed: Duration, now: Instant) {
         self.bucket
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .refilled = Instant::now() - elapsed;
+            .refilled = now - elapsed;
+    }
+
+    /// [`Self::wait_for`] at `now`, for tests that pin the instant.
+    #[cfg(test)]
+    fn wait_for_at(&self, bytes: u64, now: Instant) -> Duration {
+        let rate = self.bytes_per_second();
+        if rate == 0 {
+            return Duration::ZERO;
+        }
+        let mut bucket = self.bucket.lock().unwrap_or_else(PoisonError::into_inner);
+        let tokens = bucket.refill_at(rate, now);
+        if tokens >= bytes as f64 {
+            Duration::ZERO
+        } else {
+            Duration::from_secs_f64((bytes as f64 - tokens) / rate as f64)
+        }
     }
 }
 
@@ -213,7 +243,12 @@ impl Bucket {
     /// Tops the bucket up for the time since the last refill and returns the
     /// tokens now available.
     fn refill(&mut self, rate: u64) -> f64 {
-        let now = Instant::now();
+        self.refill_at(rate, Instant::now())
+    }
+
+    /// [`Self::refill`] as of `now`, so a test's reading and its refill share
+    /// one instant.
+    fn refill_at(&mut self, rate: u64, now: Instant) -> f64 {
         let elapsed = now.duration_since(self.refilled).as_secs_f64();
         self.refilled = now;
         let capacity = (rate / BURST_DIVISOR).max(BUCKET_FLOOR) as f64;
@@ -354,19 +389,22 @@ mod tests {
     #[test]
     fn a_spent_bucket_reports_the_time_the_budget_needs() {
         let limit = BandwidthLimit::new(1_000);
-        // The bucket is measured from a known instant. It used to be measured
-        // from `BandwidthLimit::new()`, so a test thread descheduled in
-        // between refilled the bucket and failed the absolute bounds below.
-        limit.set_idle(Duration::ZERO);
-        let first = limit.wait_for(100);
+        // The bucket and both readings are measured from one instant. It used
+        // to be measured from `BandwidthLimit::new()`, and then from a second
+        // `Instant::now()`, so a test thread descheduled in between refilled
+        // the bucket and failed the absolute bounds below -- which is what
+        // nextest's higher parallelism exposed.
+        let now = Instant::now();
+        limit.set_idle_at(Duration::ZERO, now);
+        let first = limit.wait_for_at(100, now);
         assert!(
             first.abs_diff(Duration::from_millis(100)) <= Duration::from_millis(10),
             "an empty bucket at 1 kB/s needs 100 ms: {first:?}"
         );
         // A hundred charged bytes add their own tenth of a second on top.
-        limit.debit(100);
-        limit.set_idle(Duration::ZERO);
-        let second = limit.wait_for(100);
+        limit.debit_at(100, now);
+        limit.set_idle_at(Duration::ZERO, now);
+        let second = limit.wait_for_at(100, now);
         assert!(
             second.abs_diff(Duration::from_millis(200)) <= Duration::from_millis(10),
             "a hundred charged bytes add their own hundred: {second:?}"
