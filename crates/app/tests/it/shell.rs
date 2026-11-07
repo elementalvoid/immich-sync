@@ -1,7 +1,8 @@
 //! Headless tests for the shell's window effects.
 //!
 //! `cx.quit()` and the tray icon are platform effects that a headless test
-//! cannot observe, so those are checked by the probe and the GUI smoke job.
+//! cannot observe, so those are checked by the probe and, on a real machine,
+//! by the capture recipe in `CONTRIBUTING.md`.
 //! The state-to-tooltip mapping is pure, so it is tested here.
 
 use super::common;

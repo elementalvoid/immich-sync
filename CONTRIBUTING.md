@@ -70,16 +70,18 @@ cargo nextest run --workspace
 
 `cargo nextest` (`cargo install --locked cargo-nextest`; CI pins 0.9.150) runs
 test *binaries* concurrently instead of one at a time. That was where the gate's
-wall clock went: `cargo test --workspace` took 2m51 on the maintainer's box, and
-60s of it was one real-time bandwidth binary running alone. nextest takes it to
-about 60s. Each crate still has one test binary: `crates/*/tests/it/main.rs`
-holds the old per-file tests as modules, so a filter is
-`cargo nextest run -p immich-sync -E 'test(ui)'` rather than `--test logs_ui`.
+wall clock went: `cargo test --workspace` took 2m51 on the maintainer's box.
+nextest takes it to about 47s. Each crate still has one test binary:
+`crates/*/tests/it/main.rs` holds the old per-file tests as modules, so a filter
+is `cargo nextest run -p immich-sync -E 'test(ui)'` rather than `--test logs_ui`.
 
-Plus a headless Linux smoke that launches the real binary under Xvfb with
-lavapipe and proves the captured frame is not blank. UI changes should keep the
-headless GPUI tests green; the `*_ui` modules under `crates/app/tests/it/` cover
-the surfaces.
+No CI job launches the binary. The Linux GUI smoke that used to run it under
+Xvfb with lavapipe and assert the captured frame was not blank is gone: it cost
+a job and a distro-package list to prove a frame that the headless GPUI tests
+already cover in pieces. So a change that touches rendering, startup, the tray,
+or the single-instance handoff should keep the headless GPUI tests green — the
+`*_ui` modules under `crates/app/tests/it/` cover the surfaces — and be checked
+against the capture recipe below on a real machine.
 
 `--all-features` is invalid here: the three `gpui-tray` backends are mutually
 exclusive.
