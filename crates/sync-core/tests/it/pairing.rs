@@ -4,7 +4,7 @@
 //! reconciliation scan, the real state store, and the mock server's record of
 //! what arrived and in which order.
 
-mod common;
+use super::common;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

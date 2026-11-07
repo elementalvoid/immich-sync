@@ -6,7 +6,7 @@
 //! cannot read pixels, so "readable in both themes" is checked by rendering
 //! under both and reading the same accessibility properties.
 
-mod common;
+use super::common;
 
 use common::{contrast, mock_server, press_reaches};
 

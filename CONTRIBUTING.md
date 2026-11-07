@@ -65,13 +65,23 @@ all three; the Windows and macOS jobs run clippy and the tests:
 ```sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo nextest run --workspace
 ```
 
-Plus a headless Linux smoke that launches the real binary under Xvfb with
-lavapipe and proves the captured frame is not blank. UI changes should keep the
-headless GPUI tests green; `cargo test -p immich-sync --test dashboard`,
-`--test logs_ui`, and the other `tests/*_ui.rs` files cover the surfaces.
+`cargo nextest` (`cargo install --locked cargo-nextest`; CI pins 0.9.150) runs
+test *binaries* concurrently instead of one at a time. That was where the gate's
+wall clock went: `cargo test --workspace` took 2m51 on the maintainer's box.
+nextest takes it to about 47s. Each crate still has one test binary:
+`crates/*/tests/it/main.rs` holds the old per-file tests as modules, so a filter
+is `cargo nextest run -p immich-sync -E 'test(ui)'` rather than `--test logs_ui`.
+
+No CI job launches the binary. The Linux GUI smoke that used to run it under
+Xvfb with lavapipe and assert the captured frame was not blank is gone: it cost
+a job and a distro-package list to prove a frame that the headless GPUI tests
+already cover in pieces. So a change that touches rendering, startup, the tray,
+or the single-instance handoff should keep the headless GPUI tests green — the
+`*_ui` modules under `crates/app/tests/it/` cover the surfaces — and be checked
+against the capture recipe below on a real machine.
 
 `--all-features` is invalid here: the three `gpui-tray` backends are mutually
 exclusive.
@@ -81,11 +91,34 @@ Some tests are wall-clock budgets rather than progress-bounded waits:
 tests in `engine.rs`,
 `a_server_that_stops_answering_produces_backoff_not_a_hot_loop`, the pacing
 test in `limits.rs`, and the port race in `connection.rs`. In
-`crates/app/tests/engine_model.rs`,
+`crates/app/tests/it/engine_model.rs`,
 `a_click_on_a_running_engine_starts_a_scan` is one too: it hashes a 64 MiB
 fixture so the scan outlives the 250 ms status poll that carries the scan flag,
 and `EngineModel`'s surface has no deterministic barrier. They can starve under
 heavy parallel load; run one alone before treating a failure as a regression.
+
+Concurrency makes the ones that read the clock twice flaky, so a timing test
+reads it once: `BandwidthLimit`'s unit tests pass one `Instant` to `set_idle_at`,
+`debit_at` and `wait_for_at` instead of letting a descheduled thread refill the
+bucket between two `Instant::now()` calls (nextest's parallelism is what exposed
+that). Do the same for a new timing assertion rather than widening its bounds.
+
+A test that proves a *window* fires must not pay that window in wall clock.
+Shrink it on the client instead of on the clock:
+`ImmichClient::with_window(Duration::from_millis(200))` runs the real guard over
+a real socket, and `limits.rs` then asserts the arithmetic it actually wants
+(one window after the last byte moved, at most two for a body blocked
+mid-flight). The production value is asserted once, by
+`the_production_window_is_the_specified_thirty_seconds`; a test that re-measures
+30 s is measuring the constant, not the guard. Do not reach for
+`tokio::time::pause()` to do this: auto-advance cannot tell a parked runtime
+waiting on a socket from one waiting on a timer, so a real round-trip races the
+next deadline and fails as `TimedOut` (tried; the login handshake failed).
+
+Some tests stay on the real clock because the wire is the subject: the pacing
+tests in `limits.rs` cost `bytes / rate` and are irreducible, and the scan and
+100-file tests in `sync-core` cost real hashing, uploads and fsyncs. Shrink
+those with a smaller fixture, never with a fake clock.
 
 ## Where the design lives
 
@@ -100,7 +133,7 @@ heavy parallel load; run one alone before treating a failure as a regression.
 ## Screenshots
 
 The dashboard image in the README is a real frame from the app, seeded with
-`crates/app/tests/screenshot_seed.rs`. Give the capture its own XDG directories
+`crates/app/tests/it/screenshot_seed.rs`. Give the capture its own XDG directories
 so it cannot touch your real state:
 
 ```sh
@@ -110,7 +143,7 @@ mkdir -p "$XDG_CONFIG_HOME" "$XDG_DATA_HOME/immich-sync"
 
 IMMICH_SYNC_CAPTURE_DB="$XDG_DATA_HOME/immich-sync/state.db" \
 IMMICH_SYNC_CAPTURE_ROOT="$XDG_DATA_HOME/capture" \
-cargo test -p immich-sync --test screenshot_seed -- --ignored
+cargo nextest run -p immich-sync -E 'test(screenshot_seed)' --run-ignored all
 ```
 
 Then launch the binary with the same environment under Xvfb, with lavapipe for

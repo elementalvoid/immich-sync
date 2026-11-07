@@ -7,7 +7,7 @@
 //! assert the requests on the wire as well as the progress the engine
 //! publishes, because the double is more forgiving than the real server.
 
-mod common;
+use super::common;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

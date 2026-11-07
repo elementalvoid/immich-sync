@@ -5,7 +5,7 @@
 //! accent colour, and a long quoted path wraps instead of clipping at a
 //! window narrow enough to squeeze the card.
 
-mod common;
+use super::common;
 
 use common::scroll_dashboard_into_view;
 use gpui_kit::base::test_support::{ElementSnapshot, snapshots};

@@ -10,15 +10,15 @@ publish = false
 axum = { version = "0.8", features = ["multipart"] }
 base64 = "0.22"
 hex = "0.4"
-serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.10"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-stream = "0.1"
 uuid = { version = "1", features = ["v4"] }
 
+# No `serde`: the double builds every body with `serde_json::Value` and axum's
+# `Json`, and derives nothing. `hex`, `sha1` and `tokio` were also listed here
+# with the same or a subset of the features above, which a dev target already
+# sees through the normal dependency; only `reqwest` needs its own entry.
 [dev-dependencies]
-hex = "0.4"
 reqwest = { version = "0.13", default-features = false, features = ["json", "multipart", "rustls"] }
-sha1 = "0.10"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

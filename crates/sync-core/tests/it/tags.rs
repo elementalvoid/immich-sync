@@ -5,7 +5,7 @@
 //! the tag the double holds on an asset, and the requests the client put on the
 //! wire, because the double is more forgiving than the real server.
 
-mod common;
+use super::common;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

@@ -1,6 +1,6 @@
 //! The app-scoped engine model's start handoff (SPEC R8.7).
 
-mod common;
+use super::common;
 
 use common::mock_server;
 

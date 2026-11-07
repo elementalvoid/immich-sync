@@ -307,7 +307,7 @@ pub fn main_window_options(cx: &App) -> WindowOptions {
         // width the widest row of any surface still fits in, the Dashboard's
         // header, whose title block beside the Sync now and Pause buttons needs
         // 509 px; 480 px is the height the Logs surface's cards keep their
-        // floors at in their narrowest wrap (#54). `tests/shell.rs` stands at
+        // floors at in their narrowest wrap (#54). `tests/it/shell.rs` stands at
         // exactly this size, so a layout that outgrows it fails there.
         window_min_size: Some(size(px(520.), px(480.))),
         ..Default::default()

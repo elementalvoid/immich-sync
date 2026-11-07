@@ -3,7 +3,7 @@
 //! The harness can drive keyboard focus and native accessibility properties; it
 //! cannot read pixels, so the focus *ring* itself is not asserted here.
 
-mod common;
+use super::common;
 
 use common::mock_server;
 
