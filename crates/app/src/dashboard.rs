@@ -701,7 +701,11 @@ impl Render for Dashboard {
                             div()
                                 .id(("folder-card", index))
                                 .test_support()
-                                .w(rems(17.5))
+                                // Wide enough for the longest settings line
+                                // ("Folder path includes album prefix: on") at
+                                // the default text size, so a card's settings
+                                // never wrap (#93).
+                                .w(rems(20.))
                                 .flex()
                                 // #43: the card opens the folder's detail. #57:
                                 // the card has no control of its own, so
