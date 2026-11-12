@@ -974,7 +974,9 @@ async fn changing_each_leaf_setting_renames_once() {
                     .set_album_path(path, AlbumPath::LeafName)
                     .expect("set the name")
             }),
-            "Pictures/Paris",
+            // #93: the folder-name form is the short name; the prefix stored
+            // for the folder-path form does not apply to it.
+            "Paris",
         ),
     ] {
         change(&engine, &path);

@@ -168,11 +168,15 @@ impl StatusCard {
                     // scope, and a whole-folder album has no leaves.
                     if self.album_scope == AlbumScope::Leaf {
                         lines.push(format!("Album names: {}", self.album_path.label()));
-                        lines.push(format!(
-                            "{}: {}",
-                            crate::folder_controls::ALBUM_PREFIX_LABEL,
-                            if self.album_prefix { "on" } else { "off" }
-                        ));
+                        // #93: the prefix belongs to the folder-path form, so
+                        // the folder-name form states no prefix at all.
+                        if self.album_path == AlbumPath::Relative {
+                            lines.push(format!(
+                                "{}: {}",
+                                crate::folder_controls::ALBUM_PREFIX_LABEL,
+                                if self.album_prefix { "on" } else { "off" }
+                            ));
+                        }
                     }
                 }
                 lines

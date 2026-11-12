@@ -16,12 +16,11 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use sync_core::store::{AlbumPath, AlbumScope};
 
-/// The sentence the prefix control carries (#93): what turning it on does, in
-/// the same words the status card uses.
+/// What the prefix control asks (#93), in the same words the status card uses.
 ///
-/// "Album title" is the field above it, so the sentence points at a word the
-/// user has already read instead of introducing a second name for it.
-pub(crate) const ALBUM_PREFIX_LABEL: &str = "Start names with this folder's album title";
+/// The control draws it as a question; the card states it with its answer, so
+/// the two surfaces cannot drift apart.
+pub(crate) const ALBUM_PREFIX_LABEL: &str = "Folder path includes album prefix";
 
 /// The element ids the settings controls get on one surface.
 pub(crate) struct SettingsIds {
@@ -150,13 +149,9 @@ where
                 .gap_6()
                 .min_h(rems(2.25))
         };
-        // The scope labels are long, so that radio pair stacks as one
-        // right-aligned block instead of splitting a line at the narrow dialog
-        // width.
-        let radios = || div().flex().flex_col().items_start().gap_2();
-        // The album-name labels are two words each, and the row label says
-        // "Album names", so the pair fits one line.
-        let short_radios = div().flex().flex_row().items_center().gap_4();
+        // Both radio pairs carry two-word labels, and the row label above each
+        // says what they are about, so each pair fits one line.
+        let short_radios = || div().flex().flex_row().items_center().gap_4();
         div()
             .flex()
             .flex_col()
@@ -184,12 +179,12 @@ where
             )
             .child(
                 row().child(label("Album scope")).child(
-                    radios()
+                    short_radios()
                         .child(
                             Radio::new(ids.album_leaf)
                                 .label(AlbumScope::Leaf.label())
                                 .accessibility_label(format!(
-                                    "Album scope for {}: one album per folder",
+                                    "Album scope for {}: per folder",
                                     name
                                 ))
                                 .checked(values.album_scope == AlbumScope::Leaf)
@@ -205,10 +200,7 @@ where
                         .child(
                             Radio::new(ids.album_whole)
                                 .label(AlbumScope::WholeFolder.label())
-                                .accessibility_label(format!(
-                                    "Album scope for {}: one album for this folder",
-                                    name
-                                ))
+                                .accessibility_label(format!("Album scope for {}: one album", name))
                                 .checked(values.album_scope == AlbumScope::WholeFolder)
                                 .on_change({
                                     let scope = Rc::clone(&on_album_scope);
@@ -224,7 +216,7 @@ where
             .when(values.album_scope == AlbumScope::Leaf, |this| {
                 this.child(
                     row().child(label("Album names")).child(
-                        short_radios
+                        short_radios()
                             .child(
                                 Radio::new(ids.album_path)
                                     .label(AlbumPath::Relative.label())
@@ -261,30 +253,34 @@ where
                             ),
                     ),
                 )
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .min_h(rems(2.25))
-                        .child(
-                            Checkbox::new(ids.album_prefix)
-                                // The sentence is long, so the box takes the
-                                // row's width and the label wraps inside it
-                                // instead of running past the dialog at the
-                                // narrowest window.
-                                .w_full()
-                                .min_w_0()
-                                // The visible label is the accessible name: it
-                                // already says "this folder", so a folder-name
-                                // suffix would repeat it.
-                                .label(ALBUM_PREFIX_LABEL)
-                                .checked(values.album_prefix)
-                                .on_click(move |prefixed, window, cx| {
-                                    on_album_prefix(prefixed, window, cx);
-                                }),
-                        ),
-                )
+                // The prefix is the folder-path form's choice: the folder-name
+                // form is the short name the user picked (#93).
+                .when(values.album_path == AlbumPath::Relative, |this| {
+                    this.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .min_h(rems(2.25))
+                            .child(
+                                Checkbox::new(ids.album_prefix)
+                                    // The sentence is long, so the box takes the
+                                    // row's width and the label wraps inside it
+                                    // instead of running past the dialog at the
+                                    // narrowest window.
+                                    .w_full()
+                                    .min_w_0()
+                                    // The visible label is the accessible name: it
+                                    // already says "this folder", so a folder-name
+                                    // suffix would repeat it.
+                                    .label(format!("{ALBUM_PREFIX_LABEL}?"))
+                                    .checked(values.album_prefix)
+                                    .on_click(move |prefixed, window, cx| {
+                                        on_album_prefix(prefixed, window, cx);
+                                    }),
+                            ),
+                    )
+                })
             })
             .into_any_element()
     }

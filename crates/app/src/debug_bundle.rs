@@ -939,7 +939,7 @@ log_level = \"debug\"
             "Concurrent uploads: 2",
             "/photos",
             "album mapping: on",
-            "One album for this folder",
+            "One album",
             "album title: (the folder's name)",
         ] {
             assert!(

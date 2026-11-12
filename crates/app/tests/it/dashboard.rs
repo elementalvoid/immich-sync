@@ -260,7 +260,7 @@ fn the_card_states_the_folder_settings_once() {
         Some(vec![
             "Recursive: on".to_string(),
             "Album mapping: on".to_string(),
-            "Album scope: One album for this folder".to_string(),
+            "Album scope: One album".to_string(),
         ]),
         "#57: the card states recursion, mapping, and scope once each, one per line"
     );
@@ -1546,19 +1546,20 @@ async fn add_writes_the_path_and_every_setting_in_one_request(cx: &mut TestAppCo
         window.click("folder-panel-album", cx);
         window.render_frame(cx);
         // #93: the album-name choices exist only under the per-folder scope,
-        // so they are chosen before the scope moves to the whole folder.
-        window.click("folder-panel-album-name", cx);
-        window.render_frame(cx);
+        // and the prefix only while the folder path names the albums, so each
+        // is chosen before the control that hides it moves.
         window.click("folder-panel-album-prefix", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("folder-panel-album-prefix").checked(),
+            Some(false)
+        );
+        window.click("folder-panel-album-name", cx);
         window.render_frame(cx);
         assert_eq!(
             window.find("folder-panel-album-name").selected(),
             Some(true),
             "#93: the folder name is the other choice"
-        );
-        assert_eq!(
-            window.find("folder-panel-album-prefix").checked(),
-            Some(false)
         );
         window.click("folder-panel-album-whole", cx);
         window.render_frame(cx);
@@ -1608,7 +1609,7 @@ async fn add_writes_the_path_and_every_setting_in_one_request(cx: &mut TestAppCo
         // each, instead of offering controls of its own.
         assert_eq!(
             card_settings(window, 0),
-            "Recursive: off · Album mapping: on · Album scope: One album for this folder"
+            "Recursive: off · Album mapping: on · Album scope: One album"
         );
     })
     .expect("read the new folder's card");
@@ -1640,12 +1641,8 @@ async fn the_setup_dialog_gives_each_setting_its_own_row(cx: &mut TestAppContext
             "#57: Album mapping gets its own row: {mapping:?}"
         );
         assert!(
-            leaf.bottom() <= whole.top(),
-            "#57: the two scopes sit together in the scope's row: {leaf:?} vs {whole:?}"
-        );
-        assert!(
-            (leaf.left() - whole.left()).abs() <= px(0.5),
-            "#57: the scopes line up as one control block: {leaf:?} vs {whole:?}"
+            leaf.top() == whole.top() && leaf.right() <= whole.left(),
+            "#57, #93: the two short scope labels share one line: {leaf:?} vs {whole:?}"
         );
         // #93: the naming choices take their own rows and stay inside the
         // dialog like the controls above them.
@@ -1968,11 +1965,11 @@ async fn the_setup_dialog_names_its_controls_and_traps_focus(cx: &mut TestAppCon
         );
         assert_eq!(
             window.find("folder-panel-album-leaf").label(),
-            Some("Album scope for this folder: one album per folder")
+            Some("Album scope for this folder: per folder")
         );
         assert_eq!(
             window.find("folder-panel-album-whole").label(),
-            Some("Album scope for this folder: one album for this folder")
+            Some("Album scope for this folder: one album")
         );
         assert_eq!(
             window.find("folder-panel-album-path").label(),
@@ -1984,7 +1981,7 @@ async fn the_setup_dialog_names_its_controls_and_traps_focus(cx: &mut TestAppCon
         );
         assert_eq!(
             window.find("folder-panel-album-prefix").label(),
-            Some("Start names with this folder's album title")
+            Some("Folder path includes album prefix?")
         );
         assert_eq!(
             window.find("folder-panel-cancel").label(),

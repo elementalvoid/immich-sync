@@ -96,15 +96,19 @@ pub fn album_title(folder: &SourceFolder) -> String {
 /// The title of the album one leaf folder below `folder` holds (#93).
 ///
 /// The two stored settings decide it: the leaf's path relative to the source
-/// folder (`Trips/Paris`) or its own name (`Paris`), and whether the source
-/// folder's album title comes first (`Holidays/Trips/Paris`). The source
-/// folder's own title is the user's, so the prefix follows a retitle. The
-/// separator is always `/`, whatever the platform's path separator is.
+/// folder (`Trips/Paris`) or its own name (`Paris`). The prefix belongs to the
+/// path form, because that is the name that needs to say where it came from: it
+/// puts the source folder's album title in front (`Holidays/Trips/Paris`), and
+/// the folder-name form stays the name alone (`Paris`). The source folder's own
+/// title is the user's, so the prefix follows a retitle. The separator is always
+/// `/`, whatever the platform's path separator is.
 #[must_use]
 pub fn leaf_album_title(folder: &SourceFolder, holder: &Path) -> String {
+    // #93: the folder-name form is the short name; the prefix is the path
+    // form's choice, and the control for it is shown only there.
     let name = match folder.album_path {
+        AlbumPath::LeafName => return folder_name(holder),
         AlbumPath::Relative => relative_path(Path::new(&folder.path), holder),
-        AlbumPath::LeafName => folder_name(holder),
     };
     if !folder.album_prefix {
         return name;
@@ -645,15 +649,18 @@ mod tests {
     }
 
     /// #93: a leaf album's title comes from the two stored choices, never from
-    /// the user's typing, and the source folder's own title is the prefix.
+    /// the user's typing; the source folder's own title is the prefix of the
+    /// folder-path form.
     #[test]
-    fn the_four_leaf_titles() {
+    fn the_leaf_titles_by_choice() {
         let file = Path::new("/photos/Trips/Paris/beach.jpg");
+        // #93: the prefix is the folder-path form's choice; the folder-name
+        // form is the short name alone, so a stored prefix does not apply to it.
         for (album_path, prefix, expected) in [
             (AlbumPath::Relative, false, "Trips/Paris"),
             (AlbumPath::Relative, true, "Holidays/Trips/Paris"),
             (AlbumPath::LeafName, false, "Paris"),
-            (AlbumPath::LeafName, true, "Holidays/Paris"),
+            (AlbumPath::LeafName, true, "Paris"),
         ] {
             let folder = naming(Some("Holidays"), album_path, prefix);
             assert_eq!(

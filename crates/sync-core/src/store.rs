@@ -455,11 +455,15 @@ impl AlbumScope {
     }
 
     /// The user's choice in the config window's words (GLOSSARY).
+    ///
+    /// The row label above these options already says "Album scope", so each
+    /// label carries only the part that tells the two apart, and both fit one
+    /// line beside it.
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
-            Self::Leaf => "One album per folder",
-            Self::WholeFolder => "One album for this folder",
+            Self::Leaf => "Per folder",
+            Self::WholeFolder => "One album",
         }
     }
 }
