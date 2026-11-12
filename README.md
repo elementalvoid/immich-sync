@@ -19,8 +19,9 @@ server copy.
   A tracked local file that disappears appears in **Review**, where you choose
   **Keep** or **Trash**; a rename is recognised by content and is not a
   deletion.
-- **Albums.** Put a folder's uploads into an album: one album per leaf folder,
-  or one album for the whole folder.
+- **Albums.** Put a folder's uploads into an album: one album per folder
+  (`Trips/Paris`, or `Holidays/Trips/Paris` with the folder's own album title in
+  front), or one album for the whole folder.
 - **Limits and retries.** Bandwidth and concurrency limits, backoff with a
   per-file attempt cap, and a **Failed items** view with **Retry**.
 - **A tray that keeps working when the window is closed.** Its tooltip shows the
@@ -211,12 +212,14 @@ a key from Immich's account settings.
 1. On the **Dashboard**, type or paste a folder path into **Add a folder to
    sync**, or click **Browse…** and pick it. Enter, **Browse…**, and **Add
    folder** all open **Folder setup**; none of them adds the folder yet.
-2. **Folder setup** shows the path and four choices: **Recursive** (on by
+2. **Folder setup** shows the path and its choices: **Recursive** (on by
    default), **Album mapping** (off by default), **Album scope** (**One album
-   per folder**, one album per leaf folder, by default; or **One album for
-   this folder**), and **Album title** (blank means the album takes the
+   per folder**, by default; or **One album for this folder**), **Album names**
+   (**Name each album after its folder path**, by default; or **Name each album
+   after its folder**), **Start each album's name with this folder's album
+   name** (on by default), and **Album title** (blank means the album takes the
    folder's name).
-3. **Add** records the path and all four choices in one write, and the folder's
+3. **Add** records the path and all its choices in one write, and the folder's
    status card appears on the **Dashboard**; **Cancel** writes nothing. The card
    summarizes the folder's settings; click the card, or its **Details** control,
    to change them in **Folder detail**.

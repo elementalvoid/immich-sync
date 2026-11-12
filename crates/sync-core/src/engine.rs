@@ -47,8 +47,8 @@ use crate::scan::{ScanError, scan_folder};
 use crate::skip::{has_symlink_ancestor, skip_reason_below};
 use crate::status::{AlbumRename, ConnectionHealth, FolderStatus, Status, StatusInputs};
 use crate::store::{
-    Album, AlbumScope, AttemptOutcome, AttemptRecord, FailedItem, FolderCounts, ItemRecord,
-    ItemState, ReviewDecision, ReviewItem, SourceFolder, StateStore, StoreError,
+    Album, AlbumPath, AlbumScope, AttemptOutcome, AttemptRecord, FailedItem, FolderCounts,
+    ItemRecord, ItemState, ReviewDecision, ReviewItem, SourceFolder, StateStore, StoreError,
 };
 use crate::tags::{TagStatus, Tagger};
 use crate::tracking::{Observer, Tracking, TrackingError, stored_folder};
@@ -731,6 +731,30 @@ impl Engine {
         Ok(())
     }
 
+    /// Sets how each leaf folder's album is titled for one source folder
+    /// (#93).
+    ///
+    /// The write wakes the album retry, which renames the leaf albums that
+    /// exist to the titles the new choice gives.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::set_album_mapping`].
+    pub fn set_album_path(&self, path: &str, album_path: AlbumPath) -> Result<(), EngineError> {
+        self.tracking.set_album_path(path, album_path)?;
+        Ok(())
+    }
+
+    /// Turns the source album's title into each leaf album's prefix (#93).
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::set_album_mapping`].
+    pub fn set_album_prefix(&self, path: &str, prefixed: bool) -> Result<(), EngineError> {
+        self.tracking.set_album_prefix(path, prefixed)?;
+        Ok(())
+    }
+
     /// Sets the title of one source folder's own album (#47).
     ///
     /// The title is stored with the folder's album row even while album
@@ -778,6 +802,8 @@ impl Engine {
                     recursive: entry.folder.recursive,
                     album_mapping: entry.folder.album_mapping,
                     album_scope: entry.folder.album_scope,
+                    album_path: entry.folder.album_path,
+                    album_prefix: entry.folder.album_prefix,
                     album_title: entry.folder.album_title.clone(),
                     album_rename: entry.album.rename_pending.then(|| {
                         entry
@@ -2429,6 +2455,8 @@ fn refresh_album_rows(inner: &EngineInner) {
         {
             entry.album = album;
             entry.folder.album_title = folder.album_title;
+            entry.folder.album_path = folder.album_path;
+            entry.folder.album_prefix = folder.album_prefix;
         }
     }
 }
@@ -2965,6 +2993,7 @@ mod tests {
                 album_mapping: false,
                 album_scope: AlbumScope::default(),
                 album_title: None,
+                ..Default::default()
             })
             .expect("add the folder");
         // The session is never used: this test sends no request.
@@ -3019,6 +3048,7 @@ mod tests {
                     album_mapping: false,
                     album_scope: AlbumScope::default(),
                     album_title: None,
+                    ..Default::default()
                 })
                 .expect("add the folder");
             dirs.push(dir);
@@ -3102,6 +3132,7 @@ mod tests {
                     album_mapping: false,
                     album_scope: AlbumScope::default(),
                     album_title: None,
+                    ..Default::default()
                 })
                 .expect("add the folder");
             dirs.push(dir);
@@ -3216,6 +3247,7 @@ mod tests {
                     album_mapping: false,
                     album_scope: AlbumScope::default(),
                     album_title: None,
+                    ..Default::default()
                 })
                 .expect("add the folder");
             dirs.push(dir);
@@ -3337,6 +3369,7 @@ mod tests {
                     album_mapping: false,
                     album_scope: AlbumScope::default(),
                     album_title: None,
+                    ..Default::default()
                 })
                 .expect("add the folder");
         }
@@ -3429,6 +3462,7 @@ mod tests {
                     album_mapping: false,
                     album_scope: AlbumScope::default(),
                     album_title: None,
+                    ..Default::default()
                 })
                 .expect("add the folder");
         }
@@ -3503,6 +3537,7 @@ mod tests {
                 album_mapping: false,
                 album_scope: AlbumScope::default(),
                 album_title: None,
+                ..Default::default()
             })
             .expect("add the inner folder first");
         store
@@ -3600,6 +3635,7 @@ mod tests {
                     album_mapping: false,
                     album_scope: AlbumScope::default(),
                     album_title: None,
+                    ..Default::default()
                 })
                 .expect("add the folder");
         }
@@ -3683,6 +3719,7 @@ mod tests {
                 album_mapping: false,
                 album_scope: AlbumScope::default(),
                 album_title: None,
+                ..Default::default()
             })
             .expect("add the folder");
         store
@@ -3930,6 +3967,7 @@ mod tests {
                 album_mapping: false,
                 album_scope: AlbumScope::default(),
                 album_title: None,
+                ..Default::default()
             })
             .expect("add the folder");
         let mut connection = crate::connection::Connection::new(
@@ -4004,6 +4042,7 @@ mod tests {
                 album_mapping: false,
                 album_scope: AlbumScope::default(),
                 album_title: None,
+                ..Default::default()
             })
             .expect("add the folder");
         // The session is never used: these tests send no request.

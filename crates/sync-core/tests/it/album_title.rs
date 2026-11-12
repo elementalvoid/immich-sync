@@ -17,7 +17,7 @@ use sync_core::credential::MemoryCredentialStore;
 use sync_core::engine::{Engine, EngineConfig};
 use sync_core::paths::path_key;
 use sync_core::status::AlbumRename;
-use sync_core::store::{Album, AlbumScope, ItemState, SourceFolder, StateStore};
+use sync_core::store::{Album, AlbumPath, AlbumScope, ItemState, SourceFolder, StateStore};
 use sync_core::tracking::Tracking;
 
 use common::wait_until;
@@ -60,6 +60,7 @@ fn mapped_folder(path: &Path, scope: AlbumScope, title: Option<&str>) -> SourceF
         album_mapping: true,
         album_scope: scope,
         album_title: title.map(str::to_string),
+        ..Default::default()
     }
 }
 
@@ -626,10 +627,11 @@ async fn an_api_key_without_album_update_keeps_the_title_pending_and_names_it() 
     engine.stop();
 }
 
-/// #47: under the leaf scope only the source folder's own album takes the
-/// title; a subfolder's album keeps the subfolder's name.
+/// #93: a new folder starts on the folder path with the source folder's title
+/// in front, so the source folder's own album takes the user's title and the
+/// subfolder's album says where it came from.
 #[tokio::test]
-async fn a_leaf_subfolder_album_keeps_its_folder_name() {
+async fn a_leaf_subfolders_album_takes_its_relative_path() {
     let server = MockImmich::start().await;
     let temp = tempfile::tempdir().expect("create a temp dir");
     let store = store_in(&temp);
@@ -659,8 +661,8 @@ async fn a_leaf_subfolder_album_keeps_its_folder_name() {
     names.sort();
     assert_eq!(
         names,
-        vec!["Holiday 2024".to_string(), "Trips".to_string()],
-        "#47: the source folder's album takes the title, the subfolder's keeps its name"
+        vec!["Holiday 2024".to_string(), "Holiday 2024/Trips".to_string()],
+        "#93: the source folder's album takes the title, and prefixes the leaf's path"
     );
     assert_eq!(
         server
@@ -673,7 +675,7 @@ async fn a_leaf_subfolder_album_keeps_its_folder_name() {
         server
             .album_for_asset(&asset_id_of(&store, &nested))
             .as_deref(),
-        Some("Trips")
+        Some("Holiday 2024/Trips")
     );
     engine.stop();
 }
@@ -753,6 +755,7 @@ async fn the_title_survives_a_restart_a_toggle_and_a_re_add() {
             album_mapping: true,
             album_scope: AlbumScope::WholeFolder,
             album_title: None,
+            ..Default::default()
         })
         .expect("add the folder again through the setup dialog");
     assert_eq!(
@@ -809,6 +812,243 @@ async fn two_folders_may_share_one_album_title() {
         album_of(&store, &first).album_id,
         album_of(&store, &second).album_id,
         "one album per folder, whatever the titles agree on"
+    );
+    engine.stop();
+}
+
+/// One mapped folder with the two leaf naming choices (#93).
+fn mapped_naming(path: &Path, album_path: AlbumPath, prefix: bool) -> SourceFolder {
+    SourceFolder {
+        album_path,
+        album_prefix: prefix,
+        ..mapped_folder(path, AlbumScope::Leaf, None)
+    }
+}
+
+/// #93: two leaf folders with one name are two albums, told apart by the path
+/// each title carries.
+#[tokio::test]
+async fn two_leaves_with_one_name_get_distinct_titles() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("Pictures");
+    let first = write_file(&photos, "2024/Paris/a.jpg", b"first paris");
+    let second = write_file(&photos, "2025/Paris/b.jpg", b"second paris");
+    store
+        .add_folder(&mapped_folder(&photos, AlbumScope::Leaf, None))
+        .expect("add the mapped folder");
+
+    let (engine, _tracking) = start(
+        &store,
+        signed_in_with(&server, AuthMethod::Password, "correct horse").await,
+    )
+    .await;
+    assert!(
+        wait_for_albums(&store, &server, &[first.clone(), second.clone()]).await,
+        "both files must join an album: {:?}",
+        engine.status()
+    );
+
+    let mut names = server.album_names();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            "Pictures/2024/Paris".to_string(),
+            "Pictures/2025/Paris".to_string()
+        ],
+        "#93: the path tells two same-named leaves apart"
+    );
+    assert_ne!(
+        server.album_for_asset(&asset_id_of(&store, &first)),
+        server.album_for_asset(&asset_id_of(&store, &second)),
+        "each file is in its own leaf's album"
+    );
+    engine.stop();
+}
+
+/// #93: an album made under the old names is renamed once by the next scan,
+/// and not again after that.
+#[tokio::test]
+async fn an_old_leaf_album_is_renamed_once() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("Pictures");
+    let file = write_file(&photos, "Trips/beach.jpg", b"beach bytes");
+    // The naming a folder mapped before #93 had.
+    store
+        .add_folder(&mapped_naming(&photos, AlbumPath::LeafName, false))
+        .expect("add the mapped folder");
+    let (engine, _tracking) = start(
+        &store,
+        signed_in_with(&server, AuthMethod::Password, "correct horse").await,
+    )
+    .await;
+    assert!(wait_for_albums(&store, &server, std::slice::from_ref(&file)).await);
+    assert_eq!(server.album_names(), vec!["Trips".to_string()]);
+
+    // The upgrade's choices: the folder path, with the source album in front.
+    engine
+        .set_album_path(&photos.display().to_string(), AlbumPath::Relative)
+        .expect("name the albums after their path");
+    engine
+        .set_album_prefix(&photos.display().to_string(), true)
+        .expect("prefix the source album title");
+    assert!(
+        wait_until(
+            || server
+                .album_for_asset(&asset_id_of(&store, &file))
+                .as_deref()
+                == Some("Pictures/Trips"),
+            Duration::from_secs(15)
+        )
+        .await,
+        "the old leaf album was not renamed: {:?} {:?}",
+        server.album_rename_calls(),
+        engine.status()
+    );
+    assert_eq!(server.album_rename_calls().len(), 1, "one rename");
+    let leaf = album_of(&store, &photos.join("Trips"));
+    assert_eq!(leaf.title.as_deref(), Some("Pictures/Trips"));
+    assert!(!leaf.rename_pending, "the rename settled");
+
+    // The next scan finds nothing to rename, so nothing is sent again.
+    let before = engine.status().folders[0].last_scan_ns;
+    engine.sync_now();
+    assert!(
+        wait_until(
+            || engine.status().folders[0].last_scan_ns != before,
+            Duration::from_secs(15)
+        )
+        .await,
+        "the scan did not run"
+    );
+    assert_eq!(
+        server.album_rename_calls().len(),
+        1,
+        "#93: a settled title is not sent again"
+    );
+    engine.stop();
+}
+
+/// #93: changing each leaf setting renames the album once.
+#[tokio::test]
+async fn changing_each_leaf_setting_renames_once() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("Pictures");
+    let file = write_file(&photos, "Trips/Paris/beach.jpg", b"beach bytes");
+    store
+        .add_folder(&mapped_naming(&photos, AlbumPath::LeafName, false))
+        .expect("add the mapped folder");
+    let (engine, _tracking) = start(
+        &store,
+        signed_in_with(&server, AuthMethod::Password, "correct horse").await,
+    )
+    .await;
+    assert!(wait_for_albums(&store, &server, std::slice::from_ref(&file)).await);
+    assert_eq!(server.album_names(), vec!["Paris".to_string()]);
+
+    let path = photos.display().to_string();
+    for (change, expected) in [
+        (
+            &(|engine: &Engine, path: &str| {
+                engine
+                    .set_album_path(path, AlbumPath::Relative)
+                    .expect("set the path")
+            }) as &dyn Fn(&Engine, &str),
+            "Trips/Paris",
+        ),
+        (
+            &(|engine: &Engine, path: &str| {
+                engine.set_album_prefix(path, true).expect("set the prefix")
+            }),
+            "Pictures/Trips/Paris",
+        ),
+        (
+            &(|engine: &Engine, path: &str| {
+                engine
+                    .set_album_path(path, AlbumPath::LeafName)
+                    .expect("set the name")
+            }),
+            "Pictures/Paris",
+        ),
+    ] {
+        change(&engine, &path);
+        assert!(
+            wait_until(
+                || server
+                    .album_for_asset(&asset_id_of(&store, &file))
+                    .as_deref()
+                    == Some(expected),
+                Duration::from_secs(15)
+            )
+            .await,
+            "the album did not become {expected:?}: {:?} {:?}",
+            server.album_names(),
+            engine.status()
+        );
+    }
+    assert_eq!(
+        server.album_rename_calls().len(),
+        3,
+        "#93: each setting change renames once"
+    );
+    engine.stop();
+}
+
+/// #93: retitling the source album while the prefix is on renames the leaf
+/// albums once, because their expected titles start with it.
+#[tokio::test]
+async fn retitling_the_source_album_renames_the_leaf_albums_once() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("Pictures");
+    let at_root = write_file(&photos, "cover.jpg", b"cover bytes");
+    let nested = write_file(&photos, "Trips/beach.jpg", b"beach bytes");
+    store
+        .add_folder(&mapped_folder(&photos, AlbumScope::Leaf, None))
+        .expect("add the mapped folder");
+    let (engine, _tracking) = start(
+        &store,
+        signed_in_with(&server, AuthMethod::Password, "correct horse").await,
+    )
+    .await;
+    assert!(wait_for_albums(&store, &server, &[at_root, nested]).await);
+    let mut names = server.album_names();
+    names.sort();
+    assert_eq!(names, vec!["Pictures", "Pictures/Trips"]);
+
+    engine
+        .set_album_title(&photos.display().to_string(), "Holidays")
+        .expect("retitle the source album");
+
+    assert!(
+        wait_until(
+            || {
+                let mut names = server.album_names();
+                names.sort();
+                names == vec!["Holidays", "Holidays/Trips"]
+            },
+            Duration::from_secs(15)
+        )
+        .await,
+        "the leaf album did not follow the source title: {:?} {:?}",
+        server.album_names(),
+        engine.status()
+    );
+    assert_eq!(
+        server.album_rename_calls().len(),
+        2,
+        "#93: the source album and its leaf album are renamed once each"
+    );
+    assert!(
+        !album_of(&store, &photos.join("Trips")).rename_pending,
+        "the leaf album's rename settled"
     );
     engine.stop();
 }

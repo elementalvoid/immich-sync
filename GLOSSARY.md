@@ -31,11 +31,11 @@ A per-folder rule that creates one Immich album for the folder. The album's titl
 _Avoid_: folder sync, album mode
 
 **Album title**:
-The user-visible name of one mapped album. It defaults to the folder's name and can be changed after the album exists; changing it renames the Immich album.
+The user-visible name of one mapped album. The source folder's own album takes the user's title, which defaults to the folder's name and can be changed after the album exists. A leaf folder's album takes the leaf's path relative to the source folder, or the leaf folder's name, either of them optionally starting with the source folder's album title. Changing a title renames the Immich album.
 _Avoid_: album name, title override
 
 **Album scope**:
-The user's choice for one mapped source folder: one album for the whole source folder, or one album per folder that directly contains files.
+The user's choice for one mapped source folder: one album for the whole source folder, or one album per folder that directly contains files. Under the per-folder choice, the folder's two naming choices title the albums it makes.
 _Avoid_: album mode, album structure
 
 **Duplicate**:

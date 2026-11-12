@@ -14,7 +14,7 @@ use sync_core::engine::{Engine, EngineConfig, Limits};
 use sync_core::meter::UploadTraffic;
 use sync_core::status::{Activity, ConnectionHealth, FolderStatus, Status, StatusInputs};
 use sync_core::store::{
-    AlbumScope, FailedItem, FolderCounts, ReviewItem, SourceFolder, StateStore,
+    AlbumPath, AlbumScope, FailedItem, FolderCounts, ReviewItem, SourceFolder, StateStore,
 };
 
 use crate::connection::{
@@ -115,6 +115,10 @@ enum AlbumChange {
     Mapping(bool),
     /// Set the album scope.
     Scope(AlbumScope),
+    /// Set how each leaf folder's album is titled (#93).
+    Path(AlbumPath),
+    /// Turn the source album's title into each leaf album's prefix (#93).
+    Prefix(bool),
     /// Set the title of the folder's own album.
     Title(String),
 }
@@ -957,6 +961,17 @@ impl EngineModel {
         self.change_album(path, AlbumChange::Scope(scope), cx);
     }
 
+    /// Sets how each leaf folder's album is titled for one source folder
+    /// (#93).
+    pub fn set_album_path(&mut self, path: String, album_path: AlbumPath, cx: &mut Context<Self>) {
+        self.change_album(path, AlbumChange::Path(album_path), cx);
+    }
+
+    /// Turns the source album's title into each leaf album's prefix (#93).
+    pub fn set_album_prefix(&mut self, path: String, prefixed: bool, cx: &mut Context<Self>) {
+        self.change_album(path, AlbumChange::Prefix(prefixed), cx);
+    }
+
     /// Sets the title of one source folder's own album (#47).
     ///
     /// A blank or whitespace-only title means the folder's name. The write
@@ -986,6 +1001,8 @@ impl EngineModel {
                 match change {
                     AlbumChange::Mapping(enabled) => tracking.set_album_mapping(&path, enabled),
                     AlbumChange::Scope(scope) => tracking.set_album_scope(&path, scope),
+                    AlbumChange::Path(album_path) => tracking.set_album_path(&path, album_path),
+                    AlbumChange::Prefix(prefixed) => tracking.set_album_prefix(&path, prefixed),
                     AlbumChange::Title(title) => tracking.set_album_title(&path, &title),
                 }
                 .map_err(|error| error.to_string())?;
@@ -1170,6 +1187,8 @@ impl EngineModel {
                         recursive: folder.recursive,
                         album_mapping: folder.album_mapping,
                         album_scope: folder.album_scope,
+                        album_path: folder.album_path,
+                        album_prefix: folder.album_prefix,
                         // #47: the signed-out detail still shows the title the
                         // store holds. The row may be pending here — the desired
                         // title is stored either way, and the rename waits for

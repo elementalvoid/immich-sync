@@ -17,7 +17,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::paths::path_key;
 use crate::store::{
-    AlbumScope, FailedItem, ReviewDecision, ReviewItem, SourceFolder, StateStore, StoreError,
+    AlbumPath, AlbumScope, FailedItem, ReviewDecision, ReviewItem, SourceFolder, StateStore,
+    StoreError,
 };
 
 /// What a [`Tracking`] change does to a running engine.
@@ -155,6 +156,12 @@ impl Tracking {
                 album_scope: existing
                     .as_ref()
                     .map_or_else(AlbumScope::default, |folder| folder.album_scope),
+                // #93: a re-add is not a naming edit either, so the stored
+                // leaf choices are carried like the mapping and the scope.
+                album_path: existing
+                    .as_ref()
+                    .map_or_else(AlbumPath::default, |folder| folder.album_path),
+                album_prefix: existing.as_ref().is_none_or(|folder| folder.album_prefix),
                 // #47: a re-add is not a title edit, so the stored title is
                 // carried instead of being written away.
                 album_title: existing.and_then(|folder| folder.album_title),
@@ -206,6 +213,8 @@ impl Tracking {
             recursive = folder.recursive,
             album_mapping = folder.album_mapping,
             album_scope = folder.album_scope.as_str(),
+            album_path = folder.album_path.as_str(),
+            album_prefix = folder.album_prefix,
             "a source folder was added with its confirmed settings"
         );
         self.notify(|observer| observer.folder_added(&folder));
@@ -256,6 +265,36 @@ impl Tracking {
         scope: AlbumScope,
     ) -> Result<SourceFolder, TrackingError> {
         self.update_folder(path, |folder| folder.album_scope = scope)
+    }
+
+    /// Sets how each leaf folder's album is titled for one source folder
+    /// (#93).
+    ///
+    /// The albums that exist are renamed by the retry the write wakes, so a
+    /// failure or an offline client keeps the choice and tries again later.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::set_album_mapping`].
+    pub fn set_album_path(
+        &self,
+        path: &str,
+        album_path: AlbumPath,
+    ) -> Result<SourceFolder, TrackingError> {
+        self.update_folder(path, |folder| folder.album_path = album_path)
+    }
+
+    /// Turns the source album's title into each leaf album's prefix (#93).
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::set_album_mapping`].
+    pub fn set_album_prefix(
+        &self,
+        path: &str,
+        prefixed: bool,
+    ) -> Result<SourceFolder, TrackingError> {
+        self.update_folder(path, |folder| folder.album_prefix = prefixed)
     }
 
     /// Sets the title of one source folder's own album (#47).
@@ -371,6 +410,8 @@ impl Tracking {
             folder = %folder.path,
             album_mapping = folder.album_mapping,
             album_scope = folder.album_scope.as_str(),
+            album_path = folder.album_path.as_str(),
+            album_prefix = folder.album_prefix,
             album_title = folder.album_title.as_deref().unwrap_or(""),
             "the album settings changed"
         );

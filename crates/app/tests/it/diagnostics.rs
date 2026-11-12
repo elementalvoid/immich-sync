@@ -75,9 +75,9 @@ fn confirmation_id(confirmation: &ElementSnapshot) -> ElementId {
         .cloned()
         .expect("the confirmation registers its own id")
 }
-/// The schema stands at the twelfth migration (#47 added the album title on top
-/// of the folder times #43 and the tag backfill #46).
-const DB_MIGRATION_VERSION: i64 = 12;
+/// The schema stands at the thirteenth migration (#93 added the leaf album
+/// naming on top of the album title #47).
+const DB_MIGRATION_VERSION: i64 = 13;
 
 fn temporary_paths(dir: &Path) -> AppPaths {
     AppPaths {
@@ -371,6 +371,7 @@ fn seed_folder(store: &Entity<StoreModel>, cx: &mut App, path: &Path) {
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
             album_title: None,
+            ..Default::default()
         })
         .expect("add the source folder");
 }
@@ -926,6 +927,7 @@ async fn a_rebuild_during_the_first_open_keeps_the_stored_folders(cx: &mut TestA
                 album_mapping: false,
                 album_scope: AlbumScope::Leaf,
                 album_title: None,
+                ..Default::default()
             })
             .expect("add the source folder");
     }

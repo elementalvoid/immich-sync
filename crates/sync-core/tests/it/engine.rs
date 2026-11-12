@@ -64,6 +64,7 @@ fn add_folder(store: &StateStore, path: &Path, recursive: bool) {
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
             album_title: None,
+            ..Default::default()
         })
         .expect("add the source folder");
 }
@@ -77,6 +78,7 @@ fn add_mapped_folder(store: &StateStore, path: &Path, recursive: bool, scope: Al
             album_mapping: true,
             album_scope: scope,
             album_title: None,
+            ..Default::default()
         })
         .expect("add the mapped source folder");
 }
@@ -1377,6 +1379,7 @@ async fn adding_a_folder_through_the_engine_syncs_its_existing_files() {
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
             album_title: None,
+            ..Default::default()
         }]
     );
 
@@ -1408,6 +1411,7 @@ async fn adding_a_folder_with_confirmed_settings_writes_every_choice_once() {
         album_mapping: true,
         album_scope: AlbumScope::WholeFolder,
         album_title: None,
+        ..Default::default()
     };
 
     engine
@@ -1967,26 +1971,33 @@ async fn leaf_scope_creates_one_album_per_folder_that_contains_files() {
     assert_eq!(
         sorted_album_names(&server),
         vec![
-            "2024".to_string(),
-            "Holiday".to_string(),
             "Pictures".to_string(),
-            "Winter".to_string()
+            "Pictures/Holiday".to_string(),
+            "Pictures/Winter".to_string(),
+            "Pictures/Winter/2024".to_string()
         ],
-        "R3.4: leaf scope makes one album per folder that directly contains files"
+        "R3.4, #93: leaf scope makes one album per folder that directly contains files, \
+         named after its path"
     );
     for file in &files {
         let album = server
             .album_for_asset(&asset_id_of(&store, file))
             .expect("every uploaded asset joined an album");
-        let folder = file
-            .parent()
-            .and_then(|parent| parent.file_name())
-            .expect("the fixture has a folder")
-            .to_str()
-            .expect("the fixture name is UTF-8");
+        let holder = file.parent().expect("the fixture has a folder");
+        let expected = if holder == photos.as_path() {
+            "Pictures".to_string()
+        } else {
+            let relative = holder
+                .strip_prefix(&photos)
+                .expect("the fixture is under the source folder")
+                .display()
+                .to_string()
+                .replace('\\', "/");
+            format!("Pictures/{relative}")
+        };
         assert_eq!(
             album,
-            folder,
+            expected,
             "{} joined the album of the folder that holds it",
             file.display()
         );
@@ -2077,21 +2088,27 @@ async fn two_leaf_folders_with_the_same_name_are_two_albums() {
     // held both could never be split again.
     assert_eq!(
         sorted_album_names(&server),
-        vec!["Holiday".to_string(), "Holiday".to_string()],
-        "GLOSSARY: one album per folder that directly contains files"
+        vec![
+            "Pictures/2023/Holiday".to_string(),
+            "Pictures/2024/Holiday".to_string()
+        ],
+        "#93: two leaves with one name carry different paths"
     );
     assert_eq!(
         server.create_album_requests(),
         2,
         "each folder gets its own album, so two folders share nothing"
     );
-    for file in [&in_2023, &in_2024] {
+    for (file, expected) in [
+        (&in_2023, "Pictures/2023/Holiday"),
+        (&in_2024, "Pictures/2024/Holiday"),
+    ] {
         assert_eq!(
             server
                 .album_for_asset(&asset_id_of(&store, file))
                 .as_deref(),
-            Some("Holiday"),
-            "{} joined an album named after its folder",
+            Some(expected),
+            "{} joined an album named after its path",
             file.display()
         );
     }
@@ -2683,7 +2700,7 @@ async fn a_duplicate_the_server_already_has_joins_the_album_too() {
     );
     assert_eq!(
         server.album_for_asset(&existing.asset_id).as_deref(),
-        Some("Holiday"),
+        Some("Pictures/Holiday"),
         "R3.4: a duplicate that is missing from the album is added to it"
     );
     engine.stop();
@@ -2870,7 +2887,7 @@ async fn the_same_content_twice_in_one_folder_keeps_one_membership() {
 
     assert_eq!(
         sorted_album_names(&server),
-        vec!["Holiday".to_string()],
+        vec!["Pictures/Holiday".to_string()],
         "one folder, one album"
     );
     assert_eq!(
@@ -2885,7 +2902,7 @@ async fn the_same_content_twice_in_one_folder_keeps_one_membership() {
     );
     assert_eq!(
         server.album_for_asset(&asset_id_of(&store, &second)),
-        Some("Holiday".to_string())
+        Some("Pictures/Holiday".to_string())
     );
     engine.stop();
 }

@@ -7,7 +7,7 @@
 
 use crate::connection::ConnectionState;
 use crate::meter::UploadTraffic;
-use crate::store::{AlbumScope, FolderCounts};
+use crate::store::{AlbumPath, AlbumScope, FolderCounts};
 
 /// The activity state the tray and the dashboard show (R8.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,7 +58,7 @@ impl AlbumRename {
 }
 
 /// The live state of one source folder (R2.5, R8.1).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FolderStatus {
     /// The folder path the user chose.
     pub path: String,
@@ -68,6 +68,11 @@ pub struct FolderStatus {
     pub album_mapping: bool,
     /// What the folder maps to once album mapping is on (R3.4).
     pub album_scope: AlbumScope,
+    /// How each leaf folder's album is titled under the leaf scope (#93).
+    pub album_path: AlbumPath,
+    /// Whether a leaf album's title starts with this folder's album title
+    /// (#93).
+    pub album_prefix: bool,
     /// The title the user chose for this folder's own album, or `None` when the
     /// album takes the folder's name (#47).
     pub album_title: Option<String>,

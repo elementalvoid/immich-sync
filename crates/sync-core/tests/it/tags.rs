@@ -56,6 +56,7 @@ fn add_folder(store: &StateStore, path: &Path) {
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
             album_title: None,
+            ..Default::default()
         })
         .expect("add the source folder");
 }

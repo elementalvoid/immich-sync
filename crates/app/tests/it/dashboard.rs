@@ -227,6 +227,7 @@ fn folder_progress_survives_counts_above_a_u16() {
             last_scan_ns: None,
             last_upload_ns: None,
             uploads: sync_core::meter::UploadTraffic::default(),
+            ..FolderStatus::default()
         }],
         counts,
         last_error: None,
@@ -590,6 +591,7 @@ async fn a_notice_clears_when_the_folder_arrives(cx: &mut TestAppContext) {
         album_mapping: false,
         album_scope: sync_core::store::AlbumScope::Leaf,
         album_title: None,
+        ..Default::default()
     };
     cx.update(|cx| {
         store
@@ -645,6 +647,7 @@ async fn a_satisfied_notice_does_not_come_back(cx: &mut TestAppContext) {
         album_mapping: false,
         album_scope: sync_core::store::AlbumScope::Leaf,
         album_title: None,
+        ..Default::default()
     };
     let path = folder.path.clone();
     cx.update(|cx| {
@@ -707,6 +710,7 @@ async fn a_signed_out_click_says_it_cannot_connect(cx: &mut TestAppContext) {
         album_mapping: false,
         album_scope: sync_core::store::AlbumScope::Leaf,
         album_title: None,
+        ..Default::default()
     };
     cx.update(|cx| {
         store
@@ -878,6 +882,7 @@ fn engine_status_maps_to_the_global_card_and_one_card_per_folder() {
                 last_scan_ns: Some(1_700_000_000_000_000_000),
                 last_upload_ns: Some(1_700_000_001_000_000_000),
                 uploads: sync_core::meter::UploadTraffic::default(),
+                ..FolderStatus::default()
             },
             FolderStatus {
                 path: "/mnt/unplugged".to_string(),
@@ -892,6 +897,7 @@ fn engine_status_maps_to_the_global_card_and_one_card_per_folder() {
                 last_scan_ns: None,
                 last_upload_ns: None,
                 uploads: sync_core::meter::UploadTraffic::default(),
+                ..FolderStatus::default()
             },
         ],
         counts: FolderCounts {
@@ -1013,6 +1019,7 @@ async fn the_add_control_and_the_detail_remove_reach_the_store(cx: &mut TestAppC
             album_mapping: false,
             album_scope: sync_core::store::AlbumScope::Leaf,
             album_title: None,
+            ..Default::default()
         }],
         "R2.1: the add control persisted the folder"
     );
@@ -1497,6 +1504,22 @@ async fn enter_opens_the_setup_dialog_without_writing_anything(cx: &mut TestAppC
             Some(true),
             "Album scope defaults to one album per folder"
         );
+        // #93: a new folder names each album after its folder path, with the
+        // source album's title in front.
+        assert_eq!(
+            window.find("folder-panel-album-path").selected(),
+            Some(true),
+            "Album names default to the folder path"
+        );
+        assert_eq!(
+            window.find("folder-panel-album-name").selected(),
+            Some(false)
+        );
+        assert_eq!(
+            window.find("folder-panel-album-prefix").checked(),
+            Some(true),
+            "the source album's title starts each name by default"
+        );
     })
     .expect("open the setup dialog");
 
@@ -1507,7 +1530,7 @@ async fn enter_opens_the_setup_dialog_without_writing_anything(cx: &mut TestAppC
 }
 
 #[gpui_kit::test]
-async fn add_writes_the_path_and_all_three_settings_in_one_request(cx: &mut TestAppContext) {
+async fn add_writes_the_path_and_every_setting_in_one_request(cx: &mut TestAppContext) {
     cx.executor().allow_parking();
     let temp = tempfile::tempdir().expect("create a temp dir");
     let photos = temp.path().join("photos");
@@ -1524,11 +1547,24 @@ async fn add_writes_the_path_and_all_three_settings_in_one_request(cx: &mut Test
         window.render_frame(cx);
         window.click("folder-panel-album-whole", cx);
         window.render_frame(cx);
+        window.click("folder-panel-album-name", cx);
+        window.render_frame(cx);
+        window.click("folder-panel-album-prefix", cx);
+        window.render_frame(cx);
         assert_eq!(window.find("folder-panel-recursive").checked(), Some(false));
         assert_eq!(window.find("folder-panel-album").checked(), Some(true));
         assert_eq!(
             window.find("folder-panel-album-whole").selected(),
             Some(true)
+        );
+        assert_eq!(
+            window.find("folder-panel-album-name").selected(),
+            Some(true),
+            "#93: the folder name is the other choice"
+        );
+        assert_eq!(
+            window.find("folder-panel-album-prefix").checked(),
+            Some(false)
         );
         add_in_setup(window, cx);
     })
@@ -1542,9 +1578,11 @@ async fn add_writes_the_path_and_all_three_settings_in_one_request(cx: &mut Test
             recursive: false,
             album_mapping: true,
             album_scope: sync_core::store::AlbumScope::WholeFolder,
+            album_path: sync_core::store::AlbumPath::LeafName,
+            album_prefix: false,
             album_title: None,
         },
-        "#40: one write records the path and all three settings"
+        "#40, #93: one write records the path and every setting"
     );
 
     // R8.1: the card appears with the values the user chose, and the dialog
@@ -1606,6 +1644,28 @@ async fn the_setup_dialog_gives_each_setting_its_own_row(cx: &mut TestAppContext
         assert!(
             (leaf.left() - whole.left()).abs() <= px(0.5),
             "#57: the scopes line up as one control block: {leaf:?} vs {whole:?}"
+        );
+        // #93: the naming choices take their own rows and stay inside the
+        // dialog like the controls above them.
+        let path_row = window.find("folder-panel-album-path").bounds();
+        let name_row = window.find("folder-panel-album-name").bounds();
+        let prefix = window.find("folder-panel-album-prefix").bounds();
+        assert!(
+            leaf.bottom() <= path_row.top().min(name_row.top()),
+            "#93: Album names gets its own row: {leaf:?} vs {path_row:?}"
+        );
+        assert!(
+            path_row.bottom() <= name_row.top(),
+            "#93: the two name choices sit together: {path_row:?} vs {name_row:?}"
+        );
+        assert!(
+            name_row.bottom() <= prefix.top(),
+            "#93: the prefix control gets its own row: {name_row:?} vs {prefix:?}"
+        );
+        let panel = window.find("folder-panel").bounds();
+        assert!(
+            prefix.right() <= panel.right(),
+            "#93: the naming controls stay inside the dialog: {prefix:?} in {panel:?}"
         );
     })
     .expect("read the setup dialog layout");
@@ -1848,6 +1908,7 @@ async fn adding_a_tracked_folder_says_already_added_and_changes_nothing(cx: &mut
         album_mapping: true,
         album_scope: sync_core::store::AlbumScope::WholeFolder,
         album_title: None,
+        ..Default::default()
     };
     let paths = immich_sync::paths::AppPaths {
         config_file: temp.path().join("config").join("settings.toml"),
@@ -1910,6 +1971,18 @@ async fn the_setup_dialog_names_its_controls_and_traps_focus(cx: &mut TestAppCon
         assert_eq!(
             window.find("folder-panel-album-whole").label(),
             Some("Album scope for this folder: one album for this folder")
+        );
+        assert_eq!(
+            window.find("folder-panel-album-path").label(),
+            Some("Album names for this folder: after its folder path")
+        );
+        assert_eq!(
+            window.find("folder-panel-album-name").label(),
+            Some("Album names for this folder: after its folder")
+        );
+        assert_eq!(
+            window.find("folder-panel-album-prefix").label(),
+            Some("Start each album's name with this folder's album name")
         );
         assert_eq!(
             window.find("folder-panel-cancel").label(),

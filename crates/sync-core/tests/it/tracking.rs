@@ -105,6 +105,7 @@ fn an_insert_writes_the_confirmed_settings_and_tells_the_observer() {
         album_mapping: true,
         album_scope: AlbumScope::WholeFolder,
         album_title: None,
+        ..Default::default()
     };
 
     // #40: the setup panel's one write records the path and all three
@@ -141,6 +142,7 @@ fn an_insert_refuses_a_folder_the_client_already_holds() {
         album_mapping: false,
         album_scope: AlbumScope::Leaf,
         album_title: None,
+        ..Default::default()
     });
 
     assert!(

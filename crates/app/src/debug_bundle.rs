@@ -814,6 +814,7 @@ log_level = \"debug\"
                 album_mapping: true,
                 album_scope: AlbumScope::WholeFolder,
                 album_title: None,
+                ..Default::default()
             })
             .expect("add the source folder");
         let uploaded = item("/photos/IMG_0001.jpg", 2048, ItemState::Uploaded);
@@ -904,9 +905,9 @@ log_level = \"debug\"
             std::env::consts::OS,
             std::env::consts::ARCH,
             "v3.3.1",
-            // The latest migration the state database stands at (V12: the
-            // album title #47 added on top of the folder times #43).
-            "Schema version (PRAGMA user_version): 12",
+            // The latest migration the state database stands at (V13: the
+            // leaf album naming #93 added on top of the album title #47).
+            "Schema version (PRAGMA user_version): 13",
         ] {
             assert!(
                 versions.contains(expected),

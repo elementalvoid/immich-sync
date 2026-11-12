@@ -102,6 +102,7 @@ fn seed(paths: &AppPaths, root: &Path) {
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
             album_title: None,
+            ..Default::default()
         })
         .expect("add the source folder");
     for index in 0..SEEDED_ROWS {

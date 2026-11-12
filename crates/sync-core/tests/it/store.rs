@@ -339,6 +339,7 @@ fn source_folders_persist_with_their_recursive_flag() {
             album_mapping: false,
             album_scope: AlbumScope::default(),
             album_title: None,
+            ..Default::default()
         })
         .expect("add the folder");
     store
@@ -348,6 +349,7 @@ fn source_folders_persist_with_their_recursive_flag() {
             album_mapping: false,
             album_scope: AlbumScope::default(),
             album_title: None,
+            ..Default::default()
         })
         .expect("re-adding updates the flag");
 
@@ -359,6 +361,7 @@ fn source_folders_persist_with_their_recursive_flag() {
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
             album_title: None,
+            ..Default::default()
         }],
         "R3.4: album mapping is off until the user opts in, and the scope defaults to leaf"
     );
@@ -383,6 +386,7 @@ fn a_re_added_folder_keeps_the_album_mapping_the_user_chose() {
         album_mapping: true,
         album_scope: AlbumScope::WholeFolder,
         album_title: None,
+        ..Default::default()
     };
     store.add_folder(&mapped).expect("add the mapped folder");
     store
@@ -416,6 +420,7 @@ fn inserting_a_new_folder_writes_every_setting() {
         album_mapping: true,
         album_scope: AlbumScope::WholeFolder,
         album_title: None,
+        ..Default::default()
     };
 
     assert!(
@@ -443,6 +448,7 @@ fn inserting_a_tracked_folder_changes_nothing() {
         album_mapping: true,
         album_scope: AlbumScope::WholeFolder,
         album_title: None,
+        ..Default::default()
     };
     store
         .add_folder(&original)
@@ -482,6 +488,7 @@ fn inserting_a_tracked_folder_keeps_its_album_title() {
         album_mapping: true,
         album_scope: AlbumScope::WholeFolder,
         album_title: Some("Holiday 2024".to_string()),
+        ..Default::default()
     };
     store
         .add_folder(&original)
@@ -607,6 +614,7 @@ fn an_album_title_is_stored_before_the_album_exists() {
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
             album_title: None,
+            ..Default::default()
         })
         .expect("add the source folder");
     store
@@ -638,6 +646,7 @@ fn an_album_title_is_stored_before_the_album_exists() {
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
             album_title: Some("Holiday 2024".to_string()),
+            ..Default::default()
         })
         .expect("toggle the folder");
     assert!(
@@ -1053,6 +1062,7 @@ fn folder_counts_bucket_the_states() {
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
             album_title: None,
+            ..Default::default()
         }])
         .expect("read the counts");
     assert_eq!(counts.len(), 1, "one card per folder");
@@ -1099,6 +1109,7 @@ fn nested_folders_each_own_their_rows_once() {
                 album_mapping: false,
                 album_scope: AlbumScope::Leaf,
                 album_title: None,
+                ..Default::default()
             })
             .expect("add the source folder");
     }
@@ -1644,8 +1655,8 @@ fn the_sqlite_info_reports_the_schema_the_size_and_the_table_counts() {
 
     let empty = store.sqlite_info().expect("read the sqlite info");
     assert_eq!(
-        empty.migration_version, 12,
-        "the schema stands at the twelfth migration (#47 added the album title)"
+        empty.migration_version, 13,
+        "the schema stands at the thirteenth migration (#93 added the leaf naming)"
     );
     assert!(empty.size_bytes > 0, "a migrated database occupies pages");
     assert_eq!(empty.integrity, "ok", "a fresh database is sound");
@@ -1672,6 +1683,7 @@ fn the_sqlite_info_reports_the_schema_the_size_and_the_table_counts() {
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
             album_title: None,
+            ..Default::default()
         })
         .expect("add the folder");
 
@@ -1708,6 +1720,7 @@ fn the_sizing_reports_the_tracked_bytes_and_the_state_counts() {
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
             album_title: None,
+            ..Default::default()
         })
         .expect("add the source folder");
 
@@ -1832,6 +1845,7 @@ fn a_reset_empties_every_state_table_and_leaves_the_database_sound() {
             album_mapping: true,
             album_scope: AlbumScope::Leaf,
             album_title: None,
+            ..Default::default()
         })
         .expect("add the folder");
 

@@ -9,7 +9,7 @@ use std::path::Path;
 use crate::diagnostics::format_rate;
 use sync_core::meter::UploadTraffic;
 use sync_core::status::{Activity, AlbumRename, Status};
-use sync_core::store::{AlbumScope, FolderCounts};
+use sync_core::store::{AlbumPath, AlbumScope, FolderCounts};
 
 /// The activity state of the client or one source folder (SPEC R8.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -63,6 +63,11 @@ pub struct StatusCard {
     pub album_mapping: bool,
     /// The album scope for this folder (R3.4).
     pub album_scope: AlbumScope,
+    /// How each leaf folder's album is titled under the leaf scope (#93).
+    pub album_path: AlbumPath,
+    /// Whether a leaf album's title starts with this folder's album title
+    /// (#93).
+    pub album_prefix: bool,
     /// The title the user chose for this folder's own album, or `None` when the
     /// album takes the folder's name (#47). Always `None` on the global card.
     pub album_title: Option<String>,
@@ -159,6 +164,15 @@ impl StatusCard {
                 ];
                 if self.album_mapping {
                     lines.push(format!("Album scope: {}", self.album_scope.label()));
+                    // #93: the leaf titles are only in force under the leaf
+                    // scope, and a whole-folder album has no leaves.
+                    if self.album_scope == AlbumScope::Leaf {
+                        lines.push(format!("Album names: {}", self.album_path.label()));
+                        lines.push(format!(
+                            "Start each album's name with this folder's album name: {}",
+                            if self.album_prefix { "on" } else { "off" }
+                        ));
+                    }
                 }
                 lines
             }),
@@ -284,6 +298,8 @@ impl DashboardModel {
             recursive: false,
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
+            album_path: AlbumPath::Relative,
+            album_prefix: true,
             album_title: None,
             album_rename: None,
         };
@@ -317,6 +333,8 @@ impl DashboardModel {
                 recursive: folder.recursive,
                 album_mapping: folder.album_mapping,
                 album_scope: folder.album_scope,
+                album_path: folder.album_path,
+                album_prefix: folder.album_prefix,
                 album_title: folder.album_title.clone(),
                 album_rename: folder.album_rename.clone(),
             })
@@ -368,6 +386,8 @@ pub fn sample() -> DashboardModel {
             recursive: false,
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
+            album_path: AlbumPath::Relative,
+            album_prefix: true,
             album_title: None,
             album_rename: None,
         },
@@ -396,6 +416,8 @@ pub fn sample() -> DashboardModel {
                 recursive: true,
                 album_mapping: true,
                 album_scope: AlbumScope::WholeFolder,
+                album_path: AlbumPath::Relative,
+                album_prefix: true,
                 album_title: None,
                 album_rename: None,
             },
@@ -419,6 +441,8 @@ pub fn sample() -> DashboardModel {
                 recursive: true,
                 album_mapping: true,
                 album_scope: AlbumScope::Leaf,
+                album_path: AlbumPath::Relative,
+                album_prefix: true,
                 album_title: None,
                 album_rename: None,
             },
@@ -444,6 +468,8 @@ pub fn sample() -> DashboardModel {
                 recursive: false,
                 album_mapping: true,
                 album_scope: AlbumScope::WholeFolder,
+                album_path: AlbumPath::Relative,
+                album_prefix: true,
                 album_title: None,
                 album_rename: None,
             },
@@ -467,6 +493,8 @@ pub fn sample() -> DashboardModel {
                 recursive: true,
                 album_mapping: false,
                 album_scope: AlbumScope::Leaf,
+                album_path: AlbumPath::Relative,
+                album_prefix: true,
                 album_title: None,
                 album_rename: None,
             },
@@ -480,7 +508,7 @@ mod tests {
     use crate::times;
     use sync_core::meter::UploadTraffic;
     use sync_core::status::{Activity, FolderStatus, Status};
-    use sync_core::store::FolderCounts;
+    use sync_core::store::{AlbumPath, FolderCounts};
 
     /// One status with a folder per scan time, so a test reads the newest of
     /// several folder values.
@@ -495,6 +523,8 @@ mod tests {
                     recursive: true,
                     album_mapping: false,
                     album_scope: sync_core::store::AlbumScope::Leaf,
+                    album_path: AlbumPath::Relative,
+                    album_prefix: true,
                     album_title: None,
                     album_rename: None,
                     available: true,

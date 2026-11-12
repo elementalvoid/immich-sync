@@ -85,6 +85,7 @@ fn seed_failed(paths: &AppPaths, root: &Path, names: &[&str]) {
             album_mapping: false,
             album_scope: sync_core::store::AlbumScope::Leaf,
             album_title: None,
+            ..Default::default()
         })
         .expect("add the source folder");
     for name in names {
@@ -294,6 +295,7 @@ async fn a_resume_during_engine_startup_leaves_uploads_flowing(cx: &mut TestAppC
             album_mapping: false,
             album_scope: sync_core::store::AlbumScope::Leaf,
             album_title: None,
+            ..Default::default()
         })
         .expect("add the source folder");
 
@@ -371,6 +373,7 @@ async fn a_superseded_engine_start_leaves_exactly_one_engine_watching(cx: &mut T
             album_mapping: false,
             album_scope: sync_core::store::AlbumScope::Leaf,
             album_title: None,
+            ..Default::default()
         })
         .expect("add the source folder");
 
@@ -508,6 +511,7 @@ async fn a_form_sign_in_resumes_the_engine_a_refused_session_stalled(cx: &mut Te
             album_mapping: false,
             album_scope: sync_core::store::AlbumScope::Leaf,
             album_title: None,
+            ..Default::default()
         })
         .expect("add the source folder");
 
@@ -680,6 +684,7 @@ async fn the_first_attention_transition_raises_one_notification(cx: &mut TestApp
             album_mapping: false,
             album_scope: sync_core::store::AlbumScope::Leaf,
             album_title: None,
+            ..Default::default()
         })
         .expect("add the source folder");
     drop(store);
@@ -756,6 +761,7 @@ async fn a_folder_error_with_zero_parked_items_raises_one_attention_notification
             album_mapping: true,
             album_scope: sync_core::store::AlbumScope::Leaf,
             album_title: None,
+            ..Default::default()
         })
         .expect("add the source folder");
     // The album call is refused, but the upload still lands, so nothing is
@@ -989,6 +995,7 @@ async fn a_re_login_resumes_the_batch_a_refused_connection_left_pending(cx: &mut
             album_mapping: false,
             album_scope: sync_core::store::AlbumScope::Leaf,
             album_title: None,
+            ..Default::default()
         })
         .expect("add the source folder");
 
@@ -1085,6 +1092,7 @@ async fn a_signed_out_re_add_of_a_mapped_folder_keeps_its_album_settings(cx: &mu
             album_mapping: true,
             album_scope: sync_core::store::AlbumScope::WholeFolder,
             album_title: None,
+            ..Default::default()
         })
         .expect("seed the mapped folder");
 
@@ -1138,6 +1146,7 @@ async fn a_re_spelled_re_add_keeps_the_cached_counts(cx: &mut TestAppContext) {
                 album_mapping: false,
                 album_scope: sync_core::store::AlbumScope::Leaf,
                 album_title: None,
+                ..Default::default()
             })
             .expect("seed the folder");
         store
@@ -1228,6 +1237,7 @@ async fn adding_a_nested_outer_folder_moves_the_rows_to_its_card(cx: &mut TestAp
                 album_mapping: false,
                 album_scope: sync_core::store::AlbumScope::Leaf,
                 album_title: None,
+                ..Default::default()
             })
             .expect("seed the nested folder");
         for (name, state) in [
@@ -1338,6 +1348,7 @@ async fn an_album_edit_keeps_the_counts_an_add_asked_for(cx: &mut TestAppContext
         album_mapping: false,
         album_scope: sync_core::store::AlbumScope::Leaf,
         album_title: None,
+        ..Default::default()
     };
     let mut mapped = folder.clone();
     mapped.album_mapping = true;
@@ -1376,6 +1387,7 @@ async fn an_album_edit_keeps_the_refresh_a_review_decision_asked_for(cx: &mut Te
                 album_mapping: false,
                 album_scope: sync_core::store::AlbumScope::Leaf,
                 album_title: None,
+                ..Default::default()
             })
             .expect("seed the folder");
         for name in ["keep.jpg", "other.jpg"] {
@@ -1440,6 +1452,7 @@ async fn a_signed_out_client_shows_idle_not_attention(cx: &mut TestAppContext) {
                 album_mapping: false,
                 album_scope: sync_core::store::AlbumScope::Leaf,
                 album_title: None,
+                ..Default::default()
             })
             .expect("seed the folder");
     }
@@ -1506,6 +1519,7 @@ async fn a_confirmed_folder_add_scans_the_folder_through_the_running_engine(
         album_mapping: true,
         album_scope: sync_core::store::AlbumScope::WholeFolder,
         album_title: None,
+        ..Default::default()
     };
     let request = cx.update(|cx| {
         engine.update(cx, |model, cx| {
@@ -1609,6 +1623,7 @@ async fn an_add_before_the_store_opens_reports_that_reason(cx: &mut TestAppConte
         album_mapping: false,
         album_scope: sync_core::store::AlbumScope::Leaf,
         album_title: None,
+        ..Default::default()
     };
     cx.update(|cx| {
         engine.update(cx, |model, cx| {
@@ -1732,6 +1747,7 @@ async fn a_click_on_a_running_engine_starts_a_scan(cx: &mut TestAppContext) {
                 album_mapping: false,
                 album_scope: sync_core::store::AlbumScope::Leaf,
                 album_title: None,
+                ..Default::default()
             })
             .expect("seed the folder");
         // The file is gone, so the pass hashes every same-size candidate while
@@ -1813,6 +1829,7 @@ async fn a_signed_out_click_reports_the_missing_connection(cx: &mut TestAppConte
                 album_mapping: false,
                 album_scope: sync_core::store::AlbumScope::Leaf,
                 album_title: None,
+                ..Default::default()
             })
             .expect("seed the folder");
     }
@@ -1977,6 +1994,7 @@ async fn a_click_during_a_rebuild_reports_the_rebuild(cx: &mut TestAppContext) {
                 album_mapping: false,
                 album_scope: sync_core::store::AlbumScope::Leaf,
                 album_title: None,
+                ..Default::default()
             })
             .expect("seed the folder");
     }

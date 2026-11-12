@@ -29,7 +29,8 @@ use sync_core::failure::FailureClass;
 use sync_core::hash::Sha1;
 use sync_core::status::{Activity, FolderStatus, Status};
 use sync_core::store::{
-    AlbumScope, FolderCounts, ItemRecord, ItemState, NewVersion, SourceFolder, StateStore,
+    AlbumPath, AlbumScope, FolderCounts, ItemRecord, ItemState, NewVersion, SourceFolder,
+    StateStore,
 };
 
 /// The path layout the other app tests use, so the view gets a temp database.
@@ -66,6 +67,7 @@ fn seed_folder(paths: &AppPaths, path: &Path, recursive: bool) -> SourceFolder {
         album_mapping: false,
         album_scope: AlbumScope::Leaf,
         album_title: None,
+        ..Default::default()
     };
     store.add_folder(&folder).expect("add the source folder");
     folder
@@ -464,6 +466,18 @@ async fn the_detail_shows_the_live_fields_and_writes_every_setting(cx: &mut Test
                 "folder-panel-album-whole",
                 "Album scope for photos: one album for this folder",
             ),
+            (
+                "folder-panel-album-path",
+                "Album names for photos: after its folder path",
+            ),
+            (
+                "folder-panel-album-name",
+                "Album names for photos: after its folder",
+            ),
+            (
+                "folder-panel-album-prefix",
+                "Start each album's name with this folder's album name",
+            ),
             ("folder-detail-close", "Close the folder detail"),
             ("folder-detail-failed", "View 1 failed items in photos"),
             ("folder-detail-review", "View 1 missing files in photos"),
@@ -568,6 +582,33 @@ async fn the_detail_gives_each_setting_its_own_row(cx: &mut TestAppContext) {
         assert!(
             (leaf.left() - whole.left()).abs() <= px(0.5),
             "#57: the scopes line up as one control block: {leaf:?} vs {whole:?}"
+        );
+        // #93: the two album-name choices and the prefix control take their
+        // own rows below the scope, and the long prefix sentence stays inside
+        // the dialog instead of overhanging it.
+        let path_row = window.find("folder-panel-album-path").bounds();
+        let name_row = window.find("folder-panel-album-name").bounds();
+        let prefix = window.find("folder-panel-album-prefix").bounds();
+        assert!(
+            leaf.bottom() <= path_row.top().min(name_row.top()),
+            "#93: Album names gets its own row: {leaf:?} vs {path_row:?}"
+        );
+        assert!(
+            path_row.bottom() <= name_row.top(),
+            "#93: the two name choices sit together: {path_row:?} vs {name_row:?}"
+        );
+        assert!(
+            name_row.bottom() <= prefix.top(),
+            "#93: the prefix control gets its own row: {name_row:?} vs {prefix:?}"
+        );
+        assert!(
+            (path_row.left() - name_row.left()).abs() <= px(0.5),
+            "#93: the name choices line up as one block: {path_row:?} vs {name_row:?}"
+        );
+        let panel = window.find("folder-panel").bounds();
+        assert!(
+            prefix.right() <= panel.right() && path_row.right() <= panel.right(),
+            "#93: the naming controls stay inside the dialog: {prefix:?} in {panel:?}"
         );
     });
 }
@@ -674,6 +715,9 @@ async fn the_detail_traps_focus_and_every_control_is_keyboard_reachable(cx: &mut
             "folder-panel-album",
             "folder-panel-album-leaf",
             "folder-panel-album-whole",
+            "folder-panel-album-path",
+            "folder-panel-album-name",
+            "folder-panel-album-prefix",
             "folder-detail-open",
             "folder-detail-failed",
             "folder-detail-review",
@@ -1898,6 +1942,7 @@ fn a_folder_status_carries_its_times_into_the_detail_card() {
             last_scan_ns: Some(1_700_000_000_000_000_000),
             last_upload_ns: Some(1_700_000_001_000_000_000),
             uploads: sync_core::meter::UploadTraffic::default(),
+            ..FolderStatus::default()
         }],
         counts: FolderCounts::default(),
         last_error: None,
@@ -2494,4 +2539,136 @@ async fn the_detail_shows_the_album_title_and_saves_a_new_one(cx: &mut TestAppCo
         None,
         "#47: a cleared title means the folder's name"
     );
+}
+
+/// #93: the two leaf naming choices are named, start on the new folder's
+/// defaults, write immediately in the detail, and reach the card's settings
+/// line in the same words.
+#[gpui_kit::test]
+async fn the_album_naming_choices_are_named_written_and_stated(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+    seed_folder(&paths, &photos, true);
+    let (window, store, _view) = open_dashboard(cx, &paths);
+    wait_for_store(cx, &store).await;
+
+    open_detail_now(cx, window);
+    read(cx, window, |window, _| {
+        assert_eq!(
+            window.find("folder-panel-album-path").selected(),
+            Some(true),
+            "#93: a folder starts on the folder path"
+        );
+        assert_eq!(
+            window.find("folder-panel-album-name").selected(),
+            Some(false),
+            "the folder name is the other choice"
+        );
+        assert_eq!(
+            window.find("folder-panel-album-prefix").checked(),
+            Some(true),
+            "#93: the source album's title starts each name"
+        );
+        assert_eq!(
+            label(window, "folder-panel-album-path"),
+            "Album names for photos: after its folder path"
+        );
+        assert_eq!(
+            label(window, "folder-panel-album-prefix"),
+            "Start each album's name with this folder's album name"
+        );
+    });
+
+    // The mapping has to be on for the card to state the choices.
+    act(cx, window, |window, cx| {
+        window.click("folder-panel-album", cx);
+    });
+    wait_for_folder(cx, &store, |folder| folder.album_mapping).await;
+
+    act(cx, window, |window, cx| {
+        window.click("folder-panel-album-name", cx);
+    });
+    let named = wait_for_folder(cx, &store, |folder| {
+        folder.album_path == AlbumPath::LeafName
+    })
+    .await;
+    assert!(named.album_prefix, "the other choice did not move");
+
+    act(cx, window, |window, cx| {
+        window.click("folder-panel-album-prefix", cx);
+    });
+    let plain = wait_for_folder(cx, &store, |folder| !folder.album_prefix).await;
+    assert_eq!(plain.album_path, AlbumPath::LeafName);
+
+    // The card states both choices once the dialog closes (#57, #93).
+    act(cx, window, |window, cx| window.press("escape", cx));
+    read(cx, window, |window, _| {
+        assert!(!detail_open(window));
+        assert_eq!(
+            card_settings(window, 0),
+            "Recursive: on · Album mapping: on · Album scope: One album per folder · \
+             Album names: Name each album after its folder · \
+             Start each album's name with this folder's album name: off"
+        );
+    });
+}
+
+/// #93: the naming controls fit the shell's narrowest window, where the scope
+/// and naming sentences are longest (#81's 520x480 floor).
+#[gpui_kit::test]
+async fn the_album_naming_controls_fit_the_narrowest_window(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+    seed_folder(&paths, &photos, true);
+    let (window, store, _view) = open_dashboard_at(cx, &paths, "", window_options_of(520., 480.));
+    wait_for_store(cx, &store).await;
+
+    open_detail_now(cx, window);
+    // The body already scrolls at this height for the controls above these, so
+    // the fit is asserted where the rows lie: no shrink, no overhang. The
+    // scroll that follows proves they are reachable, not that they fit.
+    read(cx, window, |window, _| {
+        let panel = window.find("folder-panel").bounds();
+        for id in [
+            "folder-panel-album-path",
+            "folder-panel-album-name",
+            "folder-panel-album-prefix",
+        ] {
+            let found = window
+                .try_find(id)
+                .unwrap_or_else(|| panic!("{id} is shown"));
+            let bounds = found.bounds();
+            assert!(
+                bounds.left() >= panel.left() && bounds.right() <= panel.right(),
+                "{id} stays inside the dialog at 520 wide: {bounds:?} in {panel:?}"
+            );
+        }
+    });
+    act(cx, window, |window, cx| {
+        for _ in 0..4 {
+            window.scroll(
+                "folder-detail-body-dim",
+                ScrollDelta::Pixels(point(px(0.), px(-160.))),
+                cx,
+            );
+        }
+    });
+    read(cx, window, |window, _| {
+        for id in [
+            "folder-panel-album-path",
+            "folder-panel-album-name",
+            "folder-panel-album-prefix",
+        ] {
+            assert!(
+                window.find(id).visible(),
+                "#93: {id} is reachable on a short window"
+            );
+        }
+    });
 }

@@ -494,6 +494,7 @@ mod tests {
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
             album_title: None,
+            ..Default::default()
         }
     }
 

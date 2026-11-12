@@ -101,6 +101,7 @@ fn seed(paths: &AppPaths, root: &Path, names: &[&str]) {
             album_mapping: false,
             album_scope: sync_core::store::AlbumScope::Leaf,
             album_title: None,
+            ..Default::default()
         })
         .expect("add the source folder");
     for name in names {
@@ -568,6 +569,7 @@ fn seed_folder(paths: &AppPaths, root: &Path) {
             album_mapping: false,
             album_scope: sync_core::store::AlbumScope::Leaf,
             album_title: None,
+            ..Default::default()
         })
         .expect("add the source folder");
 }

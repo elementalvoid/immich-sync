@@ -216,6 +216,7 @@ mod tests {
             last_scan_ns: None,
             last_upload_ns: None,
             uploads: UploadTraffic::default(),
+            ..FolderStatus::default()
         });
         status
     }

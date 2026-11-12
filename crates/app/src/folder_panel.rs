@@ -32,13 +32,13 @@ use gpui_kit::component::progress::Progress;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use sync_core::meter::UploadTraffic;
-use sync_core::store::{AlbumScope, FolderAsset, SourceFolder, StoreError};
+use sync_core::store::{AlbumPath, AlbumScope, FolderAsset, SourceFolder, StoreError};
 
 use crate::asset_link::{self, LinkOpener};
 use crate::dashboard::{CardPalette, state_tag};
 use crate::diagnostics::format_bytes;
 use crate::engine::EngineModel;
-use crate::folder_controls::{SettingsControls, SettingsIds, SettingsValues};
+use crate::folder_controls::{SettingsControls, SettingsHandlers, SettingsIds, SettingsValues};
 use crate::notice::{Notice, Severity};
 use crate::shell::ViewMode;
 use crate::status::{ActivityState, StatusCard, folder_name};
@@ -340,6 +340,7 @@ impl FolderPanel {
                 album_mapping: false,
                 album_scope: AlbumScope::Leaf,
                 album_title: None,
+                ..Default::default()
             },
             problem: None,
             pending: None,
@@ -386,6 +387,10 @@ impl FolderPanel {
             album_scope: card
                 .as_ref()
                 .map_or(AlbumScope::Leaf, |card| card.album_scope),
+            album_path: card
+                .as_ref()
+                .map_or(AlbumPath::Relative, |card| card.album_path),
+            album_prefix: card.as_ref().is_none_or(|card| card.album_prefix),
             album_title: card.as_ref().and_then(|card| card.album_title.clone()),
         };
         let stored_title = draft.album_title.clone();
@@ -629,6 +634,20 @@ impl FolderPanel {
         self.engine
             .clone()
             .update(cx, |model, cx| model.set_album_scope(path, scope, cx));
+    }
+
+    fn write_album_path(&mut self, album_path: AlbumPath, cx: &mut Context<Self>) {
+        let path = self.draft.path.clone();
+        self.engine
+            .clone()
+            .update(cx, |model, cx| model.set_album_path(path, album_path, cx));
+    }
+
+    fn write_album_prefix(&mut self, prefixed: bool, cx: &mut Context<Self>) {
+        let path = self.draft.path.clone();
+        self.engine
+            .clone()
+            .update(cx, |model, cx| model.set_album_prefix(path, prefixed, cx));
     }
 
     /// Saves the album title the detail's field holds (#47).
@@ -933,6 +952,8 @@ impl FolderPanel {
             recursive: self.draft.recursive,
             album_mapping: self.draft.album_mapping,
             album_scope: self.draft.album_scope,
+            album_path: self.draft.album_path,
+            album_prefix: self.draft.album_prefix,
         };
         let name = match self.mode {
             FolderPanelMode::Draft => "this folder".to_string(),
@@ -945,33 +966,54 @@ impl FolderPanel {
                 album_mapping: "folder-panel-album".into(),
                 album_leaf: "folder-panel-album-leaf".into(),
                 album_whole: "folder-panel-album-whole".into(),
+                album_path: "folder-panel-album-path".into(),
+                album_name: "folder-panel-album-name".into(),
+                album_prefix: "folder-panel-album-prefix".into(),
             },
             name,
             values,
-            cx.listener(move |this, recursive: &bool, _, cx| {
-                if detail {
-                    this.write_recursive(*recursive, cx);
-                } else {
-                    this.draft.recursive = *recursive;
-                    cx.notify();
-                }
-            }),
-            cx.listener(move |this, enabled: &bool, _, cx| {
-                if detail {
-                    this.write_album_mapping(*enabled, cx);
-                } else {
-                    this.draft.album_mapping = *enabled;
-                    cx.notify();
-                }
-            }),
-            cx.listener(move |this, scope: &AlbumScope, _, cx| {
-                if detail {
-                    this.write_album_scope(*scope, cx);
-                } else {
-                    this.draft.album_scope = *scope;
-                    cx.notify();
-                }
-            }),
+            SettingsHandlers {
+                recursive: cx.listener(move |this, recursive: &bool, _, cx| {
+                    if detail {
+                        this.write_recursive(*recursive, cx);
+                    } else {
+                        this.draft.recursive = *recursive;
+                        cx.notify();
+                    }
+                }),
+                album_mapping: cx.listener(move |this, enabled: &bool, _, cx| {
+                    if detail {
+                        this.write_album_mapping(*enabled, cx);
+                    } else {
+                        this.draft.album_mapping = *enabled;
+                        cx.notify();
+                    }
+                }),
+                album_scope: cx.listener(move |this, scope: &AlbumScope, _, cx| {
+                    if detail {
+                        this.write_album_scope(*scope, cx);
+                    } else {
+                        this.draft.album_scope = *scope;
+                        cx.notify();
+                    }
+                }),
+                album_path: cx.listener(move |this, album_path: &AlbumPath, _, cx| {
+                    if detail {
+                        this.write_album_path(*album_path, cx);
+                    } else {
+                        this.draft.album_path = *album_path;
+                        cx.notify();
+                    }
+                }),
+                album_prefix: cx.listener(move |this, prefixed: &bool, _, cx| {
+                    if detail {
+                        this.write_album_prefix(*prefixed, cx);
+                    } else {
+                        this.draft.album_prefix = *prefixed;
+                        cx.notify();
+                    }
+                }),
+            },
         )
         .render(cx.theme().muted_foreground)
     }
@@ -1537,6 +1579,7 @@ mod tests {
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
             album_title: None,
+            ..Default::default()
         }
     }
 
@@ -1710,6 +1753,7 @@ mod tests {
                 last_scan_ns: None,
                 last_upload_ns: None,
                 uploads: sync_core::meter::UploadTraffic::default(),
+                ..FolderStatus::default()
             }],
             counts: FolderCounts::default(),
             last_error: Some(ERROR.to_string()),
@@ -1826,6 +1870,7 @@ mod tests {
                     bytes_per_second: 2_516_582,
                     in_flight: 3,
                 },
+                ..FolderStatus::default()
             }],
             counts: FolderCounts::default(),
             last_error: None,
@@ -2019,6 +2064,7 @@ mod tests {
                 last_scan_ns: None,
                 last_upload_ns: None,
                 uploads: sync_core::meter::UploadTraffic::default(),
+                ..FolderStatus::default()
             }],
             counts: FolderCounts::default(),
             last_error: None,

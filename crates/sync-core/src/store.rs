@@ -242,6 +242,19 @@ DROP TABLE album;
 ALTER TABLE album_next RENAME TO album;
 ";
 
+/// The thirteenth schema (#93): how a leaf folder's album is titled.
+///
+/// The album scope keeps its two choices; these two columns decide a leaf
+/// album's name when the scope is per folder. Both default to the wording the
+/// issue asks for, so a database written before this schema upgrades to the
+/// new titles and renames its leaf albums once on the next reconciliation scan.
+/// `album_prefix` starts on: the point of the change is that a leaf album says
+/// where it came from.
+const SCHEMA_V13: &str = "
+ALTER TABLE source_folder ADD COLUMN album_path TEXT NOT NULL DEFAULT 'relative';
+ALTER TABLE source_folder ADD COLUMN album_prefix INTEGER NOT NULL DEFAULT 1;
+";
+
 /// How long the one writer waits for a competing lock before failing.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -451,6 +464,47 @@ impl AlbumScope {
     }
 }
 
+/// How a leaf folder's album is titled inside its mapped source folder (#93).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AlbumPath {
+    /// The leaf folder's path below the source folder (`Trips/Paris`).
+    #[default]
+    Relative,
+    /// The leaf folder's own name (`Paris`).
+    LeafName,
+}
+
+impl AlbumPath {
+    /// The exact string the state database stores.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Relative => "relative",
+            Self::LeafName => "leaf_name",
+        }
+    }
+
+    /// Parses a stored path choice. Returns `None` for a value this build does
+    /// not know, so a row a newer build wrote is not guessed at.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        Some(match text {
+            "relative" => Self::Relative,
+            "leaf_name" => Self::LeafName,
+            _ => return None,
+        })
+    }
+
+    /// The user's choice in the config window's words (#93).
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Relative => "Name each album after its folder path",
+            Self::LeafName => "Name each album after its folder",
+        }
+    }
+}
+
 /// One source folder the user selected (R2.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceFolder {
@@ -463,6 +517,11 @@ pub struct SourceFolder {
     pub album_mapping: bool,
     /// What the folder maps to once album mapping is on (R3.4).
     pub album_scope: AlbumScope,
+    /// How each leaf folder's album is titled under the leaf scope (#93).
+    pub album_path: AlbumPath,
+    /// Whether a leaf album's title starts with this folder's album title
+    /// (#93).
+    pub album_prefix: bool,
     /// The title the user chose for this folder's own album, or `None` when the
     /// album takes the folder's name (#47).
     ///
@@ -470,6 +529,22 @@ pub struct SourceFolder {
     /// being removed and added again keeps it (#47). This field is the row's
     /// title read back, never a second copy.
     pub album_title: Option<String>,
+}
+
+/// A folder's settings as a new one starts (#93): the leaf albums named after
+/// their folder path, with the source album's title in front.
+impl Default for SourceFolder {
+    fn default() -> Self {
+        Self {
+            path: String::new(),
+            recursive: false,
+            album_mapping: false,
+            album_scope: AlbumScope::default(),
+            album_path: AlbumPath::default(),
+            album_prefix: true,
+            album_title: None,
+        }
+    }
 }
 
 /// One mapped folder's album: the title the user chose and the id the server
@@ -798,6 +873,9 @@ pub enum StoreError {
     /// A row holds an album scope this build does not know.
     #[error("the state database holds an unknown album scope {0:?}")]
     UnknownAlbumScope(String),
+    /// A row holds a leaf album path choice this build does not know.
+    #[error("the state database holds an unknown album path choice {0:?}")]
+    UnknownAlbumPath(String),
     /// A file size does not fit SQLite's signed 64-bit integer.
     #[error("the file size {0} does not fit the state database")]
     SizeOutOfRange(u64),
@@ -1256,7 +1334,9 @@ impl StateStore {
                  path = excluded.path,
                  recursive = excluded.recursive,
                  album_mapping = excluded.album_mapping,
-                 album_scope = excluded.album_scope",
+                 album_scope = excluded.album_scope,
+                 album_path = excluded.album_path,
+                 album_prefix = excluded.album_prefix",
         )
         .map(|_| ())
     }
@@ -1287,8 +1367,9 @@ impl StateStore {
         let written = transaction
             .execute(
                 &format!(
-                    "INSERT INTO source_folder (path, path_key, recursive, album_mapping, album_scope)
-                     VALUES (?1, ?2, ?3, ?4, ?5)
+                    "INSERT INTO source_folder (path, path_key, recursive, album_mapping, album_scope,
+                                               album_path, album_prefix)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                      {conflict}"
                 ),
                 params![
@@ -1297,6 +1378,8 @@ impl StateStore {
                     folder.recursive,
                     folder.album_mapping,
                     folder.album_scope.as_str(),
+                    folder.album_path.as_str(),
+                    folder.album_prefix,
                 ],
             )
             .map_err(|source| self.query_error(source))?;
@@ -1345,7 +1428,8 @@ impl StateStore {
         let writer = self.writer()?;
         let mut statement = writer
             .prepare(
-                "SELECT f.path, f.recursive, f.album_mapping, f.album_scope, a.title
+                "SELECT f.path, f.recursive, f.album_mapping, f.album_scope, a.title,
+                        f.album_path, f.album_prefix
                  FROM source_folder f LEFT JOIN album a ON a.folder_key = f.path_key
                  ORDER BY f.path",
             )
@@ -1385,6 +1469,72 @@ impl StateStore {
             )
             .optional()
             .map_err(|source| self.query_error(source))
+    }
+
+    /// Every album row, with the folder path key it belongs to (#93).
+    ///
+    /// The rename pass needs the rows, not the folders: a leaf album has no
+    /// source folder of its own, and its title is derived rather than stored
+    /// by the user.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the query fails.
+    pub fn album_rows(&self) -> Result<Vec<(String, Album)>, StoreError> {
+        let writer = self.writer()?;
+        let mut statement = writer
+            .prepare(
+                "SELECT folder_key, title, album_id, rename_pending, rename_problem
+                 FROM album ORDER BY folder_key",
+            )
+            .map_err(|source| self.query_error(source))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    Album {
+                        title: row.get(1)?,
+                        album_id: row.get(2)?,
+                        rename_pending: row.get(3)?,
+                        rename_problem: row.get(4)?,
+                    },
+                ))
+            })
+            .map_err(|source| self.query_error(source))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|source| self.query_error(source))
+    }
+
+    /// The real path of the leaf folder whose album row is keyed `leaf_key`
+    /// (#93), read from an item that sits directly in it.
+    ///
+    /// The row key is case-folded on Windows and macOS (R2.4), so on those
+    /// platforms it cannot spell a title. An item's stored path can, and the
+    /// item table is the only place that keeps it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the query fails.
+    pub fn leaf_folder_path(&self, leaf_key: &str) -> Result<Option<String>, StoreError> {
+        let writer = self.writer()?;
+        let mut statement = writer
+            .prepare(
+                "SELECT path FROM sync_item
+                 WHERE path_key >= ?1 || '/' AND path_key < ?1 || '0'",
+            )
+            .map_err(|source| self.query_error(source))?;
+        let rows = statement
+            .query_map([leaf_key], |row| row.get::<_, String>(0))
+            .map_err(|source| self.query_error(source))?;
+        for row in rows {
+            let path = row.map_err(|source| self.query_error(source))?;
+            if let Some(parent) = Path::new(&path).parent()
+                && path_key(parent) == leaf_key
+            {
+                return Ok(Some(parent.display().to_string()));
+            }
+        }
+        Ok(None)
     }
 
     /// Records the title the user chose for the mapped folder `folder_key`
@@ -2466,11 +2616,21 @@ fn read_folder(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceFolder> {
             StoreError::UnknownAlbumScope(scope_text.clone()),
         )
     })?;
+    let path_text: String = row.get(5)?;
+    let album_path = AlbumPath::parse(&path_text).ok_or_else(|| {
+        conversion_error(
+            5,
+            rusqlite::types::Type::Text,
+            StoreError::UnknownAlbumPath(path_text.clone()),
+        )
+    })?;
     Ok(SourceFolder {
         path: row.get(0)?,
         recursive: row.get(1)?,
         album_mapping: row.get(2)?,
         album_scope,
+        album_path,
+        album_prefix: row.get(6)?,
         album_title: row.get(4)?,
     })
 }
@@ -2606,6 +2766,7 @@ fn migrations() -> Migrations<'static> {
         M::up(SCHEMA_V10),
         M::up(SCHEMA_V11),
         M::up(SCHEMA_V12),
+        M::up(SCHEMA_V13),
     ])
 }
 
@@ -2816,6 +2977,7 @@ mod migration_tests {
                 album_mapping: false,
                 album_scope: AlbumScope::Leaf,
                 album_title: None,
+                ..Default::default()
             }],
             "R3.4: a folder mapped before album mapping existed reads back off, at the default \
              scope, through the whole composed migration chain"
@@ -2866,6 +3028,7 @@ mod migration_tests {
                 album_mapping: true,
                 album_scope: AlbumScope::WholeFolder,
                 album_title: None,
+                ..Default::default()
             }],
             "the folder row and its album settings survive the chain"
         );
@@ -2949,6 +3112,54 @@ mod migration_tests {
                 .expect("the row")
                 .rename_pending,
             "#47: the migrated album row can ask for its rename"
+        );
+    }
+
+    /// #93: a folder mapped before the naming choices existed moves to the
+    /// new defaults, so the next scan titles its leaf albums the new way.
+    #[test]
+    fn the_leaf_naming_arrives_on_a_v12_database() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let path = temp.path().join("state.db");
+        {
+            let mut connection = Connection::open(&path).expect("open the raw database");
+            Migrations::new(vec![
+                M::up(SCHEMA_V1),
+                M::up_with_hook(SCHEMA_V2, backfill_path_keys),
+                M::up(SCHEMA_V3),
+                M::up(SCHEMA_V4),
+                M::up(SCHEMA_V5),
+                M::up(SCHEMA_V6),
+                M::up(SCHEMA_V7),
+                M::up(SCHEMA_V8),
+                M::up(SCHEMA_V9),
+                M::up(SCHEMA_V10),
+                M::up(SCHEMA_V11),
+                M::up(SCHEMA_V12),
+            ])
+            .to_latest(&mut connection)
+            .expect("create the twelfth schema");
+            connection
+                .execute(
+                    "INSERT INTO source_folder (path, path_key, recursive, album_mapping, album_scope)
+                     VALUES (?1, ?2, 1, 1, 'leaf')",
+                    params!["/photos", "/photos"],
+                )
+                .expect("insert the source folder");
+            drop(connection);
+        }
+
+        let store = StateStore::open(&path).expect("a v12 database must migrate");
+        assert_eq!(
+            store.folders().expect("read the folders")[0],
+            SourceFolder {
+                path: "/photos".to_string(),
+                recursive: true,
+                album_mapping: true,
+                album_scope: AlbumScope::Leaf,
+                ..Default::default()
+            },
+            "#93: an existing folder takes the new naming defaults"
         );
     }
 
@@ -3370,6 +3581,7 @@ mod folder_time_tests {
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
             album_title: None,
+            ..Default::default()
         }
     }
 

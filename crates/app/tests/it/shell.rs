@@ -397,6 +397,7 @@ async fn the_folder_detail_links_open_a_filtered_view(cx: &mut TestAppContext) {
                 album_mapping: false,
                 album_scope: sync_core::store::AlbumScope::Leaf,
                 album_title: None,
+                ..Default::default()
             })
             .expect("add the source folder");
     }
