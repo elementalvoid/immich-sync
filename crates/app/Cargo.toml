@@ -148,6 +148,10 @@ embed-resource = "3"
 # (ADR 0006 research §3.2). `crypto-rust` keeps the D-Bus transport encryption
 # in Rust, so the build needs no OpenSSL.
 dbus-secret-service-keyring-store = { version = "=1.0.1", features = ["crypto-rust"] }
+# The known-network check (R8.8): NetworkManager's primary connection. The
+# crate is already in the tree through the keyring store, so this adds no
+# dependency, only a direct edge to it.
+dbus = "0.9"
 
 [target."cfg(target_os = \"macos\")".dependencies]
 # SMAppService (macOS 13+), the login-item API behind the autostart setting.
@@ -162,6 +166,39 @@ smappservice-rs = "=0.1.3"
 # (ADR 0008).
 apple-native-keyring-store = { version = "=1.0.2", features = ["keychain"] }
 
+# The known-network check (R8.8): the SSID through CaptiveNetwork, the Wi-Fi
+# interface through CoreWLAN, the Location grant that gates the SSID, and a
+# System Configuration store for change events. The objc2 family is already in
+# the tree through the login-item wrapper; every crate here is a safe binding,
+# so the backend's unsafe blocks are only the calls themselves.
+dispatch2 = "0.3"
+# `getifaddrs`, to tell "Wi-Fi off with Ethernet" from "no link at all".
+libc = "0.2"
+objc2 = "0.6"
+objc2-core-foundation = "0.3"
+objc2-core-location = "0.3"
+objc2-core-wlan = "0.3"
+objc2-foundation = "0.3"
+objc2-system-configuration = "0.3"
+
 [target."cfg(windows)".dependencies]
 windows-native-keyring-store = "=1.1.0"
 windows-registry = "0.6"
+# The known-network check (R8.8): the Network List Manager for the connected
+# profile's name and its change events, the COM plumbing for both, and the IP
+# helper's adapter list for the media type. The module paths changed in 0.62
+# from `NetworkManagement::NetworkConnector` to
+# `Networking::NetworkListManager`.
+# `#[implement]` expands to `windows_core::` paths, so the crate that defines
+# the COM sink must name it directly, not only through `windows::core`.
+windows-core = "0.62"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_NetworkListManager",
+    "Win32_Networking_WinSock",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+] }

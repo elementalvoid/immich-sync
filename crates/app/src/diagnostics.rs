@@ -114,6 +114,8 @@ impl DiagnosticsModel {
             server: ServerInfo::default(),
             status: Status {
                 activity: sync_core::status::Activity::Idle,
+                pause: None,
+                network: sync_core::network::NetworkStatus::default(),
                 folders: Vec::new(),
                 counts: sync_core::store::FolderCounts::default(),
                 last_error: None,

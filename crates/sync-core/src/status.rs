@@ -7,6 +7,7 @@
 
 use crate::connection::ConnectionState;
 use crate::meter::UploadTraffic;
+use crate::network::{NetworkDecision, NetworkStatus};
 use crate::store::{AlbumPath, AlbumScope, FolderCounts};
 
 /// The activity state the tray and the dashboard show (R8.2).
@@ -16,7 +17,8 @@ pub enum Activity {
     Idle,
     /// Files are queued or in flight.
     Syncing,
-    /// The user paused new uploads (R8.7).
+    /// The user paused new uploads (R8.7), or the known-network list holds
+    /// them (R8.8). [`Status::pause`] says which.
     Paused,
     /// A failure or a missing folder needs the user.
     NeedsAttention,
@@ -31,6 +33,39 @@ impl Activity {
             Self::Syncing => "Syncing",
             Self::Paused => "Paused",
             Self::NeedsAttention => "Needs attention",
+        }
+    }
+}
+
+/// Why uploads are held (R8.7, R8.8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PauseReason {
+    /// The user paused the sync (R8.7).
+    User,
+    /// The current network is not one the user listed (R8.8).
+    NotListed,
+    /// The client cannot prove which network it is on (R8.8).
+    Unknown,
+}
+
+impl PauseReason {
+    /// The reason the network gate gives, when it holds uploads (R8.8).
+    #[must_use]
+    pub fn from_decision(decision: NetworkDecision) -> Option<Self> {
+        match decision {
+            NetworkDecision::Allowed => None,
+            NetworkDecision::NotListed => Some(Self::NotListed),
+            NetworkDecision::Unknown => Some(Self::Unknown),
+        }
+    }
+
+    /// The activity line the dashboard and the tray show (R8.1, R8.2).
+    #[must_use]
+    pub fn line(self) -> &'static str {
+        match self {
+            Self::User => "Paused",
+            Self::NotListed => "Paused — not on a known network",
+            Self::Unknown => "Paused — network unknown",
         }
     }
 }
@@ -101,6 +136,12 @@ pub struct FolderStatus {
 pub struct Status {
     /// The global activity state.
     pub activity: Activity,
+    /// Why uploads are held, when they are (R8.7, R8.8). `Some` exactly when
+    /// the activity is [`Activity::Paused`], so the reason and the state
+    /// cannot disagree.
+    pub pause: Option<PauseReason>,
+    /// What the OS reports about the network, for the Settings page (R8.8).
+    pub network: NetworkStatus,
     /// One entry per source folder, in the stored order.
     pub folders: Vec<FolderStatus>,
     /// The summed counts across folders. The review count is the store's
@@ -125,7 +166,8 @@ impl Status {
     pub fn derive(inputs: StatusInputs) -> Self {
         let StatusInputs {
             folders,
-            paused,
+            pause,
+            network,
             connection,
             review_total,
             last_error,
@@ -149,7 +191,7 @@ impl Status {
         let needs_the_user = folders
             .iter()
             .any(|folder| !folder.available || folder.last_error.is_some());
-        let activity = if paused {
+        let activity = if pause.is_some() {
             Activity::Paused
         } else if needs_the_user || connection == ConnectionHealth::NeedsAttention {
             Activity::NeedsAttention
@@ -164,6 +206,8 @@ impl Status {
         };
         Self {
             activity,
+            pause,
+            network,
             folders,
             counts,
             last_error,
@@ -214,8 +258,10 @@ impl ConnectionHealth {
 pub struct StatusInputs {
     /// One entry per source folder, in the order the cards show them.
     pub folders: Vec<FolderStatus>,
-    /// Whether the user holds new uploads (R8.7).
-    pub paused: bool,
+    /// Why uploads are held, when they are (R8.7, R8.8).
+    pub pause: Option<PauseReason>,
+    /// What the OS reports about the network (R8.8).
+    pub network: NetworkStatus,
     /// The connection, as far as the status cares.
     pub connection: ConnectionHealth,
     /// The store's global review count, when the caller can supply it.

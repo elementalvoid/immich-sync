@@ -14,6 +14,7 @@ use crate::connection::{ConnectionModel, apply_profile, profile_from_settings};
 use crate::dashboard::CardPalette;
 use crate::engine::EngineModel;
 use crate::logging::LogLevel;
+use crate::network as platform_network;
 use crate::notice::{Notice, Severity};
 use crate::paths::AppPaths;
 use crate::rows::{Row, note};
@@ -33,6 +34,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use sync_core::connection::{AuthMethod, ConnectionState, ServerProfile, SignIn};
 use sync_core::credential::Secret;
+use sync_core::network::NetworkStatus;
 use sync_core::tags::{BackfillStatus, SYNC_TAG, TagStatus};
 
 /// The number of bytes in a displayed megabyte. The stored limit stays bytes
@@ -320,6 +322,11 @@ pub struct SettingsView {
     /// It is cached here because the engine notifies on every status poll, and
     /// the section only changes when this value does.
     tag: TagStatus,
+    /// The network the engine last reported, for the known-network list
+    /// (R8.8). Cached for the same reason as the tag.
+    network: NetworkStatus,
+    /// The field a new network name is typed into (R8.8).
+    network_input: Entity<InputState>,
     /// The last failed save or autostart change, shown with the load problem.
     action_error: Option<String>,
     /// The approval hint the autostart backend last reported. It is read when the
@@ -392,6 +399,17 @@ impl SettingsView {
                 .placeholder("you@example.com")
                 .default_value(initial.email.clone())
         });
+        let network_input = cx
+            .new(|cx| InputState::new(window, cx).placeholder("Network name, as your OS shows it"));
+        subscriptions.push(cx.subscribe_in(
+            &network_input,
+            window,
+            |this, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.add_network(window, cx);
+                }
+            },
+        ));
         let secret_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(secret_placeholder_for(initial.auth_method))
@@ -439,6 +457,8 @@ impl SettingsView {
             fields,
             engine: None,
             tag: TagStatus::default(),
+            network: NetworkStatus::default(),
+            network_input,
             action_error: None,
             approval_hint: None,
             environment_problem: None,
@@ -528,15 +548,76 @@ impl SettingsView {
     /// state it renders actually changes.
     pub fn set_engine(&mut self, engine: Entity<EngineModel>, cx: &mut Context<Self>) {
         self.tag = engine.read(cx).tag_status().clone();
+        self.network = engine.read(cx).status().network.clone();
         self._subscriptions
             .push(cx.observe(&engine, |this, engine, cx| {
                 let tag = engine.read(cx).tag_status().clone();
-                if tag != this.tag {
+                let network = engine.read(cx).status().network.clone();
+                if tag != this.tag || network != this.network {
                     this.tag = tag;
+                    this.network = network;
                     cx.notify();
                 }
             }));
         self.engine = Some(engine);
+    }
+
+    /// Turns the known-network list on or off and moves the running engine to
+    /// it (R8.8).
+    ///
+    /// Turning it on is also where macOS asks for the Location permission the
+    /// SSID needs: the prompt is tied to the moment the user asks for the
+    /// feature, not to a sign-in or a restart.
+    fn toggle_known_networks(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if enabled {
+            platform_network::request_location_permission();
+        }
+        self.save_known_networks(cx, move |settings| {
+            settings.sync_only_on_known_networks = enabled;
+        });
+    }
+
+    /// Adds the typed network name to the list, ignoring a blank or a duplicate
+    /// (R8.8).
+    fn add_network(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let name = self.network_input.read(cx).value().trim().to_string();
+        self.network_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        if name.is_empty() || self.intended_settings().known_networks.contains(&name) {
+            return;
+        }
+        self.save_known_networks(cx, move |settings| settings.known_networks.push(name));
+    }
+
+    /// Removes one name from the list (R8.8).
+    fn remove_network(&mut self, name: String, cx: &mut Context<Self>) {
+        self.save_known_networks(cx, move |settings| {
+            settings.known_networks.retain(|kept| *kept != name);
+        });
+    }
+
+    /// Saves one change to the known-network list and moves the running engine
+    /// to it once the write landed (R8.8).
+    fn save_known_networks(
+        &mut self,
+        cx: &mut Context<Self>,
+        change: impl FnOnce(&mut Settings) + Send + 'static,
+    ) {
+        self.save_settings(cx, change, |view, result, cx| {
+            if result.is_ok() {
+                view.apply_known_networks(cx);
+            }
+            view.record(SAVE_PROBLEM, result, cx);
+        });
+    }
+
+    /// Moves the running engine to the saved list (R8.8).
+    fn apply_known_networks(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.engine.clone() else {
+            return;
+        };
+        let known = self.store.settings().known_networks();
+        engine.update(cx, |model, _| model.set_known_networks(known));
     }
 
     /// The newest intended settings: what a pending write will hold, or the
@@ -1233,17 +1314,132 @@ impl SettingsView {
     }
 
     /// The Sync page: scan interval and attempt cap (SPEC R2.3, R6.1).
-    fn sync_page(&self, query: &str, cx: &App) -> Option<SettingPage> {
+    fn sync_page(&self, query: &str, cx: &mut Context<Self>) -> Option<SettingPage> {
+        let settings = self.intended_settings();
+        let enabled = settings.sync_only_on_known_networks;
+        let names = settings.known_networks.clone();
+        let network_line = self.network.line();
+
+        let toggle = Rc::new(cx.listener(|this, enabled: &bool, _, cx| {
+            this.toggle_known_networks(*enabled, cx);
+        }));
+        let add = Rc::new(cx.listener(|this, _: &(), window, cx| this.add_network(window, cx)));
+        let input = self.network_input.clone();
+        let focus = input.read(cx).focus_handle(cx);
+
+        let mut known = vec![
+            Row::wrapped(
+                "Sync only on known networks",
+                "Pauses uploads and scans unless the current network is in the list below. Off by \
+                 default. A wired connection always syncs, whatever the list says.",
+                "settings-known-networks-row",
+                move |_, _| {
+                    let toggle = Rc::clone(&toggle);
+                    Switch::new("settings-known-networks")
+                        .checked(enabled)
+                        .accessibility_label("Sync only on known networks")
+                        .on_change(move |enabled, window, cx| toggle(enabled, window, cx))
+                        .into_any_element()
+                },
+            ),
+            Row::setting(
+                "Current network",
+                "The name the OS reports; the list is compared against it.",
+                move |_, _| {
+                    let element = crate::a11y::named(
+                        Role::Label,
+                        "settings-current-network",
+                        network_line.clone(),
+                        None,
+                    )
+                    .text_sm()
+                    .child(network_line.clone());
+                    element.into_any_element()
+                },
+            ),
+        ];
+        for (index, name) in names.into_iter().enumerate() {
+            let label = name.clone();
+            let target = name.clone();
+            let remove = Rc::new(cx.listener(move |this, _: &(), _, cx| {
+                this.remove_network(target.clone(), cx);
+            }));
+            // The row's own label is the network name, so the control names
+            // only the action (docs/agents/ui.md, "announce once").
+            known.push(Row::setting(name.clone(), "", move |_, _| {
+                let remove = Rc::clone(&remove);
+                Button::new(format!("settings-known-network-remove-{index}"))
+                    .label("Remove")
+                    .accessibility_label(format!("Remove {label} from the known networks"))
+                    .on_click(move |_, window, cx| remove(&(), window, cx))
+                    .into_any_element()
+            }));
+        }
+        known.push(Row::stacked(
+            "Add a network",
+            "Type the network name exactly as your OS shows it, then press Enter or Add.",
+            move |_, _| {
+                crate::a11y::named(
+                    Role::Group,
+                    "settings-known-network-input",
+                    "Add a network",
+                    Some("Type the network name as your OS shows it.".into()),
+                )
+                .track_focus(&focus)
+                .min_w_0()
+                .w_full()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_3()
+                .child(
+                    div()
+                        .flex_1()
+                        .child(Input::new(&input).aria_label("Network name")),
+                )
+                .child(
+                    Button::new("settings-known-network-add-button")
+                        .label("Add")
+                        .accessibility_label("Add the typed network name")
+                        .on_click({
+                            let add = Rc::clone(&add);
+                            move |_, window, cx| add(&(), window, cx)
+                        }),
+                )
+                .into_any_element()
+            },
+        ));
+        // Only macOS gates the Wi-Fi name behind a permission, so only there
+        // is there something to explain (R8.8).
+        #[cfg(target_os = "macos")]
+        if enabled {
+            let muted = cx.theme().muted_foreground;
+            known.push(note(move |_, _| {
+                div()
+                    .id("settings-known-networks-privacy")
+                    .test_support()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(
+                        "macOS asks for Location permission the first time this is on, because \
+                         only that permission lets the app read the Wi-Fi name.",
+                    )
+                    .into_any_element()
+            }));
+        }
         page(
             PAGE_SYNC,
-            vec![group(
-                None,
-                [FieldKey::ScanInterval, FieldKey::AttemptCap]
-                    .into_iter()
-                    .filter_map(|key| self.numeric_row(key, cx))
-                    .collect(),
-                query,
-            )],
+            vec![
+                group(
+                    None,
+                    [FieldKey::ScanInterval, FieldKey::AttemptCap]
+                        .into_iter()
+                        .filter_map(|key| self.numeric_row(key, cx))
+                        .collect(),
+                    query,
+                ),
+                group(Some("Known networks"), known, query),
+            ],
         )
     }
 

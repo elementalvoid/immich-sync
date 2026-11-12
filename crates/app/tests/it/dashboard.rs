@@ -214,6 +214,8 @@ fn folder_progress_survives_counts_above_a_u16() {
     };
     let status = Status {
         activity: Activity::Syncing,
+        pause: None,
+        network: sync_core::network::NetworkStatus::default(),
         folders: vec![FolderStatus {
             path: "/photos".to_string(),
             recursive: true,
@@ -863,6 +865,8 @@ fn engine_status_maps_to_the_global_card_and_one_card_per_folder() {
 
     let status = Status {
         activity: Activity::Syncing,
+        pause: None,
+        network: sync_core::network::NetworkStatus::default(),
         folders: vec![
             FolderStatus {
                 path: "/home/you/Pictures".to_string(),

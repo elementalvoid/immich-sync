@@ -14,6 +14,7 @@ mod limits;
 mod log_redaction;
 mod meter;
 mod missing;
+mod network;
 mod pairing;
 mod status;
 mod store;

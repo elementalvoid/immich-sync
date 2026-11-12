@@ -117,8 +117,9 @@ Acceptance: a sync at a 1 MB/s limit produces near-limit observed throughput. Ra
 - R8.5 Autostart at login is a setting. The default is off. Windows uses its Run key, Linux an XDG autostart entry, and macOS a Login Item (`SMAppService.mainApp`), falling back to a LaunchAgent plist when an unsigned bundle is refused.
 - R8.6 The theme follows the system theme.
 - R8.7 Pause stops new uploads. In-flight uploads finish or stop at a safe point.
+- R8.8 **Sync only on known networks** is a setting, off by default, with a list of names the user types. While it is on, uploads and scans wait unless the OS names the current wireless network in the list: no new attempts, the queue is kept, nothing fails, and syncing resumes on its own when a listed network comes back. A wired connection always syncs, and the list's help text says so. It fails closed: an unknown name, a missing or empty OS answer, an OS call that errors or times out, and no network at all hold uploads, and the dashboard and tray say why ("Paused — not on a known network", "Paused — network unknown"). It checks at startup, on the OS's network-change events, on a 30-second fallback poll, and after any upload network error. The Settings page shows the name the OS reports beside the list.
 
-Acceptance: every tray action works from a cold start. A second launch does not start a second process. Pause stops new uploads within 5 seconds.
+Acceptance: every tray action works from a cold start. A second launch does not start a second process. Pause stops new uploads within 5 seconds. Leaving a listed network holds uploads within 5 seconds, the queue keeps every waiting file, and returning to a listed network resumes without a click.
 
 ### R9 — Settings and paths
 

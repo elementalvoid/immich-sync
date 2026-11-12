@@ -10,11 +10,13 @@
 use std::path::Path;
 
 /// The usage strings macOS shows a TCC prompt for: the three folders a source
-/// folder commonly lives in, and the two volume kinds it can be on.
-const USAGE_KEYS: [&str; 5] = [
+/// folder commonly lives in, the two volume kinds it can be on, and the
+/// Location grant the Wi-Fi network name needs (R8.8).
+const USAGE_KEYS: [&str; 6] = [
     "NSDesktopFolderUsageDescription",
     "NSDocumentsFolderUsageDescription",
     "NSDownloadsFolderUsageDescription",
+    "NSLocationWhenInUseUsageDescription",
     "NSNetworkVolumesUsageDescription",
     "NSRemovableVolumesUsageDescription",
 ];
@@ -43,7 +45,7 @@ fn macos_config_sets_the_support_floor_and_names_the_plist() {
 }
 
 #[test]
-fn info_plist_carries_only_the_five_file_access_usage_strings() {
+fn info_plist_carries_only_the_usage_strings() {
     let plist = read("macos/Info.plist");
     let mut keys = elements(&plist, "key");
     let values = elements(&plist, "string");
@@ -54,7 +56,7 @@ fn info_plist_carries_only_the_five_file_access_usage_strings() {
     // the other — and such a value would merge into the bundle unread here.
     assert_eq!(
         keys, USAGE_KEYS,
-        "the plist holds exactly the five file-access usage strings, and nothing else"
+        "the plist holds exactly the usage strings, and nothing else"
     );
     assert_eq!(
         keys.len(),

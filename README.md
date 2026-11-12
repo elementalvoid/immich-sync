@@ -114,6 +114,11 @@ copy and its shortcuts.
    Drive, or on a removable or network volume, asks for access to files and
    folders. Allow it; without the grant the folder shows as unreadable, with the
    reason (see [Troubleshooting](#troubleshooting)).
+4. Turning **Sync only on known networks** on asks for Location permission,
+   because macOS reveals the Wi-Fi network name only to an app that has it. The
+   unsigned build cannot register for the permission the way a signed app does,
+   so if macOS refuses it the Settings page says the name is unknown and the
+   list holds uploads; turning the list off restores syncing on any network.
 
 To uninstall, first turn **Autostart at login** off if macOS refused the
 unsigned login item: that removes the LaunchAgent at
@@ -254,8 +259,10 @@ its card instead of producing one error per file.
   **Trash** for it. A rename is recognized by content and is not a deletion.
 - **Settings.** Changes save immediately. General holds **Autostart at login**
   (off by default); Limits holds the bandwidth limit (0 means unlimited) and
-  concurrent uploads; Sync holds the reconciliation scan interval and the retry
-  attempt cap; Tagging holds **Tag uploaded assets** (on by default), which adds
+  concurrent uploads; Sync holds the reconciliation scan interval, the retry
+  attempt cap, and **Sync only on known networks** (off by default) with the
+  list of network names beside it; Tagging holds **Tag uploaded assets** (on by
+  default), which adds
   the fixed tag `immich-sync` to every asset the client uploads. With an API
   key, tagging needs the `tag.create`, `tag.asset`, and `asset.update`
   permissions. The same section shows the backfill's progress and **Tag existing
@@ -272,6 +279,12 @@ its card instead of producing one error per file.
   newest file while the view is open; scrolling up pauses it and shows the new
   line count with **Jump to latest**, and **Refresh** re-reads the tail once.
   The log never contains the password, API key, or session token.
+- **Known networks.** With **Sync only on known networks** on, the client
+  pauses unless the OS names the current Wi-Fi network in your list, and shows
+  the name the OS reports beside the list. Nothing fails and the queue is kept;
+  syncing resumes by itself when a listed network comes back. Ethernet always
+  syncs, and with the list off the client syncs on any network. The name is read
+  from the OS on this computer and is never sent anywhere.
 - The theme follows the system theme.
 
 ## Where everything lives
@@ -368,6 +381,18 @@ Expected: the packages carry no Developer ID, so the app has no stable code
 identity.
 After an update, the login-Keychain entry and the **Files & Folders** grant can
 ask again. Allow them again and syncing continues; nothing is lost.
+
+### Sync is paused and the reason names the network
+
+**Sync only on known networks** is on and the client cannot prove the current
+network is on your list. The Settings page shows the name the OS reports
+("unknown" with the reason when it cannot name it), and the dashboard and tray
+say why. Add the network to the list, connect to a listed network, or turn the
+setting off. Ethernet always syncs. On Linux the name comes from NetworkManager,
+so a machine using systemd-networkd or `iwd` reports no name and stays paused
+while the setting is on; on macOS the name needs Location permission. Full
+checks per platform are in
+[docs/network-hand-checks.md](docs/network-hand-checks.md).
 
 ### Sync does not pick up a new file
 

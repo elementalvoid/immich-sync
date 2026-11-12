@@ -41,11 +41,17 @@ use crate::failure::{FailureClass, FailureKind, classify};
 use crate::hash::{Sha1, sha1_file};
 use crate::meter::UploadMeter;
 use crate::missing::{Fate, Host, SizeIndex, fate, is_gone, rename_target};
+use crate::network::{
+    CurrentNetwork, KnownNetworks, NetworkDecision, NetworkProblem, NetworkSource, NetworkStatus,
+    decide,
+};
 use crate::pairing::FolderIndex;
 use crate::paths::{PathCase, is_within, key, key_is_within, path_key};
 use crate::scan::{ScanError, scan_folder};
 use crate::skip::{has_symlink_ancestor, skip_reason_below};
-use crate::status::{AlbumRename, ConnectionHealth, FolderStatus, Status, StatusInputs};
+use crate::status::{
+    AlbumRename, ConnectionHealth, FolderStatus, PauseReason, Status, StatusInputs,
+};
 use crate::store::{
     Album, AlbumPath, AlbumScope, AttemptOutcome, AttemptRecord, FailedItem, FolderCounts,
     ItemRecord, ItemState, ReviewDecision, ReviewItem, SourceFolder, StateStore, StoreError,
@@ -107,6 +113,15 @@ pub struct EngineConfig {
     /// [`BACKFILL_BATCH`]; a test lowers it so a small library needs more than
     /// one request.
     pub tag_batch_size: usize,
+    /// How often the fallback poll re-checks the network (R8.8). Default 30
+    /// seconds: change notifications are missed across sleep and VPN
+    /// transitions, so the poll is the net under them. A test lowers it so the
+    /// poll case needs no 30-second wait.
+    pub network_poll: Duration,
+    /// How long one network check may take before it reads as unknown
+    /// (R8.8). Default 5 seconds: an OS call that hangs must hold uploads
+    /// rather than leave the last answer in force.
+    pub network_check_timeout: Duration,
 }
 
 impl Default for EngineConfig {
@@ -125,6 +140,8 @@ impl Default for EngineConfig {
             breaker_cooldown: Duration::from_secs(10),
             tag_uploaded_assets: false,
             tag_batch_size: BACKFILL_BATCH,
+            network_poll: Duration::from_secs(30),
+            network_check_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -283,6 +300,45 @@ struct EngineInner {
     rescan_hint: AtomicBool,
     /// Wakes the album retry, which sends the titles the user changed (#47).
     album_wake: Notify,
+    /// The known-network gate (R8.8): the platform's answer, the user's list,
+    /// and the last name read.
+    network: Mutex<NetworkWatch>,
+    /// Wakes the network check: the list changed, or an upload could not reach
+    /// the server (R8.8).
+    network_wake: Notify,
+    /// Whether a platform call is still running. A call that outlives its
+    /// timeout keeps this set until it returns, so a hung OS API cannot pile
+    /// up one blocked thread per check (R8.8).
+    network_check_running: AtomicBool,
+}
+
+/// The known-network gate's state (R8.8).
+#[derive(Default)]
+struct NetworkWatch {
+    /// The platform's answer. `None` in a build or test with no backend, where
+    /// the list being off is the only reachable state.
+    source: Option<Arc<dyn NetworkSource>>,
+    /// The user's list.
+    known: KnownNetworks,
+    /// The last OS answer, or `None` before the first check. With the list on,
+    /// `None` reads as unknown, which holds uploads (R8.8).
+    current: Option<Result<CurrentNetwork, NetworkProblem>>,
+}
+
+impl NetworkWatch {
+    fn decision(&self) -> NetworkDecision {
+        match &self.current {
+            Some(current) => decide(&self.known, current.as_ref()),
+            None if self.known.enabled => NetworkDecision::Unknown,
+            None => NetworkDecision::Allowed,
+        }
+    }
+
+    fn status(&self) -> NetworkStatus {
+        self.current
+            .as_ref()
+            .map_or_else(NetworkStatus::default, NetworkStatus::from_result)
+    }
 }
 
 /// The folder sync engine (R2, R3, R6.7, R8.7).
@@ -406,6 +462,9 @@ impl Engine {
             resume: Notify::new(),
             sync_now: Notify::new(),
             album_wake: Notify::new(),
+            network: Mutex::new(NetworkWatch::default()),
+            network_wake: Notify::new(),
+            network_check_running: AtomicBool::new(false),
             watcher: Mutex::new(None),
             tasks: Mutex::new(Vec::new()),
             stopped: AtomicBool::new(false),
@@ -449,6 +508,18 @@ impl Engine {
             .expect("the task list")
             .push(backfill);
         self.inner.tag_wake.notify_one();
+        // R8.8: the network check has one task of its own. The gate is already
+        // held from `watch_network`, so the list can never let an unchecked
+        // upload out while the first check runs.
+        let network = tokio::spawn({
+            let inner = Arc::clone(&self.inner);
+            async move { network_loop(inner).await }
+        });
+        self.inner
+            .tasks
+            .lock()
+            .expect("the task list")
+            .push(network);
         // #47: a title the user changed is sent by its own task, woken by the
         // edit and by the scan, so no status poll sends a request.
         let albums = tokio::spawn({
@@ -544,10 +615,60 @@ impl Engine {
         tracing::info!("the sync engine resumed");
     }
 
-    /// Whether new uploads are held.
+    /// Whether new uploads are held by the user's pause (R8.7).
+    ///
+    /// The network hold is not this: the dashboard's control and the tray's
+    /// Resume own the user's own pause, and the status carries the network
+    /// reason separately (R8.8).
     #[must_use]
     pub fn is_paused(&self) -> bool {
         self.inner.gate.is_paused()
+    }
+
+    /// Points the engine at the platform's network names and the user's list
+    /// (R8.8). Call it before [`Self::start`].
+    ///
+    /// The gate is held at once when the list is on, so uploads wait for the
+    /// first check instead of running ahead of it.
+    pub fn watch_network(&self, source: Arc<dyn NetworkSource>, known: KnownNetworks) {
+        let mut network = self.inner.network.lock().expect("the network lock");
+        network.source = Some(source);
+        network.known = known;
+        network.current = None;
+        self.inner
+            .gate
+            .hold_network(network.decision() != NetworkDecision::Allowed);
+        drop(network);
+        self.inner.network_wake.notify_one();
+        tracing::info!("the network check is watching the current network");
+    }
+
+    /// The known-network list the engine is holding (R8.8).
+    #[must_use]
+    pub fn known_networks(&self) -> KnownNetworks {
+        self.inner
+            .network
+            .lock()
+            .expect("the network lock")
+            .known
+            .clone()
+    }
+
+    /// Moves the engine to the user's newest known-network list (R8.8).
+    ///
+    /// The last OS answer decides at once, so turning the list on does not
+    /// leave an upload window open while the next check runs. Nothing here
+    /// calls the platform: that call runs off the engine's async workers.
+    pub fn set_known_networks(&self, known: KnownNetworks) {
+        {
+            let mut network = self.inner.network.lock().expect("the network lock");
+            network.known = known;
+            self.inner
+                .gate
+                .hold_network(network.decision() != NetworkDecision::Allowed);
+        }
+        self.inner.network_wake.notify_one();
+        self.inner.resume.notify_waiters();
     }
 
     /// Asks for a reconciliation scan now (R8.3).
@@ -834,9 +955,21 @@ impl Engine {
                 None
             }
         };
+        // One lock, so the reason and the status it reads cannot disagree.
+        let (pause, network) = {
+            let network = self.inner.network.lock().expect("the network lock");
+            // R8.7 first: a pause the user set is the reason they know.
+            let pause = if self.inner.gate.is_paused() {
+                Some(PauseReason::User)
+            } else {
+                PauseReason::from_decision(network.decision())
+            };
+            (pause, network.status())
+        };
         Status::derive(StatusInputs {
             folders,
-            paused: self.inner.gate.is_paused(),
+            pause,
+            network,
             connection: ConnectionHealth::from_state(&self.inner.session.state()),
             review_total,
             last_error: self
@@ -1407,11 +1540,12 @@ impl EngineInner {
         }
     }
 
-    /// Waits while the user holds uploads (R8.7).
+    /// Waits while uploads are held, by the pause or by the network (R8.7,
+    /// R8.8).
     async fn wait_while_paused(&self) {
-        while self.gate.is_paused() {
+        while self.gate.is_held() {
             let notified = self.resume.notified();
-            if !self.gate.is_paused() {
+            if !self.gate.is_held() {
                 break;
             }
             notified.await;
@@ -1750,6 +1884,101 @@ async fn wait_for_the_server(inner: &Arc<EngineInner>) -> Result<(), ClientError
         }
     }
     Ok(())
+}
+
+/// Wakes the network gate on the fallback poll, on an OS change event, on a
+/// settings change, and after a request that could not reach the server
+/// (R8.8).
+///
+/// The platform call runs on a blocking thread, because every backend is a
+/// synchronous OS API and one of them (NetworkManager over D-Bus) can wait.
+async fn network_loop(inner: Arc<EngineInner>) {
+    let mut changes = inner
+        .network
+        .lock()
+        .expect("the network lock")
+        .source
+        .as_ref()
+        .and_then(|source| source.changes());
+    loop {
+        check_network(&inner).await;
+        let poll = tokio::time::sleep(inner.config.network_poll);
+        tokio::select! {
+            () = poll => {}
+            () = inner.network_wake.notified() => {}
+            () = network_change(&mut changes) => {}
+        }
+    }
+}
+
+/// Resolves when the platform reports a network change, or never when it has
+/// no subscription.
+///
+/// A closed channel is a backend that stopped listening (no NetworkManager, a
+/// refused COM advice, a failed event thread). The receiver is dropped then,
+/// so the fallback poll alone drives the check: awaiting a closed channel
+/// returns at once and would otherwise spin this loop.
+async fn network_change(changes: &mut Option<mpsc::Receiver<()>>) {
+    let Some(channel) = changes.as_mut() else {
+        return std::future::pending().await;
+    };
+    if channel.recv().await.is_none() {
+        *changes = None;
+    }
+}
+
+/// Asks the platform once and moves the gate to its answer (R8.8).
+///
+/// A check that runs longer than the timeout reads as unknown, and a platform
+/// call still running after that blocks the next spawn until it returns, so a
+/// hung OS API cannot leave the last answer in force or accumulate threads.
+async fn check_network(inner: &Arc<EngineInner>) {
+    let Some(source) = inner
+        .network
+        .lock()
+        .expect("the network lock")
+        .source
+        .clone()
+    else {
+        return;
+    };
+    let current = if inner.network_check_running.swap(true, Ordering::SeqCst) {
+        Err(NetworkProblem::new("the network check is still running"))
+    } else {
+        let running = Arc::clone(inner);
+        let timeout = inner.config.network_check_timeout;
+        let answer = tokio::time::timeout(
+            timeout,
+            tokio::task::spawn_blocking(move || {
+                let answer = source.current();
+                // The blocked task clears the flag even when its answer
+                // arrived too late to be used.
+                running.network_check_running.store(false, Ordering::SeqCst);
+                answer
+            }),
+        )
+        .await;
+        match answer {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(_)) => {
+                inner.network_check_running.store(false, Ordering::SeqCst);
+                Err(NetworkProblem::new("the network check did not finish"))
+            }
+            Err(_) => Err(NetworkProblem::new("the network check timed out")),
+        }
+    };
+    let hold = {
+        let mut network = inner.network.lock().expect("the network lock");
+        network.current = Some(current);
+        network.decision() != NetworkDecision::Allowed
+    };
+    inner.gate.hold_network(hold);
+    // A hold that lifts wakes the dispatcher and every worker waiting on the
+    // gate, so a returning known network resumes without a click (R8.8).
+    if !hold {
+        inner.resume.notify_waiters();
+    }
+    tracing::debug!(held = hold, "the network check ran");
 }
 
 /// The dispatcher: batches queued paths, hashes them, checks them in one
@@ -2235,7 +2464,7 @@ fn is_settled(state: ItemState) -> bool {
 /// attempt, so a worker sleeping its backoff holds no slot: lowering the
 /// concurrency limit drains the pool instead of waiting out the sleep.
 async fn spawn_upload(inner: &Arc<EngineInner>, item: PreparedItem) {
-    if inner.gate.is_paused() {
+    if inner.gate.is_held() {
         inner.finish_item(&item, &UploadOutcome::Deferred);
         return;
     }
@@ -2367,6 +2596,9 @@ async fn upload_with_retries(inner: &Arc<EngineInner>, item: &PreparedItem) -> U
             // R6.6: only a connection failure feeds the breaker; a 429 or a
             // 503 is the server answering, not the server being gone.
             inner.breaker.record_failure();
+            // R8.8: a request that could not reach the server re-checks the
+            // network, so a stale "allowed" cannot keep failing.
+            inner.network_wake.notify_one();
         }
         if failure.is_permanent() || attempts >= cap {
             if !failure.is_permanent() {
@@ -2508,6 +2740,10 @@ async fn scan_loop(inner: Arc<EngineInner>) {
         if !rescan && !absences.is_empty() && !tracked {
             continue;
         }
+        // R8.7 and R8.8: a held sync scans nothing, so a paused client does no
+        // work at all. The request that woke the loop is not lost: the scan
+        // runs as soon as the hold lifts.
+        inner.wait_while_paused().await;
         scan_once(&inner).await;
     }
 }
@@ -3787,6 +4023,8 @@ mod tests {
     fn progress_is_zero_with_no_items_and_one_when_uploaded() {
         let mut status = Status {
             activity: Activity::Idle,
+            pause: None,
+            network: NetworkStatus::default(),
             folders: Vec::new(),
             counts: FolderCounts::default(),
             last_error: None,

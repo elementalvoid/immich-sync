@@ -16,6 +16,7 @@ pub mod failure;
 pub mod hash;
 pub mod meter;
 pub mod missing;
+pub mod network;
 pub mod pairing;
 pub mod paths;
 pub mod scan;

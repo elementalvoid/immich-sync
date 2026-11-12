@@ -151,6 +151,10 @@ _Avoid_: settings dialog, preferences
 The status icon in the notification area. It shows sync state and it opens the config window.
 _Avoid_: system tray, notification icon
 
+**Pause**:
+The user's hold on new uploads, from the dashboard control or the tray menu. It is separate from the known-network hold, so resuming never overrides the list.
+_Avoid_: stop, disable sync
+
 **Folder status**:
 The sync state of one source folder. The dashboard shows one card per source folder, and the folder detail renders the same status in full.
 _Avoid_: folder state, folder progress
@@ -162,6 +166,22 @@ _Avoid_: add dialog, onboarding
 **Folder detail**:
 The enlarged view of one source folder: its full path, live state and counts, its own upload activity, settings, timestamps, and the list of the assets it has uploaded, with links into the Failed and Review views filtered to it. Its Remove needs a confirmation, because the folder's uploaded assets stay on the server.
 _Avoid_: folder modal, folder popup
+
+**Known networks**:
+The user's list of network names for the **Sync only on known networks** setting, compared against the name the OS reports for the current wireless network. A wired link always syncs, because it has no name to match. The list is off by default.
+_Avoid_: allowed networks, trusted networks, whitelist
+
+**Network check**:
+The client's one read of the OS's current network, through a **network source** per platform. It decides whether uploads are held, and its answer is what the Settings page shows as the current network.
+_Avoid_: SSID lookup, network probe, reachability check
+
+**Network source**:
+The platform backend that answers the network check: NetworkManager over D-Bus on Linux, the Network List Manager on Windows, and CoreWLAN with CaptiveNetwork on macOS. It also reports the OS's network-change events, which the client uses to re-check before the 30-second fallback poll.
+_Avoid_: provider, adapter, detector
+
+**Pause reason**:
+Why uploads are held: the user's own **pause**, or the known-network list. Both read as the paused activity state; the dashboard and the tray tooltip phrase the reason.
+_Avoid_: pause kind, pause cause, hold type
 
 ### Diagnostics
 

@@ -223,6 +223,7 @@ fn the_tray_tooltip_carries_the_activity_and_the_progress() {
     };
     let tooltip = shell::tray_status_tooltip(
         sync_core::status::Activity::Syncing,
+        None,
         &ConnectionState::Connected,
         counts,
         None,
@@ -237,6 +238,7 @@ fn the_tray_tooltip_carries_the_activity_and_the_progress() {
 
     let attention = shell::tray_status_tooltip(
         sync_core::status::Activity::NeedsAttention,
+        None,
         &ConnectionState::NeedsAttention(Attention::Rejected),
         sync_core::store::FolderCounts::default(),
         Some("unsupported_format"),
@@ -245,6 +247,34 @@ fn the_tray_tooltip_carries_the_activity_and_the_progress() {
     assert!(
         attention.contains("last error: unsupported_format"),
         "R8.2: the last error reaches the tooltip: {attention}"
+    );
+}
+
+/// R8.8: the tray says why a sync is held, not just "Paused".
+#[test]
+fn the_tray_tooltip_carries_the_network_reason() {
+    let tooltip = shell::tray_status_tooltip(
+        sync_core::status::Activity::Paused,
+        Some(sync_core::status::PauseReason::NotListed),
+        &ConnectionState::Connected,
+        sync_core::store::FolderCounts::default(),
+        None,
+    );
+    assert!(
+        tooltip.contains("Paused — not on a known network"),
+        "R8.8: the tray names the network reason: {tooltip}"
+    );
+
+    let unknown = shell::tray_status_tooltip(
+        sync_core::status::Activity::Paused,
+        Some(sync_core::status::PauseReason::Unknown),
+        &ConnectionState::Connected,
+        sync_core::store::FolderCounts::default(),
+        None,
+    );
+    assert!(
+        unknown.contains("Paused — network unknown"),
+        "R8.8: an unprovable network is its own reason: {unknown}"
     );
 }
 

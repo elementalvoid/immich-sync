@@ -402,6 +402,14 @@ fn a_settings_file_without_the_tag_setting_loads_it_on() {
         store.settings().tag_uploaded_assets,
         "R3.7: a missing setting takes the on default"
     );
+    assert!(
+        !store.settings().sync_only_on_known_networks,
+        "R8.8: a file written before the list existed keeps syncing on any network"
+    );
+    assert!(
+        store.settings().known_networks.is_empty(),
+        "R8.8: the list starts empty"
+    );
     assert!(store.problem().is_none());
 }
 
@@ -419,6 +427,8 @@ fn settings_round_trip_across_a_restart() {
             settings.scan_interval_minutes = 45;
             settings.attempt_cap = 3;
             settings.tag_uploaded_assets = true;
+            settings.sync_only_on_known_networks = true;
+            settings.known_networks = vec!["Home".to_string(), "Studio".to_string()];
             settings.server_url = "https://immich.example.com".to_string();
             settings.email = "sync@example.com".to_string();
             settings.auth_method = AuthMethod::ApiKey;
@@ -437,6 +447,15 @@ fn settings_round_trip_across_a_restart() {
         settings.tag_uploaded_assets,
         "R3.7: the tag setting persists"
     );
+    assert!(
+        settings.sync_only_on_known_networks,
+        "R8.8: the list switch persists"
+    );
+    assert_eq!(
+        settings.known_networks,
+        vec!["Home".to_string(), "Studio".to_string()],
+        "R8.8: the listed names persist"
+    );
     assert_eq!(settings.server_url, "https://immich.example.com");
     assert_eq!(settings.email, "sync@example.com");
     assert_eq!(settings.auth_method, AuthMethod::ApiKey);
@@ -453,6 +472,8 @@ fn settings_round_trip_across_a_restart() {
          scan_interval_minutes = 45\n\
          attempt_cap = 3\n\
          tag_uploaded_assets = true\n\
+         sync_only_on_known_networks = true\n\
+         known_networks = [\n    \"Home\",\n    \"Studio\",\n]\n\
          server_url = \"https://immich.example.com\"\n\
          email = \"sync@example.com\"\n\
          auth_method = \"api_key\"\n\

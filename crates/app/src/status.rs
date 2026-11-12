@@ -8,7 +8,7 @@ use std::path::Path;
 
 use crate::diagnostics::format_rate;
 use sync_core::meter::UploadTraffic;
-use sync_core::status::{Activity, AlbumRename, Status};
+use sync_core::status::{Activity, AlbumRename, PauseReason, Status};
 use sync_core::store::{AlbumPath, AlbumScope, FolderCounts};
 
 /// The activity state of the client or one source folder (SPEC R8.2).
@@ -50,6 +50,9 @@ pub struct StatusCard {
     /// The source folder path; `None` on the global card.
     pub path: Option<String>,
     pub activity: ActivityState,
+    /// Why uploads are held, when the card says `Paused` (R8.7, R8.8). The
+    /// state line phrases the reason instead of a bare "Paused".
+    pub pause: Option<PauseReason>,
     /// Upload progress, 0.0 to 1.0.
     pub progress: f32,
     pub counts: Counts,
@@ -134,7 +137,12 @@ impl StatusCard {
         CardContent {
             title: self.title.clone(),
             path: self.path.clone(),
-            state: self.activity.label().to_string(),
+            // R8.8: a network hold says why, so a pause the user did not
+            // click is never left without an explanation.
+            state: self.pause.map_or_else(
+                || self.activity.label().to_string(),
+                |reason| reason.line().to_string(),
+            ),
             progress: self.progress.clamp(0.0, 1.0),
             progress_percent: format!(
                 "{}%",
@@ -285,6 +293,7 @@ impl DashboardModel {
             title: "All folders".to_string(),
             path: None,
             activity: status.activity.into(),
+            pause: status.pause,
             progress: status.progress(),
             counts: counts_from(status.counts),
             review_count: status.counts.review,
@@ -311,10 +320,8 @@ impl DashboardModel {
         let folders = status
             .folders
             .iter()
-            .map(|folder| StatusCard {
-                title: folder_name(&folder.path),
-                path: Some(folder.path.clone()),
-                activity: if !folder.available {
+            .map(|folder| {
+                let activity = if !folder.available {
                     ActivityState::NeedsAttention
                 } else if status.activity == Activity::Paused {
                     ActivityState::Paused
@@ -324,24 +331,36 @@ impl DashboardModel {
                     ActivityState::NeedsAttention
                 } else {
                     ActivityState::Idle
-                },
-                progress: folder_progress(folder.counts),
-                counts: counts_from(folder.counts),
-                review_count: folder.counts.review,
-                available: folder.available,
-                uploads: folder.uploads,
-                connection: None,
-                last_error: folder.last_error.clone(),
-                // #43: the folder detail shows both, relative and exact.
-                last_upload_ns: folder.last_upload_ns,
-                last_scan_ns: folder.last_scan_ns,
-                recursive: folder.recursive,
-                album_mapping: folder.album_mapping,
-                album_scope: folder.album_scope,
-                album_path: folder.album_path,
-                album_prefix: folder.album_prefix,
-                album_title: folder.album_title.clone(),
-                album_rename: folder.album_rename.clone(),
+                };
+                StatusCard {
+                    title: folder_name(&folder.path),
+                    path: Some(folder.path.clone()),
+                    activity,
+                    // The reason is the engine's, and a folder card shows it the
+                    // same way the global card does (R8.8). A card that is not
+                    // paused carries no reason, so the state line and the state
+                    // cannot disagree.
+                    pause: (activity == ActivityState::Paused)
+                        .then_some(status.pause)
+                        .flatten(),
+                    progress: folder_progress(folder.counts),
+                    counts: counts_from(folder.counts),
+                    review_count: folder.counts.review,
+                    available: folder.available,
+                    uploads: folder.uploads,
+                    connection: None,
+                    last_error: folder.last_error.clone(),
+                    // #43: the folder detail shows both, relative and exact.
+                    last_upload_ns: folder.last_upload_ns,
+                    last_scan_ns: folder.last_scan_ns,
+                    recursive: folder.recursive,
+                    album_mapping: folder.album_mapping,
+                    album_scope: folder.album_scope,
+                    album_path: folder.album_path,
+                    album_prefix: folder.album_prefix,
+                    album_title: folder.album_title.clone(),
+                    album_rename: folder.album_rename.clone(),
+                }
             })
             .collect();
         Self {
@@ -371,6 +390,7 @@ pub fn sample() -> DashboardModel {
             title: "All folders".to_string(),
             path: None,
             activity: ActivityState::Syncing,
+            pause: None,
             progress: 0.62,
             counts: Counts {
                 pending: 18,
@@ -401,6 +421,7 @@ pub fn sample() -> DashboardModel {
                 title: "Camera Roll".to_string(),
                 path: Some("Pictures\\Camera Roll".to_string()),
                 activity: ActivityState::Syncing,
+                pause: None,
                 progress: 0.74,
                 counts: Counts {
                     pending: 4,
@@ -430,6 +451,7 @@ pub fn sample() -> DashboardModel {
                 title: "DCIM".to_string(),
                 path: Some("Pictures\\DCIM".to_string()),
                 activity: ActivityState::Idle,
+                pause: None,
                 progress: 1.0,
                 counts: Counts {
                     pending: 0,
@@ -455,6 +477,7 @@ pub fn sample() -> DashboardModel {
                 title: "Videos".to_string(),
                 path: Some("Videos\\Projects".to_string()),
                 activity: ActivityState::NeedsAttention,
+                pause: None,
                 progress: 0.31,
                 counts: Counts {
                     pending: 7,
@@ -482,6 +505,7 @@ pub fn sample() -> DashboardModel {
                 title: "Archive".to_string(),
                 path: Some("Archive\\2024".to_string()),
                 activity: ActivityState::Paused,
+                pause: None,
                 progress: 0.0,
                 counts: Counts {
                     pending: 240,
@@ -509,10 +533,10 @@ pub fn sample() -> DashboardModel {
 
 #[cfg(test)]
 mod tests {
-    use super::{DashboardModel, sync_now_copy, upload_line};
+    use super::{ActivityState, DashboardModel, sync_now_copy, upload_line};
     use crate::times;
     use sync_core::meter::UploadTraffic;
-    use sync_core::status::{Activity, FolderStatus, Status};
+    use sync_core::status::{Activity, FolderStatus, PauseReason, Status};
     use sync_core::store::{AlbumPath, FolderCounts};
 
     /// One status with a folder per scan time, so a test reads the newest of
@@ -520,6 +544,8 @@ mod tests {
     fn status_with_scans(scans: &[Option<i64>]) -> Status {
         Status {
             activity: Activity::Idle,
+            pause: None,
+            network: sync_core::network::NetworkStatus::default(),
             folders: scans
                 .iter()
                 .enumerate()
@@ -664,5 +690,24 @@ mod tests {
             }),
             "512.0 KiB/s · 2 uploading"
         );
+    }
+
+    /// R8.8: a hold the user did not click says why, on the dashboard card the
+    /// tray tooltip mirrors.
+    #[test]
+    fn a_network_hold_states_its_reason_on_the_card() {
+        let mut status = status_with_scans(&[]);
+        status.activity = Activity::Paused;
+        status.pause = Some(PauseReason::NotListed);
+        let model = DashboardModel::from_engine(&status, None);
+        assert_eq!(model.global.activity, ActivityState::Paused);
+        assert_eq!(
+            model.global.content().state,
+            "Paused — not on a known network"
+        );
+
+        status.pause = Some(PauseReason::Unknown);
+        let model = DashboardModel::from_engine(&status, None);
+        assert_eq!(model.global.content().state, "Paused — network unknown");
     }
 }

@@ -2,7 +2,10 @@
 //! dashboard show, whether or not the engine runs.
 
 use sync_core::meter::UploadTraffic;
-use sync_core::status::{Activity, ConnectionHealth, FolderStatus, Status, StatusInputs};
+use sync_core::network::NetworkStatus;
+use sync_core::status::{
+    Activity, ConnectionHealth, FolderStatus, PauseReason, Status, StatusInputs,
+};
 use sync_core::store::{AlbumScope, FolderCounts};
 
 fn counts(pending: u32, uploaded: u32, failed: u32, review: u32) -> FolderCounts {
@@ -35,7 +38,8 @@ fn folder(path: &str, counts: FolderCounts) -> FolderStatus {
 fn inputs(folders: Vec<FolderStatus>) -> StatusInputs {
     StatusInputs {
         folders,
-        paused: false,
+        pause: None,
+        network: NetworkStatus::default(),
         connection: ConnectionHealth::Ready,
         review_total: None,
         last_error: None,
@@ -79,8 +83,23 @@ fn a_pending_item_means_syncing_and_drives_the_progress() {
 #[test]
 fn a_pause_wins_over_queued_work() {
     let mut given = inputs(vec![folder("/photos", counts(3, 0, 0, 0))]);
-    given.paused = true;
+    given.pause = Some(PauseReason::User);
     assert_eq!(Status::derive(given).activity, Activity::Paused);
+}
+
+/// R8.8: the network hold is a reason on the existing paused state, and the
+/// reason reaches the views instead of a bare "Paused".
+#[test]
+fn a_network_hold_pauses_with_its_reason() {
+    let mut given = inputs(vec![folder("/photos", counts(3, 0, 0, 0))]);
+    given.pause = Some(PauseReason::NotListed);
+    let status = Status::derive(given);
+    assert_eq!(status.activity, Activity::Paused);
+    assert_eq!(status.pause, Some(PauseReason::NotListed));
+    assert_eq!(
+        status.pause.map(PauseReason::line),
+        Some("Paused — not on a known network")
+    );
 }
 
 #[test]

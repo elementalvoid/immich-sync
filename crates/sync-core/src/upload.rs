@@ -60,19 +60,24 @@ pub enum UploadOutcome {
     /// The retry policy spent the attempt cap, so the item is parked until the
     /// user retries it by hand (R6.5).
     DeadLetter(UploadFailure),
-    /// New uploads are paused (R8.7). The item stays queued and uploads after
+    /// New uploads are held, by the pause or by the known-network list (R8.7,
+    /// R8.8). The item stays queued and uploads after
     /// [`UploadGate::resume`].
     Deferred,
 }
 
-/// Whether new uploads may start (R8.7).
+/// Whether new uploads may start (R8.7, R8.8).
 ///
-/// Pause stops new upload requests inside the acceptance window; an upload
-/// already on the wire finishes. The flag is shared with the engine's worker
-/// pool, so a resume takes effect without a restart.
+/// A hold stops new upload requests inside the acceptance window; an upload
+/// already on the wire finishes. The flags are shared with the engine's worker
+/// pool, so a resume takes effect without a restart. Two independent holds
+/// exist: the user's pause (R8.7) and the known-network gate (R8.8). The UI's
+/// Pause control owns only the first, so Resume cannot override the network
+/// rule.
 #[derive(Clone, Debug, Default)]
 pub struct UploadGate {
     paused: Arc<AtomicBool>,
+    network_held: Arc<AtomicBool>,
 }
 
 impl UploadGate {
@@ -92,10 +97,22 @@ impl UploadGate {
         self.paused.store(false, Ordering::SeqCst);
     }
 
-    /// Whether new uploads are held right now.
+    /// Holds new uploads unless the current network is allowed (R8.8).
+    pub fn hold_network(&self, hold: bool) {
+        self.network_held.store(hold, Ordering::SeqCst);
+    }
+
+    /// Whether the user paused (R8.7). The pause control and the status read
+    /// this, so the network hold is never mistaken for the user's own.
     #[must_use]
     pub fn is_paused(&self) -> bool {
         self.paused.load(Ordering::SeqCst)
+    }
+
+    /// Whether new uploads are held right now, by either hold (R8.7, R8.8).
+    #[must_use]
+    pub fn is_held(&self) -> bool {
+        self.is_paused() || self.network_held.load(Ordering::SeqCst)
     }
 }
 
@@ -407,8 +424,9 @@ impl Uploader {
     /// accepted, marking the row `uploading` first so a crash mid-request
     /// leaves it re-queueable (R6.7).
     ///
-    /// The gate is checked immediately before the request, so a pause stops
-    /// the next upload even inside an already-dispatched worker (R8.7). The
+    /// The gate is checked immediately before the request, so a pause or a
+    /// network hold stops the next upload even inside an already-dispatched
+    /// worker (R8.7, R8.8). The
     /// bandwidth limit is live, so the request streams under whatever limit is
     /// set when its bytes are read (R7.1). `meter` is the folder's: the body
     /// counts its bytes there and the request counts itself in flight while it
@@ -444,10 +462,10 @@ impl Uploader {
             attempts: 0,
             sidecar: recorded,
         };
-        if gate.is_paused() {
+        if gate.is_held() {
             item.state = ItemState::Pending;
             self.record(&item);
-            tracing::debug!(path = %item.path, "the upload was deferred while paused");
+            tracing::debug!(path = %item.path, "the upload was deferred by a hold");
             return UploadOutcome::Deferred;
         }
         self.record(&item);

@@ -2537,6 +2537,96 @@ async fn a_missing_tag_permission_is_named_in_the_tagging_section(cx: &mut TestA
 // its page, its element id, its accessible name, and its help sentence.
 // ---------------------------------------------------------------------------
 
+/// R8.8: the Sync page carries the known-network list: the switch (off by
+/// default), the current network, one Remove per saved name, and Add.
+#[gpui_kit::test]
+fn the_sync_page_shows_the_known_network_list(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let mut store = SettingsStore::open(paths.config_file.clone());
+    store
+        .update(|settings| settings.known_networks = vec!["Home".to_string()])
+        .expect("save the list");
+    let window = open_settings(cx, store, paths, FakeAutostart::new());
+
+    cx.update_window(window, |_, window, cx| {
+        draw(window, cx);
+        open_page(window, PAGE_SYNC, cx);
+        assert_eq!(
+            window.find("settings-known-networks").checked(),
+            Some(false),
+            "R8.8: the list is off on a fresh install"
+        );
+        assert_eq!(
+            window.find("settings-current-network").label(),
+            Some("Current network: unknown"),
+            "R8.8: with no engine the name is unknown, not invented"
+        );
+        assert!(
+            window.find("settings-known-network-remove-0").visible(),
+            "R8.8: a stored name has a Remove control"
+        );
+        assert!(
+            window.find("settings-known-network-add-button").visible(),
+            "R8.8: the page can add a name"
+        );
+    })
+    .expect("read the sync page");
+}
+
+/// R8.8: the switch, a typed name and Remove all reach the settings file, and
+/// the listed name gets its own row.
+#[gpui_kit::test]
+async fn a_known_network_is_added_and_removed(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let store = SettingsStore::open(paths.config_file.clone());
+    let window = open_settings(cx, store, paths.clone(), FakeAutostart::new());
+
+    cx.update_window(window, |_, window, cx| {
+        draw(window, cx);
+        open_page(window, PAGE_SYNC, cx);
+        tab_to(window, "settings-known-networks", cx);
+        window.press("space", cx);
+    })
+    .expect("turn the known-network list on");
+    let saved =
+        wait_for_settings(cx, &paths, |settings| settings.sync_only_on_known_networks).await;
+    assert!(
+        saved.sync_only_on_known_networks,
+        "R8.8: the switch persisted"
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        draw(window, cx);
+        tab_to(window, "settings-known-network-input", cx);
+        window.input("Home Wi-Fi", cx);
+        window.press("enter", cx);
+    })
+    .expect("type a network name");
+    let saved = wait_for_settings(cx, &paths, |settings| !settings.known_networks.is_empty()).await;
+    assert_eq!(
+        saved.known_networks,
+        vec!["Home Wi-Fi".to_string()],
+        "R8.8: the typed name persisted"
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        draw(window, cx);
+        assert!(
+            window.find("settings-known-network-remove-0").visible(),
+            "R8.8: the saved name gets its own row"
+        );
+        window.click("settings-known-network-remove-0", cx);
+    })
+    .expect("remove the network");
+    let saved = wait_for_settings(cx, &paths, |settings| settings.known_networks.is_empty()).await;
+    assert!(
+        saved.known_networks.is_empty(),
+        "R8.8: Remove deletes the name"
+    );
+}
+
 /// The six settings pages, in the order the sidebar lists them.
 const PAGE_CONNECTION: usize = 0;
 const PAGE_GENERAL: usize = 1;
