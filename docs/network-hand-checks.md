@@ -41,7 +41,10 @@ release ships a backend change.
 - **Name.** `CNCopyCurrentNetworkInfo` returns the SSID only with Location
   permission. Turning the list on must show the prompt once; refusing it must
   leave **Current network: unknown — Location permission is not granted**, and
-  the list must hold uploads.
+  the list must hold uploads. The prompt needs a bundled `.app` (the DMG, or a
+  `cargo packager` build): a binary run from `target/` has no usage string for
+  macOS to show, so it stays unknown — confirm that, and that the page then
+  offers **Open Location Settings**.
 - Check that the prompt reappears after an update, as the other TCC grants do
   (ADR 0008), and that allowing it then names the network.
 - **Wired.** With Wi-Fi off and Ethernet plugged in, the client must report

@@ -11,11 +11,14 @@ use std::path::Path;
 
 /// The usage strings macOS shows a TCC prompt for: the three folders a source
 /// folder commonly lives in, the two volume kinds it can be on, and the
-/// Location grant the Wi-Fi network name needs (R8.8).
-const USAGE_KEYS: [&str; 6] = [
+/// Location grant the Wi-Fi network name needs (R8.8). macOS reads
+/// `NSLocationUsageDescription` while iOS reads the When-In-Use key, so the
+/// bundle carries both.
+const USAGE_KEYS: [&str; 7] = [
     "NSDesktopFolderUsageDescription",
     "NSDocumentsFolderUsageDescription",
     "NSDownloadsFolderUsageDescription",
+    "NSLocationUsageDescription",
     "NSLocationWhenInUseUsageDescription",
     "NSNetworkVolumesUsageDescription",
     "NSRemovableVolumesUsageDescription",

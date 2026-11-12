@@ -277,6 +277,12 @@ fn megabytes_per_second_text(bytes: u64) -> String {
     format!("{whole}.{fraction_text}")
 }
 
+/// The system pane macOS opens for the Location grant the Wi-Fi name needs
+/// (R8.8).
+#[cfg(target_os = "macos")]
+const LOCATION_SETTINGS: &str =
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_LocationServices";
+
 /// The notice prefix for a settings file that could not be written.
 const SAVE_PROBLEM: &str = "Could not save the settings";
 /// The notice prefix for an autostart change that could not be applied.
@@ -468,6 +474,13 @@ impl SettingsView {
             in_flight_settings: None,
             _subscriptions: subscriptions,
         };
+        // macOS only: with the list already on, ask for the Location grant at
+        // startup as well as on the switch, so a client that was started with
+        // the setting on still prompts once (R8.8).
+        #[cfg(target_os = "macos")]
+        if view.store.settings().sync_only_on_known_networks {
+            platform_network::request_location_permission();
+        }
         view.reconcile_autostart(cx);
         // A saved profile logs in at startup with no user input (R1.3).
         // Reopening the window rebuilds this view, so the model's once guard
@@ -1318,7 +1331,7 @@ impl SettingsView {
         let settings = self.intended_settings();
         let enabled = settings.sync_only_on_known_networks;
         let names = settings.known_networks.clone();
-        let network_line = self.network.line();
+        let network_value = self.network.value();
 
         let toggle = Rc::new(cx.listener(|this, enabled: &bool, _, cx| {
             this.toggle_known_networks(*enabled, cx);
@@ -1342,22 +1355,47 @@ impl SettingsView {
                         .into_any_element()
                 },
             ),
-            Row::setting(
+            // A name or a reason can be long, so it wraps under the title
+            // rather than pushing the row past the page.
+            Row::stacked(
                 "Current network",
                 "The name the OS reports; the list is compared against it.",
                 move |_, _| {
-                    let element = crate::a11y::named(
+                    crate::a11y::named(
                         Role::Label,
                         "settings-current-network",
-                        network_line.clone(),
+                        network_value.clone(),
                         None,
                     )
+                    .min_w_0()
+                    .w_full()
                     .text_sm()
-                    .child(network_line.clone());
-                    element.into_any_element()
+                    .child(network_value.clone())
+                    .into_any_element()
                 },
             ),
         ];
+        // macOS only reveals the Wi-Fi name to an app allowed under Location
+        // Services, and a refused grant cannot be re-prompted, so the page
+        // offers the settings pane the prompt would have opened.
+        #[cfg(target_os = "macos")]
+        if enabled && !crate::network::location_permission_granted() {
+            known.push(Row::wrapped(
+                "Location permission",
+                "macOS reveals the Wi-Fi network name only to an app allowed under Location \
+                 Services. Allow Immich Sync there, then return to this page.",
+                "settings-location-permission-row",
+                |_, _| {
+                    Button::new("settings-location-permission")
+                        .label("Open Location Settings")
+                        .accessibility_label("Open Location Services settings")
+                        .on_click(|_, _, cx| {
+                            cx.open_url(LOCATION_SETTINGS);
+                        })
+                        .into_any_element()
+                },
+            ));
+        }
         for (index, name) in names.into_iter().enumerate() {
             let label = name.clone();
             let target = name.clone();

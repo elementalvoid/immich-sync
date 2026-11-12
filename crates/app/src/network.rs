@@ -51,6 +51,13 @@ pub fn request_location_permission() {
 #[cfg(not(target_os = "macos"))]
 pub fn request_location_permission() {}
 
+/// Whether macOS has granted the Location access the Wi-Fi name needs (R8.8).
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn location_permission_granted() -> bool {
+    macos::location_permission_granted()
+}
+
 /// A backend that cannot answer on this machine, with the reason the Settings
 /// page shows.
 #[derive(Debug)]
@@ -613,6 +620,12 @@ mod macos {
         // SAFETY: `watch` leaks a `WatchInfo` for exactly the store's lifetime.
         let info = unsafe { &*(info as *const WatchInfo) };
         let _ = info.wake.try_send(());
+    }
+
+    /// Whether the Location grant that gates the SSID is in place (R8.8).
+    pub fn location_permission_granted() -> bool {
+        // SAFETY: reading the authorization status has no pointer contract.
+        unsafe { location_granted(CLLocationManager::authorizationStatus_class()) }
     }
 
     /// Asks macOS for Location permission, which the SSID needs (R8.8).

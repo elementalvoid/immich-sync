@@ -2559,7 +2559,7 @@ fn the_sync_page_shows_the_known_network_list(cx: &mut TestAppContext) {
         );
         assert_eq!(
             window.find("settings-current-network").label(),
-            Some("Current network: unknown"),
+            Some("unknown"),
             "R8.8: with no engine the name is unknown, not invented"
         );
         assert!(

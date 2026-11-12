@@ -17,6 +17,8 @@
 	<string>Immich Sync uploads photos and videos from the source folders you add, including folders in your Documents folder.</string>
 	<key>NSDownloadsFolderUsageDescription</key>
 	<string>Immich Sync uploads photos and videos from the source folders you add, including folders in your Downloads folder.</string>
+	<key>NSLocationUsageDescription</key>
+	<string>Immich Sync reads the current Wi-Fi network name, so it can sync only on the networks you list.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>Immich Sync reads the current Wi-Fi network name, so it can sync only on the networks you list.</string>
 	<key>NSNetworkVolumesUsageDescription</key>

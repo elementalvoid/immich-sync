@@ -157,16 +157,18 @@ impl NetworkStatus {
         }
     }
 
-    /// The sentence the Settings page shows beside the list (R8.8).
+    /// The value the Settings page shows beside the list (R8.8). The row's own
+    /// title already says "Current network", so this is the name or the reason
+    /// alone, and a long reason wraps under that title.
     #[must_use]
-    pub fn line(&self) -> String {
+    pub fn value(&self) -> String {
         if self.wired {
-            return "Current network: wired".to_string();
+            return "wired".to_string();
         }
         match (&self.name, &self.problem) {
-            (Some(name), _) => format!("Current network: {name}"),
-            (None, Some(problem)) => format!("Current network: unknown — {problem}"),
-            (None, None) => "Current network: unknown".to_string(),
+            (Some(name), _) => name.clone(),
+            (None, Some(problem)) => format!("unknown — {problem}"),
+            (None, None) => "unknown".to_string(),
         }
     }
 }
@@ -178,24 +180,24 @@ mod tests {
     /// R8.8: the Settings line names the network when it can, and says why
     /// when it cannot.
     #[test]
-    fn the_settings_line_names_the_network_or_the_reason() {
+    fn the_settings_value_is_the_name_or_the_reason() {
         assert_eq!(
-            NetworkStatus::from_result(&Ok(CurrentNetwork::Wireless("Home".to_string()))).line(),
-            "Current network: Home"
+            NetworkStatus::from_result(&Ok(CurrentNetwork::Wireless("Home".to_string()))).value(),
+            "Home"
         );
         assert_eq!(
-            NetworkStatus::from_result(&Ok(CurrentNetwork::Wired)).line(),
-            "Current network: wired"
+            NetworkStatus::from_result(&Ok(CurrentNetwork::Wired)).value(),
+            "wired"
         );
         assert_eq!(
             NetworkStatus::from_result(&Err(NetworkProblem::new("NetworkManager not found")))
-                .line(),
-            "Current network: unknown — NetworkManager not found"
+                .value(),
+            "unknown — NetworkManager not found"
         );
-        assert_eq!(NetworkStatus::default().line(), "Current network: unknown");
+        assert_eq!(NetworkStatus::default().value(), "unknown");
         assert_eq!(
-            NetworkStatus::from_result(&Ok(CurrentNetwork::Wireless("  ".to_string()))).line(),
-            "Current network: unknown — the OS reported no network name"
+            NetworkStatus::from_result(&Ok(CurrentNetwork::Wireless("  ".to_string()))).value(),
+            "unknown — the OS reported no network name"
         );
     }
 }

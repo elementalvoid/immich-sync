@@ -117,8 +117,11 @@ copy and its shortcuts.
 4. Turning **Sync only on known networks** on asks for Location permission,
    because macOS reveals the Wi-Fi network name only to an app that has it. The
    unsigned build cannot register for the permission the way a signed app does,
-   so if macOS refuses it the Settings page says the name is unknown and the
-   list holds uploads; turning the list off restores syncing on any network.
+   so if macOS refuses it the Settings page says the name is unknown, offers
+   **Open Location Settings**, and the list holds uploads; turning the list off
+   restores syncing on any network. The prompt only works from the installed
+   **Immich Sync** app: a build run out of `target/` is not an app bundle, so
+   macOS cannot show it and the page stays unknown.
 
 To uninstall, first turn **Autostart at login** off if macOS refused the
 unsigned login item: that removes the LaunchAgent at
@@ -390,7 +393,9 @@ network is on your list. The Settings page shows the name the OS reports
 say why. Add the network to the list, connect to a listed network, or turn the
 setting off. Ethernet always syncs. On Linux the name comes from NetworkManager,
 so a machine using systemd-networkd or `iwd` reports no name and stays paused
-while the setting is on; on macOS the name needs Location permission. Full
+while the setting is on; on macOS the name needs the Location grant, and the
+Settings page has **Open Location Settings** when it is missing (the prompt
+appears only in the installed app bundle, not in a `cargo run` build). Full
 checks per platform are in
 [docs/network-hand-checks.md](docs/network-hand-checks.md).
 
