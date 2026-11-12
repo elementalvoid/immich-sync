@@ -468,15 +468,15 @@ async fn the_detail_shows_the_live_fields_and_writes_every_setting(cx: &mut Test
             ),
             (
                 "folder-panel-album-path",
-                "Album names for photos: after its folder path",
+                "Album names for photos: folder path",
             ),
             (
                 "folder-panel-album-name",
-                "Album names for photos: after its folder",
+                "Album names for photos: folder name",
             ),
             (
                 "folder-panel-album-prefix",
-                "Start each album's name with this folder's album name",
+                "Start names with this folder's album title",
             ),
             ("folder-detail-close", "Close the folder detail"),
             ("folder-detail-failed", "View 1 failed items in photos"),
@@ -594,16 +594,16 @@ async fn the_detail_gives_each_setting_its_own_row(cx: &mut TestAppContext) {
             "#93: Album names gets its own row: {leaf:?} vs {path_row:?}"
         );
         assert!(
-            path_row.bottom() <= name_row.top(),
-            "#93: the two name choices sit together: {path_row:?} vs {name_row:?}"
+            path_row.top() == name_row.top(),
+            "#93: the two short name labels share one line: {path_row:?} vs {name_row:?}"
         );
         assert!(
-            name_row.bottom() <= prefix.top(),
-            "#93: the prefix control gets its own row: {name_row:?} vs {prefix:?}"
+            path_row.right() <= name_row.left(),
+            "#93: the name choices read left to right: {path_row:?} vs {name_row:?}"
         );
         assert!(
-            (path_row.left() - name_row.left()).abs() <= px(0.5),
-            "#93: the name choices line up as one block: {path_row:?} vs {name_row:?}"
+            path_row.bottom() <= prefix.top(),
+            "#93: the prefix control gets its own row: {path_row:?} vs {prefix:?}"
         );
         let panel = window.find("folder-panel").bounds();
         assert!(
@@ -2574,11 +2574,11 @@ async fn the_album_naming_choices_are_named_written_and_stated(cx: &mut TestAppC
         );
         assert_eq!(
             label(window, "folder-panel-album-path"),
-            "Album names for photos: after its folder path"
+            "Album names for photos: folder path"
         );
         assert_eq!(
             label(window, "folder-panel-album-prefix"),
-            "Start each album's name with this folder's album name"
+            "Start names with this folder's album title"
         );
     });
 
@@ -2610,8 +2610,8 @@ async fn the_album_naming_choices_are_named_written_and_stated(cx: &mut TestAppC
         assert_eq!(
             card_settings(window, 0),
             "Recursive: on · Album mapping: on · Album scope: One album per folder · \
-             Album names: Name each album after its folder · \
-             Start each album's name with this folder's album name: off"
+             Album names: Folder name · \
+             Start names with this folder's album title: off"
         );
     });
 }
@@ -2670,5 +2670,71 @@ async fn the_album_naming_controls_fit_the_narrowest_window(cx: &mut TestAppCont
                 "#93: {id} is reachable on a short window"
             );
         }
+    });
+}
+
+/// #93: the two album-name choices are only on screen under the per-folder
+/// scope, where they mean something, and the hidden choice survives the trip.
+#[gpui_kit::test]
+async fn the_album_names_choices_appear_only_for_the_per_folder_scope(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+    seed_folder(&paths, &photos, true);
+    let (window, store, _view) = open_dashboard(cx, &paths);
+    wait_for_store(cx, &store).await;
+
+    open_detail_now(cx, window);
+    read(cx, window, |window, _| {
+        assert!(
+            window.try_find("folder-panel-album-name").is_some(),
+            "#93: the per-folder scope shows the album-name choices"
+        );
+    });
+
+    act(cx, window, |window, cx| {
+        window.click("folder-panel-album-name", cx);
+    });
+    wait_for_folder(cx, &store, |folder| {
+        folder.album_path == AlbumPath::LeafName
+    })
+    .await;
+
+    act(cx, window, |window, cx| {
+        window.click("folder-panel-album-whole", cx);
+    });
+    wait_for_folder(cx, &store, |folder| {
+        folder.album_scope == AlbumScope::WholeFolder
+    })
+    .await;
+    read(cx, window, |window, _| {
+        for id in ["folder-panel-album-path", "folder-panel-album-prefix"] {
+            assert!(
+                window.try_find(id).is_none(),
+                "#93: {id} is inert under the whole-folder scope, so it is not shown"
+            );
+        }
+    });
+
+    act(cx, window, |window, cx| {
+        window.click("folder-panel-album-leaf", cx);
+    });
+    let leaf = wait_for_folder(cx, &store, |folder| folder.album_scope == AlbumScope::Leaf).await;
+    assert_eq!(
+        leaf.album_path,
+        AlbumPath::LeafName,
+        "#93: hiding the choice does not change it"
+    );
+    read(cx, window, |window, _| {
+        assert!(
+            window.try_find("folder-panel-album-name").is_some(),
+            "the choices are back with the per-folder scope"
+        );
+        assert_eq!(
+            window.find("folder-panel-album-name").selected(),
+            Some(true)
+        );
     });
 }

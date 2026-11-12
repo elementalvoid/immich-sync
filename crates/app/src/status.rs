@@ -169,7 +169,8 @@ impl StatusCard {
                     if self.album_scope == AlbumScope::Leaf {
                         lines.push(format!("Album names: {}", self.album_path.label()));
                         lines.push(format!(
-                            "Start each album's name with this folder's album name: {}",
+                            "{}: {}",
+                            crate::folder_controls::ALBUM_PREFIX_LABEL,
                             if self.album_prefix { "on" } else { "off" }
                         ));
                     }

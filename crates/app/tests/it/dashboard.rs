@@ -1504,7 +1504,7 @@ async fn enter_opens_the_setup_dialog_without_writing_anything(cx: &mut TestAppC
             Some(true),
             "Album scope defaults to one album per folder"
         );
-        // #93: a new folder names each album after its folder path, with the
+        // #93: a new folder names each album from its folder path, with the
         // source album's title in front.
         assert_eq!(
             window.find("folder-panel-album-path").selected(),
@@ -1545,18 +1545,12 @@ async fn add_writes_the_path_and_every_setting_in_one_request(cx: &mut TestAppCo
         window.click("folder-panel-recursive", cx);
         window.click("folder-panel-album", cx);
         window.render_frame(cx);
-        window.click("folder-panel-album-whole", cx);
-        window.render_frame(cx);
+        // #93: the album-name choices exist only under the per-folder scope,
+        // so they are chosen before the scope moves to the whole folder.
         window.click("folder-panel-album-name", cx);
         window.render_frame(cx);
         window.click("folder-panel-album-prefix", cx);
         window.render_frame(cx);
-        assert_eq!(window.find("folder-panel-recursive").checked(), Some(false));
-        assert_eq!(window.find("folder-panel-album").checked(), Some(true));
-        assert_eq!(
-            window.find("folder-panel-album-whole").selected(),
-            Some(true)
-        );
         assert_eq!(
             window.find("folder-panel-album-name").selected(),
             Some(true),
@@ -1565,6 +1559,14 @@ async fn add_writes_the_path_and_every_setting_in_one_request(cx: &mut TestAppCo
         assert_eq!(
             window.find("folder-panel-album-prefix").checked(),
             Some(false)
+        );
+        window.click("folder-panel-album-whole", cx);
+        window.render_frame(cx);
+        assert_eq!(window.find("folder-panel-recursive").checked(), Some(false));
+        assert_eq!(window.find("folder-panel-album").checked(), Some(true));
+        assert_eq!(
+            window.find("folder-panel-album-whole").selected(),
+            Some(true)
         );
         add_in_setup(window, cx);
     })
@@ -1655,8 +1657,8 @@ async fn the_setup_dialog_gives_each_setting_its_own_row(cx: &mut TestAppContext
             "#93: Album names gets its own row: {leaf:?} vs {path_row:?}"
         );
         assert!(
-            path_row.bottom() <= name_row.top(),
-            "#93: the two name choices sit together: {path_row:?} vs {name_row:?}"
+            path_row.top() == name_row.top() && path_row.right() <= name_row.left(),
+            "#93: the two short name labels share one line: {path_row:?} vs {name_row:?}"
         );
         assert!(
             name_row.bottom() <= prefix.top(),
@@ -1974,15 +1976,15 @@ async fn the_setup_dialog_names_its_controls_and_traps_focus(cx: &mut TestAppCon
         );
         assert_eq!(
             window.find("folder-panel-album-path").label(),
-            Some("Album names for this folder: after its folder path")
+            Some("Album names for this folder: folder path")
         );
         assert_eq!(
             window.find("folder-panel-album-name").label(),
-            Some("Album names for this folder: after its folder")
+            Some("Album names for this folder: folder name")
         );
         assert_eq!(
             window.find("folder-panel-album-prefix").label(),
-            Some("Start each album's name with this folder's album name")
+            Some("Start names with this folder's album title")
         );
         assert_eq!(
             window.find("folder-panel-cancel").label(),

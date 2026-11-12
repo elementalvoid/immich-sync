@@ -496,11 +496,14 @@ impl AlbumPath {
     }
 
     /// The user's choice in the config window's words (#93).
+    ///
+    /// The row label above these options already says "Album names", so each
+    /// label carries only the part that tells the two apart.
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
-            Self::Relative => "Name each album after its folder path",
-            Self::LeafName => "Name each album after its folder",
+            Self::Relative => "Folder path",
+            Self::LeafName => "Folder name",
         }
     }
 }

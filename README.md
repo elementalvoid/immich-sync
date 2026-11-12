@@ -215,10 +215,11 @@ a key from Immich's account settings.
 2. **Folder setup** shows the path and its choices: **Recursive** (on by
    default), **Album mapping** (off by default), **Album scope** (**One album
    per folder**, by default; or **One album for this folder**), **Album names**
-   (**Name each album after its folder path**, by default; or **Name each album
-   after its folder**), **Start each album's name with this folder's album
-   name** (on by default), and **Album title** (blank means the album takes the
-   folder's name).
+   (**Folder path**, by default; or **Folder name**), **Start names with this
+   folder's album title** (on by default), and **Album title** (blank means the
+   album takes the folder's name). The two album-name choices appear only while
+   the scope is **One album per folder**, because a whole-folder album has no
+   names to choose.
 3. **Add** records the path and all its choices in one write, and the folder's
    status card appears on the **Dashboard**; **Cancel** writes nothing. The card
    summarizes the folder's settings; click the card, or its **Details** control,

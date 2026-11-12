@@ -437,6 +437,8 @@ impl FolderPanel {
                 self.draft.recursive = card.recursive;
                 self.draft.album_mapping = card.album_mapping;
                 self.draft.album_scope = card.album_scope;
+                self.draft.album_path = card.album_path;
+                self.draft.album_prefix = card.album_prefix;
                 self.draft.album_title = card.album_title.clone();
                 self.card = Some(card);
                 self.gone = false;
