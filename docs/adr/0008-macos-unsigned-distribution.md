@@ -70,8 +70,16 @@ not taking, is in
 - Autostart uses `SMAppService.mainApp`. If an unsigned bundle is refused, the
   macOS backend falls back to a `~/Library/LaunchAgents` plist rather than
   adding an account.
-- The `Info.plist` carries the bundle identifier, the five file-access usage strings,
-  and `LSMinimumSystemVersion`. Notifications run from the `.app`; gpui-pre disables
+- **Sync only on known networks** (SPEC R8.8) reads the Wi-Fi network name,
+  which macOS reveals only with Location permission. The app asks when the user
+  turns the list on. There is no entitlement to grant it ahead of time and no
+  signed identity to remember it, so an update may ask again; if the grant is
+  refused, the name reads as unknown, the list holds uploads, and turning the
+  list off restores syncing on any network. The hand checks are in
+  [`docs/network-hand-checks.md`](../network-hand-checks.md).
+- The `Info.plist` carries the bundle identifier, the five file-access usage
+  strings, the Location usage string for the known-network check, and
+  `LSMinimumSystemVersion`. Notifications run from the `.app`; gpui-pre disables
   them when there is no bundle identifier, and whether an unsigned bundle is also
   refused is part of the P0 probe. If it is, notifications degrade to nothing, not a
   crash.

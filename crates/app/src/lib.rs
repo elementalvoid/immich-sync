@@ -22,6 +22,7 @@ mod git_revision;
 pub mod instance;
 pub mod logging;
 pub mod logs_view;
+pub mod network;
 mod notice;
 pub mod notify;
 pub mod path_picker;

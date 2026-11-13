@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use sync_core::connection::AuthMethod;
+use sync_core::network::KnownNetworks;
 
 use crate::logging::LogLevel;
 
@@ -33,6 +34,11 @@ pub struct Settings {
     pub attempt_cap: u32,
     /// Whether uploaded assets get the sync tag (SPEC R3.7). On by default.
     pub tag_uploaded_assets: bool,
+    /// Whether uploads wait unless the current network is in the list
+    /// (SPEC R8.8). Off by default.
+    pub sync_only_on_known_networks: bool,
+    /// The network names that list allows (SPEC R8.8).
+    pub known_networks: Vec<String>,
     /// The Immich server URL (SPEC R1.1).
     pub server_url: String,
     /// The account's email address (SPEC R1.1).
@@ -41,6 +47,20 @@ pub struct Settings {
     pub auth_method: AuthMethod,
     /// The rotating file log's level (R10.3).
     pub log_level: LogLevel,
+}
+
+impl Settings {
+    /// The known-network list this file holds (R8.8).
+    ///
+    /// One mapping, so the engine's start and the Settings page cannot read the
+    /// two fields differently.
+    #[must_use]
+    pub fn known_networks(&self) -> KnownNetworks {
+        KnownNetworks {
+            enabled: self.sync_only_on_known_networks,
+            names: self.known_networks.clone(),
+        }
+    }
 }
 
 impl Default for Settings {
@@ -52,6 +72,8 @@ impl Default for Settings {
             scan_interval_minutes: 30,
             attempt_cap: 8,
             tag_uploaded_assets: true,
+            sync_only_on_known_networks: false,
+            known_networks: Vec::new(),
             server_url: String::new(),
             email: String::new(),
             auth_method: AuthMethod::Password,

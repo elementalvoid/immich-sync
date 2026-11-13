@@ -1742,6 +1742,8 @@ mod tests {
         };
         let status = Status {
             activity: Activity::NeedsAttention,
+            pause: None,
+            network: sync_core::network::NetworkStatus::default(),
             folders: vec![FolderStatus {
                 path: "/photos".to_string(),
                 recursive: true,
@@ -1855,6 +1857,8 @@ mod tests {
         };
         let status = Status {
             activity: Activity::Syncing,
+            pause: None,
+            network: sync_core::network::NetworkStatus::default(),
             folders: vec![FolderStatus {
                 path: "/photos".to_string(),
                 recursive: true,
@@ -2053,6 +2057,8 @@ mod tests {
         };
         let status = Status {
             activity: Activity::Idle,
+            pause: None,
+            network: sync_core::network::NetworkStatus::default(),
             folders: vec![FolderStatus {
                 path: "/photos".to_string(),
                 recursive: true,

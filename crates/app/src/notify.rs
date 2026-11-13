@@ -189,6 +189,8 @@ mod tests {
     fn status(activity: Activity, review: u32, failed: u32) -> Status {
         Status {
             activity,
+            pause: None,
+            network: sync_core::network::NetworkStatus::default(),
             folders: Vec::new(),
             counts: FolderCounts {
                 pending: 0,

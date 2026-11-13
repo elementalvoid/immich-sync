@@ -12,7 +12,10 @@ use std::time::Duration;
 use gpui_kit::*;
 use sync_core::engine::{Engine, EngineConfig, Limits};
 use sync_core::meter::UploadTraffic;
-use sync_core::status::{Activity, ConnectionHealth, FolderStatus, Status, StatusInputs};
+use sync_core::network::{KnownNetworks, NetworkSource, NetworkStatus};
+use sync_core::status::{
+    Activity, ConnectionHealth, FolderStatus, PauseReason, Status, StatusInputs,
+};
 use sync_core::store::{
     AlbumPath, AlbumScope, FailedItem, FolderCounts, ReviewItem, SourceFolder, StateStore,
 };
@@ -40,14 +43,17 @@ const STATUS_POLL: Duration = Duration::from_millis(250);
 /// this only decides how soon a parked item or a missing file shows up.
 const FAILED_POLL_TICKS: u32 = 4;
 
-/// The live settings the app pushes to a running engine (R7.1, R7.2, R3.7).
+/// The live settings the app pushes to a running engine (R7.1, R7.2, R3.7,
+/// R8.8).
 ///
-/// One channel carries both, so a change to either reaches the engine in the
+/// One channel carries them, so a change to any reaches the engine in the
 /// order the view made it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct LiveSettings {
     limits: Limits,
     tag_uploaded_assets: bool,
+    /// The known-network list (R8.8).
+    known: KnownNetworks,
 }
 
 /// The app-scoped engine and the status the views render.
@@ -55,6 +61,12 @@ pub struct EngineModel {
     connection: Entity<ConnectionModel>,
     store_model: Entity<StoreModel>,
     paths: AppPaths,
+    /// The platform's network names, handed to every engine this model starts
+    /// (R8.8).
+    network_source: Arc<dyn NetworkSource>,
+    /// The network the startup check read, so the Settings page can name it
+    /// before an engine runs (R8.8).
+    network: NetworkStatus,
     engine: Option<Arc<Engine>>,
     /// The newest live-settings change for the running engine. One applier task
     /// per engine drains it, so two quick edits cannot land out of order.
@@ -198,6 +210,7 @@ impl EngineModel {
         paths: &AppPaths,
         cx: &mut Context<Self>,
     ) -> Self {
+        let network_source = crate::network::platform_network();
         let subscriptions = vec![
             // The status, the review list and the parked list are refreshed
             // when the store opens, so a review that already waits in the
@@ -218,6 +231,21 @@ impl EngineModel {
                 this.try_start_engine(cx);
             }),
         ];
+        // R8.8: one check at startup, off the UI thread, so the Settings page
+        // can name the network while the client is signed out. Once an engine
+        // runs, its own check and its status own the answer.
+        let source = Arc::clone(&network_source);
+        cx.spawn(async move |this, cx| {
+            let answer = cx
+                .background_executor()
+                .spawn(async move { source.current() })
+                .await;
+            let _ = this.update(cx, |model, cx| {
+                model.network = NetworkStatus::from_result(&answer);
+                model.refresh_status(cx);
+            });
+        })
+        .detach();
         let poll = cx.spawn(async move |this, cx| {
             let mut ticks = 0_u32;
             loop {
@@ -248,6 +276,8 @@ impl EngineModel {
             connection,
             store_model,
             paths: paths.clone(),
+            network_source,
+            network: NetworkStatus::default(),
             engine: None,
             live: None,
             status: empty_status(),
@@ -696,7 +726,7 @@ impl EngineModel {
         // The applier task wakes on the newest value, so a change that
         // overtakes this one cannot be overwritten by it.
         if let Some(live) = &self.live {
-            let mut next = *live.borrow();
+            let mut next = live.borrow().clone();
             next.limits = Limits {
                 bandwidth_bytes_per_second,
                 concurrency: concurrency.max(1),
@@ -714,12 +744,23 @@ impl EngineModel {
         &self.tag
     }
 
+    /// Moves the running engine to the user's newest known-network list
+    /// (R8.8). Before it starts this is a no-op: the settings file it reads at
+    /// start already holds the value the view wrote.
+    pub fn set_known_networks(&mut self, known: KnownNetworks) {
+        if let Some(live) = &self.live {
+            let mut next = live.borrow().clone();
+            next.known = known;
+            live.send_replace(next);
+        }
+    }
+
     /// Turns the sync tag on or off on the running engine without a restart
     /// (R3.7). Before it starts this is a no-op: the settings file it reads at
     /// start already holds the value the view wrote.
     pub fn set_tag_uploads(&mut self, enabled: bool) {
         if let Some(live) = &self.live {
-            let mut next = *live.borrow();
+            let mut next = live.borrow().clone();
             next.tag_uploaded_assets = enabled;
             live.send_replace(next);
         }
@@ -1069,6 +1110,7 @@ impl EngineModel {
             return false;
         };
         let config_file = self.paths.config_file.clone();
+        let network = Arc::clone(&self.network_source);
         let paused = self.paused;
         self.start_generation = self.start_generation.wrapping_add(1);
         let start_generation = self.start_generation;
@@ -1078,6 +1120,9 @@ impl EngineModel {
                 // The settings file is small; reading it here keeps the UI
                 // thread out of the file system (N2).
                 let settings = SettingsStore::open(config_file).settings().clone();
+                // R8.8: the known-network list is the settings file's, read
+                // where the rest of the engine's settings are read.
+                let known = settings.known_networks();
                 let config = EngineConfig {
                     concurrency: usize::try_from(settings.concurrency.max(1)).unwrap_or(4),
                     bandwidth_bytes_per_second: settings.bandwidth_bytes_per_second,
@@ -1098,6 +1143,7 @@ impl EngineModel {
                         if paused {
                             engine.pause();
                         }
+                        engine.watch_network(network, known);
                         engine.start();
                         Ok(engine)
                     }
@@ -1133,15 +1179,17 @@ impl EngineModel {
                                 tokio::sync::watch::channel(LiveSettings {
                                     limits: engine.limits(),
                                     tag_uploaded_assets: engine.tag_status().enabled,
+                                    known: engine.known_networks(),
                                 });
                             let applier = Arc::clone(&engine);
                             runtime.spawn(async move {
                                 while incoming.changed().await.is_ok() {
                                     // Copy first: the borrow is not `Send`, so
                                     // it must not live across the await.
-                                    let live = *incoming.borrow_and_update();
+                                    let live = incoming.borrow_and_update().clone();
                                     applier.set_limits(live.limits).await;
                                     applier.set_tag_uploads(live.tag_uploaded_assets).await;
+                                    applier.set_known_networks(live.known);
                                 }
                             });
                             model.live = Some(changes);
@@ -1210,7 +1258,10 @@ impl EngineModel {
                     .collect::<Vec<_>>();
                 Status::derive(StatusInputs {
                     folders,
-                    paused: self.paused,
+                    pause: self.paused.then_some(PauseReason::User),
+                    // The startup check's answer; an engine's own check
+                    // takes over when it runs (R8.8).
+                    network: self.network.clone(),
                     connection: ConnectionHealth::from_state(self.connection.read(cx).state()),
                     // R5.4: the cached list is the store's whole review,
                     // including items under a removed source folder, so it is
@@ -1270,6 +1321,8 @@ impl EngineModel {
 fn empty_status() -> Status {
     Status {
         activity: Activity::Idle,
+        pause: None,
+        network: NetworkStatus::default(),
         folders: Vec::new(),
         counts: FolderCounts::default(),
         last_error: None,

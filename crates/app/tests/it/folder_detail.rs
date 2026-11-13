@@ -1925,6 +1925,8 @@ async fn the_detail_renders_in_both_themes(cx: &mut TestAppContext) {
 fn a_folder_status_carries_its_times_into_the_detail_card() {
     let status = Status {
         activity: Activity::Idle,
+        pause: None,
+        network: sync_core::network::NetworkStatus::default(),
         folders: vec![FolderStatus {
             path: "/photos".to_string(),
             recursive: true,

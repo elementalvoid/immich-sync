@@ -22,7 +22,7 @@ use crate::tab::Tab;
 use crate::upload::UploadModel;
 use crate::upload_view::UploadView;
 use sync_core::connection::{ConnectionState, ServerProfile};
-use sync_core::status::Activity;
+use sync_core::status::{Activity, PauseReason};
 use sync_core::store::FolderCounts;
 
 use std::sync::Mutex;
@@ -1003,15 +1003,20 @@ pub fn tray_tooltip(state: &ConnectionState) -> String {
 
 /// The tray tooltip for the live activity, the connection, the review count,
 /// and the progress (R8.2, R5.4).
+///
+/// A held sync says why, so a pause the user did not click is never left
+/// without an explanation (R8.8).
 #[must_use]
 pub fn tray_status_tooltip(
     activity: Activity,
+    pause: Option<PauseReason>,
     state: &ConnectionState,
     counts: FolderCounts,
     last_error: Option<&str>,
 ) -> String {
     let total = counts.uploaded + counts.pending;
-    let mut text = format!("Immich Sync — {} — {}", activity.label(), state.message());
+    let activity = pause.map_or_else(|| activity.label(), PauseReason::line);
+    let mut text = format!("Immich Sync — {activity} — {}", state.message());
     if total > 0 {
         text.push_str(&format!(" — {}/{} uploaded", counts.uploaded, total));
     }
@@ -1054,6 +1059,7 @@ pub fn show_status_on_tray(cx: &mut App) {
     let status = engine.read(cx).status().clone();
     let tooltip = tray_status_tooltip(
         status.activity,
+        status.pause,
         &state,
         status.counts,
         status.last_error.as_deref(),
