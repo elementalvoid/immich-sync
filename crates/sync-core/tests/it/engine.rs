@@ -1991,7 +1991,7 @@ async fn a_format_immich_cannot_accept_is_never_an_item_or_a_failure() {
     );
     let folder = engine.status();
     assert_eq!(
-        folder.folders[0].unsupported, 1,
+        folder.folders[0].unsupported_count, 1,
         "#95: the folder detail counts the refused file"
     );
     assert_eq!(
@@ -2007,7 +2007,7 @@ async fn a_format_immich_cannot_accept_is_never_an_item_or_a_failure() {
         store
             .folder_times(&photos.display().to_string())
             .expect("read the stored folder facts")
-            .unsupported,
+            .unsupported_count,
         1,
         "#95: the count survives a restart with the folder row"
     );
@@ -2028,7 +2028,7 @@ async fn a_later_scan_clears_the_count_once_the_refused_file_is_gone() {
 
     assert!(
         wait_until(
-            || engine.status().folders[0].unsupported == 1,
+            || engine.status().folders[0].unsupported_count == 1,
             Duration::from_secs(10)
         )
         .await,
@@ -2038,7 +2038,7 @@ async fn a_later_scan_clears_the_count_once_the_refused_file_is_gone() {
     engine.sync_now();
     assert!(
         wait_until(
-            || engine.status().folders[0].unsupported == 0,
+            || engine.status().folders[0].unsupported_count == 0,
             Duration::from_secs(10)
         )
         .await,
@@ -2047,25 +2047,26 @@ async fn a_later_scan_clears_the_count_once_the_refused_file_is_gone() {
     engine.stop();
 }
 
-/// #95: a failed row recorded before the allowlist existed is a failure no
-/// retry can fix, so the scan that sees the file drops the row and its attempt
-/// log.
+/// #95: a row recorded before the allowlist existed, for a format the client
+/// now refuses, is deleted when the scan sees the file, whatever state it was
+/// in. A row that holds a server asset stays: deleting it would lose the
+/// item's mapping and its version chain (R4).
 #[tokio::test]
-async fn a_scan_drops_a_failed_row_for_a_format_the_allowlist_refuses() {
+async fn a_scan_drops_rows_without_an_asset_for_a_format_the_allowlist_refuses() {
     let server = MockImmich::start().await;
     let temp = tempfile::tempdir().expect("create a temp dir");
     let store = store_in(&temp);
     let photos = temp.path().join("photos");
-    let song = write_file(&photos, "old.wma", b"audio bytes");
-    let path_text = song.display().to_string();
+    let failed_song = write_file(&photos, "old.wma", b"audio bytes");
+    let failed_path = failed_song.display().to_string();
     store
         .record(&ItemRecord {
-            path: path_text.clone(),
-            size: std::fs::metadata(&song)
+            path: failed_path.clone(),
+            size: std::fs::metadata(&failed_song)
                 .expect("read the fixture metadata")
                 .len(),
-            mtime_ns: mtime_ns_of(&song),
-            sha1: sha1_file(&song).expect("hash the fixture"),
+            mtime_ns: mtime_ns_of(&failed_song),
+            sha1: sha1_file(&failed_song).expect("hash the fixture"),
             asset_id: None,
             state: ItemState::DeadLetter,
             error_class: Some(FailureClass::UnsupportedFormat),
@@ -2076,26 +2077,53 @@ async fn a_scan_drops_a_failed_row_for_a_format_the_allowlist_refuses() {
         .expect("write the failed row from before the allowlist");
     store
         .record_attempt(&AttemptRecord {
-            path: path_text.clone(),
+            path: failed_path.clone(),
             started_ns: 1_700_000_000_000_000_000,
             outcome: AttemptOutcome::Failed,
             error_class: Some(FailureClass::UnsupportedFormat),
         })
         .expect("record the spent attempt");
+    // A row a previous run left queued: the requeue must not send it either.
+    let queued_song = write_file(&photos, "queued.wma", b"more audio");
+    let queued_path = queued_song.display().to_string();
+    let queued = ItemRecord {
+        path: queued_path.clone(),
+        size: std::fs::metadata(&queued_song)
+            .expect("read the fixture metadata")
+            .len(),
+        mtime_ns: mtime_ns_of(&queued_song),
+        sha1: sha1_file(&queued_song).expect("hash the fixture"),
+        asset_id: None,
+        state: ItemState::Pending,
+        error_class: None,
+        error_message: None,
+        attempts: 0,
+        sidecar: None,
+    };
+    store.record(&queued).expect("write the queued row");
+    // A refused format the server once took keeps its row and its asset.
+    let kept_song = write_file(&photos, "kept.wma", b"old audio");
+    let kept_path = kept_song.display().to_string();
+    let mut kept = queued.clone();
+    kept.path = kept_path.clone();
+    kept.state = ItemState::Uploaded;
+    kept.asset_id = Some("asset-old".to_string());
+    store.record(&kept).expect("write the row with an asset");
     add_folder(&store, &photos, true);
     let engine = start_engine(&server, &store, EngineConfig::default()).await;
 
     assert!(
         wait_until(
-            || matches!(store.item(&path_text), Ok(None)),
+            || matches!(store.item(&failed_path), Ok(None))
+                && matches!(store.item(&queued_path), Ok(None)),
             Duration::from_secs(10)
         )
         .await,
-        "#95: the scan never dropped the row the allowlist now refuses"
+        "#95: the scan never dropped the rows without an asset"
     );
     assert!(
         store
-            .attempts(&path_text)
+            .attempts(&failed_path)
             .expect("read the attempts")
             .is_empty(),
         "#95: the attempt log goes with the row"
@@ -2105,10 +2133,21 @@ async fn a_scan_drops_a_failed_row_for_a_format_the_allowlist_refuses() {
             .failed_items()
             .expect("read the failed items")
             .iter()
-            .all(|item| item.path != path_text),
+            .all(|item| item.path != failed_path),
         "#95: the failed view no longer lists it"
     );
-    assert_eq!(server.upload_requests(), 0, "nothing was sent for it");
+    assert!(
+        matches!(
+            store.item(&kept_path).expect("read the kept row"),
+            Some(row) if row.asset_id.as_deref() == Some("asset-old")
+        ),
+        "#95: a row that holds an asset keeps its mapping"
+    );
+    assert_eq!(
+        server.upload_requests(),
+        0,
+        "#95: neither refused file was sent"
+    );
     engine.stop();
 }
 

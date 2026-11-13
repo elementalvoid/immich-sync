@@ -196,12 +196,12 @@ fn seed_capture_state() {
     let now_ns = immich_sync::times::now_ns();
     let minute = 60 * 1_000_000_000;
     store
-        .record_folder_scan(&pictures.display().to_string(), now_ns - 3 * minute, 0)
+        .record_folder_scan(&pictures.display().to_string(), now_ns - 3 * minute)
         .expect("record the capture scan time");
     store
         .record_folder_upload(&pictures.display().to_string(), now_ns - 8 * minute)
         .expect("record the capture upload time");
     store
-        .record_folder_scan(&videos.display().to_string(), now_ns - 3 * minute, 0)
+        .record_folder_scan(&videos.display().to_string(), now_ns - 3 * minute)
         .expect("record the second capture scan time");
 }

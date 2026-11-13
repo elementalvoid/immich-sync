@@ -19,7 +19,7 @@ One local file that the client tracks from discovery to upload result.
 _Avoid_: job, task, file record
 
 **Unsupported file**:
-A file whose extension is not one Immich accepts. The client never queues it: it is not a sync item, has no attempt, and never becomes a failure. The folder detail shows how many the last scan of that folder refused.
+A file whose extension is not one Immich accepts. The client never queues it: it is not a sync item, has no attempt, and never becomes a failure. The folder detail shows how many the last scan of that folder refused, and the count is stored with the folder so a restart keeps it.
 _Avoid_: invalid file, rejected file, bad format
 
 **Tracking**:

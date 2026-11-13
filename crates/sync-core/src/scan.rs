@@ -27,7 +27,7 @@ pub struct ScanReport {
     /// accept. They are not sync items; the engine counts them for the folder
     /// detail and drops any failed row it recorded before the allowlist
     /// existed.
-    pub unsupported: Vec<PathBuf>,
+    pub unsupported_paths: Vec<PathBuf>,
     /// How many entries the skip rules refused. Only the unit tests read it,
     /// so a production build carries no dead counter.
     #[cfg(test)]
@@ -169,7 +169,7 @@ pub fn scan_folder(folder: &SourceFolder) -> Result<ScanReport, ScanError> {
                         path = %path.display(),
                         "Immich cannot accept this file format, so the scan does not queue it"
                     );
-                    report.unsupported.push(path.to_path_buf());
+                    report.unsupported_paths.push(path.to_path_buf());
                 }
                 _ => {}
             }
@@ -183,8 +183,8 @@ pub fn scan_folder(folder: &SourceFolder) -> Result<ScanReport, ScanError> {
     }
     // #95: one line per scan per folder. A count of zero is only interesting
     // to a debugger; a real count is what the user may want to act on.
-    let unsupported = report.unsupported.len();
-    let extensions = extension_summary(&report.unsupported);
+    let unsupported = report.unsupported_paths.len();
+    let extensions = extension_summary(&report.unsupported_paths);
     if unsupported > 0 {
         tracing::info!(
             folder = %folder.path,
@@ -324,8 +324,8 @@ mod tests {
         let report = scan_folder(&folder(temp.path(), true)).expect("scan the fixture");
 
         assert_eq!(names(&report), ["photo.jpg"]);
-        let mut unsupported: Vec<String> = report
-            .unsupported
+        let mut refused: Vec<String> = report
+            .unsupported_paths
             .iter()
             .map(|path| {
                 path.file_name()
@@ -334,10 +334,10 @@ mod tests {
                     .into_owned()
             })
             .collect();
-        unsupported.sort();
-        assert_eq!(unsupported, ["memo", "song.wma"]);
+        refused.sort();
+        assert_eq!(refused, ["memo", "song.wma"]);
         assert_eq!(
-            extension_summary(&report.unsupported),
+            extension_summary(&report.unsupported_paths),
             "none, wma",
             "#95: the log names the formats it saw, deduplicated and sorted"
         );

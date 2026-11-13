@@ -110,7 +110,7 @@ fn seed_row(paths: &AppPaths, folder: &Path, name: &str, state: ItemState) {
 fn seed_times(paths: &AppPaths, folder: &Path, scan_ns: i64, upload_ns: i64) {
     let store = StateStore::open(&paths.state_db).expect("open the state database");
     store
-        .record_folder_scan(&folder.display().to_string(), scan_ns, 0)
+        .record_folder_scan(&folder.display().to_string(), scan_ns)
         .expect("record the scan time");
     store
         .record_folder_upload(&folder.display().to_string(), upload_ns)
@@ -1166,6 +1166,12 @@ async fn a_short_window_keeps_the_footer_on_screen_and_scrolls_the_body_below_it
     let photos = temp.path().join("photos");
     std::fs::create_dir_all(&photos).expect("create the source folder");
     seed_folder(&paths, &photos, true);
+    {
+        let store = StateStore::open(&paths.state_db).expect("open the state database");
+        store
+            .record_unsupported_count(&photos.display().to_string(), 3)
+            .expect("record the refused count");
+    }
     seed_assets(
         &paths,
         &photos,
@@ -1179,6 +1185,11 @@ async fn a_short_window_keeps_the_footer_on_screen_and_scrolls_the_body_below_it
     wait_for_asset_rows(cx, window, 50).await;
     read(cx, window, |window, cx| {
         let viewport = Bounds::new(Point::default(), window.viewport_size());
+        assert_eq!(
+            label(window, "folder-detail-unsupported"),
+            "Files Immich cannot accept: 3",
+            "#95: the refused count renders on the short window"
+        );
         for id in ["folder-assets-more", "folder-detail-remove"] {
             let bounds = window.find(id).bounds();
             assert!(
@@ -1388,8 +1399,11 @@ async fn the_detail_names_the_files_immich_cannot_accept(cx: &mut TestAppContext
     {
         let store = StateStore::open(&paths.state_db).expect("open the state database");
         store
-            .record_folder_scan(&photos.display().to_string(), times::now_ns(), 3)
-            .expect("record the last scan and its refused count");
+            .record_folder_scan(&photos.display().to_string(), times::now_ns())
+            .expect("record the last scan");
+        store
+            .record_unsupported_count(&photos.display().to_string(), 3)
+            .expect("record the refused count");
     }
     let (window, store, _view) = open_dashboard(cx, &paths);
     wait_for_store(cx, &store).await;
@@ -1974,7 +1988,7 @@ fn a_folder_status_carries_its_times_into_the_detail_card() {
             last_scan_ns: Some(1_700_000_000_000_000_000),
             last_upload_ns: Some(1_700_000_001_000_000_000),
             uploads: sync_core::meter::UploadTraffic::default(),
-            unsupported: 3,
+            unsupported_count: 3,
             ..FolderStatus::default()
         }],
         counts: FolderCounts::default(),
@@ -1998,11 +2012,11 @@ fn a_folder_status_carries_its_times_into_the_detail_card() {
         "#56: the global card carries the newest folder's scan"
     );
     assert_eq!(
-        model.folders[0].unsupported, 3,
+        model.folders[0].unsupported_count, 3,
         "#95: the folder detail's count reaches the card model"
     );
     assert_eq!(
-        model.global.unsupported, 0,
+        model.global.unsupported_count, 0,
         "#95: the global card is not a folder and holds no count"
     );
     assert_eq!(

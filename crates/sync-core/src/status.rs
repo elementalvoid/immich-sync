@@ -129,7 +129,7 @@ pub struct FolderStatus {
     /// How many files in this folder Immich cannot accept, from the last
     /// reconciliation scan (#95). They are not sync items, so no other count
     /// moves; the folder detail names them in their own sentence.
-    pub unsupported: u32,
+    pub unsupported_count: u32,
     /// This folder's share of the upload traffic: the bytes its upload bodies
     /// have moved and the requests on the wire right now (R8.1).
     pub uploads: UploadTraffic,

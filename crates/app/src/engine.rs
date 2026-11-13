@@ -1253,7 +1253,7 @@ impl EngineModel {
                         last_upload_ns: times.last_upload_ns,
                         // #95: the last scan's count of files Immich cannot
                         // accept, which the store keeps for this view.
-                        unsupported: times.unsupported,
+                        unsupported_count: times.unsupported_count,
                         // The meter dies with the engine it belongs to; the
                         // store-only status has nothing on the wire (R8.1).
                         uploads: UploadTraffic::default(),

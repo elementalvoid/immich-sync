@@ -1105,7 +1105,7 @@ impl FolderPanel {
         // #95: files in this folder that Immich cannot accept are not sync
         // items, so they are named in their own sentence rather than in the
         // counts line.
-        let unsupported = self.card.as_ref().map_or(0, |card| card.unsupported);
+        let unsupported = self.card.as_ref().map_or(0, |card| card.unsupported_count);
         let last_error = self.card.as_ref().and_then(|card| card.last_error.clone());
         let now_ns = times::now_ns();
         let upload_line = times::moment_line(

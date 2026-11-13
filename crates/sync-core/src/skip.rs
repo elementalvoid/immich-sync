@@ -56,13 +56,13 @@ impl SkipReason {
 ///
 /// That page defers to the server's source for the full list, so this table is
 /// the one place the client keeps it: adding a format is a one-line change.
-/// A file whose extension is not here is never queued (#95).
-pub const SUPPORTED_MEDIA_EXTENSIONS: [&str; 40] = [
-    // Images.
-    "avif", "bmp", "gif", "heic", "heif", "jp2", "jfif", "jpeg", "jpg", "jpe", "insp", "jxl", "mpo",
-    "png", "psd", "raw", "rw2", "svg", "tif", "tiff", "webp", // Video.
-    "3gp", "3gpp", "avi", "flv", "m4v", "mkv", "mts", "m2ts", "m2t", "ts", "mp4", "insv", "mpg",
-    "mpe", "mpeg", "mxf", "mov", "webm", "wmv",
+/// The image formats come first, then the video ones. A file whose extension is
+/// not here is never queued (#95).
+pub static SUPPORTED_MEDIA_EXTENSIONS: &[&str] = &[
+    "avif", "bmp", "gif", "heic", "heif", "jp2", "jfif", "jpeg", "jpg", "jpe", "insp", "jxl",
+    "mpo", "png", "psd", "raw", "rw2", "svg", "tif", "tiff", "webp", "3gp", "3gpp", "avi", "flv",
+    "m4v", "mkv", "mts", "m2ts", "m2t", "ts", "mp4", "insv", "mpg", "mpe", "mpeg", "mxf", "mov",
+    "webm", "wmv",
 ];
 
 /// Whether a bare file name has an extension Immich accepts (#95).
@@ -72,7 +72,9 @@ pub const SUPPORTED_MEDIA_EXTENSIONS: [&str; 40] = [
 #[must_use]
 pub fn is_supported_media(name: &str) -> bool {
     name.rsplit_once('.').is_some_and(|(_, extension)| {
-        SUPPORTED_MEDIA_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+        SUPPORTED_MEDIA_EXTENSIONS
+            .iter()
+            .any(|supported| supported.eq_ignore_ascii_case(extension))
     })
 }
 
