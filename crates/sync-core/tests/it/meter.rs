@@ -101,7 +101,7 @@ async fn the_status_rates_a_upload_while_it_is_on_the_wire() {
     let temp = tempfile::tempdir().expect("create a temp dir");
     let store = store_in(&temp);
     let photos = temp.path().join("photos");
-    let path = write_file(&photos, "big.bin", BIG_BYTES);
+    let path = write_file(&photos, "big.jpg", BIG_BYTES);
     add_folder(&store, &photos, true);
 
     let engine = built(&store, signed_in(&server).await);
@@ -160,7 +160,7 @@ async fn a_paused_engine_never_puts_an_upload_on_the_wire() {
     let temp = tempfile::tempdir().expect("create a temp dir");
     let store = store_in(&temp);
     let photos = temp.path().join("photos");
-    let path = write_file(&photos, "photo.bin", 64 * 1024);
+    let path = write_file(&photos, "photo.jpg", 64 * 1024);
     add_folder(&store, &photos, true);
 
     let engine = built(&store, signed_in(&server).await);
@@ -199,7 +199,7 @@ async fn a_failed_upload_rises_and_falls_but_leaves_nothing_on_the_wire() {
     let temp = tempfile::tempdir().expect("create a temp dir");
     let store = store_in(&temp);
     let photos = temp.path().join("photos");
-    let path = write_file(&photos, "bad.bin", 64 * 1024);
+    let path = write_file(&photos, "bad.jpg", 64 * 1024);
     add_folder(&store, &photos, true);
 
     let engine = start_engine(&server, &store).await;
@@ -240,8 +240,8 @@ async fn per_folder_bytes_sum_to_the_global_reading() {
     let store = store_in(&temp);
     let photos = temp.path().join("photos");
     let trips = photos.join("trips");
-    let parent_file = write_file(&photos, "parent.bin", 64 * 1024);
-    let nested_file = write_file(&trips, "nested.bin", 96 * 1024);
+    let parent_file = write_file(&photos, "parent.jpg", 64 * 1024);
+    let nested_file = write_file(&trips, "nested.jpg", 96 * 1024);
     // R2.1: a folder and one of its subfolders are both source folders, one
     // recursive and one not.
     add_folder(&store, &photos, true);
@@ -291,7 +291,7 @@ async fn a_paused_engine_keeps_rating_an_upload_already_on_the_wire() {
     let temp = tempfile::tempdir().expect("create a temp dir");
     let store = store_in(&temp);
     let photos = temp.path().join("photos");
-    let path = write_file(&photos, "big.bin", BIG_BYTES);
+    let path = write_file(&photos, "big.jpg", BIG_BYTES);
     add_folder(&store, &photos, true);
 
     let engine = start_engine(&server, &store).await;
@@ -330,7 +330,7 @@ async fn a_manual_upload_changes_neither_the_rate_nor_the_counts() {
     add_folder(&store, &photos, true);
     // The manual file is outside every source folder, so the engine never
     // queues it: only the Upload view's own path uploads it (R7.4).
-    let manual = write_file(&temp.path().join("manual"), "one.bin", 256 * 1024);
+    let manual = write_file(&temp.path().join("manual"), "one.jpg", 256 * 1024);
 
     let engine = start_engine(&server, &store).await;
     assert!(
@@ -412,7 +412,7 @@ async fn a_rebuilt_engine_starts_the_meter_over() {
     let temp = tempfile::tempdir().expect("create a temp dir");
     let store = store_in(&temp);
     let photos = temp.path().join("photos");
-    let path = write_file(&photos, "photo.bin", 64 * 1024);
+    let path = write_file(&photos, "photo.jpg", 64 * 1024);
     add_folder(&store, &photos, true);
 
     let first = built(&store, signed_in(&server).await);
@@ -443,7 +443,7 @@ async fn stopping_the_engine_releases_an_upload_on_the_wire() {
     let temp = tempfile::tempdir().expect("create a temp dir");
     let store = store_in(&temp);
     let photos = temp.path().join("photos");
-    let _path = write_file(&photos, "big.bin", BIG_BYTES);
+    let _path = write_file(&photos, "big.jpg", BIG_BYTES);
     add_folder(&store, &photos, true);
 
     let engine = start_engine(&server, &store).await;

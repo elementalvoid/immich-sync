@@ -255,6 +255,19 @@ ALTER TABLE source_folder ADD COLUMN album_path TEXT NOT NULL DEFAULT 'relative'
 ALTER TABLE source_folder ADD COLUMN album_prefix INTEGER NOT NULL DEFAULT 1;
 ";
 
+/// The fourteenth schema (#95): how many of a folder's files Immich cannot
+/// accept.
+///
+/// The scan counts them, because the allowlist keeps them out of the state
+/// tables entirely: no item, no attempt, no failure. The count lives on the
+/// folder row so the folder detail still shows it after a restart or while no
+/// engine runs, and a later scan overwrites it with what the folder holds then.
+/// A database written before it reads zero, which is what a folder whose files
+/// all pass the allowlist reads too.
+const SCHEMA_V14: &str = "
+ALTER TABLE source_folder ADD COLUMN unsupported INTEGER NOT NULL DEFAULT 0;
+";
+
 /// How long the one writer waits for a competing lock before failing.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -587,12 +600,6 @@ pub struct FolderCounts {
     pub review: u32,
 }
 
-/// When one source folder last reconciled and last uploaded (#43).
-///
-/// The folder detail shows both, and the sync engine writes them from the
-/// paths that already know the outcome: a scan that read the folder and an
-/// upload that reached a terminal success. They sit on the folder row so a
-/// restart keeps them (`folder_time_tests`).
 /// One current asset of one source folder, for the folder detail's list (#44).
 ///
 /// The row is the file's identity plus the asset its current version holds, so
@@ -609,6 +616,14 @@ pub struct FolderAsset {
     pub created_at_ns: i64,
 }
 
+/// When one source folder last reconciled, last uploaded (#43), and how many
+/// files Immich cannot accept (#95).
+///
+/// The folder detail shows the times relative and exact, and the count in its
+/// own sentence. The sync engine writes them from the paths that already know
+/// the outcome: a scan that read the folder and an upload that reached a
+/// terminal success. They sit on the folder row so a restart keeps them
+/// (`folder_time_tests`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FolderTimes {
     /// When a reconciliation scan last read this folder, ns since the Unix
@@ -617,6 +632,10 @@ pub struct FolderTimes {
     /// When this folder last uploaded an asset, ns since the Unix epoch.
     /// `None` until one has.
     pub last_upload_ns: Option<i64>,
+    /// How many files the last scan found with a format Immich does not
+    /// accept (#95). `0` until a scan finds any, and again once one finds
+    /// none.
+    pub unsupported: u32,
 }
 
 /// One `sync_item` row, in Rust form.
@@ -2232,8 +2251,8 @@ impl StateStore {
             .map_err(|source| self.query_error(source))
     }
 
-    /// When one source folder last reconciled and last uploaded, for its
-    /// detail view (#43).
+    /// When one source folder last reconciled and last uploaded, and how many
+    /// files Immich cannot accept, for its detail view (#43, #95).
     ///
     /// An untracked path reads as [`FolderTimes::default`], the same answer a
     /// tracked folder that has run neither gives.
@@ -2245,12 +2264,14 @@ impl StateStore {
         let writer = self.writer()?;
         writer
             .query_row(
-                "SELECT last_scan_ns, last_upload_ns FROM source_folder WHERE path_key = ?1",
+                "SELECT last_scan_ns, last_upload_ns, unsupported
+                 FROM source_folder WHERE path_key = ?1",
                 [path_key(Path::new(folder))],
                 |row| {
                     Ok(FolderTimes {
                         last_scan_ns: row.get(0)?,
                         last_upload_ns: row.get(1)?,
+                        unsupported: row.get(2)?,
                     })
                 },
             )
@@ -2259,15 +2280,61 @@ impl StateStore {
             .map_err(|source| self.query_error(source))
     }
 
-    /// Records that a reconciliation scan just read one source folder (#43).
+    /// Records that a reconciliation scan just read one source folder, and how
+    /// many files it found with a format Immich cannot accept (#43, #95).
     ///
-    /// Returns whether the client holds the folder.
+    /// Both are one write: the count describes the same pass the time dates.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError`] when the write fails or the lock is poisoned.
-    pub fn record_folder_scan(&self, folder: &str, at_ns: i64) -> Result<bool, StoreError> {
-        self.record_folder_time(folder, "last_scan_ns", at_ns)
+    pub fn record_folder_scan(
+        &self,
+        folder: &str,
+        at_ns: i64,
+        unsupported: u32,
+    ) -> Result<bool, StoreError> {
+        let writer = self.writer()?;
+        let changed = writer
+            .execute(
+                "UPDATE source_folder SET last_scan_ns = ?1, unsupported = ?2
+                 WHERE path_key = ?3",
+                params![at_ns, unsupported, path_key(Path::new(folder))],
+            )
+            .map_err(|source| self.query_error(source))?;
+        Ok(changed > 0)
+    }
+
+    /// Deletes one item with its attempt log and versions (#95).
+    ///
+    /// The scan calls this for a failed row whose file format the allowlist
+    /// refuses: no later attempt can succeed, and the row would otherwise sit
+    /// in the failed view forever. `attempt` does not cascade, so it goes
+    /// first; `version` does. Returns whether a row was there.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the write fails or the lock is poisoned.
+    pub fn delete_item(&self, path: &str) -> Result<bool, StoreError> {
+        let mut writer = self.writer()?;
+        let key = path_key(Path::new(path));
+        let transaction = writer
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| self.query_error(source))?;
+        transaction
+            .execute(
+                "DELETE FROM attempt WHERE item_id =
+                     (SELECT id FROM sync_item WHERE path_key = ?1)",
+                [&key],
+            )
+            .map_err(|source| self.query_error(source))?;
+        let changed = transaction
+            .execute("DELETE FROM sync_item WHERE path_key = ?1", [&key])
+            .map_err(|source| self.query_error(source))?;
+        transaction
+            .commit()
+            .map_err(|source| self.query_error(source))?;
+        Ok(changed > 0)
     }
 
     /// Records that one source folder just uploaded an asset (#43).
@@ -2283,8 +2350,8 @@ impl StateStore {
 
     /// Writes one timestamp column of the folder row `folder` names.
     ///
-    /// The column is one of this module's two constants, never caller input,
-    /// so the statement cannot name another column.
+    /// The column is this module's own constant, never caller input, so the
+    /// statement cannot name another column.
     fn record_folder_time(
         &self,
         folder: &str,
@@ -2774,6 +2841,7 @@ fn migrations() -> Migrations<'static> {
         M::up(SCHEMA_V11),
         M::up(SCHEMA_V12),
         M::up(SCHEMA_V13),
+        M::up(SCHEMA_V14),
     ])
 }
 
@@ -3046,9 +3114,74 @@ mod migration_tests {
         );
         assert!(
             store
-                .record_folder_scan("/photos", 42)
+                .record_folder_scan("/photos", 42, 0)
                 .expect("record the scan"),
             "the migrated row accepts a scan time"
+        );
+    }
+
+    /// #95: a database written before the allowlist count existed keeps its
+    /// folders, which read as counting no refused files.
+    #[test]
+    fn the_unsupported_count_arrives_on_a_v13_database() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let path = temp.path().join("state.db");
+        {
+            let mut connection = Connection::open(&path).expect("open the raw database");
+            // Every schema before the allowlist count, so the composed chain
+            // applies V14 over a row V3 wrote.
+            Migrations::new(vec![
+                M::up(SCHEMA_V1),
+                M::up_with_hook(SCHEMA_V2, backfill_path_keys),
+                M::up(SCHEMA_V3),
+                M::up(SCHEMA_V4),
+                M::up(SCHEMA_V5),
+                M::up(SCHEMA_V6),
+                M::up(SCHEMA_V7),
+                M::up(SCHEMA_V8),
+                M::up(SCHEMA_V9),
+                M::up(SCHEMA_V10),
+                M::up(SCHEMA_V11),
+                M::up(SCHEMA_V12),
+                M::up(SCHEMA_V13),
+            ])
+            .to_latest(&mut connection)
+            .expect("create the thirteenth schema");
+            connection
+                .execute(
+                    "INSERT INTO source_folder (path, path_key, recursive)
+                     VALUES (?1, ?2, 1)",
+                    params!["/photos", "/photos"],
+                )
+                .expect("insert the source folder");
+            drop(connection);
+        }
+
+        let store = StateStore::open(&path).expect("a v13 database must migrate");
+        assert_eq!(
+            store
+                .folder_times("/photos")
+                .expect("read the folder facts")
+                .unsupported,
+            0,
+            "a folder from before the count reads as holding no refused files"
+        );
+        assert!(
+            store
+                .record_folder_scan("/photos", 42, 4)
+                .expect("record the scan and its count"),
+            "the migrated row accepts the count"
+        );
+        assert_eq!(
+            store
+                .folder_times("/photos")
+                .expect("read the folder facts"),
+            FolderTimes {
+                last_scan_ns: Some(42),
+                last_upload_ns: None,
+                unsupported: 4,
+            },
+            "#95: the count and the scan time are one write"
         );
     }
 
@@ -3611,7 +3744,7 @@ mod folder_time_tests {
 
         assert!(
             store
-                .record_folder_scan("/photos", 1_700_000_000_000_000_000)
+                .record_folder_scan("/photos", 1_700_000_000_000_000_000, 0)
                 .expect("record the scan"),
             "the tracked folder's scan time is written"
         );
@@ -3623,7 +3756,7 @@ mod folder_time_tests {
         );
         assert!(
             !store
-                .record_folder_scan("/elsewhere", 1)
+                .record_folder_scan("/elsewhere", 1, 0)
                 .expect("an untracked path writes nothing"),
             "a path this client does not hold has no row to time"
         );
@@ -3635,6 +3768,7 @@ mod folder_time_tests {
             FolderTimes {
                 last_scan_ns: Some(1_700_000_000_000_000_000),
                 last_upload_ns: Some(1_700_000_001_000_000_000),
+                unsupported: 0,
             },
             "#43: the times survive a restart"
         );

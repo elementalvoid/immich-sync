@@ -75,9 +75,9 @@ fn confirmation_id(confirmation: &ElementSnapshot) -> ElementId {
         .cloned()
         .expect("the confirmation registers its own id")
 }
-/// The schema stands at the thirteenth migration (#93 added the leaf album
-/// naming on top of the album title #47).
-const DB_MIGRATION_VERSION: i64 = 13;
+/// The schema stands at the fourteenth migration (#95 added the refused-format
+/// count on top of the leaf album naming #93).
+const DB_MIGRATION_VERSION: i64 = 14;
 
 fn temporary_paths(dir: &Path) -> AppPaths {
     AppPaths {
@@ -1048,7 +1048,7 @@ async fn the_throughput_follows_the_engine_meter_while_a_file_uploads(cx: &mut T
         "bandwidth_bytes_per_second = 131072\nconcurrency = 1\n",
     )
     .expect("write the settings");
-    let file = photos.join("large.bin");
+    let file = photos.join("large.jpg");
     fs::write(&file, vec![9_u8; 256 * 1024]).expect("write the fixture");
     let file_path = file.display().to_string();
 

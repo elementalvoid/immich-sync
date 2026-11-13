@@ -221,6 +221,9 @@ struct FolderEntry {
     /// reads them back.
     last_scan_ns: Option<i64>,
     last_upload_ns: Option<i64>,
+    /// How many files the last scan found with a format Immich cannot accept
+    /// (#95). The count is the store's too, so it survives a restart.
+    unsupported: u32,
     /// This folder's upload meter (R8.1). Every upload the engine runs for a
     /// file under this folder streams under its limit view and counts itself
     /// here, so the bytes of two concurrent uploads can never be swapped.
@@ -411,6 +414,7 @@ impl Engine {
                 last_error: None,
                 last_scan_ns: times.last_scan_ns,
                 last_upload_ns: times.last_upload_ns,
+                unsupported: times.unsupported,
                 album,
             });
         }
@@ -937,6 +941,7 @@ impl Engine {
                     }),
                     available: entry.available,
                     counts: entry.counts,
+                    unsupported: entry.unsupported,
                     last_error: entry.last_error.clone(),
                     last_scan_ns: entry.last_scan_ns,
                     last_upload_ns: entry.last_upload_ns,
@@ -1173,6 +1178,7 @@ impl Observer for EngineObserver {
                 last_error: None,
                 last_scan_ns: times.last_scan_ns,
                 last_upload_ns: times.last_upload_ns,
+                unsupported: times.unsupported,
                 // R8.1: every upload under this folder meters into this
                 // one, under the folder's view of the client limit (R7.1).
                 meter: Arc::new(UploadMeter::new(&inner.bandwidth)),
@@ -2781,9 +2787,14 @@ async fn scan_once(inner: &Arc<EngineInner>) {
         match report {
             Ok(Ok(report)) => {
                 set_folder_available(inner, &folder.path, true);
-                // #43: the folder detail shows when the folder last scanned;
-                // this is the one pass that read it.
-                note_folder_scanned(inner, &folder.path);
+                // #43 and #95: the folder detail shows when the folder last
+                // scanned and how many files Immich cannot accept; this is the
+                // one pass that read it.
+                note_folder_scanned(
+                    inner,
+                    &folder.path,
+                    u32::try_from(report.unsupported.len()).unwrap_or(u32::MAX),
+                );
                 reports.push((folder, report));
             }
             Ok(Err(ScanError::Missing(path))) => {
@@ -2817,6 +2828,8 @@ async fn scan_once(inner: &Arc<EngineInner>) {
         .iter()
         .flat_map(|(_, report)| report.files.iter().cloned())
         .collect();
+    let unsupported = unsupported_paths(&reports);
+    drop_unsupported_failures(inner, &unsupported);
     let scanned: Vec<SourceFolder> = reports.iter().map(|(folder, _)| folder.clone()).collect();
     if !scanned.is_empty() {
         reconcile_files(inner, &present, &scanned).await;
@@ -2833,6 +2846,57 @@ async fn scan_once(inner: &Arc<EngineInner>) {
     // from the upload path or a timer of its own.
     settle_album_titles(inner).await;
     tracing::info!(queued, "the reconciliation scan finished");
+}
+
+/// The files the allowlist refused in this pass, keyed the way the store keys
+/// paths so a case-only difference on Windows still finds the recorded row
+/// (#95).
+fn unsupported_paths(reports: &[(SourceFolder, crate::scan::ScanReport)]) -> HashSet<String> {
+    reports
+        .iter()
+        .flat_map(|(_, report)| report.unsupported.iter())
+        .map(|path| path_key(path.as_path()))
+        .collect()
+}
+
+/// Drops a failed row that the allowlist now refuses (#95).
+///
+/// Such a row can never succeed, and without this it would sit in the failed
+/// view forever. Only a row whose file this pass saw is deleted: a `.wma`
+/// that has been deleted or renamed keeps its row, because deciding what to do
+/// with a missing file belongs to the review (R5.3). The failed rows are one
+/// read, and failures are rare, so the pass is cheap.
+fn drop_unsupported_failures(inner: &EngineInner, unsupported: &HashSet<String>) {
+    if unsupported.is_empty() {
+        return;
+    }
+    let failed = match inner.store.failed_items() {
+        Ok(failed) => failed,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "the failed rows could not be read for the format cleanup"
+            );
+            return;
+        }
+    };
+    for item in failed {
+        if !unsupported.contains(&path_key(Path::new(&item.path))) {
+            continue;
+        }
+        match inner.store.delete_item(&item.path) {
+            Ok(true) => tracing::info!(
+                path = %item.path,
+                "a failed row for a format Immich cannot accept was removed"
+            ),
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                path = %item.path,
+                error = %error,
+                "a failed row for a refused format could not be removed"
+            ),
+        }
+    }
 }
 
 /// Clears the scan flag when it leaves scope, so every exit from [`scan_once`]
@@ -3003,16 +3067,17 @@ fn has_present_content_twin(inner: &EngineInner, row: &ItemRecord) -> bool {
 }
 
 /// Records that a reconciliation scan just read `path`, and publishes it
-/// (#43).
+/// (#43), with how many files the scan found that Immich cannot accept (#95).
 ///
 /// The folder is named by its path key throughout: `remove_folder` retains the
 /// list, so an index resolved under one lock can name another folder by the
 /// time it is used again.
-fn note_folder_scanned(inner: &EngineInner, path: &str) {
-    let at_ns = record_folder_time(inner, path, FolderMoment::Scan);
+fn note_folder_scanned(inner: &EngineInner, path: &str, unsupported: u32) {
+    let at_ns = record_folder_time(inner, path, FolderMoment::Scan { unsupported });
     let mut folders = inner.folders.lock().expect("the folder lock");
     if let Some(entry) = folder_entry_mut(&mut folders, path) {
         entry.last_scan_ns = Some(at_ns);
+        entry.unsupported = unsupported;
     }
 }
 
@@ -3036,11 +3101,12 @@ fn set_folder_available(inner: &EngineInner, path: &str, available: bool) {
     }
 }
 
-/// Which of a folder's two timestamps a write records (#43).
+/// Which of a folder's stored values a write records (#43, #95).
 #[derive(Clone, Copy)]
 enum FolderMoment {
-    /// A reconciliation scan read the folder.
-    Scan,
+    /// A reconciliation scan read the folder, and how many files it found
+    /// that Immich cannot accept.
+    Scan { unsupported: u32 },
     /// The folder uploaded an asset.
     Upload,
 }
@@ -3136,7 +3202,9 @@ fn apply_owned_counts(folders: &mut [FolderEntry], key: &str, counts: Vec<Folder
 fn record_folder_time(inner: &EngineInner, path: &str, moment: FolderMoment) -> i64 {
     let at_ns = now_ns();
     let stored = match moment {
-        FolderMoment::Scan => inner.store.record_folder_scan(path, at_ns),
+        FolderMoment::Scan { unsupported } => {
+            inner.store.record_folder_scan(path, at_ns, unsupported)
+        }
         FolderMoment::Upload => inner.store.record_folder_upload(path, at_ns),
     };
     if let Err(error) = stored {
@@ -3423,7 +3491,7 @@ mod tests {
             })
         };
         while !shifted.load(Ordering::SeqCst) {
-            note_folder_scanned(&inner, &scanned);
+            note_folder_scanned(&inner, &scanned, 0);
             // The live entries are the second write: the old path resolved the
             // index again after the store write, so a shift during that write
             // publishes the time on another folder's entry.

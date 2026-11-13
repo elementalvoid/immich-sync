@@ -1903,7 +1903,7 @@ async fn a_415_is_one_permanent_failure_and_is_never_retried() {
     let temp = tempfile::tempdir().expect("create a temp dir");
     let store = store_in(&temp);
     let photos = temp.path().join("photos");
-    let file = write_file(&photos, "photo.bin", b"unsupported bytes");
+    let file = write_file(&photos, "photo.jpg", b"unsupported bytes");
     add_folder(&store, &photos, true);
     server.fail(Operation::Upload, Fault::UnsupportedFormat);
     let engine = start_engine(&server, &store, retry_config(8)).await;
@@ -1931,12 +1931,184 @@ async fn a_415_is_one_permanent_failure_and_is_never_retried() {
     assert_eq!(failed[0].state, ItemState::FailedPermanent);
     assert_eq!(failed[0].error_class, Some(FailureClass::UnsupportedFormat));
     assert!(
-        failed[0]
-            .error_message
-            .as_deref()
-            .is_some_and(|message| !message.is_empty()),
-        "R6.5: the view shows the last error"
+        failed[0].error_message.as_deref().is_some_and(
+            |message| message.starts_with("the server does not accept this file format")
+        ),
+        "R6.5: the view shows the server's readable reason"
     );
+    engine.stop();
+}
+
+/// #95: the allowlist keeps a format Immich cannot accept out of the state
+/// tables, so it is never an item, an attempt, or a failure, and the folder
+/// detail's count is the only trace of it.
+#[tokio::test]
+async fn a_format_immich_cannot_accept_is_never_an_item_or_a_failure() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let song = write_file(&photos, "song.wma", b"audio bytes");
+    let photo = write_file(&photos, "photo.jpg", b"photo bytes");
+    add_folder(&store, &photos, true);
+    let engine = start_engine(&server, &store, EngineConfig::default()).await;
+
+    // The accepted file is the proof the pass ran: its success lands after the
+    // same scan that saw the song.
+    let photo_text = photo.display().to_string();
+    assert!(
+        wait_until(
+            || matches!(&store.item(&photo_text), Ok(Some(row)) if row.state.is_terminal_success()),
+            Duration::from_secs(10)
+        )
+        .await,
+        "the accepted file never uploaded"
+    );
+    let song_text = song.display().to_string();
+    assert!(
+        store.item(&song_text).expect("read the row").is_none(),
+        "#95: a refused format is not a sync item"
+    );
+    assert!(
+        store
+            .attempts(&song_text)
+            .expect("read the attempts")
+            .is_empty(),
+        "#95: nothing was ever attempted for it"
+    );
+    assert!(
+        engine
+            .failed_items()
+            .expect("read the failed items")
+            .iter()
+            .all(|item| item.path != song_text),
+        "#95: it is not a failure the user must answer"
+    );
+    assert_eq!(
+        server.upload_requests(),
+        1,
+        "#95: only the accepted file reached the wire"
+    );
+    let folder = engine.status();
+    assert_eq!(
+        folder.folders[0].unsupported, 1,
+        "#95: the folder detail counts the refused file"
+    );
+    assert_eq!(
+        (
+            folder.folders[0].counts.uploaded,
+            folder.folders[0].counts.pending,
+            folder.folders[0].counts.failed,
+        ),
+        (1, 0, 0),
+        "#95: a refused file moves no other count"
+    );
+    assert_eq!(
+        store
+            .folder_times(&photos.display().to_string())
+            .expect("read the stored folder facts")
+            .unsupported,
+        1,
+        "#95: the count survives a restart with the folder row"
+    );
+    engine.stop();
+}
+
+/// #95: the count describes the last scan, so a file that is gone (or now
+/// accepted) stops being counted without anything having been recorded for it.
+#[tokio::test]
+async fn a_later_scan_clears_the_count_once_the_refused_file_is_gone() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let song = write_file(&photos, "song.wma", b"audio bytes");
+    add_folder(&store, &photos, true);
+    let engine = start_engine(&server, &store, EngineConfig::default()).await;
+
+    assert!(
+        wait_until(
+            || engine.status().folders[0].unsupported == 1,
+            Duration::from_secs(10)
+        )
+        .await,
+        "the first scan never counted the refused file"
+    );
+    std::fs::remove_file(&song).expect("remove the refused file");
+    engine.sync_now();
+    assert!(
+        wait_until(
+            || engine.status().folders[0].unsupported == 0,
+            Duration::from_secs(10)
+        )
+        .await,
+        "#95: the next scan counts what the folder holds now"
+    );
+    engine.stop();
+}
+
+/// #95: a failed row recorded before the allowlist existed is a failure no
+/// retry can fix, so the scan that sees the file drops the row and its attempt
+/// log.
+#[tokio::test]
+async fn a_scan_drops_a_failed_row_for_a_format_the_allowlist_refuses() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let song = write_file(&photos, "old.wma", b"audio bytes");
+    let path_text = song.display().to_string();
+    store
+        .record(&ItemRecord {
+            path: path_text.clone(),
+            size: std::fs::metadata(&song)
+                .expect("read the fixture metadata")
+                .len(),
+            mtime_ns: mtime_ns_of(&song),
+            sha1: sha1_file(&song).expect("hash the fixture"),
+            asset_id: None,
+            state: ItemState::DeadLetter,
+            error_class: Some(FailureClass::UnsupportedFormat),
+            error_message: Some("the server does not accept this file format".to_string()),
+            attempts: 0,
+            sidecar: None,
+        })
+        .expect("write the failed row from before the allowlist");
+    store
+        .record_attempt(&AttemptRecord {
+            path: path_text.clone(),
+            started_ns: 1_700_000_000_000_000_000,
+            outcome: AttemptOutcome::Failed,
+            error_class: Some(FailureClass::UnsupportedFormat),
+        })
+        .expect("record the spent attempt");
+    add_folder(&store, &photos, true);
+    let engine = start_engine(&server, &store, EngineConfig::default()).await;
+
+    assert!(
+        wait_until(
+            || matches!(store.item(&path_text), Ok(None)),
+            Duration::from_secs(10)
+        )
+        .await,
+        "#95: the scan never dropped the row the allowlist now refuses"
+    );
+    assert!(
+        store
+            .attempts(&path_text)
+            .expect("read the attempts")
+            .is_empty(),
+        "#95: the attempt log goes with the row"
+    );
+    assert!(
+        engine
+            .failed_items()
+            .expect("read the failed items")
+            .iter()
+            .all(|item| item.path != path_text),
+        "#95: the failed view no longer lists it"
+    );
+    assert_eq!(server.upload_requests(), 0, "nothing was sent for it");
     engine.stop();
 }
 
@@ -4301,7 +4473,7 @@ async fn the_engine_reports_the_bytes_it_put_on_the_wire() {
     let temp = tempfile::tempdir().expect("create a temp dir");
     let store = store_in(&temp);
     let photos = temp.path().join("photos");
-    let file = write_file(&photos, "clip.bin", &[7_u8; 8 * 1024]);
+    let file = write_file(&photos, "clip.jpg", &[7_u8; 8 * 1024]);
     add_folder(&store, &photos, true);
 
     let engine = start_engine(&server, &store, EngineConfig::default()).await;

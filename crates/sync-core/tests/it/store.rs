@@ -1655,8 +1655,8 @@ fn the_sqlite_info_reports_the_schema_the_size_and_the_table_counts() {
 
     let empty = store.sqlite_info().expect("read the sqlite info");
     assert_eq!(
-        empty.migration_version, 13,
-        "the schema stands at the thirteenth migration (#93 added the leaf naming)"
+        empty.migration_version, 14,
+        "the schema stands at the fourteenth migration (#95 added the refused-format count)"
     );
     assert!(empty.size_bytes > 0, "a migrated database occupies pages");
     assert_eq!(empty.integrity, "ok", "a fresh database is sound");
@@ -2183,5 +2183,74 @@ fn the_folder_asset_page_pages_without_repeating_or_losing_rows() {
     assert_eq!(
         listed, expected,
         "#44: the pages are the one order, once each"
+    );
+}
+
+/// #95: the scan removes a failed row for a format the allowlist refuses, and
+/// the row's attempt log goes with it. `version` cascades; `attempt` does not,
+/// so the delete writes both in one transaction.
+#[test]
+fn deleting_a_failed_item_takes_its_attempt_log_and_versions() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let path = temp.path().join("state.db");
+    let store = StateStore::open(&path).expect("open the store");
+    let mut row = record("/photos/old.wma", ItemState::DeadLetter);
+    row.error_class = Some(FailureClass::UnsupportedFormat);
+    row.error_message = Some("the server does not accept this file format".to_string());
+    row.asset_id = Some("asset-1".to_string());
+    store.record(&row).expect("write the failed row");
+    store
+        .record_attempt(&AttemptRecord {
+            path: row.path.clone(),
+            started_ns: 1_700_000_000_000_000_000,
+            outcome: AttemptOutcome::Failed,
+            error_class: row.error_class,
+        })
+        .expect("record the spent attempt");
+    store
+        .record_version(&NewVersion {
+            path: row.path.clone(),
+            asset_id: "asset-1".to_string(),
+            sha1: hello_world_sha1(),
+            created_at_ns: 1_700_000_000_000_000_001,
+            stack_id: Some("stack-1".to_string()),
+        })
+        .expect("seed the version chain");
+
+    assert!(
+        store.delete_item(&row.path).expect("delete the failed row"),
+        "the row was there"
+    );
+
+    assert!(
+        store.item(&row.path).expect("read the item").is_none(),
+        "the row is gone"
+    );
+    assert!(
+        store
+            .attempts(&row.path)
+            .expect("read the attempts")
+            .is_empty(),
+        "the attempt log goes with the row"
+    );
+    assert!(
+        store
+            .versions(&row.path)
+            .expect("read the version chain")
+            .is_empty(),
+        "the schema's cascade takes the version chain with the row"
+    );
+    assert!(
+        store
+            .failed_items()
+            .expect("read the failed items")
+            .is_empty(),
+        "the failed view no longer lists it"
+    );
+    assert!(
+        !store
+            .delete_item(&row.path)
+            .expect("deleting a missing row is not an error"),
+        "nothing was there"
     );
 }

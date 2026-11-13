@@ -18,6 +18,10 @@ _Avoid_: parent folder, matching folder
 One local file that the client tracks from discovery to upload result.
 _Avoid_: job, task, file record
 
+**Unsupported file**:
+A file whose extension is not one Immich accepts. The client never queues it: it is not a sync item, has no attempt, and never becomes a failure. The folder detail shows how many the last scan of that folder refused.
+_Avoid_: invalid file, rejected file, bad format
+
 **Tracking**:
 The client's record of the source folders it holds and the decisions the user has made about their items. One module owns it, so a signed-out client and a running engine write the same rows by the same rules.
 _Avoid_: library, registry, folder list

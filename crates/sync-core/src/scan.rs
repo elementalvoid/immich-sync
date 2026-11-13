@@ -23,6 +23,11 @@ use crate::store::SourceFolder;
 pub struct ScanReport {
     /// The files the scan would sync, in walk order.
     pub files: Vec<PathBuf>,
+    /// The files the allowlist refused (#95): the extensions Immich cannot
+    /// accept. They are not sync items; the engine counts them for the folder
+    /// detail and drops any failed row it recorded before the allowlist
+    /// existed.
+    pub unsupported: Vec<PathBuf>,
     /// How many entries the skip rules refused. Only the unit tests read it,
     /// so a production build carries no dead counter.
     #[cfg(test)]
@@ -146,14 +151,27 @@ pub fn scan_folder(folder: &SourceFolder) -> Result<ScanReport, ScanError> {
             continue;
         }
         if let Some(reason) = skip_reason_below(root, path, None) {
-            if reason == SkipReason::Sidecar {
-                // An orphan sidecar — the media file is not there, or is
-                // already on the server — leaves no item and no count anyone
-                // reads, so the log is the only trace it ever existed.
-                tracing::debug!(
-                    path = %path.display(),
-                    "an XMP sidecar is not an asset of its own; it rides along with its media file"
-                );
+            match reason {
+                SkipReason::Sidecar => {
+                    // An orphan sidecar — the media file is not there, or is
+                    // already on the server — leaves no item and no count
+                    // anyone reads, so the log is the only trace it ever
+                    // existed.
+                    tracing::debug!(
+                        path = %path.display(),
+                        "an XMP sidecar is not an asset of its own; it rides along with its media file"
+                    );
+                }
+                SkipReason::Unsupported => {
+                    // #95: the allowlist refused it, so it is not a failure and
+                    // never reaches the store as an item of its own.
+                    tracing::debug!(
+                        path = %path.display(),
+                        "Immich cannot accept this file format, so the scan does not queue it"
+                    );
+                    report.unsupported.push(path.to_path_buf());
+                }
+                _ => {}
             }
             #[cfg(test)]
             {
@@ -163,7 +181,41 @@ pub fn scan_folder(folder: &SourceFolder) -> Result<ScanReport, ScanError> {
         }
         report.files.push(path.to_path_buf());
     }
+    // #95: one line per scan per folder. A count of zero is only interesting
+    // to a debugger; a real count is what the user may want to act on.
+    let unsupported = report.unsupported.len();
+    let extensions = extension_summary(&report.unsupported);
+    if unsupported > 0 {
+        tracing::info!(
+            folder = %folder.path,
+            unsupported,
+            extensions = %extensions,
+            "files Immich cannot accept were not queued"
+        );
+    } else {
+        tracing::debug!(
+            folder = %folder.path,
+            unsupported,
+            "every file the scan found is a format Immich accepts"
+        );
+    }
     Ok(report)
+}
+
+/// The distinct, lower-case extensions among `paths` for the scan's log line,
+/// comma-separated. A file with no extension reads as `none` (#95).
+fn extension_summary(paths: &[PathBuf]) -> String {
+    let mut names: Vec<String> = paths
+        .iter()
+        .map(|path| {
+            path.extension()
+                .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_else(|| "none".to_string())
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names.join(", ")
 }
 
 #[cfg(test)]
@@ -260,6 +312,35 @@ mod tests {
 
         assert_eq!(names(&report), ["real.jpg"]);
         assert_eq!(report.skipped, 1);
+    }
+
+    #[test]
+    fn a_refused_format_is_counted_but_never_queued() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        write(temp.path(), "photo.jpg", b"p");
+        write(temp.path(), "song.wma", b"w");
+        write(temp.path(), "memo", b"m");
+
+        let report = scan_folder(&folder(temp.path(), true)).expect("scan the fixture");
+
+        assert_eq!(names(&report), ["photo.jpg"]);
+        let mut unsupported: Vec<String> = report
+            .unsupported
+            .iter()
+            .map(|path| {
+                path.file_name()
+                    .expect("a named file")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        unsupported.sort();
+        assert_eq!(unsupported, ["memo", "song.wma"]);
+        assert_eq!(
+            extension_summary(&report.unsupported),
+            "none, wma",
+            "#95: the log names the formats it saw, deduplicated and sorted"
+        );
     }
 
     #[test]
