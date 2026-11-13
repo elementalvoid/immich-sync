@@ -520,9 +520,10 @@ mod macos {
                     .ifa_addr
                     .as_ref()
                     .is_some_and(|address| i32::from(address.sa_family) == libc::AF_LINK);
-                let flags = u32::try_from(entry.ifa_flags).unwrap_or(0);
-                let loopback = flags & u32::try_from(libc::IFF_LOOPBACK).unwrap_or(0) != 0;
-                let running = flags & u32::try_from(libc::IFF_UP).unwrap_or(0) != 0;
+                // `ifa_flags` is `u32` on macOS; the libc constants are `c_int`.
+                let flags = entry.ifa_flags;
+                let loopback = flags & (libc::IFF_LOOPBACK as u32) != 0;
+                let running = flags & (libc::IFF_UP as u32) != 0;
                 let name = CStr::from_ptr(entry.ifa_name);
                 if is_link && running && !loopback && !name.to_bytes().is_empty() {
                     up = true;
