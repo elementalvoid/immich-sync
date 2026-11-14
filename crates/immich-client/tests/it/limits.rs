@@ -279,9 +279,13 @@ async fn a_server_that_stops_reading_mid_body_fails_the_upload_within_the_stall_
 
     assert!(matches!(error, ClientError::Stalled), "{error:?}");
     // The guard can only notice at the end of a window, so it needs at least
-    // one and at most two of them: it saw bytes still moving in the first.
+    // one and at most two of them: it saw bytes still moving in the first. A
+    // third window is the probe `upload_asset` makes after a lost upload to ask
+    // the server whether the asset landed anyway - this server answers
+    // nothing, so the probe runs its own window out before the call returns.
+    // Measured on an idle machine: 1.25 windows of guard plus the probe.
     assert!(
-        elapsed >= WINDOW && elapsed <= WINDOW * 2 + Duration::from_millis(100),
+        elapsed >= WINDOW && elapsed <= WINDOW * 3 + Duration::from_millis(100),
         "an upload blocked mid-body gave up after {elapsed:?}, on a {WINDOW:?} window"
     );
     // The client could not get the whole body out, so it was blocked with

@@ -471,13 +471,18 @@ mod tests {
         }
     }
 
+    /// A model that compares releases with `0.3.0` rather than with the package
+    /// version, so a release bump does not move the version these tests are
+    /// written against.
     fn model(enabled: bool, dismissed: Option<&str>) -> UpdateModel {
-        UpdateModel::new(
+        let mut model = UpdateModel::new(
             Arc::new(Silent),
             INTERVAL,
             enabled,
             dismissed.map(str::to_string),
-        )
+        );
+        model.current = version("0.3.0");
+        model
     }
 
     /// Applies `answer` the way a landed check does.
