@@ -102,7 +102,7 @@ fn write_file(root: &Path, name: &str, bytes: usize) -> PathBuf {
 /// uploads separately and two waves never collide.
 fn small_files(root: &Path, prefix: &str, count: usize) -> Vec<PathBuf> {
     (0..count)
-        .map(|index| write_file(root, &format!("{prefix}-{index}.bin"), 64 * 1024))
+        .map(|index| write_file(root, &format!("{prefix}-{index}.jpg"), 64 * 1024))
         .collect()
 }
 
@@ -112,7 +112,7 @@ async fn a_one_megabyte_per_second_limit_paces_the_sync() {
     let temp = tempfile::tempdir().expect("create a temp dir");
     let store = store_in(&temp);
     let photos = temp.path().join("photos");
-    let path = write_file(&photos, "big.bin", BIG_BYTES);
+    let path = write_file(&photos, "big.jpg", BIG_BYTES);
     add_folder(&store, &photos);
 
     let config = EngineConfig {
@@ -155,7 +155,7 @@ async fn zero_bandwidth_means_unlimited() {
     let temp = tempfile::tempdir().expect("create a temp dir");
     let store = store_in(&temp);
     let photos = temp.path().join("photos");
-    let path = write_file(&photos, "big.bin", BIG_BYTES);
+    let path = write_file(&photos, "big.jpg", BIG_BYTES);
     add_folder(&store, &photos);
 
     let config = EngineConfig {
@@ -192,7 +192,7 @@ async fn raising_bandwidth_mid_upload_is_applied_to_the_same_upload() {
     let temp = tempfile::tempdir().expect("create a temp dir");
     let store = store_in(&temp);
     let photos = temp.path().join("photos");
-    let path = write_file(&photos, "big.bin", BIG_BYTES);
+    let path = write_file(&photos, "big.jpg", BIG_BYTES);
     add_folder(&store, &photos);
 
     // At 100 kB/s the whole file would take about 15 s, so the timeout below
@@ -333,7 +333,7 @@ async fn lowering_concurrency_completes_while_a_retry_sleeps() {
     let temp = tempfile::tempdir().expect("create a temp dir");
     let store = store_in(&temp);
     let photos = temp.path().join("photos");
-    write_file(&photos, "retrying.bin", 64 * 1024);
+    write_file(&photos, "retrying.jpg", 64 * 1024);
     add_folder(&store, &photos);
     // A long server-requested wait: a worker that held its permit across the
     // sleep would make the resize below wait the whole 30 s.

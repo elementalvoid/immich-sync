@@ -1102,6 +1102,10 @@ impl FolderPanel {
             )
         });
         let tracked = uploaded + pending + failed + review;
+        // #95: files in this folder that Immich cannot accept are not sync
+        // items, so they are named in their own sentence rather than in the
+        // counts line.
+        let unsupported = self.card.as_ref().map_or(0, |card| card.unsupported_count);
         let last_error = self.card.as_ref().and_then(|card| card.last_error.clone());
         let now_ns = times::now_ns();
         let upload_line = times::moment_line(
@@ -1222,6 +1226,20 @@ impl FolderPanel {
                     .text_color(muted)
                     .child(counts),
             )
+            .when(unsupported > 0, |this| {
+                let line = format!("Files Immich cannot accept: {unsupported}");
+                this.child(
+                    crate::a11y::named(
+                        Role::Label,
+                        "folder-detail-unsupported",
+                        line.clone(),
+                        None,
+                    )
+                    .text_sm()
+                    .text_color(muted)
+                    .child(line),
+                )
+            })
             .child(
                 crate::a11y::named(
                     Role::Label,

@@ -31,6 +31,9 @@ pub enum SkipReason {
     System,
     /// An XMP sidecar, which travels with its asset (R3.3).
     Sidecar,
+    /// A file whose extension Immich does not accept (#95). It never reaches
+    /// the server, so it never becomes a failure.
+    Unsupported,
 }
 
 impl SkipReason {
@@ -43,8 +46,36 @@ impl SkipReason {
             Self::Temporary => "temporary",
             Self::System => "system",
             Self::Sidecar => "sidecar",
+            Self::Unsupported => "unsupported",
         }
     }
+}
+
+/// The extensions Immich accepts, checked 2026-11-09 against
+/// <https://docs.immich.app/features/supported-formats/>.
+///
+/// That page defers to the server's source for the full list, so this table is
+/// the one place the client keeps it: adding a format is a one-line change.
+/// The image formats come first, then the video ones. A file whose extension is
+/// not here is never queued (#95).
+pub static SUPPORTED_MEDIA_EXTENSIONS: &[&str] = &[
+    "avif", "bmp", "gif", "heic", "heif", "jp2", "jfif", "jpeg", "jpg", "jpe", "insp", "jxl",
+    "mpo", "png", "psd", "raw", "rw2", "svg", "tif", "tiff", "webp", "3gp", "3gpp", "avi", "flv",
+    "m4v", "mkv", "mts", "m2ts", "m2t", "ts", "mp4", "insv", "mpg", "mpe", "mpeg", "mxf", "mov",
+    "webm", "wmv",
+];
+
+/// Whether a bare file name has an extension Immich accepts (#95).
+///
+/// Matching is case-insensitive, so `IMG_1.JPG` is a JPEG. A name with no
+/// extension is refused: nothing tells the client what it is.
+#[must_use]
+pub fn is_supported_media(name: &str) -> bool {
+    name.rsplit_once('.').is_some_and(|(_, extension)| {
+        SUPPORTED_MEDIA_EXTENSIONS
+            .iter()
+            .any(|supported| supported.eq_ignore_ascii_case(extension))
+    })
 }
 
 /// The lower-case names of operating-system files that never upload.
@@ -130,9 +161,14 @@ pub fn skip_reason_below(
     if metadata.is_some_and(|metadata| !metadata.is_file()) {
         return None;
     }
-    path.file_name()
-        .is_some_and(|name| is_sidecar_name(&name.to_string_lossy()))
-        .then_some(SkipReason::Sidecar)
+    let name = path.file_name()?.to_string_lossy();
+    if is_sidecar_name(&name) {
+        return Some(SkipReason::Sidecar);
+    }
+    // #95: Immich's allowlist is the client's, so a format the server cannot
+    // accept is not a sync item at all. The sidecar rule is decided first: an
+    // `.xmp` is metadata even when the server would refuse it as an asset.
+    (!is_supported_media(&name)).then_some(SkipReason::Unsupported)
 }
 
 /// The path below `root` as a forward-slash string, or `None` when `path` is
@@ -227,6 +263,80 @@ mod tests {
 
     fn metadata(path: &Path) -> Metadata {
         std::fs::symlink_metadata(path).expect("read the fixture metadata")
+    }
+
+    #[test]
+    fn the_allowlist_takes_every_supported_extension_in_either_case() {
+        for extension in SUPPORTED_MEDIA_EXTENSIONS {
+            assert!(
+                is_supported_media(&format!("photo.{extension}")),
+                "{extension} is on Immich's list"
+            );
+            assert!(
+                is_supported_media(&format!("PHOTO.{}", extension.to_ascii_uppercase())),
+                "{extension} matches in upper case too"
+            );
+        }
+    }
+
+    #[test]
+    fn a_format_immich_cannot_accept_is_not_a_sync_item() {
+        for name in ["song.wma", "SONG.WMA", "song.mp3", "song.flac"] {
+            assert!(!is_supported_media(name), "{name} is not an Immich format");
+        }
+        assert!(
+            !is_supported_media("voice recording"),
+            "a name with no extension says nothing about its format"
+        );
+        assert!(
+            !is_supported_media("photo."),
+            "an empty extension is no extension"
+        );
+
+        // The predicate is the scan's and the watcher's shared rule, so both
+        // discovery paths refuse the file and neither records it.
+        let root = Path::new("/photos");
+        assert_eq!(
+            skip_reason_below(root, &PathBuf::from("/photos/song.wma"), None),
+            Some(SkipReason::Unsupported)
+        );
+        assert_eq!(
+            skip_reason_below(root, &PathBuf::from("/photos/take 01"), None),
+            Some(SkipReason::Unsupported),
+            "an extensionless file is refused"
+        );
+        assert_eq!(
+            skip_reason_below(root, &PathBuf::from("/photos/IMG_0001.jpg"), None),
+            None
+        );
+        assert_eq!(
+            skip_reason_below(root, &PathBuf::from("/photos/trip.wma/IMG_0001.jpg"), None),
+            None,
+            "a folder named like a refused file prunes nothing"
+        );
+    }
+
+    #[test]
+    fn a_refused_file_keeps_the_more_specific_rule() {
+        // A sidecar is still metadata, and a temporary file is still
+        // temporary: neither becomes an unsupported-format count.
+        assert_eq!(
+            skip_reason_below(
+                Path::new("/photos"),
+                &PathBuf::from("/photos/IMG_0001.jpg.xmp"),
+                None
+            ),
+            Some(SkipReason::Sidecar)
+        );
+        assert_eq!(
+            skip_reason_below(
+                Path::new("/photos"),
+                &PathBuf::from("/photos/song.wma.tmp"),
+                None
+            ),
+            Some(SkipReason::Temporary)
+        );
+        assert_eq!(SkipReason::Unsupported.as_str(), "unsupported");
     }
 
     #[test]

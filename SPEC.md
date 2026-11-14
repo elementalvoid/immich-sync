@@ -46,12 +46,12 @@ Acceptance: password login works. API-key login works on a server with password 
 ### R2 — Source folders and watch rules
 
 - R2.1 The user adds and removes source folders, typing the path or choosing it in the OS folder picker. A new folder's settings (recursive, album mapping, and album scope) are confirmed in a setup dialog before the client records it or starts its scan; Add records them together and Cancel writes nothing. Each folder has a recursive toggle.
-- R2.2 The client skips hidden files and folders, symlinks and junctions, temporary and partial files, and system files by default.
+- R2.2 The client skips hidden files and folders, symlinks and junctions, temporary and partial files, and system files by default. It also skips a file whose extension is not one Immich accepts, matched without regard to case: such a file is not a sync item, so it has no state row, attempt, or failure, and the folder detail counts the files the last scan refused. The list lives in the client, checked against Immich's supported formats, and the server stays the authority: a file the list accepts and Immich still refuses is a permanent `unsupported_format` failure. The count lives on the folder row, so it survives a restart and the signed-out view. A row recorded before this rule, for a file the list now refuses, is deleted by the next scan that sees the file, unless the row holds a server asset.
 - R2.3 The watcher reports changes while the client runs. A reconciliation scan runs at startup and every 30 minutes by default.
 - R2.4 The client compares paths case-insensitively on Windows and on macOS, where APFS and HFSX are case-insensitive by default. A case-sensitive volume can hold two files that differ only in case; they share one path key, so one of them may not sync. It supports long paths.
 - R2.5 A source folder that disappears (for example, an unplugged drive) shows a folder status, not an error per file.
 
-Acceptance: a file added while the client is stopped is found at startup. A file added while the client runs is found within 10 seconds on a local disk. A file skipped by the watcher is found by the next scan. Hidden and temporary files never upload.
+Acceptance: a file added while the client is stopped is found at startup. A file added while the client runs is found within 10 seconds on a local disk. A file skipped by the watcher is found by the next scan. Hidden and temporary files never upload. A file whose format Immich cannot accept never becomes a sync item.
 
 ### R3 — Upload pipeline
 

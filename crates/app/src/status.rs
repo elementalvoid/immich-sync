@@ -95,6 +95,10 @@ pub struct StatusCard {
     /// epoch (#43). On the global card it is the newest of the folders' values
     /// (#56).
     pub last_scan_ns: Option<i64>,
+    /// How many files in this folder Immich cannot accept, from the last scan
+    /// (#95). Only the folder detail shows it; the dashboard card does not
+    /// count them as sync items, and the global card is `0`.
+    pub unsupported_count: u32,
 }
 
 /// The text one status card renders.
@@ -316,6 +320,8 @@ impl DashboardModel {
             album_prefix: true,
             album_title: None,
             album_rename: None,
+            // #95: the count belongs to a folder's detail, never to the sum.
+            unsupported_count: 0,
         };
         let folders = status
             .folders
@@ -360,6 +366,7 @@ impl DashboardModel {
                     album_prefix: folder.album_prefix,
                     album_title: folder.album_title.clone(),
                     album_rename: folder.album_rename.clone(),
+                    unsupported_count: folder.unsupported_count,
                 }
             })
             .collect();
@@ -415,6 +422,7 @@ pub fn sample() -> DashboardModel {
             album_prefix: true,
             album_title: None,
             album_rename: None,
+            unsupported_count: 0,
         },
         folders: vec![
             StatusCard {
@@ -446,6 +454,7 @@ pub fn sample() -> DashboardModel {
                 album_prefix: true,
                 album_title: None,
                 album_rename: None,
+                unsupported_count: 0,
             },
             StatusCard {
                 title: "DCIM".to_string(),
@@ -472,6 +481,7 @@ pub fn sample() -> DashboardModel {
                 album_prefix: true,
                 album_title: None,
                 album_rename: None,
+                unsupported_count: 0,
             },
             StatusCard {
                 title: "Videos".to_string(),
@@ -500,6 +510,7 @@ pub fn sample() -> DashboardModel {
                 album_prefix: true,
                 album_title: None,
                 album_rename: None,
+                unsupported_count: 0,
             },
             StatusCard {
                 title: "Archive".to_string(),
@@ -526,6 +537,7 @@ pub fn sample() -> DashboardModel {
                 album_prefix: true,
                 album_title: None,
                 album_rename: None,
+                unsupported_count: 0,
             },
         ],
     }
@@ -563,6 +575,7 @@ mod tests {
                     last_error: None,
                     last_scan_ns: *last_scan_ns,
                     last_upload_ns: None,
+                    unsupported_count: 0,
                     uploads: UploadTraffic::default(),
                 })
                 .collect(),
