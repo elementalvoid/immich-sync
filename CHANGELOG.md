@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.4.0](https://github.com/elementalvoid/immich-sync/compare/v0.3.0...v0.4.0) (2026-11-14)
+
+
+### Features
+
+* **albums:** fit the album settings on one line each ([#93](https://github.com/elementalvoid/immich-sync/issues/93)) ([94db1a1](https://github.com/elementalvoid/immich-sync/commit/94db1a13dbe3f08c2f174641515cbf5f84538d84))
+* **albums:** name nested albums by their folder path ([#93](https://github.com/elementalvoid/immich-sync/issues/93)) ([49afea6](https://github.com/elementalvoid/immich-sync/commit/49afea6b3ae780d5660a9d3007d6d075b022fc34))
+* **albums:** shorten the album naming controls ([#93](https://github.com/elementalvoid/immich-sync/issues/93)) ([197e4c9](https://github.com/elementalvoid/immich-sync/commit/197e4c9f2d93f9c3fec06827814ef9f472f9729a))
+* **dashboard:** widen the folder card so its settings do not wrap ([#93](https://github.com/elementalvoid/immich-sync/issues/93)) ([d49b0e1](https://github.com/elementalvoid/immich-sync/commit/d49b0e150da72a44c62df10814bcb7b4719d1508))
+* **folders:** pause one source folder without the others ([#94](https://github.com/elementalvoid/immich-sync/issues/94)) ([#100](https://github.com/elementalvoid/immich-sync/issues/100)) ([58e3266](https://github.com/elementalvoid/immich-sync/commit/58e3266790b257d8ff039c2333e908a866ecffb5))
+* **network:** sync only on known networks ([#96](https://github.com/elementalvoid/immich-sync/issues/96)) ([#98](https://github.com/elementalvoid/immich-sync/issues/98)) ([e6100aa](https://github.com/elementalvoid/immich-sync/commit/e6100aadfcc506d8a07d60c92878ab712c34d142))
+* **scan:** skip formats Immich cannot accept ([#95](https://github.com/elementalvoid/immich-sync/issues/95)) ([#99](https://github.com/elementalvoid/immich-sync/issues/99)) ([be08ccf](https://github.com/elementalvoid/immich-sync/commit/be08ccf8a40e8ac63ae5b8611e4c2ea40cb28f74))
+
 ## [0.3.0](https://github.com/elementalvoid/immich-sync/compare/v0.2.1...v0.3.0) (2026-11-01)
 
 
