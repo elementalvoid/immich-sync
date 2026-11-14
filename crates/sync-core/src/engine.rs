@@ -560,7 +560,9 @@ impl Engine {
             }) {
                 Ok(mut watcher) => {
                     for folder in self.folder_snapshot() {
-                        if Path::new(&folder.path).is_dir() {
+                        // #94: a paused folder is not watched, so the platform
+                        // holds no watch on it and reports no event for it.
+                        if !folder.paused && Path::new(&folder.path).is_dir() {
                             let _ = watcher.watch(Path::new(&folder.path), folder.recursive);
                         }
                     }
@@ -932,6 +934,8 @@ impl Engine {
                 FolderStatus {
                     path: entry.folder.path.clone(),
                     recursive: entry.folder.recursive,
+                    // #94: the folder's own pause, which its card states.
+                    paused: entry.folder.paused,
                     album_mapping: entry.folder.album_mapping,
                     album_scope: entry.folder.album_scope,
                     album_path: entry.folder.album_path,
@@ -1235,6 +1239,9 @@ impl Observer for EngineObserver {
         let mut watch_error = None;
         if let Some(watcher) = watcher.as_mut()
             && available
+            // #94: a paused folder is not watched, so no watch is installed
+            // for a folder that is paused when it is added or re-added.
+            && !stored.paused
         {
             // Re-adding an existing folder must move the watch to the new
             // mode. A recursive watch also watches every subfolder, and
@@ -1285,14 +1292,36 @@ impl Observer for EngineObserver {
         let Ok(Some(stored)) = stored_folder(&inner.store, &folder.path) else {
             return;
         };
+        let mut resumed = false;
+        let (paused, recursive) = (stored.paused, stored.recursive);
         if let Some(entry) = folders
             .iter_mut()
             .find(|entry| path_key(Path::new(&entry.folder.path)) == key)
         {
+            // #94: lifting the pause asks for a scan, which is what drains the
+            // folder's queued rows in the usual order.
+            resumed = entry.folder.paused && !stored.paused;
             entry.album = album_of_store(&inner.store, &stored);
             entry.folder = stored;
         }
         drop(folders);
+        // #94: the watcher follows the pause, so a paused folder costs the
+        // platform no watch and reports no event. The resume asks for a scan,
+        // which is what drains the rows it queued.
+        let mut watcher = inner.watcher.lock().expect("the watcher lock");
+        if let Some(watcher) = watcher.as_mut() {
+            let path = Path::new(&folder.path);
+            if paused {
+                let _ = watcher.unwatch(path);
+            } else if resumed {
+                let _ = watcher.watch(path, recursive);
+            }
+        }
+        drop(watcher);
+        if resumed {
+            tracing::info!(folder = %folder.path, "the folder resumed");
+            inner.reconcile.notify_one();
+        }
         // #47: the change may be an album title, which the server has to be
         // told about. A mapping or scope change queues nothing, so the retry
         // finds no pending row and sends no request.
@@ -1434,6 +1463,11 @@ impl EngineInner {
                 // scan is skipped: a resolved path is adopted through its
                 // folder root, which still exists even when the file does not.
                 let path = self.folder_root_for(&path).map_or(path, |(_, owned)| owned);
+                // #94: a paused folder's disappearance is not this pass's
+                // business; the resume's scan reconciles it.
+                if self.is_folder_paused(&path) {
+                    continue;
+                }
                 self.absences.lock().expect("the absence list").push(path);
                 self.reconcile.notify_one();
                 continue;
@@ -1442,6 +1476,10 @@ impl EngineInner {
             let Some((root, path)) = self.folder_root_for(&reported) else {
                 continue;
             };
+            // #94: the watcher leaves a paused folder alone, like the scan.
+            if self.is_folder_paused(&path) {
+                continue;
+            }
             // The batch above was invalidated under the reported spelling; a
             // path the watcher reported resolved is keyed by the folder's own
             // spelling instead, so its cached listing has to go too (R3.3).
@@ -1551,6 +1589,17 @@ impl EngineInner {
             Some(index) => Arc::clone(&folders[index].meter),
             None => Arc::new(UploadMeter::new(&self.bandwidth)),
         }
+    }
+
+    /// Whether the source folder that owns `path` is paused (#94).
+    ///
+    /// Owner is the first folder that contains the path, the rule the counts
+    /// and the meters use, so pausing a folder stops exactly what its card
+    /// counts. A path no folder owns is not paused: its folder was removed while
+    /// the item was queued.
+    fn is_folder_paused(&self, path: &Path) -> bool {
+        let folders = self.folders.lock().expect("the folder lock");
+        folder_index_in(&folders, path).is_some_and(|index| folders[index].folder.paused)
     }
 
     /// Waits while uploads are held, by the pause or by the network (R8.7,
@@ -2069,7 +2118,14 @@ fn folder_entry_for(inner: &EngineInner, path: &Path) -> Option<SourceFolder> {
 }
 
 /// Prepares one batch and checks it with one `bulk-upload-check` (R3.1).
-async fn process_batch(inner: &Arc<EngineInner>, batch: Vec<PathBuf>) {
+async fn process_batch(inner: &Arc<EngineInner>, mut batch: Vec<PathBuf>) {
+    // #94: a paused folder's paths are dropped before the batch's listing read,
+    // so the pause costs no directory walk either. They stay queued in the
+    // store and the resume's scan brings them back.
+    batch.retain(|path| !inner.is_folder_paused(path));
+    if batch.is_empty() {
+        return;
+    }
     // R3.3: the pairing rules need the folders' other files. A scan pass
     // shares one listing per folder across its batches, so a 10k-file folder
     // is walked once per scan instead of once per batch.
@@ -2336,6 +2392,12 @@ async fn prepare(
     path: &Path,
     index: &FolderIndex,
 ) -> Option<PreparedItem> {
+    // #94: a paused folder is left alone, so the item costs no hash, no row
+    // write, and no attempt. A row it queued before the pause waits for the
+    // resume's scan.
+    if inner.is_folder_paused(path) {
+        return None;
+    }
     let key = path_key(path);
     {
         let mut in_flight = inner.in_flight.lock().expect("the in-flight lock");
@@ -2477,7 +2539,7 @@ fn is_settled(state: ItemState) -> bool {
 /// attempt, so a worker sleeping its backoff holds no slot: lowering the
 /// concurrency limit drains the pool instead of waiting out the sleep.
 async fn spawn_upload(inner: &Arc<EngineInner>, item: PreparedItem) {
-    if inner.gate.is_held() {
+    if inner.gate.is_held() || inner.is_folder_paused(&item.path) {
         inner.finish_item(&item, &UploadOutcome::Deferred);
         return;
     }
@@ -2559,9 +2621,12 @@ async fn upload_with_retries(inner: &Arc<EngineInner>, item: &PreparedItem) -> U
         let started_ns = now_ns();
         attempts += 1;
         let meter = inner.meter_for(&item.path);
+        // #94: the folder's own pause is checked with the gate, immediately
+        // before the request, so the item stays queued as a pending row.
+        let folder_paused = inner.is_folder_paused(&item.path);
         let mut outcome = inner
             .uploader
-            .upload_prepared(item, &inner.gate, &meter)
+            .upload_prepared(item, &inner.gate, folder_paused, &meter)
             .await;
         // R4.2: an upload that reached the server is a new version of the file
         // when the item already has one, so the associations carry over before
@@ -2782,6 +2847,9 @@ async fn scan_once(inner: &Arc<EngineInner>) {
         .lock()
         .expect("the folder lock")
         .iter()
+        // #94: the scan leaves a paused folder alone, so its last-scan time and
+        // its unsupported count keep the pass that actually read it.
+        .filter(|entry| !entry.folder.paused)
         .map(|entry| entry.folder.clone())
         .collect();
     let mut reports: Vec<(SourceFolder, crate::scan::ScanReport)> = Vec::new();

@@ -905,9 +905,10 @@ log_level = \"debug\"
             std::env::consts::OS,
             std::env::consts::ARCH,
             "v3.3.1",
-            // The latest migration the state database stands at (V14: the
-            // refused-format count #95 added on top of the leaf naming #93).
-            "Schema version (PRAGMA user_version): 14",
+            // The latest migration the state database stands at (V15: the
+            // per-folder pause #94 added on top of the refused-format count
+            // #95).
+            "Schema version (PRAGMA user_version): 15",
         ] {
             assert!(
                 versions.contains(expected),

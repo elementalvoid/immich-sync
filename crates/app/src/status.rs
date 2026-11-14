@@ -61,6 +61,9 @@ pub struct StatusCard {
     /// Whether the watcher and the scan descend into subfolders (R2.1);
     /// only meaningful on a folder card.
     pub recursive: bool,
+    /// Whether the user paused this folder (#94). Only a folder card can be
+    /// paused; the global card's activity covers its own holds.
+    pub paused: bool,
     /// Whether this source folder's files join an album (R3.4); always `false`
     /// on the global card, which is not a mapped folder.
     pub album_mapping: bool,
@@ -314,6 +317,7 @@ impl DashboardModel {
                 .filter_map(|folder| folder.last_scan_ns)
                 .max(),
             recursive: false,
+            paused: false,
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
             album_path: AlbumPath::Relative,
@@ -329,7 +333,7 @@ impl DashboardModel {
             .map(|folder| {
                 let activity = if !folder.available {
                     ActivityState::NeedsAttention
-                } else if status.activity == Activity::Paused {
+                } else if folder.paused || status.activity == Activity::Paused {
                     ActivityState::Paused
                 } else if folder.counts.pending > 0 {
                     ActivityState::Syncing
@@ -342,13 +346,19 @@ impl DashboardModel {
                     title: folder_name(&folder.path),
                     path: Some(folder.path.clone()),
                     activity,
-                    // The reason is the engine's, and a folder card shows it the
-                    // same way the global card does (R8.8). A card that is not
-                    // paused carries no reason, so the state line and the state
-                    // cannot disagree.
-                    pause: (activity == ActivityState::Paused)
-                        .then_some(status.pause)
-                        .flatten(),
+                    // #94: a folder the user paused says so in its own words,
+                    // which is the bare "Paused" the global hold reads too.
+                    // Otherwise the reason is the engine's, and a folder card
+                    // shows it the same way the global card does (R8.8). A card
+                    // that is not paused carries no reason, so the state line
+                    // and the state cannot disagree.
+                    pause: if activity != ActivityState::Paused {
+                        None
+                    } else if folder.paused {
+                        Some(PauseReason::User)
+                    } else {
+                        status.pause
+                    },
                     progress: folder_progress(folder.counts),
                     counts: counts_from(folder.counts),
                     review_count: folder.counts.review,
@@ -360,6 +370,7 @@ impl DashboardModel {
                     last_upload_ns: folder.last_upload_ns,
                     last_scan_ns: folder.last_scan_ns,
                     recursive: folder.recursive,
+                    paused: folder.paused,
                     album_mapping: folder.album_mapping,
                     album_scope: folder.album_scope,
                     album_path: folder.album_path,
@@ -416,6 +427,7 @@ pub fn sample() -> DashboardModel {
             last_upload_ns: None,
             last_scan_ns: Some(1_700_000_060_000_000_000),
             recursive: false,
+            paused: false,
             album_mapping: false,
             album_scope: AlbumScope::Leaf,
             album_path: AlbumPath::Relative,
@@ -448,6 +460,7 @@ pub fn sample() -> DashboardModel {
                 last_upload_ns: Some(1_700_000_000_000_000_000),
                 last_scan_ns: Some(1_700_000_060_000_000_000),
                 recursive: true,
+                paused: false,
                 album_mapping: true,
                 album_scope: AlbumScope::WholeFolder,
                 album_path: AlbumPath::Relative,
@@ -475,6 +488,7 @@ pub fn sample() -> DashboardModel {
                 last_upload_ns: Some(1_700_000_000_000_000_000),
                 last_scan_ns: None,
                 recursive: true,
+                paused: false,
                 album_mapping: true,
                 album_scope: AlbumScope::Leaf,
                 album_path: AlbumPath::Relative,
@@ -504,6 +518,7 @@ pub fn sample() -> DashboardModel {
                 last_upload_ns: Some(1_700_000_000_000_000_000),
                 last_scan_ns: Some(1_700_000_060_000_000_000),
                 recursive: false,
+                paused: false,
                 album_mapping: true,
                 album_scope: AlbumScope::WholeFolder,
                 album_path: AlbumPath::Relative,
@@ -531,6 +546,7 @@ pub fn sample() -> DashboardModel {
                 last_upload_ns: None,
                 last_scan_ns: None,
                 recursive: true,
+                paused: true,
                 album_mapping: false,
                 album_scope: AlbumScope::Leaf,
                 album_path: AlbumPath::Relative,
@@ -564,6 +580,7 @@ mod tests {
                 .map(|(index, last_scan_ns)| FolderStatus {
                     path: format!("/photos/{index}"),
                     recursive: true,
+                    paused: false,
                     album_mapping: false,
                     album_scope: sync_core::store::AlbumScope::Leaf,
                     album_path: AlbumPath::Relative,
@@ -703,6 +720,66 @@ mod tests {
             }),
             "512.0 KiB/s · 2 uploading"
         );
+    }
+
+    /// #94: one paused folder reads "Paused" on its own card and leaves the
+    /// client's state alone; every folder paused reads Paused globally, and the
+    /// folder keeps its own words even under a network hold.
+    #[test]
+    fn a_paused_folder_card_reads_paused_without_pausing_the_client() {
+        let mut status = status_with_scans(&[None, None]);
+        status.activity = Activity::Syncing;
+        status.folders[0].paused = true;
+        status.folders[0].counts.pending = 2;
+        status.folders[1].counts.pending = 2;
+        status.counts.pending = 4;
+
+        let model = DashboardModel::from_engine(&status, None);
+        assert_eq!(model.folders[0].activity, super::ActivityState::Paused);
+        assert_eq!(model.folders[0].content().state, "Paused");
+        assert_eq!(
+            model.folders[1].activity,
+            super::ActivityState::Syncing,
+            "#94: the other folder keeps its own state"
+        );
+        assert_eq!(
+            model.global.content().state,
+            "Syncing",
+            "#94: one paused folder does not pause the client"
+        );
+
+        // The network hold is the client's reason, but the user's own folder
+        // pause is the one that folder's card states. The real derivation
+        // pairs a global reason with the Paused activity.
+        status.pause = Some(PauseReason::NotListed);
+        status.activity = Activity::Paused;
+        let model = DashboardModel::from_engine(&status, None);
+        assert_eq!(model.folders[0].content().state, "Paused");
+        assert_eq!(
+            model.folders[1].content().state,
+            "Paused — not on a known network"
+        );
+
+        // Every folder paused: the client reads Paused with no global reason.
+        status.pause = None;
+        status.activity = Activity::Paused;
+        status.folders[1].paused = true;
+        let model = DashboardModel::from_engine(&status, None);
+        assert_eq!(model.global.activity, super::ActivityState::Paused);
+        assert_eq!(model.global.content().state, "Paused");
+        assert_eq!(model.global.pause, None);
+        assert_eq!(model.folders[1].content().state, "Paused");
+
+        // A folder that is no longer readable needs the user, and a pause must
+        // not mask that: the state line and the pill's state agree.
+        status.folders[0].available = false;
+        let model = DashboardModel::from_engine(&status, None);
+        assert_eq!(
+            model.folders[0].activity,
+            super::ActivityState::NeedsAttention
+        );
+        assert_eq!(model.folders[0].content().state, "Needs attention");
+        assert_eq!(model.folders[0].pause, None);
     }
 
     /// R8.8: a hold the user did not click says why, on the dashboard card the

@@ -116,7 +116,7 @@ Acceptance: a sync at a 1 MB/s limit produces near-limit observed throughput. Ra
 - R8.4 Closing the window hides it. Quit exits the client. A second launch focuses the first instance.
 - R8.5 Autostart at login is a setting. The default is off. Windows uses its Run key, Linux an XDG autostart entry, and macOS a Login Item (`SMAppService.mainApp`), falling back to a LaunchAgent plist when an unsigned bundle is refused.
 - R8.6 The theme follows the system theme.
-- R8.7 Pause stops new uploads. In-flight uploads finish or stop at a safe point.
+- R8.7 Pause stops new uploads. In-flight uploads finish or stop at a safe point. A source folder is paused on its own from its card or its detail: a paused folder is not scanned, watched, hashed, or uploaded, so its queued items stay pending and nothing fails, and an upload already on the wire finishes. Resuming the folder scans it and drains the queue in the usual order. The pause is stored on the folder, so a restart keeps it and the startup scan leaves the folder's last reconciliation scan alone. Pause follows **Owner**: the first folder that contains a file owns it, so pausing that folder stops the file and pausing another folder does not. The global pause, a folder pause, and the known-network hold are independent and compose, and the client's activity reads Paused only when every source folder is paused or the global pause or network hold is on. The global card's pending, uploaded and failed counts, its progress, its upload rate and its activity leave paused folders out, so a paused queue cannot hold the client at Syncing; the review count is still every folder's, because a decision the user owes stays theirs.
 - R8.8 **Sync only on known networks** is a setting, off by default, with a list of names the user types. While it is on, uploads and scans wait unless the OS names the current wireless network in the list: no new attempts, the queue is kept, nothing fails, and syncing resumes on its own when a listed network comes back. A wired connection always syncs, and the list's help text says so. It fails closed: an unknown name, a missing or empty OS answer, an OS call that errors or times out, and no network at all hold uploads, and the dashboard and tray say why ("Paused — not on a known network", "Paused — network unknown"). It checks at startup, on the OS's network-change events, on a 30-second fallback poll, and after any upload network error. The Settings page shows the name the OS reports beside the list.
 
 Acceptance: every tray action works from a cold start. A second launch does not start a second process. Pause stops new uploads within 5 seconds. Leaving a listed network holds uploads within 5 seconds, the queue keeps every waiting file, and returning to a listed network resumes without a click.
@@ -158,7 +158,7 @@ Acceptance: a clean Windows machine installs from the NSIS installer. A clean Li
 
 ## 5. Data model summary
 
-- `source_folder`: path, recursive flag, album mapping flag, album scope, leaf album path choice, leaf album title prefix flag, last reconciliation scan, last successful upload.
+- `source_folder`: path, recursive flag, pause flag, album mapping flag, album scope, leaf album path choice, leaf album title prefix flag, last reconciliation scan, last successful upload.
 - `album`: mapped folder path key, album title, album id, rename pending flag and reason.
 - `sync_item`: path, size, mtime, SHA-1, current asset id, stack id, state, last error class.
 - `version`: item id, asset id, SHA-1, created at, current flag.

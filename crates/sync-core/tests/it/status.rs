@@ -202,3 +202,96 @@ fn the_upload_traffic_is_summed_across_folders() {
         }
     );
 }
+
+/// #94: the global card reads Paused only when every folder is paused. One
+/// paused folder leaves the client's state alone and shows the pause on its own
+/// card, and the reason stays the folders' rather than the global pause's.
+#[test]
+fn a_folder_pause_pauses_the_client_only_when_every_folder_is_paused() {
+    let mut paused = folder("/photos", counts(3, 0, 0, 0));
+    paused.paused = true;
+    let mut syncing = folder("/videos", counts(1, 0, 0, 0));
+
+    let one = Status::derive(inputs(vec![paused.clone(), syncing.clone()]));
+    assert_eq!(
+        one.activity,
+        Activity::Syncing,
+        "#94: one paused folder leaves the client's own state alone"
+    );
+    assert_eq!(
+        one.pause, None,
+        "#94: a folder pause is not a global hold, so it has no global reason"
+    );
+
+    syncing.paused = true;
+    let every = Status::derive(inputs(vec![paused, syncing]));
+    assert_eq!(
+        every.activity,
+        Activity::Paused,
+        "#94: every folder paused reads as Paused"
+    );
+    assert_eq!(
+        every.pause, None,
+        "#94: the paused folders show the reason on their own cards"
+    );
+
+    assert_eq!(
+        Status::derive(inputs(Vec::new())).activity,
+        Activity::Idle,
+        "no folder is not every folder paused"
+    );
+}
+
+/// #94: the global card sums only the work it can do, so a paused folder's
+/// queue neither holds the client at Syncing nor dilutes its progress. A review
+/// the user owes is still counted.
+#[test]
+fn a_paused_folder_is_left_out_of_the_global_sums() {
+    let mut paused = folder("/photos", counts(5, 1, 2, 1));
+    paused.paused = true;
+    let active = folder("/videos", counts(1, 3, 0, 2));
+
+    let status = Status::derive(inputs(vec![paused, active]));
+
+    assert_eq!(
+        status.counts.pending, 1,
+        "#94: the paused folder's queue is not the client's work"
+    );
+    assert_eq!(status.counts.uploaded, 3);
+    assert_eq!(status.counts.failed, 0);
+    assert_eq!(
+        status.counts.review, 3,
+        "a decision the user owes is still theirs, paused folder or not"
+    );
+    assert!(
+        (status.progress() - 0.75).abs() < f32::EPSILON,
+        "#94: the paused folder must not dilute the global progress"
+    );
+    assert_eq!(status.activity, Activity::Syncing);
+
+    // With the only unpaused folder idle, the paused queue cannot hold the
+    // client at Syncing.
+    let mut quiet = folder("/videos", counts(0, 3, 0, 0));
+    quiet.paused = false;
+    let mut paused = folder("/photos", counts(5, 0, 0, 0));
+    paused.paused = true;
+    let status = Status::derive(inputs(vec![paused, quiet]));
+    assert_eq!(
+        status.activity,
+        Activity::Idle,
+        "#94: a paused folder's queue does not read as the client syncing"
+    );
+}
+
+/// #94: a paused folder's frozen availability does not hold the client's state;
+/// its own card says so.
+#[test]
+fn a_paused_folder_does_not_hold_the_client_at_needs_attention() {
+    let mut paused = folder("/photos", FolderCounts::default());
+    paused.paused = true;
+    paused.available = false;
+
+    let status = Status::derive(inputs(vec![paused]));
+
+    assert_eq!(status.activity, Activity::Paused);
+}

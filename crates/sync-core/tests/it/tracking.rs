@@ -377,3 +377,56 @@ fn an_observer_may_edit_a_folder_from_its_callback() {
         "the observer's edit from the callback did not land"
     );
 }
+
+/// R8.7: pausing one folder is a stored setting. It survives a restart, a
+/// re-add keeps it, and the engine hears the change.
+#[test]
+fn a_folder_pause_survives_a_reopen_and_a_re_add() {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let database = temp.path().join("data").join("state.db");
+    let photos = temp.path().join("photos");
+    let path = photos.display().to_string();
+    let folder = SourceFolder {
+        path: path.clone(),
+        recursive: true,
+        ..SourceFolder::default()
+    };
+    let tracking = Arc::new(Tracking::new(Arc::new(
+        StateStore::open(&database).expect("open the state store"),
+    )));
+    tracking
+        .insert_folder(&folder)
+        .expect("insert the source folder");
+    let observer = Arc::new(Recorded::default());
+    tracking.attach(observer.clone());
+
+    tracking
+        .set_folder_paused(&path, true)
+        .expect("pause the source folder");
+
+    assert!(
+        tracking.folders().expect("read the folders")[0].paused,
+        "R8.7: the pause is the row's"
+    );
+    assert_eq!(
+        observer.events(),
+        vec![format!("changed {path}")],
+        "R8.7: the engine hears the pause from the one folder-change event"
+    );
+    drop(tracking);
+
+    let reopened = Tracking::new(Arc::new(
+        StateStore::open(&database).expect("reopen the state store"),
+    ));
+    assert!(
+        reopened.folders().expect("read the folders")[0].paused,
+        "R8.7: a paused folder is still paused after a restart"
+    );
+    reopened
+        .add_folder(&path, true)
+        .expect("re-add the paused folder");
+    assert!(
+        reopened.folders().expect("read the folders")[0].paused,
+        "R8.7: a re-add is not a pause edit, so it keeps the pause"
+    );
+}

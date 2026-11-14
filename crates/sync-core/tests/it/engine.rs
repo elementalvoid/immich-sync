@@ -69,6 +69,19 @@ fn add_folder(store: &StateStore, path: &Path, recursive: bool) {
         .expect("add the source folder");
 }
 
+/// Pauses or resumes one stored folder, the way tracking writes it (#94).
+fn pause_folder(store: &StateStore, path: &Path, paused: bool) {
+    let folder = store
+        .folders()
+        .expect("read the folders")
+        .into_iter()
+        .find(|folder| folder.path == path.display().to_string())
+        .expect("the folder is stored");
+    store
+        .add_folder(&SourceFolder { paused, ..folder })
+        .expect("write the folder pause");
+}
+
 /// Adds a folder whose files join an album (R3.4).
 fn add_mapped_folder(store: &StateStore, path: &Path, recursive: bool, scope: AlbumScope) {
     store
@@ -89,13 +102,22 @@ async fn start_engine(
     store: &Arc<StateStore>,
     config: EngineConfig,
 ) -> Arc<Engine> {
+    start_engine_tracking(server, store, config).await.0
+}
+
+/// Builds and starts an engine over `store`, and hands back its tracking, so a
+/// test can pause a folder while the engine runs (#94).
+async fn start_engine_tracking(
+    server: &MockImmich,
+    store: &Arc<StateStore>,
+    config: EngineConfig,
+) -> (Arc<Engine>, Arc<Tracking>) {
+    let tracking = Arc::new(Tracking::new(store.clone()));
     let session = signed_in(server).await;
-    let engine = Arc::new(
-        Engine::new(Arc::new(Tracking::new(store.clone())), session, config)
-            .expect("build the engine"),
-    );
+    let engine =
+        Arc::new(Engine::new(tracking.clone(), session, config).expect("build the engine"));
     engine.start();
-    engine
+    (engine, tracking)
 }
 
 /// Whether every path has a terminal success row.
@@ -631,6 +653,332 @@ async fn pause_stops_new_uploads_within_five_seconds_and_resume_continues() {
         )
         .await,
         "R8.7: resume did not continue the queue"
+    );
+    assert_eq!(server.upload_requests(), 2);
+    engine.stop();
+}
+
+/// #94: the reconciliation scan leaves a paused folder alone, so the startup
+/// pass walks nothing under it, records no scan time, and discovers no file.
+/// Resuming the folder lets the next scan find it.
+#[tokio::test]
+async fn a_reconciliation_scan_skips_a_paused_folder_until_it_resumes() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let paused = temp.path().join("paused");
+    let active = temp.path().join("active");
+    let skipped = write_file(&paused, "skipped.jpg", b"skipped");
+    let sent = write_file(&active, "sent.jpg", b"sent");
+    add_folder(&store, &paused, true);
+    add_folder(&store, &active, true);
+    pause_folder(&store, &paused, true);
+    let (engine, tracking) = start_engine_tracking(
+        &server,
+        &store,
+        EngineConfig {
+            concurrency: 2,
+            watch: false,
+            ..EngineConfig::default()
+        },
+    )
+    .await;
+
+    assert!(
+        wait_until(
+            || all_terminal(&store, std::slice::from_ref(&sent)),
+            Duration::from_secs(10)
+        )
+        .await,
+        "the unpaused folder's file still uploads"
+    );
+    let skipped_path = skipped.display().to_string();
+    assert_eq!(
+        store.item(&skipped_path).expect("read the item"),
+        None,
+        "#94: the scan queued nothing under the paused folder"
+    );
+    assert_eq!(
+        store
+            .folder_times(&paused.display().to_string())
+            .expect("read the paused folder's times")
+            .last_scan_ns,
+        None,
+        "#94: a skipped folder's last-scan time does not advance"
+    );
+    assert!(
+        store
+            .folder_times(&active.display().to_string())
+            .expect("read the active folder's times")
+            .last_scan_ns
+            .is_some(),
+        "the folder the pass walked records its scan"
+    );
+
+    tracking
+        .set_folder_paused(&paused.display().to_string(), false)
+        .expect("resume the folder");
+
+    assert!(
+        wait_until(
+            || all_terminal(&store, std::slice::from_ref(&skipped)),
+            Duration::from_secs(10)
+        )
+        .await,
+        "#94: resuming the folder lets the next scan upload its file"
+    );
+    assert_eq!(server.upload_requests(), 2);
+    engine.stop();
+}
+
+/// #94: a row a paused folder queued before the pause does not reach the wire,
+/// while another folder's file uploads. Resume drains it in the usual order and
+/// nothing becomes a failure.
+#[tokio::test]
+async fn a_paused_folder_holds_its_queued_item_while_another_folder_uploads() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let paused = temp.path().join("paused");
+    let active = temp.path().join("active");
+    let held = write_file(&paused, "held.jpg", b"held");
+    let sent = write_file(&active, "sent.jpg", b"sent");
+    add_folder(&store, &paused, true);
+    add_folder(&store, &active, true);
+    // R6.7: the durable row a previous run left queued for the paused folder.
+    store
+        .record(&ItemRecord {
+            path: held.display().to_string(),
+            size: 4,
+            mtime_ns: 0,
+            sha1: Sha1::from_hex("2aae6c35c94fcfb415dbe95f408b9ce91ee846ed").expect("a hex SHA-1"),
+            asset_id: None,
+            state: ItemState::Pending,
+            error_class: None,
+            error_message: None,
+            attempts: 0,
+            sidecar: None,
+        })
+        .expect("write the queued row");
+    pause_folder(&store, &paused, true);
+    let (engine, tracking) = start_engine_tracking(
+        &server,
+        &store,
+        EngineConfig {
+            concurrency: 2,
+            watch: false,
+            ..EngineConfig::default()
+        },
+    )
+    .await;
+
+    assert!(
+        wait_until(
+            || all_terminal(&store, std::slice::from_ref(&sent)),
+            Duration::from_secs(10)
+        )
+        .await,
+        "the unpaused folder's file uploads while the other folder is paused"
+    );
+    assert_eq!(
+        server.upload_requests(),
+        1,
+        "#94: the paused folder's queued item must not reach the wire"
+    );
+    // #94: the client's own counts leave the paused folder out, so its held
+    // row cannot keep the global card at Syncing with nothing it may upload.
+    assert_eq!(
+        engine.status().counts.pending,
+        0,
+        "#94: the paused folder's held row is not the client's pending work"
+    );
+    assert_eq!(
+        engine.status().activity,
+        Activity::Idle,
+        "#94: the paused queue does not read as the client syncing"
+    );
+    let row = store
+        .item(&held.display().to_string())
+        .expect("read the held item")
+        .expect("the queued row stays");
+    assert_eq!(
+        row.state,
+        ItemState::Pending,
+        "#94: a held item stays queued and becomes no failure"
+    );
+
+    tracking
+        .set_folder_paused(&paused.display().to_string(), false)
+        .expect("resume the folder");
+
+    assert!(
+        wait_until(
+            || all_terminal(&store, std::slice::from_ref(&held)),
+            Duration::from_secs(10)
+        )
+        .await,
+        "#94: resuming the folder uploads the item it held"
+    );
+    assert_eq!(server.upload_requests(), 2);
+    engine.stop();
+}
+
+/// #94: the global pause and a folder pause compose. A global resume starts the
+/// unpaused folder and leaves the paused one held until its own resume.
+#[tokio::test]
+async fn a_global_resume_leaves_a_folder_pause_in_place() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let paused = temp.path().join("paused");
+    let active = temp.path().join("active");
+    let held = write_file(&paused, "held.jpg", b"held");
+    let sent = write_file(&active, "sent.jpg", b"sent");
+    let (engine, tracking) = start_engine_tracking(
+        &server,
+        &store,
+        EngineConfig {
+            concurrency: 2,
+            watch: false,
+            ..EngineConfig::default()
+        },
+    )
+    .await;
+
+    // The engine starts with no folder, so the adds are the only discovery.
+    engine.pause();
+    tracking
+        .insert_folder(&SourceFolder {
+            path: paused.display().to_string(),
+            recursive: true,
+            paused: true,
+            ..SourceFolder::default()
+        })
+        .expect("add the paused folder");
+    tracking
+        .insert_folder(&SourceFolder {
+            path: active.display().to_string(),
+            recursive: true,
+            ..SourceFolder::default()
+        })
+        .expect("add the unpaused folder");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        server.upload_requests(),
+        0,
+        "the global pause holds both folders"
+    );
+
+    engine.resume();
+
+    assert!(
+        wait_until(
+            || all_terminal(&store, std::slice::from_ref(&sent)),
+            Duration::from_secs(10)
+        )
+        .await,
+        "#94: the global resume starts the unpaused folder"
+    );
+    assert_eq!(
+        server.upload_requests(),
+        1,
+        "#94: a global resume leaves the folder pause in place"
+    );
+    assert_eq!(
+        store
+            .item(&held.display().to_string())
+            .expect("read the item"),
+        None,
+        "#94: the paused folder was still not scanned"
+    );
+
+    tracking
+        .set_folder_paused(&paused.display().to_string(), false)
+        .expect("resume the folder");
+    assert!(
+        wait_until(
+            || all_terminal(&store, std::slice::from_ref(&held)),
+            Duration::from_secs(10)
+        )
+        .await,
+        "#94: the folder's own resume drains it"
+    );
+    assert_eq!(server.upload_requests(), 2);
+    engine.stop();
+}
+
+/// #94, R8.7: the pause stops new attempts only. The upload already on the
+/// wire finishes and takes its terminal success, and the folder's other queued
+/// file waits for the resume.
+#[tokio::test]
+async fn pausing_a_folder_mid_upload_lets_that_upload_finish() {
+    let server = MockImmich::start().await;
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let store = store_in(&temp);
+    let photos = temp.path().join("photos");
+    let first = write_file(&photos, "first.jpg", b"first");
+    let second = write_file(&photos, "second.jpg", b"second");
+    add_folder(&store, &photos, true);
+    // The first upload occupies the only worker for a second, which gives the
+    // test a real in-flight window to pause inside.
+    server.fail(Operation::Upload, Fault::Slow(Duration::from_secs(1)));
+    let (engine, tracking) = start_engine_tracking(
+        &server,
+        &store,
+        EngineConfig {
+            concurrency: 1,
+            watch: false,
+            ..EngineConfig::default()
+        },
+    )
+    .await;
+
+    assert!(
+        wait_until(|| server.upload_requests() == 1, Duration::from_secs(5)).await,
+        "the first upload did not start"
+    );
+    tracking
+        .set_folder_paused(&photos.display().to_string(), true)
+        .expect("pause the folder mid-upload");
+
+    let paths = [first.clone(), second.clone()];
+    assert!(
+        wait_until(
+            || terminal_count(&store, &paths) == 1,
+            Duration::from_secs(10)
+        )
+        .await,
+        "#94: the upload already on the wire must finish"
+    );
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        server.upload_requests(),
+        1,
+        "#94: the folder's pause starts no second upload"
+    );
+    let waiting = paths
+        .iter()
+        .map(|path| {
+            store
+                .item(&path.display().to_string())
+                .expect("read")
+                .expect("the queued file has a row")
+                .state
+        })
+        .find(|state| !state.is_terminal_success());
+    assert_eq!(
+        waiting,
+        Some(ItemState::Pending),
+        "#94: the other file stays queued rather than failing"
+    );
+
+    tracking
+        .set_folder_paused(&photos.display().to_string(), false)
+        .expect("resume the folder");
+
+    assert!(
+        wait_until(|| all_terminal(&store, &paths), Duration::from_secs(10)).await,
+        "#94: resume drains what the pause held"
     );
     assert_eq!(server.upload_requests(), 2);
     engine.stop();

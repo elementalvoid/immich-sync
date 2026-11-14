@@ -162,6 +162,9 @@ impl Tracking {
                     .as_ref()
                     .map_or_else(AlbumPath::default, |folder| folder.album_path),
                 album_prefix: existing.as_ref().is_none_or(|folder| folder.album_prefix),
+                // #94: a re-add is not a pause edit either, so the stored pause
+                // is carried and a paused folder stays paused.
+                paused: existing.as_ref().is_some_and(|folder| folder.paused),
                 // #47: a re-add is not a title edit, so the stored title is
                 // carried instead of being written away.
                 album_title: existing.and_then(|folder| folder.album_title),
@@ -297,6 +300,23 @@ impl Tracking {
         self.update_folder(path, |folder| folder.album_prefix = prefixed)
     }
 
+    /// Pauses or resumes one source folder (#94).
+    ///
+    /// A paused folder is not scanned, watched, hashed, or uploaded; what it
+    /// already queued waits, and resuming drains it. The global pause is
+    /// separate, so either one holds the folder's uploads.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::set_album_mapping`].
+    pub fn set_folder_paused(
+        &self,
+        path: &str,
+        paused: bool,
+    ) -> Result<SourceFolder, TrackingError> {
+        self.update_folder(path, |folder| folder.paused = paused)
+    }
+
     /// Sets the title of one source folder's own album (#47).
     ///
     /// A blank or whitespace-only title is stored as none, which means the
@@ -413,7 +433,8 @@ impl Tracking {
             album_path = folder.album_path.as_str(),
             album_prefix = folder.album_prefix,
             album_title = folder.album_title.as_deref().unwrap_or(""),
-            "the album settings changed"
+            paused = folder.paused,
+            "the folder settings changed"
         );
         self.notify(|observer| observer.folder_changed(&folder));
         Ok(folder)

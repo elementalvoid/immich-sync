@@ -17,8 +17,9 @@ pub enum Activity {
     Idle,
     /// Files are queued or in flight.
     Syncing,
-    /// The user paused new uploads (R8.7), or the known-network list holds
-    /// them (R8.8). [`Status::pause`] says which.
+    /// The user paused new uploads (R8.7), the known-network list holds them
+    /// (R8.8), or every folder is paused (#94). [`Status::pause`] says which
+    /// global reason applies, and the folder cards carry their own.
     Paused,
     /// A failure or a missing folder needs the user.
     NeedsAttention,
@@ -99,6 +100,9 @@ pub struct FolderStatus {
     pub path: String,
     /// Whether the watcher and the scan descend into subfolders (R2.1).
     pub recursive: bool,
+    /// Whether the user paused this folder (#94). A paused folder is not
+    /// scanned, watched, hashed, or uploaded; the global pause is separate.
+    pub paused: bool,
     /// Whether this folder's files join an album (R3.4).
     pub album_mapping: bool,
     /// What the folder maps to once album mapping is on (R3.4).
@@ -140,9 +144,11 @@ pub struct FolderStatus {
 pub struct Status {
     /// The global activity state.
     pub activity: Activity,
-    /// Why uploads are held, when they are (R8.7, R8.8). `Some` exactly when
-    /// the activity is [`Activity::Paused`], so the reason and the state
-    /// cannot disagree.
+    /// Why uploads are held, when they are (R8.7, R8.8). `Some` when the
+    /// client's pause or the known-network list holds them, so the views can
+    /// phrase the reason. A pause carried by every folder has no global reason
+    /// (#94): the activity is [`Activity::Paused`] and the folder cards say
+    /// why.
     pub pause: Option<PauseReason>,
     /// What the OS reports about the network, for the Settings page (R8.8).
     pub network: NetworkStatus,
@@ -180,10 +186,18 @@ impl Status {
         let mut counts = FolderCounts::default();
         let mut uploads = UploadTraffic::default();
         for folder in &folders {
+            // #94: the global card sums the work the client can do now, so a
+            // paused folder's queue neither holds it at Syncing nor dilutes its
+            // progress, and its meter is not the client's rate. A review the
+            // user owes is still theirs, so that count is summed for every
+            // folder.
+            counts.review += folder.counts.review;
+            if folder.paused {
+                continue;
+            }
             counts.pending += folder.counts.pending;
             counts.uploaded += folder.counts.uploaded;
             counts.failed += folder.counts.failed;
-            counts.review += folder.counts.review;
             uploads.add(folder.uploads);
         }
         // R5.4: a row under a removed source folder is still a decision the
@@ -192,10 +206,16 @@ impl Status {
         if let Some(total) = review_total {
             counts.review = total;
         }
+        // #94: a paused folder's frozen availability and errors are its card's
+        // to state, so they do not hold the client's own state.
         let needs_the_user = folders
             .iter()
+            .filter(|folder| !folder.paused)
             .any(|folder| !folder.available || folder.last_error.is_some());
-        let activity = if pause.is_some() {
+        // #94: every folder paused is the client's paused state too, with no
+        // global reason of its own.
+        let every_folder_paused = !folders.is_empty() && folders.iter().all(|folder| folder.paused);
+        let activity = if pause.is_some() || every_folder_paused {
             Activity::Paused
         } else if needs_the_user || connection == ConnectionHealth::NeedsAttention {
             Activity::NeedsAttention
