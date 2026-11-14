@@ -1,0 +1,12 @@
+# The gate's nextest settings (ci.yml), read by `cargo nextest run`.
+#
+# The stall-guard tests in `crates/immich-client/tests/it/limits.rs` measure a
+# 200 ms window on the wall clock. A runner that is busy with other tests can
+# wake that timer a window late, and then the elapsed time lands outside the
+# budget the guard keeps: the Linux job failed with 608-720 ms against a 500 ms
+# ceiling (#97, and the same test on main before it), and the same failure is
+# reproducible locally when eight copies share two cores. Run one at a time and
+# the measurement is about the guard again, not about the scheduler.
+[[profile.default.overrides]]
+filter = 'package(immich-client) & test(limits::)'
+threads-required = 'num-cpus'
