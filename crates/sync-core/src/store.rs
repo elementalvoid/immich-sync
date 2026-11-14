@@ -268,6 +268,18 @@ const SCHEMA_V14: &str = "
 ALTER TABLE source_folder ADD COLUMN unsupported INTEGER NOT NULL DEFAULT 0;
 ";
 
+/// The fifteenth schema (#94): the user's own pause of one source folder.
+///
+/// A paused folder is not scanned, watched, hashed, or uploaded; its queued
+/// rows wait until the user resumes it. The flag lives on the folder row so a
+/// restart keeps the pause and the signed-out client shows it.
+///
+/// A database written before it reads `0`: every folder starts syncing, which
+/// is what it did before the column existed.
+const SCHEMA_V15: &str = "
+ALTER TABLE source_folder ADD COLUMN paused INTEGER NOT NULL DEFAULT 0;
+";
+
 /// How long the one writer waits for a competing lock before failing.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -549,6 +561,10 @@ pub struct SourceFolder {
     /// being removed and added again keeps it (#47). This field is the row's
     /// title read back, never a second copy.
     pub album_title: Option<String>,
+    /// Whether the user paused this folder (#94). A paused folder is not
+    /// scanned, watched, hashed, or uploaded, and its queued rows wait for the
+    /// resume; the global pause is separate and the two compose.
+    pub paused: bool,
 }
 
 /// A folder's settings as a new one starts (#93): the leaf albums named after
@@ -563,6 +579,7 @@ impl Default for SourceFolder {
             album_path: AlbumPath::default(),
             album_prefix: true,
             album_title: None,
+            paused: false,
         }
     }
 }
@@ -1362,7 +1379,8 @@ impl StateStore {
                  album_mapping = excluded.album_mapping,
                  album_scope = excluded.album_scope,
                  album_path = excluded.album_path,
-                 album_prefix = excluded.album_prefix",
+                 album_prefix = excluded.album_prefix,
+                 paused = excluded.paused",
         )
         .map(|_| ())
     }
@@ -1394,8 +1412,8 @@ impl StateStore {
             .execute(
                 &format!(
                     "INSERT INTO source_folder (path, path_key, recursive, album_mapping, album_scope,
-                                               album_path, album_prefix)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                                               album_path, album_prefix, paused)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                      {conflict}"
                 ),
                 params![
@@ -1406,6 +1424,7 @@ impl StateStore {
                     folder.album_scope.as_str(),
                     folder.album_path.as_str(),
                     folder.album_prefix,
+                    folder.paused,
                 ],
             )
             .map_err(|source| self.query_error(source))?;
@@ -1455,7 +1474,7 @@ impl StateStore {
         let mut statement = writer
             .prepare(
                 "SELECT f.path, f.recursive, f.album_mapping, f.album_scope, a.title,
-                        f.album_path, f.album_prefix
+                        f.album_path, f.album_prefix, f.paused
                  FROM source_folder f LEFT JOIN album a ON a.folder_key = f.path_key
                  ORDER BY f.path",
             )
@@ -2737,6 +2756,7 @@ fn read_folder(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceFolder> {
         album_path,
         album_prefix: row.get(6)?,
         album_title: row.get(4)?,
+        paused: row.get(7)?,
     })
 }
 
@@ -2873,6 +2893,7 @@ fn migrations() -> Migrations<'static> {
         M::up(SCHEMA_V12),
         M::up(SCHEMA_V13),
         M::up(SCHEMA_V14),
+        M::up(SCHEMA_V15),
     ])
 }
 
@@ -2891,6 +2912,29 @@ pub fn migrations_before_tag_backfill() -> Migrations<'static> {
         M::up(SCHEMA_V7),
         M::up(SCHEMA_V8),
         M::up(SCHEMA_V9),
+    ])
+}
+
+/// The migration list as it stood before the per-folder pause (#94), so the
+/// upgrade-path test can build a database at the schema the upgrade really
+/// starts from.
+#[doc(hidden)]
+pub fn migrations_before_folder_pause() -> Migrations<'static> {
+    Migrations::new(vec![
+        M::up(SCHEMA_V1),
+        M::up_with_hook(SCHEMA_V2, backfill_path_keys),
+        M::up(SCHEMA_V3),
+        M::up(SCHEMA_V4),
+        M::up(SCHEMA_V5),
+        M::up(SCHEMA_V6),
+        M::up(SCHEMA_V7),
+        M::up(SCHEMA_V8),
+        M::up(SCHEMA_V9),
+        M::up(SCHEMA_V10),
+        M::up(SCHEMA_V11),
+        M::up(SCHEMA_V12),
+        M::up(SCHEMA_V13),
+        M::up(SCHEMA_V14),
     ])
 }
 
@@ -3520,6 +3564,50 @@ mod migration_tests {
             store.tag_backfill_total().expect("count the library"),
             1,
             "the migrated row's asset is what the backfill covers"
+        );
+    }
+
+    /// #94: a database written before the per-folder pause still migrates, its
+    /// folders start syncing, and the new column round-trips.
+    #[test]
+    fn a_v14_database_gains_the_folder_pause_column() {
+        let temp = tempfile::tempdir().expect("create a temp dir");
+        let path = temp.path().join("state.db");
+        {
+            let mut connection = Connection::open(&path).expect("open the raw database");
+            // The fourteenth schema: the pause column does not exist yet.
+            migrations_before_folder_pause()
+                .to_latest(&mut connection)
+                .expect("create the fourteenth schema");
+            connection
+                .execute(
+                    "INSERT INTO source_folder (path, path_key, recursive)
+                     VALUES ('/photos', '/photos', 1)",
+                    [],
+                )
+                .expect("insert the old folder");
+            drop(connection);
+        }
+
+        let store = StateStore::open(&path).expect("a v14 database must migrate");
+        let folders = store.folders().expect("read the folders");
+        assert_eq!(folders.len(), 1, "the existing folder survives");
+        assert!(
+            !folders[0].paused,
+            "#94: a folder written before the column existed starts unpaused"
+        );
+
+        store
+            .add_folder(&SourceFolder {
+                paused: true,
+                ..folders[0].clone()
+            })
+            .expect("pause the folder after the migration");
+        drop(store);
+        let reopened = StateStore::open(&path).expect("reopen the migrated database");
+        assert!(
+            reopened.folders().expect("read the folders")[0].paused,
+            "#94: the migrated column round-trips"
         );
     }
 

@@ -1,4 +1,4 @@
-//! The per-folder settings controls, rendered in one place (#43, #93).
+//! The per-folder settings controls, rendered in one place (#43, #93, #94).
 //!
 //! Folder setup and the folder detail's settings show the same stored row:
 //! Recursive, Album mapping, Album scope, how each album below the folder is
@@ -6,9 +6,13 @@
 //! layout, and their accessible names live here, so the two surfaces cannot
 //! drift apart. The owner supplies the handlers, which is what lets the detail
 //! write each change through the engine while the setup dialog keeps its draft.
+//!
+//! The folder's Pause/Resume control lives here too (#94), because the
+//! dashboard card and the folder detail render it and only the click differs.
 
 use std::rc::Rc;
 
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::radio::Radio;
 use gpui_kit::component::switch::Switch;
@@ -284,4 +288,32 @@ where
             })
             .into_any_element()
     }
+}
+
+/// The visible label and the accessible name every Pause/Resume toggle uses
+/// (#94, R8.7). One mapping, so the dashboard's global toggle and each
+/// folder's cannot read one thing to a person and another to a screen reader.
+///
+/// The tray menu is not a toggle: it offers Pause and Resume side by side
+/// (R8.3), so it takes neither of these labels.
+#[must_use]
+pub(crate) fn pause_copy(paused: bool) -> (&'static str, &'static str) {
+    if paused {
+        ("Resume", "Resume syncing")
+    } else {
+        ("Pause", "Pause syncing")
+    }
+}
+
+/// The Pause/Resume control one source folder gets (#94).
+///
+/// The dashboard card and the folder detail render it, so the visible label
+/// and the accessible name cannot drift apart. The caller attaches the click,
+/// because the two surfaces write through different owners.
+pub(crate) fn pause_control(id: impl Into<ElementId>, name: &str, paused: bool) -> Button {
+    let (label, action) = pause_copy(paused);
+    Button::new(id)
+        .secondary()
+        .label(label)
+        .accessibility_label(format!("{action} {name}"))
 }

@@ -11,6 +11,9 @@
 //! It is test-only: the product never writes these fixtures. The folders it
 //! creates under `IMMICH_SYNC_CAPTURE_ROOT` are real directories, so the
 //! dashboard's availability check passes and the cards show live counts.
+//!
+//! The third folder, `Archive`, is paused (#94), so the capture shows a paused
+//! card beside two syncing ones and a client whose global counts leave it out.
 
 use std::path::Path;
 
@@ -84,8 +87,10 @@ fn seed_capture_state() {
 
     let pictures = Path::new(&root).join("Pictures");
     let videos = Path::new(&root).join("Videos");
+    let archive = Path::new(&root).join("Archive");
     std::fs::create_dir_all(&pictures).expect("create the Pictures folder");
     std::fs::create_dir_all(&videos).expect("create the Videos folder");
+    std::fs::create_dir_all(&archive).expect("create the Archive folder");
     for (folder, album_mapping) in [(&pictures, true), (&videos, false)] {
         store
             .add_folder(&SourceFolder {
@@ -106,6 +111,16 @@ fn seed_capture_state() {
             })
             .expect("add the capture folder");
     }
+    // #94: the paused folder keeps the two demo configs as they were and adds
+    // the one state the README has no picture of yet.
+    store
+        .add_folder(&SourceFolder {
+            path: archive.display().to_string(),
+            recursive: true,
+            paused: true,
+            ..SourceFolder::default()
+        })
+        .expect("add the paused capture folder");
 
     let mut index = 0;
     // #44: the folder detail lists the assets' current versions, newest first,
@@ -179,6 +194,18 @@ fn seed_capture_state() {
             &format!("RAW_{refused}.cr3"),
             ItemState::FailedPermanent,
         );
+    }
+    // #94: the paused folder shows what it holds: a settled backlog and the
+    // queue the pause is holding. The global card leaves both out.
+    for photo in 0..120 {
+        write(
+            &archive,
+            &format!("ARCHIVE_{photo:04}.jpg"),
+            ItemState::Uploaded,
+        );
+    }
+    for held in 0..9 {
+        write(&archive, &format!("HELD_{held}.jpg"), ItemState::Pending);
     }
     // The deletion-review capture: three files that disappeared and wait for a
     // keep-or-trash decision (R5.3).

@@ -90,7 +90,10 @@ Some tests are wall-clock budgets rather than progress-bounded waits:
 `a_folder_with_100_files_syncs_without_manual_action`, the re-login budget
 tests in `engine.rs`,
 `a_server_that_stops_answering_produces_backoff_not_a_hot_loop`, the pacing
-test in `limits.rs`, and the port race in `connection.rs`. In
+test in `limits.rs`, the port race in `connection.rs`, and
+`pausing_a_folder_mid_upload_lets_that_upload_finish` in `engine.rs` and
+`a_paused_folder_card_lets_the_upload_on_the_wire_finish` in the app's
+`dashboard.rs`, which hold an upload open for a second to pause inside it. In
 `crates/app/tests/it/engine_model.rs`,
 `a_click_on_a_running_engine_starts_a_scan` is one too: it hashes a 64 MiB
 fixture so the scan outlives the 250 ms status poll that carries the scan flag,
@@ -133,8 +136,10 @@ those with a smaller fixture, never with a fake clock.
 ## Screenshots
 
 The dashboard image in the README is a real frame from the app, seeded with
-`crates/app/tests/it/screenshot_seed.rs`. Give the capture its own XDG directories
-so it cannot touch your real state:
+`crates/app/tests/it/screenshot_seed.rs`: Pictures (mapped, whole-folder album),
+Videos (unmapped), and Archive, which is paused (#94) so the shot shows a paused
+card beside two syncing ones. Give the capture its own XDG directories so it
+cannot touch your real state:
 
 ```sh
 export XDG_CONFIG_HOME="$PWD/.scratch/shot/config"

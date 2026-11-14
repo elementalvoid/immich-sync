@@ -120,9 +120,9 @@ pub struct EngineModel {
     _poll: Task<()>,
 }
 
-/// What one album edit changes on a source folder (R3.4, #47).
+/// What one folder-settings edit changes on a source folder (R3.4, #47, #94).
 #[derive(Clone)]
-enum AlbumChange {
+enum FolderChange {
     /// Turn album mapping on or off.
     Mapping(bool),
     /// Set the album scope.
@@ -133,6 +133,8 @@ enum AlbumChange {
     Prefix(bool),
     /// Set the title of the folder's own album.
     Title(String),
+    /// Pause or resume the folder's own sync (#94).
+    Paused(bool),
 }
 
 /// What one "Sync now" click did (#56).
@@ -994,23 +996,23 @@ impl EngineModel {
     /// The store write runs on the worker runtime, so the UI thread never waits
     /// behind it (N2), and the status republishes when it lands.
     pub fn set_album_mapping(&mut self, path: String, enabled: bool, cx: &mut Context<Self>) {
-        self.change_album(path, AlbumChange::Mapping(enabled), cx);
+        self.change_folder(path, FolderChange::Mapping(enabled), cx);
     }
 
     /// Sets the album scope for one source folder (R3.4).
     pub fn set_album_scope(&mut self, path: String, scope: AlbumScope, cx: &mut Context<Self>) {
-        self.change_album(path, AlbumChange::Scope(scope), cx);
+        self.change_folder(path, FolderChange::Scope(scope), cx);
     }
 
     /// Sets how each leaf folder's album is titled for one source folder
     /// (#93).
     pub fn set_album_path(&mut self, path: String, album_path: AlbumPath, cx: &mut Context<Self>) {
-        self.change_album(path, AlbumChange::Path(album_path), cx);
+        self.change_folder(path, FolderChange::Path(album_path), cx);
     }
 
     /// Turns the source album's title into each leaf album's prefix (#93).
     pub fn set_album_prefix(&mut self, path: String, prefixed: bool, cx: &mut Context<Self>) {
-        self.change_album(path, AlbumChange::Prefix(prefixed), cx);
+        self.change_folder(path, FolderChange::Prefix(prefixed), cx);
     }
 
     /// Sets the title of one source folder's own album (#47).
@@ -1020,16 +1022,27 @@ impl EngineModel {
     /// folder's album row and sent by the engine's retry once one runs, so the
     /// view never depends on a connection to keep what the user typed.
     pub fn set_album_title(&mut self, path: String, title: String, cx: &mut Context<Self>) {
-        self.change_album(path, AlbumChange::Title(title), cx);
+        self.change_folder(path, FolderChange::Title(title), cx);
     }
 
-    /// Runs one album edit on the worker runtime and republishes the status.
+    /// Pauses or resumes one source folder (#94).
+    ///
+    /// The write lands while the client is signed out too, so a folder paused
+    /// before sign-in stays paused when the engine starts. The running engine
+    /// hears the change from its observer, which is what stops its next
+    /// attempt or scan.
+    pub fn set_folder_paused(&mut self, path: String, paused: bool, cx: &mut Context<Self>) {
+        self.change_folder(path, FolderChange::Paused(paused), cx);
+    }
+
+    /// Runs one folder-settings edit on the worker runtime and republishes the
+    /// status.
     ///
     /// A newer edit supersedes an older result still in flight, the same way an
     /// add or a remove does, so a slow write cannot undo a later one. The
-    /// folder list comes back with the write, so the card that shows the mapping
+    /// folder list comes back with the write, so the card that shows the setting
     /// shows what the store now holds (R8.1).
-    fn change_album(&mut self, path: String, change: AlbumChange, cx: &mut Context<Self>) {
+    fn change_folder(&mut self, path: String, change: FolderChange, cx: &mut Context<Self>) {
         // A newer edit supersedes an older result still in flight.
         self.generation = self.generation.wrapping_add(1);
         let tracking = self.store_model.read(cx).tracking();
@@ -1040,11 +1053,12 @@ impl EngineModel {
                 // N2: the store write belongs on the worker, not the UI thread.
                 let tracking = tracking.ok_or_else(|| STORE_OPENING.to_string())?;
                 match change {
-                    AlbumChange::Mapping(enabled) => tracking.set_album_mapping(&path, enabled),
-                    AlbumChange::Scope(scope) => tracking.set_album_scope(&path, scope),
-                    AlbumChange::Path(album_path) => tracking.set_album_path(&path, album_path),
-                    AlbumChange::Prefix(prefixed) => tracking.set_album_prefix(&path, prefixed),
-                    AlbumChange::Title(title) => tracking.set_album_title(&path, &title),
+                    FolderChange::Mapping(enabled) => tracking.set_album_mapping(&path, enabled),
+                    FolderChange::Scope(scope) => tracking.set_album_scope(&path, scope),
+                    FolderChange::Path(album_path) => tracking.set_album_path(&path, album_path),
+                    FolderChange::Prefix(prefixed) => tracking.set_album_prefix(&path, prefixed),
+                    FolderChange::Title(title) => tracking.set_album_title(&path, &title),
+                    FolderChange::Paused(paused) => tracking.set_folder_paused(&path, paused),
                 }
                 .map_err(|error| error.to_string())?;
                 tracking.folders().map_err(|error| error.to_string())
@@ -1233,6 +1247,8 @@ impl EngineModel {
                     .map(|((folder, counts), times)| FolderStatus {
                         path: folder.path.clone(),
                         recursive: folder.recursive,
+                        // #94: the signed-out view keeps a paused folder paused.
+                        paused: folder.paused,
                         album_mapping: folder.album_mapping,
                         album_scope: folder.album_scope,
                         album_path: folder.album_path,

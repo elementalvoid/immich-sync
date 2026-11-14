@@ -75,9 +75,9 @@ fn confirmation_id(confirmation: &ElementSnapshot) -> ElementId {
         .cloned()
         .expect("the confirmation registers its own id")
 }
-/// The schema stands at the fourteenth migration (#95 added the refused-format
-/// count on top of the leaf album naming #93).
-const DB_MIGRATION_VERSION: i64 = 14;
+/// The schema stands at the fifteenth migration (#94 added the per-folder
+/// pause on top of the refused-format count #95).
+const DB_MIGRATION_VERSION: i64 = 15;
 
 fn temporary_paths(dir: &Path) -> AppPaths {
     AppPaths {

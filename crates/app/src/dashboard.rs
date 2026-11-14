@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use crate::asset_link::{self, LinkOpener};
 use crate::engine::{EngineModel, SyncNowOutcome};
+use crate::folder_controls::pause_control;
 use crate::folder_panel::{FolderOpener, FolderPanel, FolderPanelEvent};
 use crate::notice::{Notice, Severity};
 use crate::path_picker::{self, Picked};
@@ -173,6 +174,17 @@ impl Dashboard {
                 self.model.global.activity = ActivityState::Syncing;
                 cx.notify();
             }
+        }
+    }
+
+    /// Pauses or resumes one source folder (#94).
+    ///
+    /// The engine writes it through tracking, so the change lands while the
+    /// client is signed out too. Without an engine the sample model is a fixed
+    /// fixture, so there is nothing to write.
+    fn set_folder_paused(&mut self, path: String, paused: bool, cx: &mut Context<Self>) {
+        if let Some(engine) = &self.engine {
+            engine.update(cx, |model, cx| model.set_folder_paused(path, paused, cx));
         }
     }
 
@@ -559,11 +571,7 @@ impl Dashboard {
         if sync_notice.is_none() {
             self.sync_notice = None;
         }
-        let (pause_label, pause_name) = if paused {
-            ("Resume", "Resume syncing")
-        } else {
-            ("Pause", "Pause syncing")
-        };
+        let (pause_label, pause_name) = crate::folder_controls::pause_copy(paused);
 
         div()
             .flex()
@@ -681,11 +689,28 @@ impl Render for Dashboard {
                             let path = folder.path.clone().unwrap_or_default();
                             let title = folder.title.clone();
                             // #53: removal is the detail's confirmed action.
+                            // #94: the folder's own Pause/Resume sits beside
+                            // it, so one card can stop without the others.
                             let footer = live.then(|| {
                                 let path = path.clone();
+                                let pause_path = path.clone();
+                                let paused = folder.paused;
                                 div()
                                     .flex()
                                     .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        pause_control(("folder-pause", index), &title, paused)
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.set_folder_paused(
+                                                    pause_path.clone(),
+                                                    !paused,
+                                                    cx,
+                                                );
+                                            })),
+                                    )
                                     .child(
                                         Button::new(("folder-details", index))
                                             .secondary()

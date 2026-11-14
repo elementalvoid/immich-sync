@@ -201,18 +201,16 @@ async fn a_revoked_session_token_is_rejected() {
 
 #[tokio::test]
 async fn an_unreachable_server_is_its_own_error() {
-    // Bind a port, then release it: the connection is refused.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind a port");
-    let port = listener.local_addr().expect("the port is known").port();
-    drop(listener);
-
-    let client = ImmichClient::new(&format!("http://127.0.0.1:{port}")).expect("a valid URL");
+    // Port 1 on loopback is privileged and outside the ephemeral range the
+    // double binds from, so the connection is refused and no concurrent test
+    // can take the port in between. Releasing an ephemeral port instead raced a
+    // test that bound it first: that test's request landed in another server's
+    // log and this one answered `about` (seen on CI).
+    let client = ImmichClient::new("http://127.0.0.1:1").expect("a valid URL");
     let error = client
         .about(Auth::ApiKey("api-key-1234"))
         .await
-        .expect_err("nothing listens on the released port");
+        .expect_err("nothing listens on port 1");
 
     assert!(matches!(error, ClientError::Unreachable(_)), "{error:?}");
 }

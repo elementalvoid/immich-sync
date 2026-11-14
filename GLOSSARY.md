@@ -156,8 +156,12 @@ The status icon in the notification area. It shows sync state and it opens the c
 _Avoid_: system tray, notification icon
 
 **Pause**:
-The user's hold on new uploads, from the dashboard control or the tray menu. It is separate from the known-network hold, so resuming never overrides the list.
+The user's hold on new uploads, from the dashboard control, the tray menu, or one source folder's own control. Each hold is separate from the others, so resuming one never overrides another.
 _Avoid_: stop, disable sync
+
+**Folder pause**:
+One source folder's own **pause**. The reconciliation scan and the watcher leave a paused folder alone, so it costs no scanning, hashing, or disk work, and its queued items wait without failing; resuming scans it and drains the queue. It follows **Owner**, so pausing a folder stops exactly the items that folder's card counts.
+_Avoid_: per-folder setting, folder hold
 
 **Folder status**:
 The sync state of one source folder. The dashboard shows one card per source folder, and the folder detail renders the same status in full.

@@ -426,7 +426,9 @@ impl Uploader {
     ///
     /// The gate is checked immediately before the request, so a pause or a
     /// network hold stops the next upload even inside an already-dispatched
-    /// worker (R8.7, R8.8). The
+    /// worker (R8.7, R8.8). `folder_paused` is the caller's answer for the
+    /// folder that owns the item, which holds it the same way (#94). Either
+    /// hold leaves the row `pending`, so the item is queued, not failed. The
     /// bandwidth limit is live, so the request streams under whatever limit is
     /// set when its bytes are read (R7.1). `meter` is the folder's: the body
     /// counts its bytes there and the request counts itself in flight while it
@@ -435,6 +437,7 @@ impl Uploader {
         &self,
         prepared: &PreparedItem,
         gate: &UploadGate,
+        folder_paused: bool,
         meter: &UploadMeter,
     ) -> UploadOutcome {
         let path = prepared.path.to_string_lossy().into_owned();
@@ -462,7 +465,7 @@ impl Uploader {
             attempts: 0,
             sidecar: recorded,
         };
-        if gate.is_held() {
+        if gate.is_held() || folder_paused {
             item.state = ItemState::Pending;
             self.record(&item);
             tracing::debug!(path = %item.path, "the upload was deferred by a hold");

@@ -365,14 +365,22 @@ async fn a_card_click_and_its_details_control_open_the_detail(cx: &mut TestAppCo
             "#43, #81: a press on the card body gets the keyboard back on that card"
         );
     });
-    // The card is a container, not a tab stop: Tab descends to its Details
-    // control, which is where a keyboard user continues (#43).
+    // The card is a container, not a tab stop: Tab descends to its controls in
+    // order, the pause control first (#94) and then Details (#43).
+    act(cx, window, |window, cx| window.press("tab", cx));
+    read(cx, window, |window, _| {
+        assert_eq!(
+            window.find(("folder-pause", 0_usize)).focused(),
+            Some(true),
+            "#94: Tab from the restored card reaches its Pause control first"
+        );
+    });
     act(cx, window, |window, cx| window.press("tab", cx));
     read(cx, window, |window, _| {
         assert_eq!(
             window.find(("folder-details", 0_usize)).focused(),
             Some(true),
-            "#43: Tab from the restored card reaches its Details control"
+            "#43: Tab continues to the card's Details control"
         );
     });
 
@@ -396,8 +404,8 @@ async fn a_card_click_and_its_details_control_open_the_detail(cx: &mut TestAppCo
         );
     });
 
-    // #57: the card states the settings and offers no control of its own, so
-    // the only interactive parts are the card itself and Details.
+    // #57, #94: the card states the settings as text, so it has no switch or
+    // radio; its only controls are its own Pause/Resume and Details.
     read(cx, window, |window, _| {
         let card = ElementId::from(("folder-card", 0_usize));
         let controls: Vec<_> = gpui_kit::base::test_support::snapshots(window)
@@ -413,6 +421,76 @@ async fn a_card_click_and_its_details_control_open_the_detail(cx: &mut TestAppCo
         assert!(
             !detail_open(window),
             "nothing on the card opened the detail"
+        );
+    });
+}
+
+/// #94: the detail's own Pause/Resume control writes the folder's pause, reads
+/// Paused, and names the reason as the user's own rather than an error.
+#[gpui_kit::test]
+async fn the_detail_pauses_the_folder_and_names_the_reason(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+    seed_folder(&paths, &photos, true);
+    let (window, store, _view) = open_dashboard(cx, &paths);
+    wait_for_store(cx, &store).await;
+    open_detail_now(cx, window);
+
+    act(cx, window, |window, cx| {
+        window.click("folder-detail-pause", cx);
+    });
+    wait_for_folder(cx, &store, |folder| folder.paused).await;
+
+    read(cx, window, |window, _| {
+        assert_eq!(label(window, "folder-detail-state"), "Paused");
+        assert_eq!(
+            window.find("folder-detail-pause").label(),
+            Some("Resume syncing photos"),
+            "#94: the detail's control offers the resume"
+        );
+        let panel = window.find("folder-panel").bounds();
+        let control = window.find("folder-detail-pause").bounds();
+        assert!(
+            control.left() >= panel.left() && control.right() <= panel.right(),
+            "#94: the detail's pause control stays inside the dialog"
+        );
+        let reason = label(window, "folder-detail-paused");
+        assert_eq!(
+            reason, "You paused this folder. Queued files wait and upload when you resume.",
+            "#94: the detail names the user's own pause as the reason"
+        );
+        assert_eq!(
+            window.find("folder-detail-paused").role(),
+            Some(gpui_kit::Role::Alert),
+            "#94: the reason is announced when it appears"
+        );
+        assert!(
+            window.try_find("folder-detail-error").is_none(),
+            "#94: a pause is not an error"
+        );
+    });
+
+    act(cx, window, |window, cx| {
+        window.click("folder-detail-pause", cx);
+    });
+    wait_for_folder(cx, &store, |folder| !folder.paused).await;
+
+    read(cx, window, |window, _| {
+        assert_eq!(
+            label(window, "folder-detail-state"),
+            "Idle",
+            "#94: the resumed folder keeps its own state"
+        );
+        assert!(
+            window.try_find("folder-detail-paused").is_none(),
+            "#94: the reason goes with the pause"
+        );
+        assert_eq!(
+            window.find("folder-detail-pause").label(),
+            Some("Pause syncing photos")
         );
     });
 }

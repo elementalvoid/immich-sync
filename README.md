@@ -233,7 +233,13 @@ a key from Immich's account settings.
    status card appears on the **Dashboard**; **Cancel** writes nothing. The card
    summarizes the folder's settings; click the card, or its **Details** control,
    to change them in **Folder detail**.
-4. **Remove**, in **Folder detail**, stops syncing that folder; the detail asks
+4. **Pause**, on a folder's card or in **Folder detail**, stops that folder
+   alone: the client stops scanning, watching, hashing, and uploading it, keeps
+   its queued files, and uploads them in the usual order when you click
+   **Resume**. An upload already on the wire finishes. The pause is stored, so
+   it survives a restart, and the **Pause** control in the header and the tray
+   is separate: it holds every folder.
+5. **Remove**, in **Folder detail**, stops syncing that folder; the detail asks
    for confirmation first. Nothing is deleted from the server: the folder's
    uploaded assets stay there.
 

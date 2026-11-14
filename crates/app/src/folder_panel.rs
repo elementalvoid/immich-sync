@@ -392,6 +392,8 @@ impl FolderPanel {
                 .map_or(AlbumPath::Relative, |card| card.album_path),
             album_prefix: card.as_ref().is_none_or(|card| card.album_prefix),
             album_title: card.as_ref().and_then(|card| card.album_title.clone()),
+            // #94: the detail starts from the folder's own pause.
+            paused: card.as_ref().is_some_and(|card| card.paused),
         };
         let stored_title = draft.album_title.clone();
         let title_input = title_field(&path, stored_title.as_deref(), window, cx);
@@ -440,6 +442,7 @@ impl FolderPanel {
                 self.draft.album_path = card.album_path;
                 self.draft.album_prefix = card.album_prefix;
                 self.draft.album_title = card.album_title.clone();
+                self.draft.paused = card.paused;
                 self.card = Some(card);
                 self.gone = false;
             }
@@ -643,6 +646,14 @@ impl FolderPanel {
         self.engine
             .clone()
             .update(cx, |model, cx| model.set_album_path(path, album_path, cx));
+    }
+
+    /// Pauses or resumes this folder (#94).
+    fn write_paused(&mut self, paused: bool, cx: &mut Context<Self>) {
+        let path = self.draft.path.clone();
+        self.engine
+            .clone()
+            .update(cx, |model, cx| model.set_folder_paused(path, paused, cx));
     }
 
     fn write_album_prefix(&mut self, prefixed: bool, cx: &mut Context<Self>) {
@@ -1076,6 +1087,27 @@ impl FolderPanel {
             .into_any_element()
     }
 
+    /// The folder's Pause/Resume control and, while it is paused, the reason
+    /// the user reads: their own pause, never an error (#94).
+    fn pause_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let paused = self.card.as_ref().is_some_and(|card| card.paused);
+        let title = self.folder_name();
+        let mut row = div().flex().flex_col().gap_2().w_full().child(
+            div().flex().flex_row().items_center().gap_2().child(
+                crate::folder_controls::pause_control("folder-detail-pause", &title, paused)
+                    .on_click(cx.listener(move |this, _, _, cx| this.write_paused(!paused, cx))),
+            ),
+        );
+        if paused {
+            row = row.child(Notice::new(
+                "folder-detail-paused",
+                Severity::Info,
+                "You paused this folder. Queued files wait and upload when you resume.",
+            ));
+        }
+        row.into_any_element()
+    }
+
     /// The detail body: the live state, the settings that write immediately,
     /// the timestamps, the links into the filtered views, and Remove (#43).
     fn detail_body(
@@ -1220,6 +1252,7 @@ impl FolderPanel {
                         .child(percent),
                     ),
             )
+            .child(self.pause_row(cx))
             .child(
                 crate::a11y::named(Role::Label, "folder-detail-counts", counts.clone(), None)
                     .text_sm()

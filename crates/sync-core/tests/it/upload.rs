@@ -452,7 +452,12 @@ async fn a_failed_attempt_that_carried_no_sidecar_keeps_the_recorded_digest() {
         live_photo_video: None,
     };
     let outcome = uploader
-        .upload_prepared(&prepared, &UploadGate::new(), &UploadMeter::detached())
+        .upload_prepared(
+            &prepared,
+            &UploadGate::new(),
+            false,
+            &UploadMeter::detached(),
+        )
         .await;
     let UploadOutcome::Failed(failure) = &outcome else {
         panic!("expected the faulted attempt to fail, got {outcome:?}");
@@ -500,7 +505,7 @@ async fn a_paused_upload_leaves_the_sidecar_owed() {
         live_photo_video: None,
     };
     let outcome = uploader
-        .upload_prepared(&prepared, &gate, &UploadMeter::detached())
+        .upload_prepared(&prepared, &gate, false, &UploadMeter::detached())
         .await;
 
     assert_eq!(outcome, UploadOutcome::Deferred);

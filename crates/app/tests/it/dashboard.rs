@@ -771,6 +771,318 @@ fn pause_control_renames_itself_and_flips_the_global_state(cx: &mut TestAppConte
     .expect("update the dashboard window");
 }
 
+/// #94, R8.7: a pause clicked on the card while the folder's upload is on the
+/// wire. The card reads Paused, that upload finishes, and the folder's next
+/// file waits for the resume.
+#[gpui_kit::test]
+async fn a_paused_folder_card_lets_the_upload_on_the_wire_finish(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let (_runtime, server) = common::mock_server();
+    // One upload on the wire for a second, so the click lands while it runs.
+    server.fail(
+        mock_immich::Operation::Upload,
+        mock_immich::Fault::Slow(std::time::Duration::from_secs(1)),
+    );
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = immich_sync::paths::AppPaths {
+        config_file: temp.path().join("config").join("settings.toml"),
+        state_db: temp.path().join("data").join("state.db"),
+        autostart_dir: temp.path().join("config").join("autostart"),
+    };
+    std::fs::create_dir_all(paths.config_file.parent().expect("the config directory"))
+        .expect("create the config directory");
+    std::fs::write(&paths.config_file, "concurrency = 1\n").expect("write the settings");
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the source folder");
+    let first = photos.join("first.jpg");
+    let second = photos.join("second.jpg");
+    std::fs::write(&first, vec![7_u8; 64 * 1024]).expect("write the first file");
+    std::fs::write(&second, vec![8_u8; 64 * 1024]).expect("write the second file");
+
+    let store = cx.update(|cx| cx.new(|cx| immich_sync::store::StoreModel::open(&paths, cx)));
+    wait_for_store(cx, &store).await;
+    let folder = sync_core::store::SourceFolder {
+        path: photos.display().to_string(),
+        recursive: true,
+        ..Default::default()
+    };
+    cx.update(|cx| {
+        // The folder is in the store before the engine reads it, so the start
+        // scan finds both files.
+        store
+            .read(cx)
+            .store()
+            .expect("the store is open")
+            .add_folder(&folder)
+            .expect("seed the source folder");
+        store.update(cx, |store, cx| store.set_folders(vec![folder.clone()], cx));
+    });
+
+    let profile = sync_core::connection::ServerProfile {
+        server_url: server.base_url().to_string(),
+        email: "sync@example.com".to_string(),
+        method: sync_core::connection::AuthMethod::Password,
+    };
+    let credentials: std::sync::Arc<dyn sync_core::credential::CredentialStore> =
+        std::sync::Arc::new(sync_core::credential::MemoryCredentialStore::new());
+    let engine = cx.update(|cx| {
+        gpui_kit::init(cx);
+        cx.set_reduce_motion(true);
+        let connection =
+            cx.new(|_| immich_sync::connection::ConnectionModel::new(profile.clone(), credentials));
+        connection.update(cx, |model, cx| {
+            model.sign_in(
+                sync_core::connection::SignIn {
+                    email: profile.email.clone(),
+                    secret: sync_core::connection::Secret::new("correct horse"),
+                    method: profile.method,
+                },
+                profile.clone(),
+                cx,
+            );
+        });
+        cx.new(|cx| immich_sync::engine::EngineModel::new(connection, store.clone(), &paths, cx))
+    });
+    let window = cx.update(|cx| {
+        gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: Point::default(),
+                    size: size(px(1200.), px(800.)),
+                })),
+                ..Default::default()
+            },
+            cx,
+            |window, cx| {
+                let engine = engine.clone();
+                cx.new(|cx| Dashboard::with_engine(engine, window, cx))
+            },
+        )
+        .expect("open the dashboard window")
+        .0
+    });
+
+    // The pause must land while the request is on the wire.
+    for _ in 0..900 {
+        if server.upload_requests() >= 1 {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        server.upload_requests(),
+        1,
+        "the first upload did not start"
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        scroll_dashboard_into_view(window, cx, ("folder-pause", 0_usize));
+        window.click(("folder-pause", 0_usize), cx);
+    })
+    .expect("pause the folder while its upload is on the wire");
+    wait_for_folder(cx, &store, |folder| folder.paused).await;
+
+    // The card is read before any row is terminal, so the request is still on
+    // the wire at the moment it says Paused.
+    let uploads = [first.clone(), second.clone()];
+    let state_of = |cx: &mut TestAppContext, path: &std::path::Path| {
+        cx.read(|cx| {
+            store
+                .read(cx)
+                .store()
+                .and_then(|store| store.item(&path.display().to_string()).ok().flatten())
+                .map(|row| row.state)
+        })
+    };
+    let finished = |cx: &mut TestAppContext, path: &std::path::Path| {
+        matches!(
+            state_of(cx, path),
+            Some(sync_core::store::ItemState::Uploaded | sync_core::store::ItemState::Duplicate)
+        )
+    };
+    assert!(
+        uploads.iter().all(|path| !finished(cx, path)),
+        "#94: the slowed upload is still on the wire"
+    );
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find(("status-state-folder", 0_usize)).label(),
+            Some("Paused"),
+            "#94: the card reads Paused while the upload finishes"
+        );
+    })
+    .expect("render the paused card");
+
+    // The path that reached the wire takes its terminal row; the other waits.
+    for _ in 0..900 {
+        if uploads.iter().any(|path| finished(cx, path)) {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+        cx.run_until_parked();
+    }
+    // Longer than the slowed response, so a second request would have started.
+    for _ in 0..30 {
+        cx.executor()
+            .timer(std::time::Duration::from_millis(100))
+            .await;
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        server.upload_requests(),
+        1,
+        "#94: the folder's pause starts no second upload"
+    );
+    let done = uploads.iter().filter(|path| finished(cx, path)).count();
+    let states: Vec<_> = uploads.iter().map(|path| state_of(cx, path)).collect();
+    assert_eq!(
+        done, 1,
+        "#94: the upload already on the wire finishes: {states:?}"
+    );
+    assert_eq!(
+        states
+            .iter()
+            .filter(|state| **state == Some(sync_core::store::ItemState::Pending))
+            .count(),
+        1,
+        "#94: the other file stays queued, never a failure: {states:?}"
+    );
+
+    // Resume drains the queue in the usual order.
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        scroll_dashboard_into_view(window, cx, ("folder-pause", 0_usize));
+        window.click(("folder-pause", 0_usize), cx);
+    })
+    .expect("resume the folder");
+    for _ in 0..900 {
+        let done = uploads.iter().all(|path| {
+            matches!(
+                state_of(cx, path),
+                Some(sync_core::store::ItemState::Uploaded)
+                    | Some(sync_core::store::ItemState::Duplicate)
+            )
+        });
+        if done {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+        cx.run_until_parked();
+    }
+    assert!(
+        uploads.iter().all(|path| {
+            matches!(
+                state_of(cx, path),
+                Some(sync_core::store::ItemState::Uploaded)
+                    | Some(sync_core::store::ItemState::Duplicate)
+            )
+        }),
+        "#94: the resume uploads the file the pause held"
+    );
+    assert_eq!(server.upload_requests(), 2);
+}
+
+/// #94: one folder's own Pause/Resume control. The card reads Paused while the
+/// folder is, the other cards keep their state, and a click writes the store.
+#[gpui_kit::test]
+async fn a_folder_card_shows_and_clears_its_own_pause(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let photos = temp.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("create the fixture folder");
+    let (window, store, _view) = open_live_dashboard(cx, temp.path());
+    wait_for_store(cx, &store).await;
+    let folder = sync_core::store::SourceFolder {
+        path: photos.display().to_string(),
+        recursive: true,
+        paused: true,
+        ..Default::default()
+    };
+    cx.update(|cx| {
+        store
+            .read(cx)
+            .store()
+            .expect("the store is open")
+            .add_folder(&folder)
+            .expect("seed the paused source folder");
+        store.update(cx, |store, cx| store.set_folders(vec![folder.clone()], cx));
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find(("status-state-folder", 0_usize)).label(),
+            Some("Paused"),
+            "#94: a paused folder's card reads Paused"
+        );
+        assert_eq!(
+            window.find(("folder-pause", 0_usize)).label(),
+            Some("Resume syncing photos"),
+            "#94: the card's control offers the resume, named for its folder"
+        );
+
+        // #94: the pause control shares the card's footer row with Details and
+        // stays inside the card at its fixed width.
+        let card = window.find(("folder-card", 0_usize)).bounds();
+        let pause = window.find(("folder-pause", 0_usize)).bounds();
+        let details = window.find(("folder-details", 0_usize)).bounds();
+        assert_eq!(
+            pause.top(),
+            details.top(),
+            "#94: the pause control sits beside Details"
+        );
+        assert!(
+            pause.right() <= card.right() && details.right() <= card.right(),
+            "#94: both footer controls fit inside the card"
+        );
+
+        scroll_dashboard_into_view(window, cx, ("folder-pause", 0_usize));
+        window.click(("folder-pause", 0_usize), cx);
+    })
+    .expect("click the folder's Resume control");
+
+    wait_for_folder(cx, &store, |folder| !folder.paused).await;
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find(("status-state-folder", 0_usize)).label(),
+            Some("Idle"),
+            "#94: the resumed folder's card drops the paused state"
+        );
+        assert_eq!(
+            window.find(("folder-pause", 0_usize)).label(),
+            Some("Pause syncing photos")
+        );
+
+        // docs/agents/ui.md: the narrowest window is where the footer has the
+        // least room, so the two controls must still share one row inside the
+        // card there.
+        window.resize(size(px(520.), px(480.)));
+        window.bounds_changed(cx);
+        window.render_frame(cx);
+        let card = window.find(("folder-card", 0_usize)).bounds();
+        let pause = window.find(("folder-pause", 0_usize)).bounds();
+        let details = window.find(("folder-details", 0_usize)).bounds();
+        // The footer is one non-wrapping row, so a control that no longer fits
+        // overflows the card rather than moving below it.
+        assert!(
+            pause.right() <= card.right() && details.right() <= card.right(),
+            "#94: both controls stay inside the card at the narrowest window"
+        );
+    })
+    .expect("render after the resume");
+}
+
 /// The live dashboard over a real (initially disconnected) engine model.
 ///
 /// The view handle comes back too, so a test can drive one of its seams
@@ -1588,6 +1900,7 @@ async fn add_writes_the_path_and_every_setting_in_one_request(cx: &mut TestAppCo
             album_path: sync_core::store::AlbumPath::LeafName,
             album_prefix: false,
             album_title: None,
+            paused: false,
         },
         "#40, #93: one write records the path and every setting"
     );
