@@ -26,7 +26,8 @@ use immich_sync::paths::AppPaths;
 use immich_sync::review_view::ReviewView;
 use immich_sync::settings_view::SettingsView;
 use immich_sync::shell::{
-    self, About, AppShell, Hide, Minimize, Pause, Quit, Resume, Show, SyncNow, ViewMode,
+    self, About, AppShell, Hide, Minimize, Pause, Quit, Resume, Show, ShowUpdatePane, SyncNow,
+    ViewMode,
 };
 use immich_sync::store::StoreModel;
 use immich_sync::upload::UploadModel;
@@ -181,9 +182,9 @@ fn the_main_window_opens_compact_resizable_and_with_a_floor(cx: &mut TestAppCont
     );
 }
 
-#[test]
-fn tray_menu_labels_match_their_actions() {
-    let items = shell::tray_menu();
+#[gpui_kit::test]
+fn tray_menu_labels_match_their_actions(cx: &mut TestAppContext) {
+    let items = cx.read(shell::tray_menu);
     let entries: Vec<(String, &dyn Action)> = items
         .iter()
         .filter_map(|item| match item {
@@ -195,7 +196,8 @@ fn tray_menu_labels_match_their_actions() {
     assert_eq!(
         entries.len(),
         5,
-        "R8.3: Show, Pause, Resume, Sync now, and Quit"
+        "R8.3: Show, Pause, Resume, Sync now, and Quit; R12 adds the release item only \
+         while one is known"
     );
     assert_eq!(entries[0].0, "Show");
     assert!(entries[0].1.partial_eq(&Show));
@@ -211,6 +213,37 @@ fn tray_menu_labels_match_their_actions() {
         matches!(items[1], MenuItem::Separator) && matches!(items[5], MenuItem::Separator),
         "separators divide the window action, the sync controls, and Quit"
     );
+}
+
+/// R12: the tray's and the app menu's item switches to Settings and opens the
+/// seventh page, the way the folder detail lands on Failed and Review.
+#[gpui_kit::test]
+fn the_update_action_opens_the_settings_updates_page(cx: &mut TestAppContext) {
+    boot(cx);
+    cx.update(|cx| cx.dispatch_action(&Show));
+    cx.run_until_parked();
+    let window = cx
+        .read(|cx| cx.windows().first().copied())
+        .expect("the window is open");
+
+    cx.update(|cx| cx.dispatch_action(&ShowUpdatePane));
+    cx.run_until_parked();
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("settings-page-panel").label(),
+            Some("Updates"),
+            "R12: the action lands on the Updates page"
+        );
+        assert_eq!(
+            window.find("settings-page-updates").selected(),
+            Some(true),
+            "R12: the page's own tab reports the selection"
+        );
+    })
+    .expect("read the shell's surface");
 }
 
 #[test]
@@ -372,8 +405,10 @@ fn open_shell_on(
             cx,
             |window, cx| {
                 let dashboard = cx.new(|cx| Dashboard::with_engine(engine.clone(), window, cx));
-                let settings =
-                    cx.new(|cx| SettingsView::from_environment(window, cx, connection.clone()));
+                let updates = common::idle_updates(cx);
+                let settings = cx.new(|cx| {
+                    SettingsView::from_environment(window, cx, connection.clone(), updates.clone())
+                });
                 let upload_view = cx.new(|cx| UploadView::new(upload.clone(), window, cx));
                 let failed = cx.new(|cx| FailedView::new(engine.clone(), window, cx));
                 let diagnostics_model = cx.new(|cx| {

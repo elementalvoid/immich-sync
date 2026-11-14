@@ -22,5 +22,6 @@ mod screenshot_seed;
 mod settings;
 mod settings_ui;
 mod shell;
+mod update;
 mod upload_ui;
 mod window;

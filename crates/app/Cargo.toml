@@ -14,13 +14,18 @@ gpui-kit.workspace = true
 gpui-tray.workspace = true
 interprocess.workspace = true
 keyring-core = "=1.0.1"
+# The one GitHub request the update check makes (R12, ADR 0009). The crate is
+# already in the tree through `immich-client`, and its default TLS is the
+# rustls stack with the platform verifier, so certificate verification stays on.
+reqwest = "0.13"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 sync-core = { path = "../sync-core" }
 # `local-offset` reads the platform's time zone, so the folder detail can show
 # the exact local RFC-3339 time (#43). It is a local file read, never a network
 # path (R9.2).
 time = { version = "0.3", features = ["local-offset"] }
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 toml = "1"
 tracing = "0.1"
 tracing-appender = "0.2"

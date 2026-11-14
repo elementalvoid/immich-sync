@@ -16,20 +16,32 @@ use crate::failed_view::FailedView;
 use crate::logs_view::LogsView;
 use crate::paths::AppPaths;
 use crate::review_view::ReviewView;
-use crate::settings_view::SettingsView;
+use crate::settings::SettingsStore;
+use crate::settings_view::{PAGE_UPDATES, SettingsView};
 use crate::store::StoreModel;
 use crate::tab::Tab;
+use crate::update::{INTERVAL, Release, UpdateModel};
 use crate::upload::UploadModel;
 use crate::upload_view::UploadView;
 use sync_core::connection::{ConnectionState, ServerProfile};
 use sync_core::status::{Activity, PauseReason};
 use sync_core::store::FolderCounts;
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 actions!(
     immich_sync,
-    [Show, Hide, Quit, Pause, Resume, SyncNow, About, Minimize]
+    [
+        Show,
+        Hide,
+        Quit,
+        Pause,
+        Resume,
+        SyncNow,
+        About,
+        Minimize,
+        ShowUpdatePane
+    ]
 );
 
 /// Global holding the tray icon so [`Quit`] can remove it.
@@ -60,7 +72,9 @@ pub fn init(cx: &mut App) {
         // The macOS menu bar's own items; nothing else dispatches them, so
         // registering the handlers everywhere leaves Linux and Windows alone.
         .on_action(about)
-        .on_action(minimize);
+        .on_action(minimize)
+        // The tray's and the app menu's way into the Updates page (R12).
+        .on_action(show_update_pane);
     // The macOS menu bar and the shortcuts it advertises (issue #64). The keys
     // are bound before the bar is built: an item draws its key equivalent from
     // the keymap, and GPUI has no `OsAction` for Quit or Close. With no context
@@ -72,7 +86,7 @@ pub fn init(cx: &mut App) {
             KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("cmd-w", Hide, None),
         ]);
-        cx.set_menus(app_menu());
+        cx.set_menus(app_menu(cx));
     }
     let connection = install_connection_with(cx, show_connection_on_tray);
     install_models(cx, connection);
@@ -124,6 +138,10 @@ pub fn engine(cx: &App) -> Entity<EngineModel> {
     cx.global::<EngineHandle>().0.clone()
 }
 
+/// The app-level handle to the one update check (R12).
+struct UpdateHandle(Entity<UpdateModel>);
+impl Global for UpdateHandle {}
+
 /// The app-level handle to the one shared state store.
 struct StoreHandle(Entity<StoreModel>);
 impl Global for StoreHandle {}
@@ -159,14 +177,67 @@ pub fn install_models(
     let store = cx.new(|cx| StoreModel::open(&paths, cx));
     let engine = cx.new(|cx| EngineModel::new(connection.clone(), store.clone(), &paths, cx));
     let upload = cx.new(|cx| UploadModel::new(connection, store.clone(), cx));
+    // The check reads the switch and the dismissal from the file it writes
+    // through the settings view, which keeps the file's one writer (R12).
+    let saved = SettingsStore::open(paths.config_file.clone());
+    let settings = saved.settings().clone();
+    let updates = cx.new(|_| {
+        UpdateModel::new(
+            Arc::new(crate::update::GitHubSource::new()),
+            INTERVAL,
+            settings.check_for_updates,
+            settings.dismissed_update.clone(),
+        )
+    });
     cx.set_global(StoreHandle(store.clone()));
     cx.set_global(EngineHandle(engine.clone()));
     cx.set_global(UploadHandle(upload.clone()));
+    cx.set_global(UpdateHandle(updates.clone()));
     cx.set_global(TrayTooltip(Mutex::new(String::new())));
     // The tooltip follows the engine's live activity as well as the connection.
     cx.observe(&engine, |_, cx| show_status_on_tray(cx))
         .detach();
+    // The two menus are the surfaces that outlive the window, so they follow
+    // the release as it arrives and as it is dismissed (R12).
+    cx.observe(&updates, |_, cx| show_update_on_menus(cx))
+        .detach();
     (store, engine)
+}
+
+/// Runs the update check the settings file asks for (R12).
+///
+/// Called by the real boot path only: a test boots the shell without it, so no
+/// test run reaches GitHub.
+pub fn start_updates(cx: &mut App) {
+    let Some(handle) = cx.try_global::<UpdateHandle>() else {
+        tracing::error!("the update check is not installed, so the startup check did not run");
+        return;
+    };
+    let updates = handle.0.clone();
+    updates.update(cx, |model, cx| model.start(cx));
+}
+
+/// Rebuilds the menus that can name an available release (R12).
+///
+/// `gpui-tray` 0.1.4 runs its menu closure when the tray is built and again
+/// after the icon is activated or one of its items is clicked
+/// (`gpui-tray-0.1.4/src/tray.rs:324,340`); it has no callback for the moment
+/// the menu opens. So the state that decides the item is pushed here, when it
+/// changes, and the menus are already right when the user next opens one.
+fn show_update_on_menus(cx: &mut App) {
+    if let Some(tray) = cx.try_global::<TrayHandle>() {
+        let tray = tray.0.clone();
+        if let Err(error) = tray.refresh_menu(cx) {
+            // The item is then stale until the next activation rebuilds the
+            // menu, so the reason belongs in the log, not nowhere.
+            tracing::warn!(
+                error = %error,
+                "could not rebuild the tray menu for the update item"
+            );
+        }
+    }
+    #[cfg(target_os = "macos")]
+    cx.set_menus(app_menu(cx));
 }
 
 /// Creates the connection model and registers the tray observer at App scope.
@@ -256,6 +327,26 @@ fn about(_: &About, cx: &mut App) {
     });
 }
 
+/// The tray's and the app menu's entry point: the Updates page (R12).
+///
+/// The page is inside the settings surface, so this is the same two steps
+/// [`AppShell::show_filtered`] takes for Failed and Review.
+fn show_update_pane(_: &ShowUpdatePane, cx: &mut App) {
+    show_window(cx);
+    let Some(window) = cx.windows().first().copied() else {
+        return;
+    };
+    let _ = window.update(cx, |root, _, cx| {
+        let shell = root
+            .downcast::<base::Root>()
+            .ok()
+            .and_then(|root| root.read(cx).view().clone().downcast::<AppShell>().ok());
+        if let Some(shell) = shell {
+            shell.update(cx, |shell, cx| shell.show_update(cx));
+        }
+    });
+}
+
 /// Window > Minimize. [`show_window`] does not undo it: `minimize_window` is
 /// `miniaturize:`, and `activate_window()` is only `makeKeyAndOrderFront:`,
 /// which does not deminiaturize. gpui exposes no deminiaturize, so after this
@@ -340,12 +431,18 @@ pub fn open_main_window(cx: &mut App) -> anyhow::Result<()> {
         .try_global::<StoreHandle>()
         .map(|handle| handle.0.clone())
         .ok_or_else(|| anyhow::anyhow!("the state store is not installed"))?;
+    let updates = cx
+        .try_global::<UpdateHandle>()
+        .map(|handle| handle.0.clone())
+        .ok_or_else(|| anyhow::anyhow!("the update check is not installed"))?;
     let (window, _view) = gpui_kit::open_window(main_window_options(cx), cx, |window, cx| {
         // The connection state is one entity both surfaces read, so the
         // dashboard's global card follows a sign-in from the settings form,
         // and reopening the window after a hide reuses the same state.
         let dashboard = cx.new(|cx| Dashboard::with_engine(engine.clone(), window, cx));
-        let settings = cx.new(|cx| SettingsView::from_environment(window, cx, connection.clone()));
+        let settings = cx.new(|cx| {
+            SettingsView::from_environment(window, cx, connection.clone(), updates.clone())
+        });
         // The Limits card pushes a change straight to the running engine
         // (R7.1, R7.2), and the Tagging section follows its tag state (R3.7).
         settings.update(cx, |view, cx| view.set_engine(engine.clone(), cx));
@@ -685,6 +782,13 @@ impl AppShell {
             .set_offset(point(x.clamp(-max, px(0.)), offset.y));
     }
 
+    /// Opens the Updates page: the tray's and the app menu's entry point (R12).
+    pub fn show_update(&mut self, cx: &mut Context<Self>) {
+        self.settings
+            .update(cx, |view, cx| view.show_page(PAGE_UPDATES, cx));
+        self.show(ViewMode::Settings, cx);
+    }
+
     /// Opens a list view narrowed to one source folder (#41).
     ///
     /// The folder detail calls this to link into the failed items or the
@@ -932,7 +1036,7 @@ pub fn install_tray(cx: &mut App) -> gpui_tray::Result<()> {
         .icon(icon()?)
         .tooltip("Immich Sync")
         .on_activate(Show)
-        .menu(|_| tray_menu());
+        .menu(|cx| tray_menu(cx));
     // The macOS menu bar has no room for a text title beside the icon; Windows
     // and Linux keep theirs (issue #64).
     #[cfg(not(target_os = "macos"))]
@@ -945,18 +1049,39 @@ pub fn install_tray(cx: &mut App) -> gpui_tray::Result<()> {
     Ok(())
 }
 
-/// The tray menu: Show, Pause, Resume, Sync now, and Quit (R8.3).
+/// The tray menu: Show, Pause, Resume, Sync now, and Quit, plus the available
+/// release above the Quit separator (R8.3, R12).
 #[must_use]
-pub fn tray_menu() -> Vec<MenuItem> {
-    vec![
+pub fn tray_menu(cx: &App) -> Vec<MenuItem> {
+    let mut items = vec![
         MenuItem::action("Show", Show),
         MenuItem::separator(),
         MenuItem::action("Pause", Pause),
         MenuItem::action("Resume", Resume),
         MenuItem::action("Sync now", SyncNow),
-        MenuItem::separator(),
-        MenuItem::action("Quit", Quit),
-    ]
+    ];
+    if let Some(label) = update_menu_item(cx) {
+        items.push(MenuItem::action(label, ShowUpdatePane));
+    }
+    items.push(MenuItem::separator());
+    items.push(MenuItem::action("Quit", Quit));
+    items
+}
+
+/// The one menu item an available release adds, with its label (R12).
+///
+/// It exists only while a release is known and the user has not silenced it, so
+/// the menus read as they did before the check found anything.
+fn update_menu_item(cx: &App) -> Option<String> {
+    let updates = cx.try_global::<UpdateHandle>()?.0.clone();
+    let release = updates.read(cx).available().cloned()?;
+    Some(update_menu_label(&release))
+}
+
+/// The wording both menus use for an available release (R12).
+#[must_use]
+fn update_menu_label(release: &Release) -> String {
+    format!("Version {} is available…", release.version)
 }
 
 /// The macOS menu bar: the app menu, Edit, and Window (issue #64).
@@ -968,13 +1093,16 @@ pub fn tray_menu() -> Vec<MenuItem> {
 /// Built on macOS and under test only; elsewhere it would be a dead menu.
 #[cfg(any(test, target_os = "macos"))]
 #[must_use]
-fn app_menu() -> Vec<Menu> {
+pub(crate) fn app_menu(cx: &App) -> Vec<Menu> {
+    let mut items = vec![MenuItem::action("About Immich Sync", About)];
+    // Below About, and only while a release is known and not dismissed (R12).
+    if let Some(label) = update_menu_item(cx) {
+        items.push(MenuItem::action(label, ShowUpdatePane));
+    }
+    items.push(MenuItem::separator());
+    items.push(MenuItem::action("Quit Immich Sync", Quit));
     vec![
-        Menu::new("Immich Sync").items([
-            MenuItem::action("About Immich Sync", About),
-            MenuItem::separator(),
-            MenuItem::action("Quit Immich Sync", Quit),
-        ]),
+        Menu::new("Immich Sync").items(items),
         // `os_action` gives AppKit the editing selector while the item still
         // carries the action the text inputs already bind to cmd-x/c/v/a.
         Menu::new("Edit").items([
@@ -1117,12 +1245,15 @@ fn tray_icon_rgba(size: u32) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        About, Hide, Minimize, Quit, app_menu, hide_window, install_connection_with,
-        install_models, show_window, tray_icon_rgba, tray_icon_size,
+        About, Hide, Minimize, Quit, ShowUpdatePane, UpdateHandle, app_menu, hide_window,
+        install_connection_with, install_models, show_window, tray_icon_rgba, tray_icon_size,
+        tray_menu,
     };
-    use gpui_kit::{Action, MenuItem, OsAction, TestAppContext, base};
+    use crate::update::{INTERVAL, Latest, Release, ReleaseSource, UpdateModel, Version};
+    use gpui_kit::{Action, AppContext as _, MenuItem, OsAction, TestAppContext, base};
     use std::cell::RefCell;
     use std::rc::Rc;
+    use std::sync::Arc;
     use sync_core::connection::{Attention, ConnectionState};
 
     /// The labels and OS actions of a menu's real items, in order.
@@ -1146,9 +1277,9 @@ mod tests {
     /// menu, built from the same actions the tray menu uses. AppKit gives the
     /// items below the first menu no OS role, so About and Quit are plain app
     /// actions and Close is this app's Hide.
-    #[test]
-    fn the_app_menu_is_the_macos_app_edit_and_window_bar() {
-        let menus = app_menu();
+    #[gpui_kit::test]
+    fn the_app_menu_is_the_macos_app_edit_and_window_bar(cx: &mut TestAppContext) {
+        let menus = cx.read(app_menu);
         let names: Vec<&str> = menus.iter().map(|menu| menu.name.as_ref()).collect();
         assert_eq!(names, ["Immich Sync", "Edit", "Window"]);
 
@@ -1182,6 +1313,134 @@ mod tests {
         );
         assert!(carries(&menus[2].items[0], &Hide));
         assert!(carries(&menus[2].items[1], &Minimize));
+    }
+
+    /// A source that answers one newer release, so a test can reach the menus
+    /// without a request (R12).
+    struct OneRelease(Release);
+
+    impl ReleaseSource for OneRelease {
+        fn latest(&self) -> Latest<'_> {
+            Box::pin(async move { Ok(Some(self.0.clone())) })
+        }
+    }
+
+    fn release() -> Release {
+        Release {
+            version: Version {
+                major: 0,
+                minor: 4,
+                patch: 0,
+            },
+            url: "https://github.com/elementalvoid/immich-sync/releases/tag/v0.4.0".to_string(),
+            notes: "Fixes.".to_string(),
+        }
+    }
+
+    /// Installs `updates` as the app's one check and runs its startup check.
+    fn install_update(
+        cx: &mut TestAppContext,
+        updates: UpdateModel,
+    ) -> gpui_kit::Entity<UpdateModel> {
+        let updates = cx.update(|cx| {
+            gpui_kit::init(cx);
+            let updates = cx.new(|_| updates);
+            cx.set_global(UpdateHandle(updates.clone()));
+            updates.update(cx, |model, cx| model.start(cx));
+            updates
+        });
+        cx.executor().allow_parking();
+        updates
+    }
+
+    /// Waits until the check's answer has landed.
+    async fn settled(cx: &mut TestAppContext, updates: &gpui_kit::Entity<UpdateModel>) -> bool {
+        for _ in 0..600 {
+            cx.run_until_parked();
+            if cx.read(|cx| updates.read(cx).status().clone())
+                != crate::update::CheckStatus::Checking
+            {
+                return true;
+            }
+            cx.executor()
+                .timer(std::time::Duration::from_millis(10))
+                .await;
+        }
+        false
+    }
+
+    /// R12: both menus name the available release above the Quit separator, and
+    /// a dismissed release leaves neither menu with an item.
+    #[gpui_kit::test]
+    async fn the_menus_name_the_available_release_until_it_is_dismissed(cx: &mut TestAppContext) {
+        let updates = install_update(
+            cx,
+            UpdateModel::new(Arc::new(OneRelease(release())), INTERVAL, true, None),
+        );
+        assert!(settled(cx, &updates).await, "the check never answered");
+
+        let tray = cx.read(|cx| {
+            tray_menu(cx)
+                .iter()
+                .filter_map(|item| match item {
+                    MenuItem::Action { name, action, .. } => {
+                        Some((name.to_string(), action.partial_eq(&ShowUpdatePane)))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            tray,
+            [
+                ("Show".to_string(), false),
+                ("Pause".to_string(), false),
+                ("Resume".to_string(), false),
+                ("Sync now".to_string(), false),
+                ("Version 0.4.0 is available…".to_string(), true),
+                ("Quit".to_string(), false),
+            ],
+            "R12: the item sits above the Quit separator and carries the action"
+        );
+
+        let app = cx.read(|cx| {
+            let menus = app_menu(cx);
+            menus[0]
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    MenuItem::Action { name, .. } => Some(name.to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            app,
+            [
+                "About Immich Sync".to_string(),
+                "Version 0.4.0 is available…".to_string(),
+                "Quit Immich Sync".to_string(),
+            ],
+            "R12: the app menu keeps the item below About"
+        );
+
+        cx.update(|cx| {
+            updates.update(cx, |model, cx| {
+                model.set_dismissed(Some("0.4.0".to_string()), cx)
+            });
+        });
+        let tray = cx.read(|cx| {
+            tray_menu(cx)
+                .iter()
+                .filter(|item| matches!(item, MenuItem::Action { .. }))
+                .count()
+        });
+        assert_eq!(tray, 5, "R12: a dismissed release removes both items");
+        let app = cx.read(|cx| {
+            let menus = app_menu(cx);
+            menus[0].items.len()
+        });
+        assert_eq!(app, 3, "About, the separator, and Quit");
     }
 
     /// #64: the status item is 18 pt on macOS and 32 px elsewhere, and the art

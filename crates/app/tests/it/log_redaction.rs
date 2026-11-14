@@ -74,8 +74,19 @@ fn open_settings_view(
         let autostart: Rc<dyn Autostart> = Rc::new(UnavailableAutostart::new(
             "the test run has no OS autostart mechanism".to_string(),
         ));
+        let updates = common::idle_updates(cx);
         gpui_kit::open_window(window_options(), cx, |window, cx| {
-            cx.new(|cx| SettingsView::new(store, paths, autostart, connection, window, cx))
+            cx.new(|cx| {
+                SettingsView::new(
+                    store,
+                    paths,
+                    autostart,
+                    connection,
+                    updates.clone(),
+                    window,
+                    cx,
+                )
+            })
         })
         .expect("open the settings window")
         .0

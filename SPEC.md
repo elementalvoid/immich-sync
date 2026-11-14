@@ -147,6 +147,17 @@ Acceptance: a permanent error raises one notification. Grep of the log finds no 
 
 Acceptance: a clean Windows machine installs from the NSIS installer. A clean Linux desktop installs from the deb or the AppImage. A clean Mac drags the DMG's app to Applications and launches it through Open Anyway. The provenance attestation verifies for every artifact once the repository is public.
 
+### R12 — Update check
+
+- R12.1 The client reads GitHub's newest published release at startup and at most once every 24 hours while it runs, with `GET https://api.github.com/repos/elementalvoid/immich-sync/releases/latest`, `Accept: application/vnd.github+json`, and `User-Agent: immich-sync/<package version>`. It reads `tag_name`, `html_url`, and `body`, and compares the tag with the package version. It downloads, verifies, and installs nothing ([ADR 0009](docs/adr/0009-update-check-never-installs.md)).
+- R12.2 **Check for updates** is a setting, on by default, with a switch on the **Updates** page: the seventh page of Settings, appended so the six existing pages keep their places. Turning it off cancels the timer, drops the known release, and removes the notification and both menu items. Turning it on checks immediately.
+- R12.3 A newer release raises one system notification and one item each in the tray menu and the macOS app menu, named after its version. Each release is announced once per process. A release the user silenced is never announced.
+- R12.4 **Don't remind me about this release** stores that release's version in the settings file. The stored version, not a flag, is the mechanism: the release stays quiet across restarts, and the next release has a different version so it speaks again. **Remind me** clears it.
+- R12.5 The Updates page carries the **Check for updates** switch with the check's answer on the same line, in exactly one status sentence: checks are off, checking, up to date with the running version, could not check, or the available version. When that answer is a newer release, the page adds a *New release available* line, the release's notes as Markdown in a box that fills the height the page has left, and one line holding **Open release page** and the remind control, which reads `Remind me about <version>` once that release is silenced.
+- R12.6 A check that fails is silent: no dialog and no error message. The reason is one `info` line in the log, the page says it will try again at the next check, and the next attempt is the next interval, never an immediate retry.
+
+Acceptance: with the switch on, the client makes one request at startup and none again inside 24 hours; with it off, none. A fake source proves one notification per release, none for a dismissed release, one menu item that names the version, and an action that opens the Updates page. A dismissed release is still quiet after a restart.
+
 ## 4. Non-functional requirements
 
 - N1 Platform: Windows 10 and 11 (x64, arm64 if the toolchain permits), Linux (deb and AppImage), and macOS 13 (Ventura) or later on arm64 and x86_64. The macOS packages are unsigned and unnotarized (R11.2).

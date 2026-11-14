@@ -319,7 +319,11 @@ paths.
 
 - **Credentials** are stored in the operating system's credential store and are
   never written to the settings file or the log.
-- **No telemetry.** The only network traffic is to the Immich server you enter.
+- **No telemetry.** The client uploads only to the Immich server you enter. The
+  one other request is the update check: at startup and at most once a day it
+  asks GitHub for the newest published release, and the request carries this
+  client's version and nothing else. **Settings › Updates** switches it off.
+  Nothing is downloaded or installed; **Open release page** opens your browser.
 - **Redacted logs.** The log pipeline redacts passwords, API keys, session
   tokens, and URL userinfo. The **Collect bundle** archive re-serialises the
   settings and leaves out server-supplied failure text, so no credential reaches
