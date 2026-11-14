@@ -1325,14 +1325,18 @@ mod tests {
         }
     }
 
+    /// A release this build is not: the package version with its patch bumped,
+    /// so a release bump cannot turn it into the version already running (R12).
     fn release() -> Release {
+        let current = Version::parse(crate::version::package_version())
+            .expect("the package version is three numbers");
+        let version = Version {
+            patch: current.patch + 1,
+            ..current
+        };
         Release {
-            version: Version {
-                major: 0,
-                minor: 4,
-                patch: 0,
-            },
-            url: "https://github.com/elementalvoid/immich-sync/releases/tag/v0.4.0".to_string(),
+            version,
+            url: format!("https://github.com/elementalvoid/immich-sync/releases/tag/v{version}"),
             notes: "Fixes.".to_string(),
         }
     }
@@ -1378,6 +1382,8 @@ mod tests {
             UpdateModel::new(Arc::new(OneRelease(release())), INTERVAL, true, None),
         );
         assert!(settled(cx, &updates).await, "the check never answered");
+        let newest = release();
+        let item = format!("Version {} is available…", newest.version);
 
         let tray = cx.read(|cx| {
             tray_menu(cx)
@@ -1397,7 +1403,7 @@ mod tests {
                 ("Pause".to_string(), false),
                 ("Resume".to_string(), false),
                 ("Sync now".to_string(), false),
-                ("Version 0.4.0 is available…".to_string(), true),
+                (item.clone(), true),
                 ("Quit".to_string(), false),
             ],
             "R12: the item sits above the Quit separator and carries the action"
@@ -1418,7 +1424,7 @@ mod tests {
             app,
             [
                 "About Immich Sync".to_string(),
-                "Version 0.4.0 is available…".to_string(),
+                item.clone(),
                 "Quit Immich Sync".to_string(),
             ],
             "R12: the app menu keeps the item below About"
@@ -1426,7 +1432,7 @@ mod tests {
 
         cx.update(|cx| {
             updates.update(cx, |model, cx| {
-                model.set_dismissed(Some("0.4.0".to_string()), cx)
+                model.set_dismissed(Some(newest.version.to_string()), cx)
             });
         });
         let tray = cx.read(|cx| {
