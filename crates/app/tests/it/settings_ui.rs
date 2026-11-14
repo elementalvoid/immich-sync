@@ -34,6 +34,7 @@ use immich_sync::shell::AppShell;
 use immich_sync::status;
 use immich_sync::store::StoreModel;
 use immich_sync::theme;
+use immich_sync::update::UpdateModel;
 use immich_sync::upload::UploadModel;
 use immich_sync::upload_view::UploadView;
 use mock_immich::{Fault, Operation};
@@ -162,6 +163,12 @@ fn window_options() -> WindowOptions {
     }
 }
 
+/// The update check a settings test renders: never started, so it makes no
+/// request, and off, so the page shows the one state that depends on nothing.
+fn idle_updates(cx: &mut TestAppContext) -> Entity<UpdateModel> {
+    cx.update(common::idle_updates)
+}
+
 fn open_settings(
     cx: &mut TestAppContext,
     store: SettingsStore,
@@ -217,10 +224,33 @@ fn open_settings_over_connection(
     autostart: Rc<dyn Autostart>,
     connection: Entity<ConnectionModel>,
 ) -> (AnyWindowHandle, Entity<SettingsView>) {
+    let updates = idle_updates(cx);
+    open_settings_with_updates(cx, store, paths, autostart, connection, updates)
+}
+
+/// Opens the settings view over an update check the test supplies (R12).
+fn open_settings_with_updates(
+    cx: &mut TestAppContext,
+    store: SettingsStore,
+    paths: AppPaths,
+    autostart: Rc<dyn Autostart>,
+    connection: Entity<ConnectionModel>,
+    updates: Entity<UpdateModel>,
+) -> (AnyWindowHandle, Entity<SettingsView>) {
     cx.update(|cx| {
         gpui_kit::init(cx);
         gpui_kit::open_window(window_options(), cx, |window, cx| {
-            cx.new(|cx| SettingsView::new(store, paths, autostart, connection.clone(), window, cx))
+            cx.new(|cx| {
+                SettingsView::new(
+                    store,
+                    paths,
+                    autostart,
+                    connection.clone(),
+                    updates.clone(),
+                    window,
+                    cx,
+                )
+            })
         })
         .expect("open the settings window")
     })
@@ -291,8 +321,17 @@ fn open_settings_over_resolution(
             let store: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
             ConnectionModel::new(ServerProfile::default(), store)
         });
+        let updates = common::idle_updates(cx);
         gpui_kit::open_window(window_options(), cx, |window, cx| {
-            cx.new(|cx| SettingsView::from_resolved_paths(resolved, window, cx, connection.clone()))
+            cx.new(|cx| {
+                SettingsView::from_resolved_paths(
+                    resolved,
+                    window,
+                    cx,
+                    connection.clone(),
+                    updates.clone(),
+                )
+            })
         })
         .expect("open the settings window")
         .0
@@ -315,8 +354,17 @@ fn open_shell(
         });
         let window = gpui_kit::open_window(window_options(), cx, |window, cx| {
             let dashboard = cx.new(|_| Dashboard::new(status::sample()));
+            let updates = common::idle_updates(cx);
             let settings = cx.new(|cx| {
-                SettingsView::new(store, paths, autostart, connection.clone(), window, cx)
+                SettingsView::new(
+                    store,
+                    paths,
+                    autostart,
+                    connection.clone(),
+                    updates.clone(),
+                    window,
+                    cx,
+                )
             });
             let store_model = cx.new(|cx| immich_sync::store::StoreModel::open(&upload_paths, cx));
             let upload_model =
@@ -2627,15 +2675,17 @@ async fn a_known_network_is_added_and_removed(cx: &mut TestAppContext) {
     );
 }
 
-/// The six settings pages, in the order the sidebar lists them.
+/// The seven settings pages, in the order the sidebar lists them.
 const PAGE_CONNECTION: usize = 0;
 const PAGE_GENERAL: usize = 1;
 const PAGE_LIMITS: usize = 2;
 const PAGE_SYNC: usize = 3;
 const PAGE_TAGGING: usize = 4;
 const PAGE_STORAGE: usize = 5;
+/// The Updates page (R12).
+const PAGE_UPDATES: usize = 6;
 /// The number of settings pages.
-const PAGE_COUNT: usize = 6;
+const PAGE_COUNT: usize = 7;
 
 /// The page strip's tabs, in the order the surface lists them.
 const PAGE_BUTTONS: [&str; PAGE_COUNT] = [
@@ -2645,6 +2695,7 @@ const PAGE_BUTTONS: [&str; PAGE_COUNT] = [
     "settings-page-sync",
     "settings-page-tagging",
     "settings-page-storage",
+    "settings-page-updates",
 ];
 
 /// The name each page tab carries, which is the page's own name.
@@ -2655,6 +2706,7 @@ const PAGE_TITLES: [&str; PAGE_COUNT] = [
     "Sync",
     "Tagging",
     "Storage",
+    "Updates",
 ];
 
 /// The sentence each page panel carries as its accessible description, which the
@@ -2668,6 +2720,7 @@ const PAGE_DESCRIPTIONS: [&str; PAGE_COUNT] = [
      search.",
     "Read-only. The database stays on this computer; it never lives on a network share or in a \
      cloud-sync folder.",
+    "Whether a newer version exists, and what it changes.",
 ];
 
 /// Every control that takes the keyboard, page by page. A read-only value, such
@@ -2686,6 +2739,7 @@ const PAGE_CONTROLS: [&[&str]; PAGE_COUNT] = [
     &["settings-scan-interval", "settings-attempt-cap"],
     &["settings-tag-upload", "settings-tag-link"],
     &[],
+    &["settings-check-updates"],
 ];
 
 /// One settings row, as the surface promises it.
@@ -2816,6 +2870,13 @@ const ROWS: &[RowPin] = &[
         "Read-only. Resolved from the platform; never on a network share or a \
          cloud-sync folder.",
     ),
+    control_row(
+        PAGE_UPDATES,
+        "settings-check-updates",
+        "Check for updates",
+        "settings-check-updates-row",
+        "Checks GitHub for new releases.",
+    ),
 ];
 
 /// The rows whose field is a text input as wide as the page, so a field that
@@ -2874,12 +2935,14 @@ fn open_shell_at(
             cx,
             |window, cx| {
                 let dashboard = cx.new(|_| Dashboard::new(status::sample()));
+                let updates = common::idle_updates(cx);
                 let settings = cx.new(|cx| {
                     SettingsView::new(
                         store,
                         paths,
                         FakeAutostart::new(),
                         connection.clone(),
+                        updates.clone(),
                         window,
                         cx,
                     )
@@ -2928,7 +2991,7 @@ fn open_shell_at(
     })
 }
 
-/// #78: the surface is six pages, and each row is named and explained on its
+/// #78: the surface is seven pages, and each row is named and explained on its
 /// own page, not on another.
 #[gpui_kit::test]
 fn every_settings_row_is_named_and_explained_on_its_own_page(cx: &mut TestAppContext) {
@@ -3506,4 +3569,386 @@ fn pasting_into_the_search_field_asks_the_surface_to_render(cx: &mut TestAppCont
         );
     })
     .expect("read the search field");
+}
+
+// ---------------------------------------------------------------------------
+// The Updates page (R12, ADR 0009). The check itself is driven through the fake
+// source in `common`, so no test here reaches GitHub.
+
+/// Opens the settings with an update check the test supplies, starts it, and
+/// returns the model so the test can read what it found.
+fn open_updates(
+    cx: &mut TestAppContext,
+    paths: &AppPaths,
+    source: Arc<dyn immich_sync::update::ReleaseSource>,
+    enabled: bool,
+    dismissed: Option<String>,
+) -> (AnyWindowHandle, Entity<UpdateModel>) {
+    let store = SettingsStore::open(paths.config_file.clone());
+    let profile = profile_from_settings(store.settings());
+    let connection = cx.update(|cx| {
+        let credentials: SharedCredentialStore = Arc::new(MemoryCredentialStore::new());
+        cx.new(|_| ConnectionModel::new(profile, credentials))
+    });
+    let updates = cx.update(|cx| {
+        cx.new(|_| UpdateModel::new(source, immich_sync::update::INTERVAL, enabled, dismissed))
+    });
+    let (window, _view) = open_settings_with_updates(
+        cx,
+        store,
+        paths.clone(),
+        FakeAutostart::new(),
+        connection,
+        updates.clone(),
+    );
+    cx.update(|cx| updates.update(cx, |model, cx| model.start(cx)));
+    (window, updates)
+}
+
+/// The status sentence the Updates page shows right now.
+fn update_status(window: &mut Window, cx: &mut App) -> Option<String> {
+    draw(window, cx);
+    window
+        .try_find("settings-update-status")
+        .and_then(|found| found.label().map(str::to_string))
+}
+
+/// Pumps the executor until the Updates page shows `wanted` as its status.
+async fn wait_for_update_status(cx: &mut TestAppContext, window: AnyWindowHandle, wanted: &str) {
+    for _ in 0..600 {
+        cx.run_until_parked();
+        let label = cx
+            .update_window(window, |_, window, cx| update_status(window, cx))
+            .ok()
+            .flatten();
+        if label.as_deref() == Some(wanted) {
+            return;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+    }
+    let label = cx
+        .update_window(window, |_, window, cx| update_status(window, cx))
+        .ok()
+        .flatten();
+    panic!("the Updates page never showed {wanted:?}; it shows {label:?}");
+}
+
+/// R12: the switch is the page's one always-present row, with the last check's
+/// answer on its own line beside it and the short sentence that names the
+/// request.
+#[gpui_kit::test]
+fn the_updates_page_shows_the_switch_and_its_status(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let window = open_settings(
+        cx,
+        SettingsStore::open(paths.config_file.clone()),
+        paths,
+        FakeAutostart::new(),
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        draw(window, cx);
+        open_page(window, PAGE_UPDATES, cx);
+        assert_eq!(
+            window.find("settings-check-updates").label(),
+            Some("Check for updates"),
+            "R12: the switch is named"
+        );
+        assert_eq!(
+            window.find("settings-check-updates-row").description(),
+            Some("Checks GitHub for new releases."),
+            "R12: the row says what the check is, in one sentence"
+        );
+        let status = window.find("settings-update-status");
+        assert_eq!(
+            status.label(),
+            Some("Checks are off."),
+            "R12: a check that is off says so"
+        );
+        // The answer sits on the switch's line, not in a row of its own: the
+        // two overlap vertically.
+        let switch = window.find("settings-check-updates");
+        assert!(
+            status.bounds().top() < switch.bounds().bottom()
+                && switch.bounds().top() < status.bounds().bottom(),
+            "R12: the status shares the switch's line: {:?} vs {:?}",
+            status.bounds(),
+            switch.bounds()
+        );
+        assert!(
+            window.try_find("settings-update-link").is_none(),
+            "R12: no release means no link to open"
+        );
+    })
+    .expect("render the updates page");
+}
+
+/// R12: a check in flight says it is checking.
+#[gpui_kit::test]
+async fn the_updates_page_says_it_is_checking(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let (window, _updates) = open_updates(cx, &paths, common::FakeReleases::holding(), true, None);
+    cx.update_window(window, |_, window, cx| open_page(window, PAGE_UPDATES, cx))
+        .expect("open the updates page");
+    wait_for_update_status(cx, window, "Checking…").await;
+}
+
+/// R12: a check that found nothing newer says which version is current.
+#[gpui_kit::test]
+async fn an_up_to_date_check_names_the_running_version(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let source = common::FakeReleases::new(vec![common::Answer::UpToDate]);
+    let (window, _updates) = open_updates(cx, &paths, source, true, None);
+    cx.update_window(window, |_, window, cx| open_page(window, PAGE_UPDATES, cx))
+        .expect("open the updates page");
+    wait_for_update_status(
+        cx,
+        window,
+        &format!("Up to date ({}).", immich_sync::version::package_version()),
+    )
+    .await;
+}
+
+/// R12: a check that could not complete says when it tries again, not what
+/// went wrong.
+#[gpui_kit::test]
+async fn a_failed_check_says_it_will_try_again(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let source = common::FakeReleases::new(vec![common::Answer::Failed]);
+    let (window, _updates) = open_updates(cx, &paths, source, true, None);
+    cx.update_window(window, |_, window, cx| open_page(window, PAGE_UPDATES, cx))
+        .expect("open the updates page");
+    wait_for_update_status(
+        cx,
+        window,
+        "Could not check; it will try again at the next check.",
+    )
+    .await;
+}
+
+/// R12: an available release shows its heading, its notes in the box that fills
+/// the page, the release page's own URL behind one of two buttons on one line.
+#[gpui_kit::test]
+async fn an_available_release_shows_its_notes_and_opens_its_page(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let release = common::newer_release();
+    let source = common::FakeReleases::new(vec![common::Answer::Release(release.clone())]);
+    let (window, _updates) = open_updates(cx, &paths, source, true, None);
+    cx.update_window(window, |_, window, cx| open_page(window, PAGE_UPDATES, cx))
+        .expect("open the updates page");
+    wait_for_update_status(
+        cx,
+        window,
+        &format!("Version {} is available.", release.version),
+    )
+    .await;
+
+    cx.update_window(window, |_, window, cx| {
+        draw(window, cx);
+        let heading = window.find("settings-update-heading");
+        assert_eq!(
+            heading.label(),
+            Some("New release available"),
+            "R12: the notes carry their own heading"
+        );
+        // The notes take the page's leftover height instead of a fixed box, so a
+        // long release scrolls and a tall window shows more of it.
+        let notes = window.find("settings-update-notes");
+        assert!(notes.visible(), "R12: the notes are drawn");
+        assert!(
+            notes.bounds().size.height > px(600.),
+            "R12: the notes fill the page, not a fixed box: {:?}",
+            notes.bounds()
+        );
+        assert!(
+            notes.bounds().top() >= heading.bounds().bottom(),
+            "R12: the notes sit under their heading: {:?} vs {:?}",
+            notes.bounds(),
+            heading.bounds()
+        );
+        let actions = window.find("settings-update-actions");
+        assert!(
+            actions.bounds().top() - notes.bounds().bottom() <= px(16.),
+            "R12: the notes reach the buttons' line: {:?} vs {:?}",
+            notes.bounds(),
+            actions.bounds()
+        );
+        // The two controls share one line, and each names itself: neither needs
+        // a sentence above it.
+        let link = window.find("settings-update-link");
+        let remind = window.find("settings-update-remind");
+        assert_eq!(
+            link.label(),
+            Some(format!("Open the release page for version {}", release.version).as_str()),
+            "R12: the link names the release it opens"
+        );
+        assert_eq!(
+            remind.label(),
+            Some(format!("Don't remind me about {}", release.version).as_str()),
+            "R12: the remind control names the release"
+        );
+        assert!(
+            link.bounds().top() < remind.bounds().bottom()
+                && remind.bounds().top() < link.bounds().bottom(),
+            "R12: the two buttons share one line: {:?} vs {:?}",
+            link.bounds(),
+            remind.bounds()
+        );
+        window.click("settings-update-link", cx);
+    })
+    .expect("press the release-page link");
+
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some(release.url.as_str()),
+        "R12: the link opens the URL the response carried"
+    );
+}
+
+/// R12: dismissing stores the version, the control turns around, and a settings
+/// file reloaded from disk keeps the release quiet.
+#[gpui_kit::test]
+async fn a_dismissed_release_stays_quiet_across_a_reload(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let release = common::newer_release();
+    let version = release.version.to_string();
+    let source = common::FakeReleases::new(vec![common::Answer::Release(release.clone())]);
+    let (window, updates) = open_updates(cx, &paths, source, true, None);
+    cx.update_window(window, |_, window, cx| open_page(window, PAGE_UPDATES, cx))
+        .expect("open the updates page");
+    wait_for_update_status(cx, window, &format!("Version {version} is available.")).await;
+
+    cx.update_window(window, |_, window, cx| {
+        window.click("settings-update-remind", cx)
+    })
+    .expect("dismiss the release");
+    let saved = wait_for_settings(cx, &paths, |settings| {
+        settings.dismissed_update.as_deref() == Some(version.as_str())
+    })
+    .await;
+    assert_eq!(saved.dismissed_update.as_deref(), Some(version.as_str()));
+    assert!(
+        cx.read(|cx| updates.read(cx).available().is_none()),
+        "R12: the menus lose the item the moment the dismissal lands"
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        draw(window, cx);
+        assert_eq!(
+            window.find("settings-update-remind").label(),
+            Some(format!("Remind me about {version}").as_str()),
+            "R12: the control turns around"
+        );
+        assert!(
+            window.find("settings-update-notes").visible(),
+            "R12: a silenced release still shows its notes"
+        );
+    })
+    .expect("read the dismissed page");
+
+    // A restart reads the same file: the release is still known and still
+    // silenced, so neither menu speaks.
+    let reloaded = SettingsStore::open(paths.config_file.clone());
+    assert_eq!(
+        reloaded.settings().dismissed_update.as_deref(),
+        Some(version.as_str()),
+        "R12: the silenced version survives a restart"
+    );
+    let quiet = cx.update(|cx| {
+        cx.new(|_| {
+            UpdateModel::new(
+                common::FakeReleases::new(vec![common::Answer::Release(release.clone())]),
+                immich_sync::update::INTERVAL,
+                reloaded.settings().check_for_updates,
+                reloaded.settings().dismissed_update.clone(),
+            )
+        })
+    });
+    cx.update(|cx| quiet.update(cx, |model, cx| model.start(cx)));
+    for _ in 0..600 {
+        cx.run_until_parked();
+        if matches!(
+            cx.read(|cx| quiet.read(cx).status().clone()),
+            immich_sync::update::CheckStatus::Available(_)
+        ) {
+            break;
+        }
+        cx.executor().timer(Duration::from_millis(10)).await;
+    }
+    assert!(
+        cx.read(|cx| quiet.read(cx).release().is_some()),
+        "R12: the restarted check still knows the release"
+    );
+    assert!(
+        cx.read(|cx| quiet.read(cx).available().is_none()),
+        "R12: and it stays quiet about it"
+    );
+}
+
+/// R12: the switch saves, turns the check off, and turning it back on checks
+/// again.
+#[gpui_kit::test]
+async fn the_check_switch_persists_and_turns_the_check_off_and_on(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let temp = tempfile::tempdir().expect("create a temp dir");
+    let paths = temporary_paths(temp.path());
+    let source = common::FakeReleases::new(vec![common::Answer::UpToDate]);
+    let (window, _updates) = open_updates(cx, &paths, source.clone(), true, None);
+    cx.update_window(window, |_, window, cx| open_page(window, PAGE_UPDATES, cx))
+        .expect("open the updates page");
+    wait_for_update_status(
+        cx,
+        window,
+        &format!("Up to date ({}).", immich_sync::version::package_version()),
+    )
+    .await;
+    let requests = source.requests();
+    assert_eq!(requests, 1, "R12: the startup check asked once");
+
+    cx.update_window(window, |_, window, cx| {
+        assert_eq!(
+            window.find("settings-check-updates").checked(),
+            Some(true),
+            "R12: the check is on by default"
+        );
+        window.click("settings-check-updates", cx);
+    })
+    .expect("turn the check off");
+    let saved = wait_for_settings(cx, &paths, |settings| !settings.check_for_updates).await;
+    assert!(!saved.check_for_updates, "R12: the switch persisted off");
+    wait_for_update_status(cx, window, "Checks are off.").await;
+    assert_eq!(
+        source.requests(),
+        requests,
+        "R12: a switch that is off makes no request"
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        window.click("settings-check-updates", cx)
+    })
+    .expect("turn the check back on");
+    let saved = wait_for_settings(cx, &paths, |settings| settings.check_for_updates).await;
+    assert!(saved.check_for_updates, "R12: the switch persisted on");
+    wait_for_update_status(
+        cx,
+        window,
+        &format!("Up to date ({}).", immich_sync::version::package_version()),
+    )
+    .await;
+    assert_eq!(
+        source.requests(),
+        requests + 1,
+        "R12: turning it on checks immediately"
+    );
 }

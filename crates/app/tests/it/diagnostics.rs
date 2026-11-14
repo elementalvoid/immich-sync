@@ -234,6 +234,7 @@ fn open_shell(
                     paths.clone(),
                     autostart(),
                     connection.clone(),
+                    common::idle_updates(cx),
                     window,
                     cx,
                 )

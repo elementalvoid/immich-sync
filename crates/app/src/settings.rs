@@ -47,6 +47,12 @@ pub struct Settings {
     pub auth_method: AuthMethod,
     /// The rotating file log's level (R10.3).
     pub log_level: LogLevel,
+    /// Whether the client asks GitHub about a newer release (R12). On by
+    /// default.
+    pub check_for_updates: bool,
+    /// The release version the user silenced (R12). A stored version rather
+    /// than a flag, so the next release speaks again.
+    pub dismissed_update: Option<String>,
 }
 
 impl Settings {
@@ -78,6 +84,8 @@ impl Default for Settings {
             email: String::new(),
             auth_method: AuthMethod::Password,
             log_level: LogLevel::Info,
+            check_for_updates: true,
+            dismissed_update: None,
         }
     }
 }

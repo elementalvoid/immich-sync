@@ -183,7 +183,15 @@ fn open_shell_at(
         gpui_kit::open_window(window_options_at(width, height), cx, |window, cx| {
             let dashboard = cx.new(|_| Dashboard::new(status::sample()));
             let settings = cx.new(|cx| {
-                SettingsView::new(store, paths, autostart(), connection.clone(), window, cx)
+                SettingsView::new(
+                    store,
+                    paths,
+                    autostart(),
+                    connection.clone(),
+                    common::idle_updates(cx),
+                    window,
+                    cx,
+                )
             });
             let store_model = cx.new(|cx| immich_sync::store::StoreModel::open(&upload_paths, cx));
             let upload_model =
@@ -247,7 +255,15 @@ fn open_logs_view(
         });
         gpui_kit::open_window(window_options(), cx, |window, cx| {
             let settings = cx.new(|cx| {
-                SettingsView::new(store, paths, autostart(), connection.clone(), window, cx)
+                SettingsView::new(
+                    store,
+                    paths,
+                    autostart(),
+                    connection.clone(),
+                    common::idle_updates(cx),
+                    window,
+                    cx,
+                )
             });
             cx.new(|cx| LogsView::new(settings, cx))
         })

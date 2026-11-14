@@ -6,6 +6,7 @@
 //! accessibility snapshot's `visible()` reports the clip mask, so a clipped
 //! element is measurable, not guessed.
 
+use super::common;
 use std::fs;
 use std::path::Path;
 use std::rc::Rc;
@@ -164,6 +165,7 @@ fn open_shell(
                     model_paths.clone(),
                     autostart(),
                     connection.clone(),
+                    common::idle_updates(cx),
                     window,
                     cx,
                 )

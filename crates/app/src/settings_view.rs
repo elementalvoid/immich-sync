@@ -1,7 +1,7 @@
-//! The settings surface (SPEC R7, R8.5, R9): General, Limits, Sync, and the
-//! read-only Storage locations.
+//! The settings surface (SPEC R7, R8.5, R9, R12): Connection, General, Limits,
+//! Sync, Tagging, the read-only Storage locations, and Updates.
 //!
-//! Every control is keyboard reachable: the page strip puts all six pages in
+//! Every control is keyboard reachable: the page strip puts all seven pages in
 //! the Tab order, `Switch` activates with Enter or Space, `NumberInput` edits
 //! with the keyboard and steps with Up and Down, and both draw the kit's focus
 //! ring. Each row also observes its control's focus handle so a test can assert
@@ -20,16 +20,19 @@ use crate::paths::AppPaths;
 use crate::rows::{Row, note};
 use crate::settings::{Settings, SettingsStore};
 use crate::tab::Tab;
+use crate::update::{CheckStatus, UpdateModel};
 
 use gpui_kit::base::ObservedElement;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState, NumberInput};
 use gpui_kit::component::radio::Radio;
+use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_kit::component::setting::{
     SelectIndex, SettingGroup, SettingPage, Settings as SettingsPages,
 };
 use gpui_kit::component::switch::Switch;
+use gpui_kit::component::text::TextView;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use sync_core::connection::{AuthMethod, ConnectionState, ServerProfile, SignIn};
@@ -57,7 +60,7 @@ struct Page {
 
 /// The pages, in the order the surface lists them. The page strip and the page
 /// a tab opens read the same entry, so a name cannot drift from its tab.
-const PAGES: [Page; 6] = [
+const PAGES: [Page; 7] = [
     Page {
         id: "settings-page-connection",
         title: "Connection",
@@ -90,7 +93,15 @@ const PAGES: [Page; 6] = [
         description: "Read-only. The database stays on this computer; it never lives on a network \
                       share or in a cloud-sync folder.",
     },
+    Page {
+        id: "settings-page-updates",
+        title: "Updates",
+        description: "Whether a newer version exists, and what it changes.",
+    },
 ];
+
+/// The line over the Updates page's release notes (R12).
+const UPDATE_HEADING: &str = "New release available";
 
 /// The index of each page in `PAGES`, so a page builder names the page it builds
 /// instead of repeating its title.
@@ -104,6 +115,8 @@ const PAGE_LIMITS: usize = 2;
 const PAGE_SYNC: usize = 3;
 const PAGE_TAGGING: usize = 4;
 const PAGE_STORAGE: usize = 5;
+/// The Updates page, which the tray and the app menu open (R12).
+pub(crate) const PAGE_UPDATES: usize = 6;
 
 /// One numeric setting the view edits, its text, and its bounds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -333,6 +346,12 @@ pub struct SettingsView {
     network: NetworkStatus,
     /// The field a new network name is typed into (R8.8).
     network_input: Entity<InputState>,
+    /// The update check whose answer the Updates page renders (R12).
+    updates: Entity<UpdateModel>,
+    /// Where the release notes are scrolled to (R12).
+    notes_scroll: ScrollHandle,
+    /// Where the Updates page body is scrolled to, at the shell's floor (R12).
+    body_scroll: ScrollHandle,
     /// The last failed save or autostart change, shown with the load problem.
     action_error: Option<String>,
     /// The approval hint the autostart backend last reported. It is read when the
@@ -364,6 +383,7 @@ impl SettingsView {
         paths: AppPaths,
         autostart: Rc<dyn Autostart>,
         connection: Entity<ConnectionModel>,
+        updates: Entity<UpdateModel>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -448,6 +468,9 @@ impl SettingsView {
         subscriptions.push(cx.observe(&connection, |this, _, cx| {
             this.save_connected_profile(cx);
         }));
+        // The Updates page renders the check's answer, which arrives on the
+        // worker runtime (R12).
+        subscriptions.push(cx.observe(&updates, |_, _, cx| cx.notify()));
 
         let mut view = Self {
             store,
@@ -465,6 +488,9 @@ impl SettingsView {
             tag: TagStatus::default(),
             network: NetworkStatus::default(),
             network_input,
+            updates,
+            notes_scroll: ScrollHandle::new(),
+            body_scroll: ScrollHandle::new(),
             action_error: None,
             approval_hint: None,
             environment_problem: None,
@@ -498,8 +524,9 @@ impl SettingsView {
         window: &mut Window,
         cx: &mut Context<Self>,
         connection: Entity<ConnectionModel>,
+        updates: Entity<UpdateModel>,
     ) -> Self {
-        Self::from_resolved_paths(AppPaths::resolve(), window, cx, connection)
+        Self::from_resolved_paths(AppPaths::resolve(), window, cx, connection, updates)
     }
 
     /// Builds the view from an already-attempted path resolution.
@@ -511,6 +538,7 @@ impl SettingsView {
         window: &mut Window,
         cx: &mut Context<Self>,
         connection: Entity<ConnectionModel>,
+        updates: Entity<UpdateModel>,
     ) -> Self {
         let (store, paths, environment_problem) = match resolved {
             Ok(paths) => (SettingsStore::open(paths.config_file.clone()), paths, None),
@@ -536,7 +564,7 @@ impl SettingsView {
                 "{error:#}"
             )))
         });
-        let mut view = Self::new(store, paths, autostart, connection, window, cx);
+        let mut view = Self::new(store, paths, autostart, connection, updates, window, cx);
         view.environment_problem = environment_problem;
         view
     }
@@ -1037,8 +1065,8 @@ impl SettingsView {
         strip
     }
 
-    /// Opens one page from the strip.
-    fn show_page(&mut self, page: usize, cx: &mut Context<Self>) {
+    /// Opens one page from the strip, or from the tray and the app menu (R12).
+    pub(crate) fn show_page(&mut self, page: usize, cx: &mut Context<Self>) {
         self.page = page;
         cx.notify();
     }
@@ -1090,6 +1118,7 @@ impl SettingsView {
             self.sync_page(&query, cx),
             self.tagging_page(&query, cx),
             self.storage_page(&query, cx),
+            self.updates_page(&query, cx),
         ]
         .into_iter()
         .enumerate()
@@ -1628,6 +1657,242 @@ impl SettingsView {
         )
     }
 
+    /// The Updates page's only settings row: the switch, with the last check's
+    /// answer on the same line (R12).
+    ///
+    /// The switch shows the user's newest intent, so a queued or in-flight write
+    /// is reflected before it lands (N2).
+    fn updates_switch_row(&self, cx: &mut Context<Self>) -> Row {
+        let enabled = self.intended_settings().check_for_updates;
+        let (severity, sentence) = {
+            let model = self.updates.read(cx);
+            (status_severity(model.status()), model.status_text())
+        };
+        let toggle = Rc::new(cx.listener(|this, enabled: &bool, _, cx| {
+            this.toggle_check_for_updates(*enabled, cx);
+        }));
+        Row::wrapped(
+            "Check for updates",
+            "Checks GitHub for new releases.",
+            "settings-check-updates-row",
+            move |_, _| {
+                let toggle = Rc::clone(&toggle);
+                // The answer sits on the switch's line rather than in a row of
+                // its own: a notice carries it as its accessible name as well as
+                // its visible text, so it is never information only an
+                // accessible name holds (R12, docs/agents/ui.md).
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
+                    .child(Notice::new(
+                        "settings-update-status",
+                        severity,
+                        sentence.clone(),
+                    ))
+                    .child(
+                        Switch::new("settings-check-updates")
+                            .checked(enabled)
+                            .accessibility_label("Check for updates")
+                            .on_change(move |enabled, window, cx| toggle(enabled, window, cx)),
+                    )
+                    .into_any_element()
+            },
+        )
+    }
+
+    /// The Updates page as the search sees it.
+    ///
+    /// The body is drawn by [`Self::updates_body`], not by the kit's page, so
+    /// this copy exists for its words alone: the switch's title and its sentence
+    /// are what a search query matches. Nothing here is rendered.
+    fn updates_page(&self, query: &str, cx: &mut Context<Self>) -> Option<SettingPage> {
+        let rows = vec![self.updates_switch_row(cx)];
+        page(PAGE_UPDATES, vec![group(None, rows, query)])
+    }
+
+    /// The Updates page's body (R12, ADR 0009).
+    ///
+    /// The kit draws a page as a list measured to its content
+    /// (`gpui-component-0.8.1/src/setting/page.rs:125`), so a row in it cannot
+    /// grow with the window. The release notes have to fill the height left
+    /// above the buttons, so this page draws its own body; the row it keeps goes
+    /// through [`Row::render`], the shape the Logs and Diagnostics cards use.
+    fn updates_body(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let switch = self.updates_switch_row(cx);
+        let release = self.updates.read(cx).release().cloned();
+        let scroll = self.body_scroll.clone();
+        let mut body = div()
+            .id("settings-update-body")
+            .test_support()
+            .track_scroll(&scroll)
+            .flex()
+            .flex_col()
+            .size_full()
+            .min_h_0()
+            .p_4()
+            .gap_3()
+            // At the shell's 480 px floor the switch row wraps and the notes
+            // keep their floor, so the body as a whole scrolls; its bar says so,
+            // the way the kit's page list draws one.
+            .overflow_y_scroll()
+            .child(switch.render(window, cx));
+        if let Some(release) = release {
+            body = body
+                .child(
+                    crate::a11y::named(
+                        Role::Label,
+                        "settings-update-heading",
+                        UPDATE_HEADING,
+                        None,
+                    )
+                    .text_sm()
+                    .child(UPDATE_HEADING),
+                )
+                .child(self.notes_box(release.notes, cx))
+                .child(self.update_buttons(release.url, release.version.to_string(), cx));
+        }
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .relative()
+            .child(body)
+            .child(
+                Scrollbar::vertical(&self.body_scroll)
+                    .mode(ScrollbarMode::Always)
+                    .viewport_from_layout(),
+            )
+            .into_any_element()
+    }
+
+    /// The release's notes, in the frame that fills the page (R12).
+    ///
+    /// `Scrollable::overflow_y_scrollbar` is the kit's own scroller, but 0.8.1
+    /// cannot express this app's wheel rule (the delta would also scroll the
+    /// page, #54) and it renames the element to nested ids, so the pair is built
+    /// here (`gpui-component-0.8.1/src/scroll/scrollable.rs`). The frame says
+    /// the text is cut, because a clip with only a thin bar for evidence reads
+    /// as the end of the notes.
+    fn notes_box(&self, notes: String, cx: &App) -> AnyElement {
+        let border = cx.theme().border;
+        let scroll = self.notes_scroll.clone();
+        div()
+            // The frame is what the height belongs to, so this is the element a
+            // test measures (R12).
+            .id("settings-update-notes")
+            .test_support()
+            .flex()
+            .flex_col()
+            .w_full()
+            .min_w_0()
+            // It takes every pixel the page has left, and it keeps a floor so a
+            // short window does not squeeze the notes out of sight.
+            .flex_1()
+            .min_h(rems(6.))
+            .relative()
+            .border_1()
+            .border_color(border)
+            .rounded_md()
+            .overflow_hidden()
+            .child(
+                div()
+                    .id("settings-update-notes-scroll")
+                    .track_scroll(&scroll)
+                    // The wheel over the notes is the notes': GPUI applies the
+                    // delta to every scroll box under the pointer, so without
+                    // this the page moves too (#54, the Logs tail's reason).
+                    .on_scroll(|_, _, cx| cx.stop_propagation())
+                    .size_full()
+                    // The scrollbar overlays this padding, so a line's ending is
+                    // never covered.
+                    .px_3()
+                    .py_2()
+                    .pr_5()
+                    .overflow_y_scroll()
+                    .child(TextView::markdown("settings-update-notes-text", notes)),
+            )
+            .child(
+                Scrollbar::vertical(&scroll)
+                    .mode(ScrollbarMode::Always)
+                    .viewport_from_layout(),
+            )
+            .into_any_element()
+    }
+
+    /// The release page's button and the remind control, on one line (R12).
+    fn update_buttons(&self, url: String, version: String, cx: &mut Context<Self>) -> AnyElement {
+        let dismissed = self.updates.read(cx).is_dismissed();
+        let reminded = version.clone();
+        let remind = Rc::new(cx.listener(move |this, _: &(), _, cx| {
+            this.set_update_dismissed(!dismissed, reminded.clone(), cx);
+        }));
+        let label = if dismissed {
+            format!("Remind me about {version}")
+        } else {
+            format!("Don't remind me about {version}")
+        };
+        div()
+            .id("settings-update-actions")
+            .test_support()
+            .flex()
+            .flex_row()
+            .justify_end()
+            .items_center()
+            .gap_2()
+            .child(
+                Button::new("settings-update-link")
+                    .label("Open release page")
+                    .accessibility_label(format!("Open the release page for version {version}"))
+                    .on_click(move |_, _, cx| cx.open_url(&url)),
+            )
+            .child(
+                Button::new("settings-update-remind")
+                    .label(label.clone())
+                    .accessibility_label(label)
+                    .on_click(move |_, window, cx| remind(&(), window, cx)),
+            )
+            .into_any_element()
+    }
+
+    /// Saves the **Check for updates** switch and moves the running check to it
+    /// (R12).
+    fn toggle_check_for_updates(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.save_settings(
+            cx,
+            move |settings| settings.check_for_updates = enabled,
+            move |view, result, cx| {
+                // The stored value is what the check reads, so a failed save
+                // cannot move the check away from the file.
+                if result.is_ok() {
+                    view.updates
+                        .update(cx, |model, cx| model.set_enabled(enabled, cx));
+                }
+                view.record(SAVE_PROBLEM, result, cx);
+            },
+        );
+    }
+
+    /// Saves the user's silence for the release the page shows, or clears it
+    /// (R12).
+    fn set_update_dismissed(&mut self, dismissed: bool, version: String, cx: &mut Context<Self>) {
+        let stored = dismissed.then_some(version);
+        let saved = stored.clone();
+        self.save_settings(
+            cx,
+            move |settings| settings.dismissed_update = stored,
+            move |view, result, cx| {
+                if result.is_ok() {
+                    view.updates
+                        .update(cx, |model, cx| model.set_dismissed(saved, cx));
+                }
+                view.record(SAVE_PROBLEM, result, cx);
+            },
+        );
+    }
+
     /// One numeric row: the field, its unit, and its focus handle.
     fn numeric_row(&self, key: FieldKey, cx: &App) -> Option<Row> {
         let input = self
@@ -1700,12 +1965,36 @@ impl Render for SettingsView {
             // ride on the panel, where a screen reader reads them as the name and
             // the description of the page the tab opened (B1).
             let shown_page = &PAGES[shown];
+            // The Updates page draws its own body, because the kit's page is a
+            // list measured to its content and the notes have to fill the height
+            // the page has left (R12).
+            let content = if shown == PAGE_UPDATES {
+                self.updates_body(window, cx)
+            } else {
+                RenderOnce::render(
+                    SettingsPages::new(("settings-pages", selected))
+                        .pages(pages.into_iter().map(|(_, page)| page))
+                        .default_selected_index(SelectIndex {
+                            page_ix: selected,
+                            group_ix: None,
+                        })
+                        .sidebar_width(px(0.))
+                        .sidebar_size_range(px(0.)..px(0.))
+                        .sidebar_style(&hidden())
+                        .header_style(&hidden()),
+                    window,
+                    cx,
+                )
+                .into_any_element()
+            };
             crate::a11y::named(
                 Role::TabPanel,
                 "settings-page-panel",
                 shown_page.title,
                 Some(shown_page.description.into()),
             )
+            .flex()
+            .flex_col()
             .flex_1()
             .min_h_0()
             .w_full()
@@ -1715,20 +2004,7 @@ impl Render for SettingsView {
             // `handle_cover`.
             .pl(px(1.))
             .overflow_hidden()
-            .child(RenderOnce::render(
-                SettingsPages::new(("settings-pages", selected))
-                    .pages(pages.into_iter().map(|(_, page)| page))
-                    .default_selected_index(SelectIndex {
-                        page_ix: selected,
-                        group_ix: None,
-                    })
-                    .sidebar_width(px(0.))
-                    .sidebar_size_range(px(0.)..px(0.))
-                    .sidebar_style(&hidden())
-                    .header_style(&hidden()),
-                window,
-                cx,
-            ))
+            .child(content)
             .child(handle_cover(background))
             .into_any_element()
         };
@@ -1909,6 +2185,14 @@ fn secret_placeholder_for(method: AuthMethod) -> &'static str {
 }
 
 /// The accent that marks one connection state on the settings notice.
+fn status_severity(status: &CheckStatus) -> Severity {
+    match status {
+        CheckStatus::Failed => Severity::Warning,
+        CheckStatus::UpToDate => Severity::Success,
+        CheckStatus::Off | CheckStatus::Checking | CheckStatus::Available(_) => Severity::Info,
+    }
+}
+
 fn connection_severity(state: &ConnectionState) -> Severity {
     match state {
         ConnectionState::Connected => Severity::Success,

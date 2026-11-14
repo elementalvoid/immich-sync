@@ -191,6 +191,26 @@ _Avoid_: provider, adapter, detector
 Why uploads are held: the user's own **pause**, or the known-network list. Both read as the paused activity state; the dashboard and the tray tooltip phrase the reason.
 _Avoid_: pause kind, pause cause, hold type
 
+### Updates
+
+**Update check**:
+The client's one read of GitHub's newest published release: at startup and at
+most once every 24 hours, with a switch on the **Updates** page and no ability
+to install anything. Failure is silent; the reason is one line in the log.
+_Avoid_: auto-update, version poll, release feed
+
+**Release page**:
+The GitHub page one published release carries. The client links to it and never
+builds the URL from the version, so a stale link cannot open an empty page.
+_Avoid_: download page, changelog URL
+
+**Dismissed release**:
+A release the user silenced with `Don't remind me about <version>`. The
+silence is stored as that release's version, so it survives a restart, the
+control turns into `Remind me about <version>`, and the next release speaks
+again.
+_Avoid_: muted update, ignored version, snooze
+
 ### Diagnostics
 
 **Client version**:

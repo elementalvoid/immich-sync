@@ -6,7 +6,7 @@
 //! `dead_code` allows say which parts that binary left out.
 
 use gpui_kit::test::ElementSnapshot;
-use gpui_kit::{App, Bounds, ElementId, Point, Window};
+use gpui_kit::{App, AppContext as _, Bounds, ElementId, Entity, Point, Window};
 use mock_immich::MockImmich;
 
 /// Starts the offline Immich double on its own runtime: a GPUI test runs on
@@ -263,4 +263,129 @@ pub fn assert_migrated_rows(window: &Window, table: &[MigratedRow], surface: &st
         seen, 5,
         "the {surface} surface draws its five migrated rows"
     );
+}
+
+/// What one update check answers.
+#[allow(dead_code)]
+#[derive(Clone)]
+pub enum Answer {
+    /// A published release.
+    Release(immich_sync::update::Release),
+    /// The answer names no release.
+    UpToDate,
+    /// The check could not complete.
+    Failed,
+}
+
+/// The update check's source, answered from memory so no test reaches GitHub
+/// (R12).
+///
+/// It counts the requests it was asked for, so a test can prove the check ran
+/// once at startup and not again inside the interval.
+#[allow(dead_code)]
+pub struct FakeReleases {
+    /// What each request answers, taken in order; the last answer repeats.
+    answers: std::sync::Mutex<Vec<Answer>>,
+    /// How many requests reached the source.
+    requests: std::sync::atomic::AtomicUsize,
+    /// When set, one request never answers, so the status stays
+    /// `Checking…`.
+    hold: bool,
+}
+
+#[allow(dead_code)]
+impl FakeReleases {
+    /// A source that answers `answers` in order, repeating the last one.
+    pub fn new(answers: Vec<Answer>) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            answers: std::sync::Mutex::new(answers),
+            requests: std::sync::atomic::AtomicUsize::new(0),
+            hold: false,
+        })
+    }
+
+    /// A source whose one request stays in flight.
+    pub fn holding() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            answers: std::sync::Mutex::new(Vec::new()),
+            requests: std::sync::atomic::AtomicUsize::new(0),
+            hold: true,
+        })
+    }
+
+    /// The requests the check made.
+    pub fn requests(&self) -> usize {
+        self.requests.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl immich_sync::update::ReleaseSource for FakeReleases {
+    fn latest(&self) -> immich_sync::update::Latest<'_> {
+        self.requests
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let answer = {
+            let mut answers = self.answers.lock().expect("the fake's answers");
+            if answers.len() > 1 {
+                Some(answers.remove(0))
+            } else {
+                answers.first().cloned()
+            }
+        };
+        let hold = self.hold;
+        Box::pin(async move {
+            if hold {
+                std::future::pending::<()>().await;
+            }
+            match answer {
+                Some(Answer::Release(release)) => Ok(Some(release)),
+                Some(Answer::Failed) => Err(anyhow::anyhow!("403 from GitHub")),
+                Some(Answer::UpToDate) | None => Ok(None),
+            }
+        })
+    }
+}
+
+/// One published release, for a fake answer (R12).
+#[allow(dead_code)]
+pub fn release(text: &str) -> immich_sync::update::Release {
+    immich_sync::update::Release {
+        version: immich_sync::update::Version::parse(text).expect("a version this test named"),
+        url: format!("https://github.com/elementalvoid/immich-sync/releases/tag/v{text}"),
+        notes: format!("## What changed in {text}\n\n- The folder card no longer wraps."),
+    }
+}
+
+/// An update check that never runs, for a test that is not about it (R12).
+#[allow(dead_code)]
+pub fn idle_updates(cx: &mut App) -> Entity<immich_sync::update::UpdateModel> {
+    cx.new(|_| {
+        immich_sync::update::UpdateModel::new(
+            FakeReleases::new(Vec::new()),
+            immich_sync::update::INTERVAL,
+            false,
+            None,
+        )
+    })
+}
+
+/// A release newer than the running package, so the check reports it (R12).
+///
+/// The version is derived from the package version, so a release bump does not
+/// turn this into "up to date".
+#[allow(dead_code)]
+pub fn newer_release() -> immich_sync::update::Release {
+    let current = immich_sync::update::Version::parse(immich_sync::version::package_version())
+        .expect("the package version is three numbers");
+    let version = immich_sync::update::Version {
+        patch: current.patch + 1,
+        ..current
+    };
+    immich_sync::update::Release {
+        version,
+        url: format!("https://github.com/elementalvoid/immich-sync/releases/tag/v{version}"),
+        notes: format!(
+            "## What changed in {version}\n\n- The folder card no longer wraps.\n- {}",
+            "A long release note that the fixed-height box scrolls instead of growing the page."
+        ),
+    }
 }

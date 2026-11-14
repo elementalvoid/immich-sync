@@ -432,6 +432,8 @@ fn settings_round_trip_across_a_restart() {
             settings.server_url = "https://immich.example.com".to_string();
             settings.email = "sync@example.com".to_string();
             settings.auth_method = AuthMethod::ApiKey;
+            settings.check_for_updates = false;
+            settings.dismissed_update = Some("0.4.0".to_string());
         })
         .expect("save the changed settings");
 
@@ -477,7 +479,18 @@ fn settings_round_trip_across_a_restart() {
          server_url = \"https://immich.example.com\"\n\
          email = \"sync@example.com\"\n\
          auth_method = \"api_key\"\n\
-         log_level = \"info\"\n"
+         log_level = \"info\"\n\
+         check_for_updates = false\n\
+         dismissed_update = \"0.4.0\"\n"
+    );
+    assert!(
+        !settings.check_for_updates,
+        "R12: the update switch round-trips"
+    );
+    assert_eq!(
+        settings.dismissed_update.as_deref(),
+        Some("0.4.0"),
+        "R12: the silenced version round-trips"
     );
 }
 

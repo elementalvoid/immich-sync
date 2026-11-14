@@ -38,6 +38,7 @@ pub mod store;
 mod tab;
 pub mod theme;
 pub mod times;
+pub mod update;
 pub mod upload;
 pub mod upload_view;
 pub mod version;
@@ -146,6 +147,9 @@ fn run_client() -> anyhow::Result<()> {
 fn boot(cx: &mut App, incoming: Receiver<instance::Request>) {
     gpui_kit::init(cx);
     shell::init(cx);
+    // The startup check needs the network, so only the real boot path starts
+    // it: a test boots the shell without one and never reaches GitHub (R12).
+    shell::start_updates(cx);
 
     // A second launch reaches the shell through GPUI's executor, the same way
     // gpui-tray dispatches its native events.
